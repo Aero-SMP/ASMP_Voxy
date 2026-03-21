@@ -8,6 +8,7 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.FogRenderer;
 import net.minecraft.client.renderer.FogRenderer.FogMode;
+import net.minecraft.world.level.material.FogType;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -30,10 +31,16 @@ public class MixinFogRenderer {
         float tickDelta,
         CallbackInfo ci
     ) {
-        var vrs = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
+        var vrs = IGetVoxyRenderSystem.getNullable();
+        if (vrs == null) return;
 
-        if (VoxyConfig.CONFIG.renderVanillaFog || vrs == null || vrs.voxy$getRenderSystem() == null) {
-            RenderSystem.setShaderFogEnd(viewDistance);
+        if (RenderSystem.getShaderFogEnd() < 10.0f) return;
+
+        if (camera.getFluidInCamera() != FogType.NONE || thickFog) {
+            if (!VoxyConfig.CONFIG.renderVanillaFog) {
+                RenderSystem.setShaderFogStart(999999999);
+                RenderSystem.setShaderFogEnd(999999999);
+            }
         } else {
             RenderSystem.setShaderFogStart(999999999);
             RenderSystem.setShaderFogEnd(999999999);

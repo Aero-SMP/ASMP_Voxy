@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
@@ -13,6 +14,7 @@ import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.util.GPUTiming;
 import net.minecraft.client.Minecraft;
+import net.minecraft.util.Mth;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryStack;
 
@@ -21,11 +23,20 @@ import java.util.function.BooleanSupplier;
 
 import static org.lwjgl.opengl.ARBComputeShader.glDispatchCompute;
 import static org.lwjgl.opengl.ARBShaderImageLoadStore.glBindImageTexture;
+import static org.lwjgl.opengl.GL11C.GL_BLEND;
 import static org.lwjgl.opengl.GL11C.GL_DEPTH_COMPONENT;
+import static org.lwjgl.opengl.GL11C.GL_DEPTH_TEST;
 import static org.lwjgl.opengl.GL11C.GL_NEAREST;
+import static org.lwjgl.opengl.GL11C.GL_ONE;
+import static org.lwjgl.opengl.GL11C.GL_ONE_MINUS_SRC_ALPHA;
 import static org.lwjgl.opengl.GL11C.GL_RGBA8;
+import static org.lwjgl.opengl.GL11C.GL_SRC_ALPHA;
+import static org.lwjgl.opengl.GL11C.GL_STENCIL_TEST;
 import static org.lwjgl.opengl.GL11C.GL_TEXTURE_MAG_FILTER;
 import static org.lwjgl.opengl.GL11C.GL_TEXTURE_MIN_FILTER;
+import static org.lwjgl.opengl.GL11C.glDisable;
+import static org.lwjgl.opengl.GL11C.glEnable;
+import static org.lwjgl.opengl.GL14C.glBlendFuncSeparate;
 import static org.lwjgl.opengl.GL20C.glUniform4f;
 import static org.lwjgl.opengl.GL30.GL_DEPTH_ATTACHMENT;
 import static org.lwjgl.opengl.GL30.GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME;
@@ -41,6 +52,7 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     private GlTexture colourSSAOTex;
     private final GlFramebuffer fbSSAO = new GlFramebuffer();
 
+    private final boolean useEnvFog;
     private final FullscreenBlit finalBlit;
 
     private final SSAO ssao;
@@ -95,14 +107,42 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
         this.finalBlit.bind();
 
+        float fogStart = RenderSystem.getShaderFogStart();
+        float fogEnd = RenderSystem.getShaderFogEnd();
+        float[] fogColor = RenderSystem.getShaderFogColor();
+
+        float renderDistance = Minecraft.getInstance().gameRenderer.getRenderDistance();
+
+        boolean fogCoversAllRendering = fogEnd < renderDistance;
+
+        if (this.useEnvFog) {
+            if (Math.abs(fogEnd - fogStart) > 1) {
+                float invEndFogDelta = 1f / (fogEnd - fogStart);
+                float endDistance = Math.max(renderDistance, 20 * 16); //TODO: make this constant a config option
+                endDistance *= (float) Math.sqrt(3);
+                float startDelta = -fogStart * invEndFogDelta;
+                float clampedDist = Mth.clamp(endDistance * invEndFogDelta + startDelta, 0.0f, 1.0f);
+                glUniform4f(4, invEndFogDelta, startDelta, clampedDist, 0);
+                glUniform4f(5, fogColor[0], fogColor[1], fogColor[2], 1.0f);
+            } else {
+                glUniform4f(4, 0, 0, 0, 0);
+                glUniform4f(5, 0, 0, 0, 0);
+            }
+        }
+
         glBindTextureUnit(3, this.colourSSAOTex.id);
 
         //Do alpha blending
-        
-        glEnable(GL_BLEND);
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        AbstractRenderPipeline.transformBlitDepth(this.finalBlit, this.fb.getDepthTex().id, sourceFrameBuffer, viewport, new Matrix4f(viewport.vanillaProjection).mul(viewport.modelView));
-        glDisable(GL_BLEND);
+        //Unbelievably jank hack, only blit out to the framebuffer if we are rendering fog
+        if (!fogCoversAllRendering) {
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            AbstractRenderPipeline.transformBlitDepth(this.finalBlit, this.fb.getDepthTex().id, sourceFrameBuffer, viewport, new Matrix4f(viewport.vanillaProjection).mul(viewport.modelView));
+            glDisable(GL_BLEND);
+        } else {
+            glDisable(GL_STENCIL_TEST);
+            glDisable(GL_DEPTH_TEST);
+        }
         //glBlitNamedFramebuffer(this.fbSSAO.id, sourceFrameBuffer, 0,0, viewport.width, viewport.height, 0,0, viewport.width, viewport.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
 
