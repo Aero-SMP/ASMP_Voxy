@@ -36,7 +36,7 @@ public class MixinFogRenderer {
 
         if (RenderSystem.getShaderFogEnd() < 10.0f) return;
 
-        if (camera.getFluidInCamera() != FogType.NONE || thickFog) {
+        if (camera.getFluidInCamera() != FogType.NONE) {
             if (!VoxyConfig.CONFIG.renderVanillaFog) {
                 RenderSystem.setShaderFogStart(999999999);
                 RenderSystem.setShaderFogEnd(999999999);
