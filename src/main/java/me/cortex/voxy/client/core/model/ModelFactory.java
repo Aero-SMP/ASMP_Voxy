@@ -15,10 +15,10 @@ import me.cortex.voxy.common.util.Pair;
 import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColor;
+import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
@@ -37,8 +37,6 @@ import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.material.FluidState;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
-
-import com.mojang.authlib.minecraft.client.MinecraftClient;
 
 import java.lang.invoke.VarHandle;
 import java.util.*;
@@ -807,7 +805,13 @@ public class ModelFactory {
     }
 
     private static BlockColor getColourProvider(Block block) {
-        return Minecraft.getInstance().getBlockColors().blockColors.byId(BuiltInRegistries.BLOCK.getId(block));
+        BlockState defaultState = block.defaultBlockState();
+        var blockColors = Minecraft.getInstance().getBlockColors();
+        int color = blockColors.getColor(defaultState, null, BlockPos.ZERO, 0);
+        if (color != 0 && color != -1) {
+            return (state, world, pos, tintIndex) -> blockColors.getColor(state, world, pos, tintIndex);
+        }
+        return null;
     }
 
     //TODO: add a method to detect biome dependent colours (can do by detecting if getColor is ever called)
