@@ -807,6 +807,9 @@ public class ModelFactory {
     private static BlockColor getColourProvider(Block block) {
         BlockState defaultState = block.defaultBlockState();
         var blockColors = Minecraft.getInstance().getBlockColors();
+        if (block instanceof LiquidBlock) {
+            return (state, world, pos, tintIndex) -> blockColors.getColor(state, world, pos, tintIndex);
+        }
         int color;
         try {
             color = blockColors.getColor(defaultState, null, BlockPos.ZERO, 0);
