@@ -10,6 +10,9 @@ import org.spongepowered.asm.mixin.Mixin;
 public class MixinCloudRenderer {
     @WrapMethod(method = {"getCloudRenderDistance"})
     private static int voxy$cloudRenderDistance(Operation<Integer> original) {
-        return Math.max(original.call(), (int)(VoxyConfig.CONFIG.sectionRenderDistance * 32F) * 2 + 9);
+        if (VoxyConfig.CONFIG.adaptCloudDistance) {
+            return Math.max(original.call(), (int) (VoxyConfig.CONFIG.sectionRenderDistance * 32F) * 2 + 9);
+        }
+        return VoxyConfig.CONFIG.cloudDistance < 1 ? original.call() : VoxyConfig.CONFIG.cloudDistance * 2 + 9;
     }
 }

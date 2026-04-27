@@ -56,7 +56,6 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     private final FullscreenBlit finalBlit;
 
     private final SSAO ssao;
-    private boolean useEnvFog;
 
     protected NormalRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier) {
         super(properties, nodeManager, nodeCleaner, traversal, frexSupplier, false);
