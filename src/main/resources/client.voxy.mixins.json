@@ -24,6 +24,7 @@
     "minecraft.MixinClientPacketListener",
     "minecraft.MixinDebugScreenOverlay",
     "minecraft.MixinFogRenderer",
+    "minecraft.MixinGameRenderer",
     // "minecraft.MixinGlDebug",
     "minecraft.MixinLevelRenderer",
     "minecraft.MixinMinecraft",
