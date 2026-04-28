@@ -77,6 +77,21 @@ public class VoxyRenderSystem {
     private final AbstractRenderPipeline pipeline;
     private final RenderProperties properties;
 
+    // Fog parameters captured before modification by MixinFogRenderer, for Voxy's own fog pass
+    private float capturedFogStart;
+    private float capturedFogEnd;
+    private final float[] capturedFogColor = new float[4];
+
+    public void setCapturedFog(float fogStart, float fogEnd, float[] fogColor) {
+        this.capturedFogStart = fogStart;
+        this.capturedFogEnd = fogEnd;
+        System.arraycopy(fogColor, 0, this.capturedFogColor, 0, 4);
+    }
+
+    public float getCapturedFogStart() { return this.capturedFogStart; }
+    public float getCapturedFogEnd()   { return this.capturedFogEnd; }
+    public float[] getCapturedFogColor() { return this.capturedFogColor; }
+
     private static AbstractSectionRenderer.Factory<?,? extends IGeometryData> getRenderBackendFactory() {
         //TODO: need todo a thing where selects optimal section render based on if supports the pipeline and geometry data type
         return MDICSectionRenderer.FACTORY;

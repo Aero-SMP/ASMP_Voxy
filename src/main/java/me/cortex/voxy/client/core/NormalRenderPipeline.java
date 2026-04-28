@@ -2,6 +2,7 @@ package me.cortex.voxy.client.core;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.gl.shader.Shader;
@@ -106,10 +107,10 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     @Override
     protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
         this.finalBlit.bind();
-
-        float fogStart = RenderSystem.getShaderFogStart();
-        float fogEnd = RenderSystem.getShaderFogEnd();
-        float[] fogColor = RenderSystem.getShaderFogColor();
+        var vrs = IGetVoxyRenderSystem.getNullable();
+        float fogStart = vrs != null ? vrs.getCapturedFogStart() : RenderSystem.getShaderFogStart();
+        float fogEnd   = vrs != null ? vrs.getCapturedFogEnd()   : RenderSystem.getShaderFogEnd();
+        float[] fogColor = vrs != null ? vrs.getCapturedFogColor() : RenderSystem.getShaderFogColor();
 
         float renderDistance = Minecraft.getInstance().gameRenderer.getRenderDistance();
 
