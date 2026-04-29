@@ -154,7 +154,7 @@ public abstract class VoxyConfigScreenPages {
 
         OptionImpl<VoxyConfig, Boolean> adaptCloudDistanceOption = OptionImpl.createBuilder(boolean.class, storage)
                 .setName(Component.literal("Adapt cloud distance"))
-                .setTooltip(Component.literal("Extends cloud distance to the current render distance"))
+                .setTooltip(Component.literal("Extends the cloud distance according to the current render distance. It's automatically capped at 256"))
                 .setControl(TickBoxControl::new)
                 .setBinding((s, v) -> s.adaptCloudDistance = v, s -> s.adaptCloudDistance)
                 .setImpact(OptionImpact.LOW)
@@ -204,7 +204,7 @@ public abstract class VoxyConfigScreenPages {
                             return Component.literal(v < 1 ? "Default" : Integer.toString(v));
                         }))
                         .setBinding((s, v) -> s.cloudDistance = v, s -> s.cloudDistance)
-                        .setImpact(OptionImpact.LOW)
+                        .setImpact(OptionImpact.VARIES)
                         .build()
                 ).add(OptionImpl.createBuilder(SSAO.SSAOMode.class, storage)
                         .setName(Component.translatable("voxy.config.general.ssao_mode"))
