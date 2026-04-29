@@ -124,10 +124,12 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
                 float startDelta = -fogStart * invEndFogDelta;
                 float clampedDist = Mth.clamp(endDistance * invEndFogDelta + startDelta, 0.0f, 1.0f);
                 glUniform4f(4, invEndFogDelta, startDelta, clampedDist, 0);
-                glUniform4f(5, fogColor[0], fogColor[1], fogColor[2], 1.0f);
+                glUniform4f(5, fogColor[0], fogColor[1], fogColor[2], VoxyConfig.CONFIG.fogIntensity);
+                glUniform1f(6, VoxyConfig.CONFIG.fogDensity);
             } else {
                 glUniform4f(4, 0, 0, 0, 0);
                 glUniform4f(5, 0, 0, 0, 0);
+                glUniform1f(6, 0.0f);
             }
         }
 

@@ -9,6 +9,7 @@ layout(binding = 3) uniform sampler2D colourTex;
 #ifdef USE_ENV_FOG
 layout(location = 4) uniform vec4 endParams;
 layout(location = 5) uniform vec4 fogColour;
+layout(location = 6) uniform float fogDensity;
 #endif
 #endif
 
@@ -51,6 +52,7 @@ void main() {
     #ifdef USE_ENV_FOG
     if (fogColour.a>0.0){
         float fogLerp = clamp(fma(length(point.xyz),endParams.x,endParams.y),0,endParams.z);//512 is 32*16 which is the render distance in blocks
+        if (fogDensity > 0.0) fogLerp = (exp(fogDensity * fogLerp) - 1.0) / (exp(fogDensity) - 1.0);
         colour.rgb = mix(colour.rgb, fogColour.rgb, fogLerp*fogColour.a);
     }
     #endif
