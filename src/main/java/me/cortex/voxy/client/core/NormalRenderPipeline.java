@@ -15,7 +15,6 @@ import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.util.GPUTiming;
 import net.minecraft.client.Minecraft;
-import net.minecraft.util.Mth;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryStack;
 
@@ -116,15 +115,19 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
 
         if (this.useEnvFog) {
             if (Math.abs(fogEnd - fogStart) > 1) {
-                float invEndFogDelta = 1f / (fogEnd - fogStart);
-                float startDelta = -fogStart * invEndFogDelta;
-                glUniform4f(4, invEndFogDelta, startDelta, 1.0f, 0);
-                glUniform4f(5, fogColor[0], fogColor[1], fogColor[2], VoxyConfig.CONFIG.fogIntensity);
-                glUniform1f(6, VoxyConfig.CONFIG.fogDensity);
+                glUniform1f(4, fogStart);
+                glUniform1f(5, fogEnd);
+                glUniform4f(6, fogColor[0], fogColor[1], fogColor[2], 1.0f);
+                glUniform1i(7, RenderSystem.getShaderFogShape().getIndex());
+                glUniform1f(8, VoxyConfig.CONFIG.fogIntensity);
+                glUniform1f(9, VoxyConfig.CONFIG.fogDensity);
             } else {
-                glUniform4f(4, 0, 0, 0, 0);
-                glUniform4f(5, 0, 0, 0, 0);
-                glUniform1f(6, 0.0f);
+                glUniform1f(4, 0);
+                glUniform1f(5, 0);
+                glUniform4f(6, 0, 0, 0, 0);
+                glUniform1i(7, 0);
+                glUniform1f(8, 0);
+                glUniform1f(9, 0);
             }
         }
 
