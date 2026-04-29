@@ -112,18 +112,13 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
         float fogEnd   = vrs != null ? vrs.getCapturedFogEnd()   : RenderSystem.getShaderFogEnd();
         float[] fogColor = vrs != null ? vrs.getCapturedFogColor() : RenderSystem.getShaderFogColor();
 
-        float renderDistance = Minecraft.getInstance().gameRenderer.getRenderDistance();
-
-        boolean fogCoversAllRendering = fogEnd < renderDistance;
+        boolean fogCoversAllRendering = fogEnd < VoxyRenderSystem.getRenderDistance();
 
         if (this.useEnvFog) {
             if (Math.abs(fogEnd - fogStart) > 1) {
                 float invEndFogDelta = 1f / (fogEnd - fogStart);
-                float endDistance = Math.max(renderDistance, 20 * 16); //TODO: make this constant a config option
-                endDistance *= (float) Math.sqrt(3);
                 float startDelta = -fogStart * invEndFogDelta;
-                float clampedDist = Mth.clamp(endDistance * invEndFogDelta + startDelta, 0.0f, 1.0f);
-                glUniform4f(4, invEndFogDelta, startDelta, clampedDist, 0);
+                glUniform4f(4, invEndFogDelta, startDelta, 1.0f, 0);
                 glUniform4f(5, fogColor[0], fogColor[1], fogColor[2], VoxyConfig.CONFIG.fogIntensity);
                 glUniform1f(6, VoxyConfig.CONFIG.fogDensity);
             } else {
