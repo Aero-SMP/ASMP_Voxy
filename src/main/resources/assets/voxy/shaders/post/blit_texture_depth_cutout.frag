@@ -53,7 +53,7 @@ void main() {
     if (fogColour.a>0.0){
         float fogLerp = clamp(fma(length(point.xyz),endParams.x,endParams.y),0,endParams.z);//512 is 32*16 which is the render distance in blocks
         if (fogDensity > 0.0) fogLerp = (exp(fogDensity * fogLerp) - 1.0) / (exp(fogDensity) - 1.0);
-        colour.rgb = mix(colour.rgb, fogColour.rgb, fogLerp*fogColour.a);
+        colour.rgb = mix(colour.rgb, fogColour.rgb, clamp(fogLerp*fogColour.a, 0.0, 1.0));
     }
     #endif
     #else

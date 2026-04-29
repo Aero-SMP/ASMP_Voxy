@@ -37,6 +37,7 @@ public class VoxyConfig implements OptionStorage<VoxyConfig> {
     public int skyFogDistance = 96;
     public float fogIntensity = 1.0f;
     public float fogDensity = 0.0f;
+    public boolean linkFogToRenderDistance = true;
     public boolean dontUseSodiumBuilderThreads = false;
 
     public String ssaoMode;
