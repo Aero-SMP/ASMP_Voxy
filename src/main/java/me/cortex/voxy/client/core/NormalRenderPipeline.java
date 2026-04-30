@@ -115,19 +115,17 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
 
         if (this.useEnvFog) {
             if (Math.abs(fogEnd - fogStart) > 1) {
-                glUniform1f(4, fogStart);
-                glUniform1f(5, fogEnd);
-                glUniform4f(6, fogColor[0], fogColor[1], fogColor[2], 1.0f);
-                glUniform1i(7, RenderSystem.getShaderFogShape().getIndex());
-                glUniform1f(8, VoxyConfig.CONFIG.fogIntensity);
-                glUniform1f(9, VoxyConfig.CONFIG.fogDensity);
+                glUniform2f(4, fogStart, fogEnd);
+                glUniform4f(5, fogColor[0], fogColor[1], fogColor[2], 1.0f);
+                glUniform1i(6, RenderSystem.getShaderFogShape().getIndex());
+                glUniform1f(7, VoxyConfig.CONFIG.fogIntensity);
+                glUniform1f(8, VoxyConfig.CONFIG.fogDensity);
             } else {
-                glUniform1f(4, 0);
-                glUniform1f(5, 0);
-                glUniform4f(6, 0, 0, 0, 0);
-                glUniform1i(7, 0);
+                glUniform2f(4, 0, 0);
+                glUniform4f(5, 0, 0, 0, 0);
+                glUniform1i(6, 0);
+                glUniform1f(7, 0);
                 glUniform1f(8, 0);
-                glUniform1f(9, 0);
             }
         }
 

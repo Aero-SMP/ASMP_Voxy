@@ -7,12 +7,11 @@ layout(location = 2) uniform mat4 projMat;
 #ifdef EMIT_COLOUR
 layout(binding = 3) uniform sampler2D colourTex;
 #ifdef USE_ENV_FOG
-layout(location = 4) uniform float fogStart;
-layout(location = 5) uniform float fogEnd;
-layout(location = 6) uniform vec4 fogColor;
-layout(location = 7) uniform int fogShape;
-layout(location = 8) uniform float fogIntensity;
-layout(location = 9) uniform float fogDensity;
+layout(location = 4) uniform vec2 fogParams;//.x=fogStart,.y=fogEnd
+layout(location = 5) uniform vec4 fogColor;
+layout(location = 6) uniform int fogShape;
+layout(location = 7) uniform float fogIntensity;
+layout(location = 8) uniform float fogDensity;
 #endif
 #endif
 
@@ -55,7 +54,7 @@ void main() {
     #ifdef USE_ENV_FOG
     if (fogIntensity > 0.0){
         float dist = getFragDistance(fogShape, point.xyz);
-        float fogLerp = smoothstep(fogStart, fogEnd, dist);
+        float fogLerp = smoothstep(fogParams.x, fogParams.y, dist);
         if (fogDensity > 0.0) fogLerp = (exp(fogDensity * fogLerp) - 1.0) / (exp(fogDensity) - 1.0);
         colour.rgb = mix(colour.rgb, fogColor.rgb, clamp(fogLerp * fogIntensity, 0.0, 1.0));
     }
