@@ -50,7 +50,7 @@ repositories {
 def gitCommitHash = { ->
     try {
         ExecOutput result = providers.exec {
-            commandLine = ['git', 'rev-parse', '--short', 'HEAD']
+            commandLine = ['git', 'rev-parse', 'HEAD']
             ignoreExitValue = true
         }
 
