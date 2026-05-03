@@ -29,7 +29,7 @@
   "voxy.config.general.environmental_fog.tooltip": "Enables or disables voxy rendering environmental fog",
 
   "voxy.config.general.render_fog": "Enable render fog",
-  "voxy.config.general.render_fog.tooltip": "Enables or disables render fog effect",
+  "voxy.config.general.render_fog.tooltip": "Enables or disables the voxy fog effect",
 
   "voxy.config.general.ssao_mode": "SSAO Mode",
   "voxy.config.general.ssao_mode.tooltip": "The mode used for screenspace ambient occlusion (Auto attempts to pick the best option while reducing performance impact)",

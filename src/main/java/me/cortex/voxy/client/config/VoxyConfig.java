@@ -33,11 +33,10 @@ public class VoxyConfig implements OptionStorage<VoxyConfig> {
     public float sectionRenderDistance = 16;
     public int serviceThreads = (int) Math.max(CpuLayout.getCoreCount()/1.5, 1);
     public float subDivisionSize = 64;
-    public boolean renderVanillaFog = true;
+    public boolean renderVoxyFog = true;
     public int skyFogDistance = 96;
     public float fogIntensity = 1.0f;
     public float fogDensity = 0.0f;
-    public boolean linkFogToRenderDistance = true;
     public boolean adaptCloudDistance = true;
     public int cloudDistance = 0;
     public boolean dontUseSodiumBuilderThreads = false;

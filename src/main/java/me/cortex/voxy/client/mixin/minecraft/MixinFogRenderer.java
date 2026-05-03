@@ -34,33 +34,29 @@ public class MixinFogRenderer {
 
         if (RenderSystem.getShaderFogEnd() < 10.0f) return;
 
-        // Capture original fog values BEFORE we modify them,
-        // so Voxy's own fog pass can use the correct values
-        float capturedFogEnd = RenderSystem.getShaderFogEnd();
-        if (VoxyConfig.CONFIG.linkFogToRenderDistance && fogMode == FogMode.FOG_TERRAIN) {
-            capturedFogEnd = VoxyConfig.CONFIG.sectionRenderDistance * 32 * 16;
-        }
-        vrs.setCapturedFog(
-            RenderSystem.getShaderFogStart(),
-            capturedFogEnd,
-            RenderSystem.getShaderFogColor()
-        );
-
-        if (!VoxyConfig.CONFIG.renderVanillaFog) {
-            RenderSystem.setShaderFogStart(999999999);
-            RenderSystem.setShaderFogEnd(999999999);
-            return;
-        }
-
-        if (fogMode == FogMode.FOG_TERRAIN && camera.getFluidInCamera() == FogType.NONE) {
-            RenderSystem.setShaderFogStart(999999999);
-            RenderSystem.setShaderFogEnd(999999999);
-            return;
-        }
-
+        // Adjust sky fog so it always looks smooth and doesn't change with render distance
         if (fogMode == FogMode.FOG_SKY) {
             RenderSystem.setShaderFogStart(0);
             RenderSystem.setShaderFogEnd(VoxyConfig.CONFIG.skyFogDistance);
+        }
+
+        if (fogMode == FogMode.FOG_TERRAIN) {
+            // Do NOT override unique fog, it's always displayed close and meant for restricting vision
+            boolean noFogType = camera.getFluidInCamera() == FogType.NONE;
+
+            // Capture original fog values BEFORE we modify them,
+            // so Voxy's own fog pass can use the correct values
+            float capturedFogEnd = noFogType ?
+                VoxyConfig.CONFIG.sectionRenderDistance * 32 * 16 : RenderSystem.getShaderFogEnd();
+
+            vrs.setCapturedFog(RenderSystem.getShaderFogStart(), capturedFogEnd, RenderSystem.getShaderFogColor());
+
+            // Always hide vanilla terrain fog - either replaced by voxy or disabled completely
+            // unless it's special fog, in that case it must be rendered to restrict vision in regular chunks
+            if (noFogType) {
+                RenderSystem.setShaderFogStart(999999999);
+                RenderSystem.setShaderFogEnd(999999999);
+            }
         }
     }
 }
