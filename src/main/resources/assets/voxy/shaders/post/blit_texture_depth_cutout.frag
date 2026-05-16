@@ -16,6 +16,7 @@ layout(location = 8) uniform float fogDensity;
 #endif
 
 #import <voxy:util/depthutils.glsl>
+#import <sodium:include/fog.glsl>
 
 out vec4 colour;
 in vec2 UV;

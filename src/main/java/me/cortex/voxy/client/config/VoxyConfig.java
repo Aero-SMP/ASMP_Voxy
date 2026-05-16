@@ -31,7 +31,6 @@ public class VoxyConfig {
     public float sectionRenderDistance = 16;
     public int serviceThreads = (int) Math.max(CpuLayout.getCoreCount()/1.5, 1);
     public float subDivisionSize = 64;
-    public boolean renderVoxyFog = true;
     public int skyFogDistance = 96;
     public float fogIntensity = 1.0f;
     public float fogDensity = 0.0f;
@@ -41,7 +40,7 @@ public class VoxyConfig {
 
     public String ssaoMode;
 
-    public boolean useEnvironmentalFog;
+    public boolean useEnvironmentalFog = true;
 
     public SSAO.SSAOMode getSSAOMode() {
         if (this.ssaoMode == null) return SSAO.SSAOMode.AUTO;
