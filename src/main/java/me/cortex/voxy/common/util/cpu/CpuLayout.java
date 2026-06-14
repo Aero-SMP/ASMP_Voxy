@@ -5,7 +5,7 @@ import com.sun.jna.platform.win32.WinNT;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.ThreadUtils;
-import net.minecraft.Util;
+import org.lwjgl.system.Platform;
 import oshi.SystemInfo;
 
 import java.util.Arrays;
@@ -16,16 +16,19 @@ public class CpuLayout {
     private CpuLayout(){}
 
     public static void setThreadAffinity(Core... cores) {
+//? if 1.21.1 {
         var affinity = new Affinity[cores.length];
         for (int i = 0; i < cores.length; i++) {
             affinity[i] = cores[i].affinity;
         }
         setThreadAffinity(affinity);
+//? }
     }
 
     public static void setThreadAffinity(Affinity... affinities) {
-        var platform = Util.getPlatform();
-        if (platform == Util.OS.WINDOWS) {
+//? if 1.21.1 {
+        var platform = Platform.get();
+        if (platform == Platform.WINDOWS) {
             long[] msks = new long[affinities.length];
             short[] groups = new short[affinities.length];Arrays.fill(groups, (short) -1);
             int i = 0;
@@ -36,7 +39,7 @@ public class CpuLayout {
                 msks[idx] |= a.msk;
             }
             ThreadUtils.SetThreadSelectedCpuSetMasksWin32(Arrays.copyOf(msks, i), Arrays.copyOf(groups, i));
-        } else if (platform == Util.OS.LINUX) {
+        } else if (platform == Platform.LINUX) {
             Arrays.sort(affinities, (a, b) -> a.group - b.group);
             long[] msks = new long[affinities.length];
             for (int i=0; i<affinities.length; i++) {
@@ -46,9 +49,13 @@ public class CpuLayout {
         } else {
             Logger.error("Don't know how to set thread affinity on this platform.");
         }
+//? }
     }
 
     private static Core[] generateCoreLayoutWindows() {
+//? if 1.20.1 {
+        return null;
+//? } else {
         var cores = Kernel32Util.getLogicalProcessorInformationEx(WinNT.LOGICAL_PROCESSOR_RELATIONSHIP.RelationProcessorCore);
         boolean allSameClass = true;
         for (var coreO : cores) {
@@ -73,9 +80,13 @@ public class CpuLayout {
         }
         sort(res);
         return res;
+//? }
     }
 
     private static Core[] generateCoreLayoutLinux() {
+//? if 1.20.1 {
+        return null;
+//? } else {
         var processor = new SystemInfo().getHardware().getProcessor();
         Int2ObjectOpenHashMap<Affinity> affinityMsk = new Int2ObjectOpenHashMap<>();
         for (var thread : processor.getLogicalProcessors()) {
@@ -104,10 +115,12 @@ public class CpuLayout {
         }
         sort(cores);
         return cores;
+//? }
     }
 
 
     private static void sort(Core[] cores) {
+//? if 1.21.1 {
         Arrays.sort(cores, (a,b)->{
             if (a.isEfficiency == b.isEfficiency) {
                 int c = Short.compareUnsigned(a.affinity.group, b.affinity.group);
@@ -119,6 +132,7 @@ public class CpuLayout {
                 return a.isEfficiency?1:-1;
             }
         });
+//? }
     }
 
     public record Affinity(long msk, short group) {}
@@ -126,14 +140,14 @@ public class CpuLayout {
 
     }
 
+//? if 1.21.1 {
     public static final Core[] CORES;
     static {
         Core[] cores = null;
         try {
-            var platform = Util.getPlatform();
-            if (platform == Util.OS.WINDOWS) {
+            if (Platform.get() == Platform.WINDOWS) {
                 cores = generateCoreLayoutWindows();
-            } else if (platform == Util.OS.LINUX) {
+            } else if (Platform.get() == Platform.LINUX) {
                 cores = generateCoreLayoutLinux();
             }
         } catch (Exception e) {
@@ -141,8 +155,10 @@ public class CpuLayout {
         }
         CORES = cores;
     }
+//? }
 
     public static void main(String[] args) throws InterruptedException {
+//? if 1.21.1 {
         System.err.println(Arrays.toString(CORES));
         setThreadAffinity(CORES[0], CORES[1]);
         for (int i = 0; i < 20; i++) {
@@ -160,13 +176,18 @@ public class CpuLayout {
         while (true) {
             Thread.sleep(100);
         }
+//? }
     }
 
     public static int getCoreCount() {
+//? if 1.20.1 {
+        return Runtime.getRuntime().availableProcessors();
+//? } else {
         if (CORES==null) {
             return Runtime.getRuntime().availableProcessors();
         } else {
             return CORES.length;
         }
+//? }
     }
 }

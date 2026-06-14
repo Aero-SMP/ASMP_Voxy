@@ -7,7 +7,6 @@ import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
 import me.cortex.voxy.commonImpl.VoxyCommon;
-import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.FileReader;
 import java.io.IOException;
@@ -15,8 +14,13 @@ import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+//? if 1.20.1
+import me.jellysquid.mods.sodium.client.gui.options.storage.OptionStorage;
 
-public class VoxyConfig {
+public class VoxyConfig
+//? if 1.20.1
+    implements OptionStorage<VoxyConfig>
+{
     private static final Gson GSON = new GsonBuilder()
             .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .setPrettyPrinting()
@@ -95,10 +99,15 @@ public class VoxyConfig {
     }
 
     private static Path getConfigPath() {
-        return FabricLoader.getInstance()
-                .getConfigDir()
-                .resolve("voxy-config.json");
+        return VoxyCommon.getPlatformUtil().getConfigDir().resolve("voxy-config.json");
     }
+
+    //? if 1.20.1 {
+    @Override
+    public VoxyConfig getData() {
+        return this;
+    }
+    //? }
 
     public boolean isRenderingEnabled() {
         return VoxyCommon.isAvailable() && this.enabled && this.enableRendering;

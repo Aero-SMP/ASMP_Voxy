@@ -13,7 +13,7 @@ public class MixinCloudRenderer {
         if (!VoxyConfig.CONFIG.isRenderingEnabled())
             return original.call();
         if (VoxyConfig.CONFIG.adaptCloudDistance) {
-            return Math.clamp((int)(VoxyConfig.CONFIG.sectionRenderDistance * 32F) + 9, original.call(), 265);
+            return Math.clamp((int)(VoxyConfig.CONFIG.sectionRenderDistance * 32F) + 9, original.call(), 256);
         }
         return VoxyConfig.CONFIG.cloudDistance < 1 ? original.call() : VoxyConfig.CONFIG.cloudDistance + 9;
     }

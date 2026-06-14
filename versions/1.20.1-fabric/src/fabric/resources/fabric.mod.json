@@ -17,16 +17,13 @@
   "environment": "*",
   "entrypoints": {
     "client": [
-      "me.cortex.voxy.client.VoxyClient"
+      "me.cortex.voxy.client.FabricVoxyClient"
     ],
     "modmenu": [
       "me.cortex.voxy.client.config.ModMenuIntegration"
     ],
-    "sodium:config_api_user": [
-      "me.cortex.voxy.client.config.VoxyConfigMenu"
-    ],
     "main": [
-      "me.cortex.voxy.commonImpl.VoxyCommon"
+      "me.cortex.voxy.commonImpl.FabricVoxyCommon"
     ]
   },
   "mixins": [
@@ -34,15 +31,22 @@
       "config": "client.voxy.mixins.json",
       "environment": "client"
     },
-    "common.voxy.mixins.json"
+    {
+      "config": "fabric-client.voxy.mixins.json",
+      "environment": "client"
+    },
+    "common.voxy.mixins.json",
+    "fabric-common.voxy.mixins.json"
   ],
   "depends": {
     "minecraft": [
-      "1.21.1"
+      "1.20.1"
     ],
     "fabricloader": ">=0.14.22",
     "fabric-api": ">=0.91.1",
-    "sodium": ">=0.8.12-alpha.2+mc1.21.1"
+    "sodium": [
+      "=0.5.13"
+    ]
   },
   "breaks": {
     "voxyworldgenv2": "=2.2.2"

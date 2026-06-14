@@ -39,13 +39,29 @@ public final class ReuseVertexConsumer implements VertexConsumer {
     }
 
     @Override
-    public ReuseVertexConsumer addVertex(float x, float y, float z) {
+    public ReuseVertexConsumer addVertex(
+    //? if 1.20.1 {
+        double x,
+        double y,
+        double z
+    //?} else {
+        float x, 
+        float y, 
+        float z
+    //?}
+    ) {
         this.ensureCanPut();
         this.ptr += VERTEX_FORMAT_SIZE; this.count++; //Goto next vertex
         this.meta(this.defaultMeta|this.globalOrMetadata);
+        //? if 1.20.1 {
+        MemoryUtil.memPutFloat(this.ptr, (float) x);
+        MemoryUtil.memPutFloat(this.ptr + 4, (float) y);
+        MemoryUtil.memPutFloat(this.ptr + 8, (float) z);
+        //?} else {
         MemoryUtil.memPutFloat(this.ptr, x);
         MemoryUtil.memPutFloat(this.ptr + 4, y);
         MemoryUtil.memPutFloat(this.ptr + 8, z);
+        //?}
         return this;
     }
 
@@ -86,6 +102,23 @@ public final class ReuseVertexConsumer implements VertexConsumer {
     public ReuseVertexConsumer setNormal(float x, float y, float z) {
         return this;
     }
+
+    //? if 1.20.1 {
+    @Override
+    public void defaultColor(int red, int green, int blue, int alpha) {
+        return;
+    }
+
+    @Override
+    public void endVertex() {
+        return;
+    }
+
+    @Override
+    public void unsetDefaultColor() {
+        return;
+    }
+    //?}
 
     public ReuseVertexConsumer quad(BakedQuad quad, RenderType layer) {
         return this.quad(quad, false, layer);

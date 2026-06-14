@@ -15,6 +15,7 @@ import org.apache.commons.lang3.stream.Streams;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.function.LongConsumer;
 
 //TODO: replace synchronize with StampedLock

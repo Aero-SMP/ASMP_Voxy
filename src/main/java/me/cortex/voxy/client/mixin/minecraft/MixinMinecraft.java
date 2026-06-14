@@ -9,7 +9,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Minecraft.class)
 public class MixinMinecraft {
-    @Inject(method = "disconnect", at = @At("TAIL"))
+    @Inject(method = {"disconnect", "clearLevel"}, at = @At("TAIL"), require = 1, expect = 1)
     private void voxy$injectWorldClose(CallbackInfo ci) {
         if (ClientSessionEvents.inSession) {
             ClientSessionEvents.sessionEnd();

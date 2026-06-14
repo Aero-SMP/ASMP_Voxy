@@ -1,10 +1,10 @@
 # Project exclude paths
-/.gradle/
-/.idea/
-/build/
-/run/
-/out/
-/logs/
+.gradle/
+.idea/
+build/
+run/
+out/
+logs/
 
 bin/
 .classpath
@@ -13,3 +13,4 @@ bin/
 .settings/
 
 .vscode/
+*.xml
