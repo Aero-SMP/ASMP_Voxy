@@ -16,8 +16,6 @@ authors="Cortex"
 config="client.voxy.mixins.json"
 [[mixins]]
 config="common.voxy.mixins.json"
-[[mixins]]
-config="neoforge-common.voxy.mixins.json"
 
 [modproperties.${mod_id}]
 "sodium:config_api_user" = "me.cortex.voxy.client.config.VoxyConfigMenu"

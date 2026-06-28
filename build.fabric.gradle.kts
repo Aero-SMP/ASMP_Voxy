@@ -10,9 +10,8 @@ extra["loaderName"] = "fabric"
 extra["loaderDisplayName"] = "Fabric"
 extra["archiveTaskName"] = "remapJar"
 extra["sourceJavaDir"] = "src/fabric/java"
-extra["sourceResourcesDir"] = "src/fabric/resources"
 extra["additionalSourceJavaDirs"] = listOf(
-    "versions/${prop("deps.minecraft", "minecraft_version")}/src",
+    "versions/${prop("deps.minecraft", "minecraft_version")}/src/java",
     "versions/${prop("deps.minecraft", "minecraft_version")}-fabric/src/fabric/java"
 )
 
@@ -37,29 +36,33 @@ afterEvaluate {
         ssc.named("main") {
             java.setSrcDirs(
                 listOf(
+                    // Stonecutter-processed shared core (src/main/java)
                     file("build/generated/stonecutter/main/java"),
-                    // include per-version fabric sources
-                    rootProject.file("versions/${minecraftVersion}-fabric/src/fabric/java"),
-                    // include only the shared commonImpl package and client entrypoints from root
-                    rootProject.file("src/fabric/java/me/cortex/voxy/commonImpl"),
-                    rootProject.file("src/fabric/java/me/cortex/voxy/client"),
-                    rootProject.file("versions/${minecraftVersion}/src"),
-                    rootProject.file("src/versions/${minecraftVersion}/java")
+                    // loader-shared sources
+                    rootProject.file("src/fabric/java"),
+                    // per-Minecraft-version sources shared across loaders
+                    rootProject.file("versions/${minecraftVersion}/src/java"),
+                    // per-variant fabric sources
+                    rootProject.file("versions/${minecraftVersion}-fabric/src/fabric/java")
                 )
             )
-            if (versionedFabricRes.exists()) {
-                resources.srcDir(versionedFabricRes)
-            }
+            // Stonecutter only chisels Java into its generated tree; resources are not
+            // redirected automatically. Point the resource roots at the chiseled mirror so
+            // version/loader-conditional files (the mixin configs, accesswidener) are valid
+            // for this variant instead of the raw templated src/main/resources.
+            resources.setSrcDirs(
+                listOfNotNull(
+                    file("build/generated/stonecutter/main/resources"),
+                    rootProject.file("src/main/generated"),
+                    versionedFabricRes.takeIf { it.exists() }
+                )
+            )
         }
     }
-    // Ensure stonecutter generation runs before Java compilation for this variant
-    tasks.matching { it.name == "compileJava" }.configureEach {
+    // Ensure stonecutter generation runs before compilation/resource processing for this variant
+    tasks.matching { it.name == "compileJava" || it.name == "processResources" }.configureEach {
         dependsOn("stonecutterPrepare", "stonecutterGenerate")
     }
-}
-
-tasks.withType<JavaCompile>().configureEach {
-    options.compilerArgs.add("-AoutRefMapFile=${destinationDirectory.get().asFile.absolutePath}/voxy.refmap.json")
 }
 
 
@@ -73,7 +76,6 @@ val xzVersion: String by extra
 val sqliteJdbcVersion: String by extra
 
 val lwjglVersion = "3.3.1"
-val accessWidenerOutput = layout.buildDirectory.file("generated/accesswidener/${modId}-fabric.accesswidener").get().asFile
 
 // Force LWJGL to the 1.20.1-compatible version for 1.20.1 variant projects.
 if (project.name.startsWith("1.20.1")) {
@@ -91,44 +93,9 @@ if (project.name.startsWith("1.20.1")) {
     }
 }
 
-run {
-    val awCommon = rootProject.file("src/main/resources/${modId}.accesswidener")
-    val awFabricVersioned = rootProject.file("versions/${minecraftVersion}-fabric/src/main/resources/${modId}-fabric.accesswidener")
-    val awFabricRoot = rootProject.file("src/fabric/resources/${modId}-fabric.accesswidener")
-    val awOut = accessWidenerOutput
-
-    val parts = mutableListOf<String>()
-    if (awFabricVersioned.exists()) parts.add(awFabricVersioned.readText())
-    if (awFabricRoot.exists() && awFabricRoot != awFabricVersioned) parts.add(awFabricRoot.readText())
-    if (awCommon.exists()) parts.add(awCommon.readText())
-
-    if (parts.isNotEmpty()) {
-        val base = parts[0].trimEnd()
-        val appended = if (parts.size > 1) {
-            parts.subList(1, parts.size).joinToString("\n\n") { part ->
-                val lines = part.lines()
-                val body = lines.dropWhile { it.trim().startsWith("accessWidener") || it.trim().isEmpty() }
-                body.joinToString("\n").trimEnd()
-            }
-        } else ""
-
-        awOut.parentFile.mkdirs()
-        val outText = buildString {
-            append(base)
-            if (appended.isNotBlank()) {
-                append('\n').append('\n')
-                append(appended)
-                if (!appended.endsWith('\n')) append('\n')
-            } else if (!base.endsWith('\n')) {
-                append('\n')
-            }
-        }
-        awOut.writeText(outText)
-    }
-}
 
 loom {
-    accessWidenerPath = accessWidenerOutput
+    accessWidenerPath = sc.process(rootProject.file("src/main/resources/voxy.accesswidener"), "build/processed.accesswidener")
 }
 
 dependencies {
@@ -229,53 +196,7 @@ fabricApi {
     }
 }
 
-tasks {
-    register("mergeAccessWideners") {
-        doLast {
-            val awCommon = rootProject.file("src/main/resources/${modId}.accesswidener")
-            val awFabricVersioned = rootProject.file("versions/${minecraftVersion}-fabric/src/main/resources/${modId}-fabric.accesswidener")
-            val awOut = accessWidenerOutput
-
-            val parts = mutableListOf<String>()
-            if (awFabricVersioned.exists()) parts.add(awFabricVersioned.readText())
-            val awFabricRoot = rootProject.file("src/fabric/resources/${modId}-fabric.accesswidener")
-            if (awFabricRoot.exists()) parts.add(awFabricRoot.readText())
-            if (awCommon.exists()) parts.add(awCommon.readText())
-
-            if (parts.isNotEmpty()) {
-                val base = parts[0].trimEnd()
-                val appended = if (parts.size > 1) {
-                    parts.subList(1, parts.size).joinToString("\n\n") { part ->
-                        val lines = part.lines()
-                        val body = lines.dropWhile { it.trim().startsWith("accessWidener") || it.trim().isEmpty() }
-                        body.joinToString("\n").trimEnd()
-                    }
-                } else ""
-
-                awOut.parentFile.mkdirs()
-                val outText = buildString {
-                    append(base)
-                    if (appended.isNotBlank()) {
-                        append('\n').append('\n')
-                        append(appended)
-                        if (!appended.endsWith('\n')) append('\n')
-                    } else if (!base.endsWith('\n')) {
-                        append('\n')
-                    }
-                }
-                awOut.writeText(outText)
-            }
-        }
-    }
-}
-
-tasks.matching { it.name == "validateAccessWidener" || it.name == "remapJar" }.configureEach {
-    dependsOn("mergeAccessWideners")
-}
-
-tasks.named<Jar>("jar") {
-}
-
-tasks.named("remapJar").configure {
-    dependsOn("mergeAccessWideners")
-}
+// The mixin configs (client/common.voxy.mixins.json) live in src/main/resources and are
+// chiseled by Stonecutter into build/generated/stonecutter/main/resources, which is the
+// main resource source dir. processResources copies them as-is; Fabric's mixin loader
+// reads the chiseled output (which retains `//?` markers as comments) without issue.

@@ -9,7 +9,6 @@ extra["loaderName"] = "legacyforge"
 extra["loaderDisplayName"] = "LegacyForge"
 extra["archiveTaskName"] = "jar"
 extra["sourceJavaDir"] = "src/forge/java"
-extra["sourceResourcesDir"] = "src/forge/resources"
 
 plugins {
     id("java")
@@ -19,42 +18,25 @@ plugins {
     id("dev.kikugie.fletching-table.lexforge") version "0.1.0-alpha.23"
 }
 
-// Note: NeoForge uses the fletching-table plugin to convert access wideners
-// into accesstransformers. LegacyForge does not apply that plugin by default,
-// but accesstransformers are registered above so a converted ATS (if provided)
-// will be picked up. If you want automatic accesswidener -> accesstransformer
-// conversion for Forge, apply the appropriate fletching-table plugin here.
+apply(from = rootProject.file("build.common.gradle.kts"))
 
-// Register automatic conversion from `voxy.accesswidener` -> accesstransformer
-// using the fletching-table plugin (safe because plugin is applied above).
 fletchingTable {
     accessConverter.register(sourceSets.main) {
-        add("voxy-forge.accesswidener")
+        add(sc.process(rootProject.file("src/main/resources/voxy.accesswidener"), "build/processed.accesswidener").path)
     }
 }
 
 extensions.configure<MixinExtension> {
     add(sourceSets.main.get(), "voxy.refmap.json")
+    sc.process(rootProject.file("src/main/resources/client.voxy.mixins.json"), "build/processed.client.voxy.mixins.json")
+    sc.process(rootProject.file("src/main/resources/common.voxy.mixins.json"), "build/processed.common.voxy.mixins.json")
     config("client.voxy.mixins.json")
     config("common.voxy.mixins.json")
-    config("forge-common.voxy.mixins.json")
 }
-
-apply(from = rootProject.file("build.common.gradle.kts"))
 
 val modId = prop("mod.id", "archives_base_name")
 val mcVersion = prop("deps.minecraft", "minecraft_version")
 val forgeVersion = prop("deps.forge", "forge_version")
-
-// Include per-version common sources so generated classes reference existing types
-// (e.g., me.cortex.voxy.common.util.cpu.CpuLayout)
-// Defer adding rootProject source dirs until after project evaluation so plugins
-// (like LegacyForge) don't overwrite our additions.
-
-// Ensure we can resolve artifacts (mixinextras, etc.) that live on Maven Central
-repositories {
-    mavenCentral()
-}
 
 if (project.name.startsWith("1.20.1")) {
     configurations.configureEach {
@@ -104,8 +86,8 @@ dependencies {
     modCompileOnly("${nvidiumMaven}:nvidium:${prop("deps.nvidium")}")
 
 
-    modCompileOnly("org.sinytra:Connector:1.0.0-beta.48+1.20.1")
-    modRuntimeOnly("maven.modrinth:connector-extras:1.11.2+1.20.1")
+    // modCompileOnly("org.sinytra:Connector:1.0.0-beta.48+1.20.1")
+    // modRuntimeOnly("maven.modrinth:connector-extras:1.11.2+1.20.1")
     modCompileOnly("maven.local:modmenu-bridge:1.11.2+1.20.1")
     // val modmenuVer = prop("deps.modmenu")
     // modCompileOnly("maven.modrinth:modmenu:$modmenuVer")
@@ -146,55 +128,62 @@ dependencies {
     implementation("org.tukaani:xz:$xzVersion")
     runtimeOnly("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")
 
-    shadedDependencies("redis.clients:jedis:$jedisVersion")
-    shadedDependencies("org.rocksdb:rocksdbjni:$rocksdbVersion")
-    shadedDependencies("org.apache.commons:commons-pool2:$commonsPoolVersion")
-    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")
-    shadedDependencies("org.tukaani:xz:$xzVersion")
-    shadedDependencies("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")
-    shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion")
-    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")
-    shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-windows")
-    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-windows")
-    shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux")
-    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")
+    implementation(jarJar("redis.clients:jedis:$jedisVersion")!!)
+    implementation(jarJar("org.rocksdb:rocksdbjni:$rocksdbVersion")!!)
+    implementation(jarJar("org.apache.commons:commons-pool2:$commonsPoolVersion")!!)
+    implementation(jarJar("org.lz4:lz4-java:$lz4Version")!!)
+    implementation(jarJar("org.tukaani:xz:$xzVersion")!!)
+    implementation(jarJar("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")!!)
+    implementation(shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion")!!)
+    implementation(shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")!!)
+    implementation(shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-windows")!!)
+    implementation(shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-windows")!!)
+    implementation(shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux")!!)
+    implementation(shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")!!)
 }
 
-// Configure the LegacyForge plugin according to ModDevGradle LEGACY.md
-plugins.withId("net.neoforged.moddev.legacyforge") {
-    legacyForge {
-        version = "$mcVersion-$forgeVersion"
-        accessTransformers.from(tasks.processResources.map {
-            it.destinationDir.resolve("META-INF/accesstransformer.cfg")
-        })
-        accessTransformers.from(rootProject.file("src/forge/resources/META-INF/voxy-forge.accesstransformer.cfg"))
-        validateAccessTransformers = true
-        runs {
-            register("client") {
-                gameDirectory = file("run/")
-                client()
-            }
-            register("server") {
-                gameDirectory = file("run/")
-                server()
-            }
-            register("data") {
-                gameDirectory = file("run/")
-                data()
-            }
-        }
+// Dev runs (runClient/runServer) don't receive the jarJar'd / shaded libraries on their
+// classpath. The moddev `additionalRuntimeClasspath` configuration is created when runs are
+// registered, so populate it after evaluation with voxy's runtime libraries.
+afterEvaluate {
+    listOf(
+        "redis.clients:jedis:$jedisVersion",
+        "org.rocksdb:rocksdbjni:$rocksdbVersion",
+        "org.apache.commons:commons-pool2:$commonsPoolVersion",
+        "org.lz4:lz4-java:$lz4Version",
+        "org.tukaani:xz:$xzVersion",
+        "org.xerial:sqlite-jdbc:$sqliteJdbcVersion",
+        "org.lwjgl:lwjgl-lmdb:$lwjglVersion",
+        "org.lwjgl:lwjgl-zstd:$lwjglVersion",
+        "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux",
+        "org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux",
+    ).forEach { dependencies.add("additionalRuntimeClasspath", it) }
+}
 
-        mods {
-            register(modId) {
-                sourceSet(sourceSets["main"])
-            }
+legacyForge {
+    version = "$mcVersion-$forgeVersion"
+    accessTransformers.from("src/main/resources/META-INF/accesstransformer.cfg")
+    validateAccessTransformers = true
+    runs {
+        register("client") {
+            gameDirectory = file("run/")
+            client()
+        }
+        register("server") {
+            gameDirectory = file("run/")
+            server()
+        }
+        register("data") {
+            gameDirectory = file("run/")
+            data()
         }
     }
-}
 
-// Ensure per-version common sources are included after plugins configure source sets
-tasks.named<Jar>("sourcesJar").configure {
-    dependsOn("stonecutterPrepare", "stonecutterGenerate")
+    mods {
+        register(modId) {
+            sourceSet(sourceSets["main"])
+        }
+    }
 }
 
 afterEvaluate {
@@ -202,61 +191,22 @@ afterEvaluate {
         ssc.named("main") {
             java.setSrcDirs(
                 listOf(
+                    // Stonecutter-processed shared core (src/main/java)
                     file("build/generated/stonecutter/main/java"),
-                        // include per-version forge sources
-                        rootProject.file("versions/${mcVersion}-forge/src/forge/java"),
-                    // include only the shared commonImpl package and client entrypoints from root
-                    rootProject.file("src/forge/java/me/cortex/voxy/commonImpl"),
-                    rootProject.file("src/forge/java/me/cortex/voxy/client"),
-                    rootProject.file("versions/1.20.1/src"),
-                    rootProject.file("src/versions/1.20.1/java")
+                    // loader-shared sources
+                    rootProject.file("src/forge/java"),
+                    // per-Minecraft-version sources shared across loaders
+                    rootProject.file("versions/${mcVersion}/src/java")
                 )
             )
         }
     }
-    // Ensure stonecutter generation runs before Java compilation for this variant
-    tasks.matching { it.name == "compileJava" }.configureEach {
-        dependsOn("stonecutterPrepare", "stonecutterGenerate")
-    }
-
-    tasks.withType(JavaCompile::class.java).configureEach {
-        // Source selection is handled centrally in build.common.gradle.kts so
-        // avoid overriding it here. The compile task still depends on
-        // stonecutterPrepare and stonecutterGenerate above.
-    }
 }
-
-tasks.withType<Copy>().matching { it.name == "processResources" }.configureEach {
-    exclude("**/fabric.mod.json")
-    doLast {
-        val generatedAccessTransformer = destinationDir.resolve("META-INF/accesstransformer.cfg")
-        val forgeAccessTransformer = rootProject.file("src/forge/resources/META-INF/voxy-forge.accesstransformer.cfg")
-
-        if (!forgeAccessTransformer.exists()) return@doLast
-
-        val mergedText = buildString {
-            if (generatedAccessTransformer.exists()) {
-                append(generatedAccessTransformer.readText().trimEnd())
-            }
-            val forgeText = forgeAccessTransformer.readText().trimEnd()
-            if (forgeText.isNotBlank()) {
-                if (isNotEmpty()) append('\n')
-                append(forgeText)
-            }
-            if (isNotEmpty()) append('\n')
-        }
-
-        generatedAccessTransformer.parentFile.mkdirs()
-        generatedAccessTransformer.writeText(mergedText)
-    }
-}
-
-
 
 tasks.named<Jar>("jar") {
     manifest.attributes(
         mapOf(
-            "MixinConfigs" to "client.voxy.mixins.json,common.voxy.mixins.json,forge-common.voxy.mixins.json"
+            "MixinConfigs" to "client.voxy.mixins.json,common.voxy.mixins.json"
         )
     )
     from({
@@ -272,8 +222,4 @@ tasks.named<Jar>("jar") {
         }
     })
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/*.EC")
-}
-
-tasks.matching { it.name == "createMinecraftArtifacts" }.configureEach {
-    dependsOn("processResources")
 }

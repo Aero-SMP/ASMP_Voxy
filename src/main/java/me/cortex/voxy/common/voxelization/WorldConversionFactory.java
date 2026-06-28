@@ -23,7 +23,7 @@ import net.minecraft.world.level.chunk.SingleValuePalette;
 import java.util.WeakHashMap;
 
 public class WorldConversionFactory {
-    private static final boolean LITHIUM_INSTALLED = VoxyCommon.getPlatformUtil().isModLoaded("lithium");
+    private static final boolean LITHIUM_INSTALLED = VoxyCommon.getPlatformUtil().isModLoaded("lithium") || VoxyCommon.getPlatformUtil().isModLoaded("radium") | VoxyCommon.getPlatformUtil().isModLoaded("canary");
 
     private static final class Cache {
         private final int[] biomeCache = new int[4*4*4];

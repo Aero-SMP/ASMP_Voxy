@@ -6,9 +6,8 @@ extra["loaderName"] = "neoforge"
 extra["loaderDisplayName"] = "NeoForge"
 extra["archiveTaskName"] = "jar"
 extra["sourceJavaDir"] = "src/neoforge/java"
-extra["sourceResourcesDir"] = "src/neoforge/resources"
 extra["additionalSourceJavaDirs"] = listOf(
-    "versions/${prop("deps.minecraft", "minecraft_version")}/src"
+    "versions/${prop("deps.minecraft", "minecraft_version")}/src/java"
 )
 
 plugins {
@@ -19,10 +18,6 @@ plugins {
 }
 
 apply(from = rootProject.file("build.common.gradle.kts"))
-
-repositories {
-    mavenCentral()
-}
 
 val modId: String by extra
 val minecraftVersion: String by extra
@@ -45,10 +40,12 @@ val shadedDependencies = configurations.create("shadedDependencies") {
 dependencies {
     // annotationProcessor("net.fabricmc:sponge-mixin:0.17.2+mixin.0.8.7")
 
+    // Compile against the flat caffeinemc maven jars (api + impl surface); run against the
+    // complete Modrinth distribution jar (bundles sodium's core, e.g. Workarounds).
     val sodiumNeoVer = prop("deps.sodium")
-    compileOnly("net.caffeinemc:sodium-neoforge-mod:$sodiumNeoVer")
-    runtimeOnly("net.caffeinemc:sodium-neoforge-mod:$sodiumNeoVer")
-    compileOnly("net.caffeinemc:sodium-neoforge-api:$sodiumNeoVer")
+    implementation("net.caffeinemc:sodium-neoforge-mod:$sodiumNeoVer")
+    implementation("net.caffeinemc:sodium-neoforge-api:$sodiumNeoVer")
+    implementation("net.caffeinemc:sodium-neoforge:$sodiumNeoVer")
 
     val lithiumNeo = prop("deps.lithium")
     implementation("maven.modrinth:lithium:$lithiumNeo")
@@ -107,18 +104,33 @@ dependencies {
     shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")
 }
 
+// Dev runs (runClient/runServer) don't receive the shaded libraries on their classpath.
+// The moddev `additionalRuntimeClasspath` configuration is created when runs are registered,
+// so populate it after evaluation with voxy's runtime libraries.
+afterEvaluate {
+    listOf(
+        "redis.clients:jedis:$jedisVersion",
+        "org.rocksdb:rocksdbjni:$rocksdbVersion",
+        "org.apache.commons:commons-pool2:$commonsPoolVersion",
+        "org.lz4:lz4-java:$lz4Version",
+        "org.tukaani:xz:$xzVersion",
+        "org.xerial:sqlite-jdbc:$sqliteJdbcVersion",
+        "org.lwjgl:lwjgl-lmdb:$lwjglVersion",
+        "org.lwjgl:lwjgl-zstd:$lwjglVersion",
+        "org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux",
+        "org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux",
+    ).forEach { dependencies.add("additionalRuntimeClasspath", it) }
+}
+
 fletchingTable {
     accessConverter.register(sourceSets.main) {
-        add("voxy.accesswidener")
+        add(sc.process(rootProject.file("src/main/resources/voxy.accesswidener"), "build/processed.accesswidener").path)
     }
 }
 
 neoForge {
     version = neoForgeVersion
-    accessTransformers.from(tasks.processResources.map {
-        it.destinationDir.resolve("META-INF/accesstransformer.cfg")
-    })
-    accessTransformers.from("src/main/resources/META-INF/voxy-neoforge.accesstransformer.cfg")
+    accessTransformers.from("src/main/resources/META-INF/accesstransformer.cfg")
     validateAccessTransformers = true
 
     if (providers.gradleProperty("deps.parchment").isPresent) {

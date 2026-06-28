@@ -3,6 +3,9 @@ plugins {
 }
 // Stonecutter activation is controlled from settings.gradle.kts (generate all variants by default)
 stonecutter {
+    handlers {
+        inherit("json5", "json")
+    }
     // Activate the variant for local verification
     active("1.20.1-fabric")
     gradle.rootProject.allprojects.forEach { p ->

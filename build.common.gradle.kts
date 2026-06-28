@@ -34,7 +34,6 @@ val loaderName = (extra.properties["loaderName"] as? String)?.takeIf { it.isNotB
 val loaderDisplayName = (extra.properties["loaderDisplayName"] as? String)?.takeIf { it.isNotBlank() } ?: loaderName
 val archiveTaskName = (extra.properties["archiveTaskName"] as? String)?.takeIf { it.isNotBlank() } ?: "jar"
 val sourceJavaDir = extra.properties["sourceJavaDir"] as? String
-val sourceResourcesDir = extra.properties["sourceResourcesDir"] as? String
 val additionalSourceJavaDirs = (extra.properties["additionalSourceJavaDirs"] as? List<*>)
     ?.filterIsInstance<String>()
     ?: emptyList()
@@ -124,64 +123,11 @@ extensions.configure<StonecutterBuildExtension> {
     }
 }
 
-// Ensure overrides persist after all projects/plugins configure source sets
-// Per-project source-set overrides are handled in the subprojects loop below.
-
-// Note: execution-time compile-source enforcement is handled per-project
-// inside the `proj.afterEvaluate { ... }` block below. Avoid duplicating that
-// logic here so the behavior is defined in a single place.
-
-// (Removed experimental task-graph/allprojects overrides - they caused Kotlin DSL
-// typing errors. The reliable per-project `projectsEvaluated` and `afterEvaluate`
-// sourceSet/task configuration above is preserved.)
-
-subprojects.forEach { proj ->
-    // Ensure sourceSet override is applied when the Java plugin (or plugins that apply it)
-    // are applied to the subproject. This avoids later plugin reconfiguration clobbering
-    // our per-variant source directories.
-    // Java plugin: projects configure their own source sets as needed.
-    // If Fabric Loom is applied, configure a fabric-scoped enforcement that will run
-    // after the plugin applies (this addresses Loom re-adding source dirs late).
-    // Fabric Loom plugin: leave source-set adjustments to per-project configuration.
-    // Register processing and postprocess tasks at configuration time so they are
-    // discoverable by Gradle task lookups (invoking :project:task). Placing these
-    // inside afterEvaluate prevents Gradle from seeing them when resolving tasks
-    // from the command line.
-    // No afterEvaluate-specific adjustments.
-}
-
-// No legacy postprocessing tasks remain.
-
-// Stonecutter task wiring is handled per-project or by higher-level build logic.
-
-extensions.findByType(JavaPluginExtension::class.java)?.apply {
-    sourceSets.register("mc1201") {
-        java.srcDir("src/versions/1.20.1/java")
-        resources.srcDir("src/versions/1.20.1/resources")
-    }
-    sourceSets.register("mc1211") {
-        java.srcDir("src/versions/1.21.1/java")
-        resources.srcDir("src/versions/1.21.1/resources")
-    }
-}
-// Stonecutter now performs textual replacements during generation. The previous manual
-// post-processing walk-and-replace tasks were removed
-// in favor of Stonecutter's `replacements.string(...) { replace(...) }` DSL configured
-// in `settings.gradle.kts`.
-
-listOf("mc1201").forEach { ss ->
-    val implName = "${ss}Implementation"
-    if (configurations.findByName(implName) != null) {
-        configurations.getByName(implName).extendsFrom(configurations.getByName("implementation"))
-    }
-}
-
-listOf("mc1211").forEach { ss ->
-    val implName = "${ss}Implementation"
-    if (configurations.findByName(implName) != null) {
-        configurations.getByName(implName).extendsFrom(configurations.getByName("implementation"))
-    }
-}
+// Source sets are wired per-loader: the shared core (src/main/java) is processed by
+// Stonecutter into build/generated/stonecutter/main/java; per-version and per-loader
+// sources are added via `sourceJavaDir` / `additionalSourceJavaDirs` (see below) or the
+// loader buildscripts. Textual API differences between versions are handled by
+// Stonecutter's `replacements.string(...)` DSL configured in settings.gradle.kts.
 
 tasks.withType<Copy>().matching { it.name == "processResources" }.configureEach {
     val commit = try {
@@ -229,7 +175,6 @@ extensions.configure<SourceSetContainer> {
                 if (!already) java.srcDir(f)
             }
         }
-        sourceResourcesDir?.let { resources.srcDir(rootProject.file(it)) }
         resources.srcDir("src/main/generated")
     }
 }

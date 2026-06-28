@@ -31,12 +31,7 @@
       "config": "client.voxy.mixins.json",
       "environment": "client"
     },
-    {
-      "config": "fabric-client.voxy.mixins.json",
-      "environment": "client"
-    },
-    "common.voxy.mixins.json",
-    "fabric-common.voxy.mixins.json"
+    "common.voxy.mixins.json"
   ],
   "depends": {
     "minecraft": [

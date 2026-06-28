@@ -8,7 +8,13 @@
     "defaultRequire": 1
   },
   "mixins": [
-    "minecraft.MixinWorld"
+    "minecraft.MixinWorld",
+//? if fabric
+    "chunky.MixinFabricWorld",
+//? if forge
+    "chunky.MixinForgeWorld",
+//? if neoforge
+    "chunky.MixinNeoForgeWorld"
   ],
   "overwrites": {
     "requireAnnotations": true
