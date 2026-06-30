@@ -90,18 +90,25 @@ dependencies {
     implementation("org.tukaani:xz:$xzVersion")
     runtimeOnly("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")
 
-    shadedDependencies("redis.clients:jedis:$jedisVersion")
-    shadedDependencies("org.rocksdb:rocksdbjni:$rocksdbVersion")
-    shadedDependencies("org.apache.commons:commons-pool2:$commonsPoolVersion")
-    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")
-    shadedDependencies("org.tukaani:xz:$xzVersion")
-    shadedDependencies("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")
+    jarJar("redis.clients:jedis:$jedisVersion")
+    jarJar("org.rocksdb:rocksdbjni:$rocksdbVersion")
+    jarJar("org.apache.commons:commons-pool2:$commonsPoolVersion")
+    jarJar("org.tukaani:xz:$xzVersion")
+    jarJar("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")
+
     shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion")
     shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")
     shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-windows")
     shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-windows")
     shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux")
     shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")
+}
+
+tasks.named<Jar>("jar") {
+    from(shadedDependencies.elements.map { jars -> jars.map { zipTree(it) } }) {
+        exclude("**/module-info.class", "META-INF/MANIFEST.MF", "META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA")
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
 // Dev runs (runClient/runServer) don't receive the shaded libraries on their classpath.

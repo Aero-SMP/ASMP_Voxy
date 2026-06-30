@@ -62,10 +62,6 @@ val shadedDependencies = configurations.create("shadedDependencies") {
     isTransitive = false
 }
 
-configurations.matching { it.name == "runtimeClasspath" }.configureEach {
-    extendsFrom(shadedDependencies)
-}
-
 dependencies {
     // MixinExtras required by generated mixins (used across variants)
     annotationProcessor("io.github.llamalad7:mixinextras-common:0.5.4")
@@ -134,12 +130,12 @@ dependencies {
     implementation(jarJar("org.lz4:lz4-java:$lz4Version")!!)
     implementation(jarJar("org.tukaani:xz:$xzVersion")!!)
     implementation(jarJar("org.xerial:sqlite-jdbc:$sqliteJdbcVersion")!!)
-    implementation(shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion")!!)
-    implementation(shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")!!)
-    implementation(shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-windows")!!)
-    implementation(shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-windows")!!)
-    implementation(shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux")!!)
-    implementation(shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")!!)
+    shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion")
+    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion")
+    shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-windows")
+    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-windows")
+    shadedDependencies("org.lwjgl:lwjgl-lmdb:$lwjglVersion:natives-linux")
+    shadedDependencies("org.lwjgl:lwjgl-zstd:$lwjglVersion:natives-linux")
 }
 
 // Dev runs (runClient/runServer) don't receive the jarJar'd / shaded libraries on their
@@ -209,17 +205,18 @@ tasks.named<Jar>("jar") {
             "MixinConfigs" to "client.voxy.mixins.json,common.voxy.mixins.json"
         )
     )
-    from({
-        shadedDependencies.files.map { dependencyJar: java.io.File ->
-            if (dependencyJar.isDirectory) {
-                dependencyJar
-            } else {
-                zipTree(dependencyJar).matching {
-                    exclude("module-info.class", "META-INF/versions/**/module-info.class")
-                    exclude("META-INF/INDEX.LIST")
-                }
-            }
-        }
-    })
-    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/*.EC")
+    // Merge the LWJGL lmdb/zstd bindings + natives into the mod jar. Drop each shaded jar's
+    // module-info and manifest/signatures so the classes and native binaries fold into the mod's
+    // own module rather than declaring separate (colliding) modules.
+    from({ shadedDependencies.map { zipTree(it) } }) {
+        exclude(
+            "module-info.class",
+            "META-INF/MANIFEST.MF",
+            "META-INF/*.SF",
+            "META-INF/*.DSA",
+            "META-INF/*.RSA",
+            "META-INF/versions/**/module-info.class",
+        )
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
