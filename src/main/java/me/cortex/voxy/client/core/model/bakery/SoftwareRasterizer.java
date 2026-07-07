@@ -151,7 +151,7 @@ public class SoftwareRasterizer {
                 float w1 = edge(v2, v3, cx, cy)*invArea;
                 float w2 = edge(v3, v1, cx, cy)*invArea;
                 float w3 = 1.0f-w1-w2;
-                if ((w1>0.0f&&w2>0.0f&&w3>0.0f)||(orZero&&w1>=0.0f&&w2>=0.0f&&w3>=0.0f)) {
+                if (w1>=0.0f&&w2>=0.0f&&w3>=0.0f) {
                     //Dont need to worry about perspective correction afak as it should already be all correct
 
                     //pixel is inside the triangle
