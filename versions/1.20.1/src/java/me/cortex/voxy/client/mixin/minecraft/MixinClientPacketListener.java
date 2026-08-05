@@ -10,7 +10,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientPacketListener.class)
 public class MixinClientPacketListener {
-    @Inject(method = "handleLogin", at = @At("HEAD"))
+    @Inject(method = "handleLogin", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/Minecraft;setLevel(Lnet/minecraft/client/multiplayer/ClientLevel;)V", shift = At.Shift.BEFORE))
     private void voxy$init(ClientboundLoginPacket packet, CallbackInfo ci) {
         if (!ClientSessionEvents.inSession) {
             ClientSessionEvents.sessionStart();
