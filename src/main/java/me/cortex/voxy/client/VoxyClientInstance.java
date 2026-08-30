@@ -11,7 +11,6 @@ import me.cortex.voxy.common.config.section.SectionSerializationStorage;
 import me.cortex.voxy.common.config.section.SectionStorageConfig;
 import me.cortex.voxy.common.config.storage.other.CompressionStorageAdaptor;
 import me.cortex.voxy.common.config.storage.rocksdb.RocksDBStorageBackend;
-import me.cortex.voxy.commonImpl.ImportManager;
 import me.cortex.voxy.commonImpl.VoxyInstance;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
@@ -44,11 +43,6 @@ public class VoxyClientInstance extends VoxyInstance {
             }
         }
         this.setNumThreads(target);
-    }
-
-    @Override
-    protected ImportManager createImportManager() {
-        return new ClientImportManager();
     }
 
     @Override

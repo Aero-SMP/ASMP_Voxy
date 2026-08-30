@@ -107,7 +107,6 @@ dependencies {
     compileOnly "drouarb:nvidium:${providers.gradleProperty('nvidium_version').get()}"
     compileOnly "maven.modrinth:iris:${providers.gradleProperty('iris_version').get()}"
     compileOnly files('libs/modmenu-bridge-1.12.1+1.21.1.jar')
-    compileOnly "maven.modrinth:sodium-extra:${providers.gradleProperty('sodium_extra_version').get()}"
     compileOnly "me.shedaniel.cloth:cloth-config-neoforge:${providers.gradleProperty('cloth_config_version').get()}"
 
     runtimeOnly 'io.github.douira:glsl-transformer:2.0.1'
@@ -118,43 +117,26 @@ dependencies {
     runtimeOnly "maven.modrinth:chunky:${chunkyVersion}"
     runtimeOnly "maven.modrinth:spark:${providers.gradleProperty('spark_version').get()}"
     compileOnly "maven.modrinth:vivecraft:${providers.gradleProperty('vivecraft_version').get()}"
-    compileOnly "maven.modrinth:flashback:${providers.gradleProperty('flashback_version').get()}"
 
     implementation platform("org.lwjgl:lwjgl-bom:${lwjglVersion}")
     implementation 'org.lwjgl:lwjgl'
-    implementation "org.lwjgl:lwjgl-lmdb:${lwjglVersion}"
     implementation "org.lwjgl:lwjgl-zstd:${lwjglVersion}"
     runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
     runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
     runtimeOnly "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-windows"
     runtimeOnly "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux"
 
-    def jedisVersion = providers.gradleProperty('jedis_version').get()
     def rocksdbVersion = providers.gradleProperty('rocksdb_version').get()
-    def commonsPoolVersion = providers.gradleProperty('commons_pool_version').get()
     def lz4Version = providers.gradleProperty('lz4_version').get()
-    def xzVersion = providers.gradleProperty('xz_version').get()
-    def sqliteJdbcVersion = providers.gradleProperty('sqlite_jdbc_version').get()
 
-    implementation "redis.clients:jedis:${jedisVersion}"
     implementation "org.rocksdb:rocksdbjni:${rocksdbVersion}"
-    implementation "org.apache.commons:commons-pool2:${commonsPoolVersion}"
     implementation "org.lz4:lz4-java:${lz4Version}"
-    implementation "org.tukaani:xz:${xzVersion}"
-    runtimeOnly "org.xerial:sqlite-jdbc:${sqliteJdbcVersion}"
 
-    jarJar "redis.clients:jedis:${jedisVersion}"
     jarJar "org.rocksdb:rocksdbjni:${rocksdbVersion}"
-    jarJar "org.apache.commons:commons-pool2:${commonsPoolVersion}"
-    jarJar "org.tukaani:xz:${xzVersion}"
-    jarJar "org.xerial:sqlite-jdbc:${sqliteJdbcVersion}"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl-lmdb:${lwjglVersion}"
     add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}"
     add shadedConfiguration.name, "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl-lmdb:${lwjglVersion}:natives-windows"
     add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-windows"
     add shadedConfiguration.name, "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl-lmdb:${lwjglVersion}:natives-linux"
     add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux"
 }
 
@@ -167,15 +149,9 @@ tasks.named('jar', Jar) {
 
 afterEvaluate {
     [
-        "redis.clients:jedis:${providers.gradleProperty('jedis_version').get()}",
         "org.rocksdb:rocksdbjni:${providers.gradleProperty('rocksdb_version').get()}",
-        "org.apache.commons:commons-pool2:${providers.gradleProperty('commons_pool_version').get()}",
         "org.lz4:lz4-java:${providers.gradleProperty('lz4_version').get()}",
-        "org.tukaani:xz:${providers.gradleProperty('xz_version').get()}",
-        "org.xerial:sqlite-jdbc:${providers.gradleProperty('sqlite_jdbc_version').get()}",
-        "org.lwjgl:lwjgl-lmdb:${lwjglVersion}",
         "org.lwjgl:lwjgl-zstd:${lwjglVersion}",
-        "org.lwjgl:lwjgl-lmdb:${lwjglVersion}:natives-linux",
         "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux",
     ].each { dependency ->
         dependencies.add('additionalRuntimeClasspath', dependency)

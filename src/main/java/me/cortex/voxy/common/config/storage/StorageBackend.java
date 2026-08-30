@@ -3,8 +3,6 @@ package me.cortex.voxy.common.config.storage;
 import me.cortex.voxy.common.config.IMappingStorage;
 import me.cortex.voxy.common.util.MemoryBuffer;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.function.LongConsumer;
 
 public abstract class StorageBackend implements IMappingStorage {
@@ -21,17 +19,4 @@ public abstract class StorageBackend implements IMappingStorage {
     public abstract void close();
 
     public abstract void iteratePositions(int level, LongConsumer callback);
-
-    public List<StorageBackend> getChildBackends() {
-        return List.of();
-    }
-
-    public final List<StorageBackend> collectAllBackends() {
-        List<StorageBackend> backends = new ArrayList<>();
-        backends.add(this);
-        for (var child : this.getChildBackends()) {
-            backends.addAll(child.collectAllBackends());
-        }
-        return backends;
-    }
 }

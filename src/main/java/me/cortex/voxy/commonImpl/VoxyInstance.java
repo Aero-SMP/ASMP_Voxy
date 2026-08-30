@@ -14,14 +14,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.locks.StampedLock;
-import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 //TODO: add thread access verification (I.E. only accessible on a single thread)
 public abstract class VoxyInstance {
     private volatile boolean isRunning = true;
     private final Thread worldCleaner;
-    public final BooleanSupplier savingServiceRateLimiter;//Can run if this returns true
     protected final UnifiedServiceThreadPool threadPool;
     protected final SectionSavingService savingService;
     protected final VoxelIngestService ingestService;
@@ -29,15 +27,11 @@ public abstract class VoxyInstance {
     private final StampedLock activeWorldLock = new StampedLock();
     private final HashMap<WorldIdentifier, WorldEngine> activeWorlds = new HashMap<>();
 
-    protected final ImportManager importManager;
-
     public VoxyInstance() {
         Logger.info("Initializing voxy instance");
         this.threadPool = new UnifiedServiceThreadPool();
         this.savingService = new SectionSavingService(this.getServiceManager());
         this.ingestService = new VoxelIngestService(this.getServiceManager());
-        this.importManager = this.createImportManager();
-        this.savingServiceRateLimiter = ()->this.savingService.getTaskCount()<1200;
         this.worldCleaner = new Thread(()->{
             try {
                 while (this.isRunning) {
@@ -68,10 +62,6 @@ public abstract class VoxyInstance {
         this.setNumThreads(3);
     }
 
-    protected ImportManager createImportManager() {
-        return new ImportManager();
-    }
-
     public ServiceManager getServiceManager() {
         return this.threadPool.serviceManager;
     }
@@ -81,10 +71,6 @@ public abstract class VoxyInstance {
     public VoxelIngestService getIngestService() {
         return this.ingestService;
     }
-    public ImportManager getImportManager() {
-        return this.importManager;
-    }
-
     //TODO: reference count the world object
     // have automatic world cleanup after ~1 minute of inactivity and the reference count equaling zero possibly
     // note, the reference count should be separate from the number of active chunks to prevent many issues
@@ -223,14 +209,6 @@ public abstract class VoxyInstance {
             throw new RuntimeException(e);
         }
         this.cleanIdle();
-
-        if (!this.activeWorlds.isEmpty()) {
-            long stamp = this.activeWorldLock.readLock();
-            for (var world : this.activeWorlds.values()) {
-                this.importManager.cancelImport(world);
-            }
-            this.activeWorldLock.unlockRead(stamp);
-        }
 
         try {this.ingestService.shutdown();} catch (Exception e) {Logger.error(e);}
         try {this.savingService.shutdown();} catch (Exception e) {Logger.error(e);}

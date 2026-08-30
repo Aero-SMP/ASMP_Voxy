@@ -1,7 +1,6 @@
 package me.cortex.voxy.commonImpl.lod;
 
 import me.cortex.voxy.commonImpl.lod.LodStreamingService;
-import me.cortex.voxy.commonImpl.lod.TellusAdapter;
 import me.cortex.voxy.commonImpl.mixin.minecraft.InvokerServerChunkCache;
 import me.cortex.voxy.commonImpl.lod.LodNetwork;
 import net.minecraft.core.SectionPos;
@@ -50,7 +49,6 @@ public final class LodGenerationService {
         final AtomicInteger remainingInRadius = new AtomicInteger(0);
         // chunks that failed to finish, retry count so we give up instead of looping
         final Map<Long, Integer> failCounts = new ConcurrentHashMap<>();
-        boolean tellusActive;
         boolean loaded;
 
         DimensionState(ServerLevel level) {
@@ -120,11 +118,7 @@ public final class LodGenerationService {
     }
 
     private DimensionState getOrSetupState(ServerLevel level) {
-        return dimensionStates.computeIfAbsent(level.dimension(), k -> {
-            DimensionState state = new DimensionState(level);
-            state.tellusActive = TellusAdapter.isTellusWorld(level);
-            return state;
-        });
+        return dimensionStates.computeIfAbsent(level.dimension(), ignored -> new DimensionState(level));
     }
 
     public void initialize(MinecraftServer server) {
@@ -140,7 +134,6 @@ public final class LodGenerationService {
     public void shutdown() {
         running.set(false);
         stopWorker();
-        TellusAdapter.shutdown();
 
         // clear our tickets or the world hangs on the save screen when leaving
         releaseAllTickets();
@@ -241,8 +234,8 @@ public final class LodGenerationService {
         }
     }
 
-    private int radiusFor(DimensionState ds) {
-        return ds.tellusActive ? Math.max(LodStreamingConfig.DATA.generationRadius, 128) : LodStreamingConfig.DATA.generationRadius;
+    private int generationRadius() {
+        return LodStreamingConfig.DATA.generationRadius;
     }
 
     // resend completed in-range chunks each player is missing, nearest first, joiners first
@@ -261,7 +254,7 @@ public final class LodGenerationService {
             List<ChunkPos> syncBatch = new ArrayList<>();
             // small slice per pass, each chunk serializes on the main thread so a big
             // batch is a tick spike. backfill continues over the next passes anyway
-            collectCompletedInRange(ds, player.chunkPosition(), radiusFor(ds), synced, syncBatch, CATCHUP_BATCH);
+            collectCompletedInRange(ds, player.chunkPosition(), generationRadius(), synced, syncBatch, CATCHUP_BATCH);
             if (syncBatch.isEmpty()) {
                 clearBackfill(uuid);
                 continue;
@@ -319,7 +312,7 @@ public final class LodGenerationService {
 
                 ServerPlayer player = players.get(i);
                 DimensionState ds = getOrSetupState((ServerLevel) player.level());
-                int radius = radiusFor(ds);
+                int radius = generationRadius();
 
                 List<ChunkPos> batch = findWork(ds, player.chunkPosition(), radius, ds.trackedBatches);
                 if (batch == null) {
@@ -384,14 +377,7 @@ public final class LodGenerationService {
             if (state.trackedChunks.add(pos.toLong())) {
                 activeTaskCount.incrementAndGet();
                 chunksQueued.incrementAndGet();
-                if (state.tellusActive) {
-                    TellusAdapter.enqueueGenerate(state.level, pos, () -> {
-                        onSuccess(state, pos);
-                        completeTask(state, pos);
-                    });
-                } else {
-                    readyToGenerate.add(pos);
-                }
+                readyToGenerate.add(pos);
             } else {
                 throttle.release();
                 onFailure(state, pos);
@@ -582,9 +568,6 @@ public final class LodGenerationService {
         DimensionState state = getOrSetupState(newLevel);
 
         if (!state.loaded) {
-            if (state.tellusActive) {
-                LodStreamingService.LOGGER.info("tellus world detected for {}, enabling fast generation", currentDimensionKey);
-            }
             loadChunks(newLevel, currentDimensionKey, state.completedChunks);
             synchronized(state.completedChunks) {
                 for (long pos : state.completedChunks) {
@@ -604,7 +587,7 @@ public final class LodGenerationService {
         Map<DimensionState, Integer> maxCounts = new HashMap<>();
         for (ServerPlayer player : players) {
             DimensionState state = getOrSetupState((ServerLevel) player.level());
-            int radius = state.tellusActive ? Math.max(LodStreamingConfig.DATA.generationRadius, 128) : LodStreamingConfig.DATA.generationRadius;
+            int radius = generationRadius();
             int missing = countMissingInRange(state, player.chunkPosition(), radius);
             maxCounts.merge(state, missing, Math::max);
         }

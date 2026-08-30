@@ -123,6 +123,4 @@ public class VoxyCommon {
     public static Path getConfigDir() {
         return FMLPaths.CONFIGDIR.get();
     }
-
-    public static final boolean IS_MINE_IN_ABYSS = false;
 }

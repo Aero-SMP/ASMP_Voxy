@@ -177,12 +177,6 @@ public class VoxyRenderSystem {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
                 int maxSec = (Minecraft.getInstance().level.getMaxSection() - 1) >> 5;
 
-                //Do some very cheeky stuff for MiB
-                if (VoxyCommon.IS_MINE_IN_ABYSS) {//TODO: make this somehow configurable
-                    minSec = -8;
-                    maxSec = 7;
-                }
-
                 this.renderDistanceTracker = new RenderDistanceTracker(40,
                         minSec,
                         maxSec,
@@ -216,13 +210,6 @@ public class VoxyRenderSystem {
         var viewport = this.getViewport();
         if (viewport == null) {
             return null;
-        }
-
-        //Do some very cheeky stuff for MiB
-        if (VoxyCommon.IS_MINE_IN_ABYSS) {
-            int sector = (((int)Math.floor(cameraX)>>4)+512)>>10;
-            cameraX -= sector<<14;//10+4
-            cameraY += (16+(256-32-sector*30))*16;
         }
 
         //cameraY += 100;
@@ -296,8 +283,6 @@ public class VoxyRenderSystem {
         if (boundFB == 0) {
             throw new IllegalStateException("Cannot use the default framebuffer as cannot source from it");
         }
-
-        //this.autoBalanceSubDivSize();
 
         this.pipeline.preSetup(viewport);
 
@@ -395,27 +380,6 @@ public class VoxyRenderSystem {
         TimingStatistics.F.stop();
          */
     }
-
-
-
-    private void autoBalanceSubDivSize() {
-        //only increase quality while there are very few mesh queues, this stops,
-        // e.g. while flying and is rendering alot of low quality chunks
-        boolean canDecreaseSize = this.renderGen.getTaskCount() < 300;
-        int MIN_FPS = 55;
-        int MAX_FPS = 65;
-        float INCREASE_PER_SECOND = 60;
-        float DECREASE_PER_SECOND = 30;
-        //Auto fps targeting
-        if (Minecraft.getInstance().getFps() < MIN_FPS) {
-            VoxyConfig.CONFIG.subDivisionSize = Math.min(VoxyConfig.CONFIG.subDivisionSize + INCREASE_PER_SECOND / Math.max(1f, Minecraft.getInstance().getFps()), 256);
-        }
-
-        if (MAX_FPS < Minecraft.getInstance().getFps() && canDecreaseSize) {
-            VoxyConfig.CONFIG.subDivisionSize = Math.max(VoxyConfig.CONFIG.subDivisionSize - DECREASE_PER_SECOND / Math.max(1f, Minecraft.getInstance().getFps()), 28);
-        }
-    }
-
     public static float getRenderDistance() {
         return Minecraft.getInstance().options.getEffectiveRenderDistance()*16;
     }
