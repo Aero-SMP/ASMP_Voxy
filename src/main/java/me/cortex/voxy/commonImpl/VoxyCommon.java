@@ -2,7 +2,9 @@ package me.cortex.voxy.commonImpl;
 
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.config.Serialization;
+import me.cortex.voxy.commonImpl.lod.LodStreamingService;
 import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLLoader;
 import net.neoforged.fml.loading.FMLPaths;
@@ -17,8 +19,9 @@ public class VoxyCommon {
     public static final boolean IS_DEDICATED_SERVER;
     public static final boolean IS_IN_MINECRAFT;
 
-    public VoxyCommon() {
+    public VoxyCommon(IEventBus modBus) {
         Serialization.init();
+        new LodStreamingService(modBus);
     }
 
     static {

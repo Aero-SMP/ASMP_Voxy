@@ -45,5 +45,22 @@
   "voxy.config.general.fogDensity": "Fog density",
   "voxy.config.general.fogDensity.tooltip": "Density of the fog, higher values make the fog thicker",
   "voxy.config.general.skyFogDistance": "Sky fog distance",
-  "voxy.config.general.skyFogDistance.tooltip": "Distance at which sky fog starts to render in chunks"
+  "voxy.config.general.skyFogDistance.tooltip": "Distance at which sky fog starts to render in chunks",
+
+  "voxy.config.lod_streaming.title": "Voxy LOD Streaming",
+  "voxy.config.lod_streaming.category.client": "Client",
+  "voxy.config.lod_streaming.category.server": "Server",
+  "voxy.config.lod_streaming.server.readonly": "§7These are the server's settings. Only a server operator can change them.",
+  "voxy.config.lod_streaming.option.enabled": "LOD Generation Enabled",
+  "voxy.config.lod_streaming.option.enabled.tooltip": "Enable or disable server-side LOD generation.",
+  "voxy.config.lod_streaming.option.f3_stats": "Show F3 Menu Stats",
+  "voxy.config.lod_streaming.option.f3_stats.tooltip": "Show LOD streaming statistics in the F3 debug menu.",
+  "voxy.config.lod_streaming.option.radius": "Generation Radius",
+  "voxy.config.lod_streaming.option.radius.tooltip": "The radius in chunks around players to generate.",
+  "voxy.config.lod_streaming.option.update_interval": "Scanner Interval (Ticks)",
+  "voxy.config.lod_streaming.option.update_interval.tooltip": "How often to scan for ungenerated chunks.",
+  "voxy.config.lod_streaming.option.max_queue": "Max Queue Size",
+  "voxy.config.lod_streaming.option.max_queue.tooltip": "Maximum chunks retained in the pending queue.",
+  "voxy.config.lod_streaming.option.max_active": "Max Parallel Tasks",
+  "voxy.config.lod_streaming.option.max_active.tooltip": "Maximum chunks generated simultaneously."
 }

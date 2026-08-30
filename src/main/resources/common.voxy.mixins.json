@@ -9,6 +9,8 @@
   },
   "mixins": [
     "minecraft.MixinWorld",
+    "minecraft.MixinServerLevelUpdates",
+    "minecraft.InvokerServerChunkCache",
     "chunky.MixinNeoForgeWorld"
   ],
   "overwrites": {

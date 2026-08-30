@@ -5,6 +5,7 @@ build/
 run/
 out/
 logs/
+deploy.properties
 
 bin/
 .classpath

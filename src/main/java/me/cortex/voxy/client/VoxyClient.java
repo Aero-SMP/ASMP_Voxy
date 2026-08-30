@@ -1,5 +1,6 @@
 package me.cortex.voxy.client;
 
+import me.cortex.voxy.client.lod.ClientLodStreaming;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.config.VoxyConfig;
@@ -26,6 +27,7 @@ public class VoxyClient {
     public VoxyClient(IEventBus modBus, ModContainer container) {
         NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) ->
                 event.getDispatcher().register(VoxyCommands.register()));
+        new ClientLodStreaming(modBus, container);
     }
 
     public static void initVoxyClient() {
