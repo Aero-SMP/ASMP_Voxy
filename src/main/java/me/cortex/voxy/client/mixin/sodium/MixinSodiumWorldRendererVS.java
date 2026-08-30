@@ -6,8 +6,6 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-//? if forge
-import com.mojang.blaze3d.vertex.PoseStack;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.util.IrisUtil;
@@ -21,18 +19,6 @@ public class MixinSodiumWorldRendererVS {
     
     @Unique
     private ChunkRenderMatrices voxy$capturedMatrices;
-//? if forge {
-    @Inject(method = "drawChunkLayer(Lnet/minecraft/client/renderer/RenderType;Lcom/mojang/blaze3d/vertex/PoseStack;DDD)V", at = @At("HEAD"))
-    private void voxy$captureMatrices(RenderType renderLayer, PoseStack matrixStack, double x, double y, double z, CallbackInfo ci) {
-        ChunkRenderMatrices matrices = ChunkRenderMatrices.from(matrixStack);
-        this.voxy$capturedMatrices = matrices;
-    }
-
-    @Inject(method = "drawChunkLayer(Lnet/minecraft/client/renderer/RenderType;Lcom/mojang/blaze3d/vertex/PoseStack;DDD)V", at = @At("TAIL"))
-    private void injectRender(RenderType renderLayer, PoseStack matrixStack, double x, double y, double z, CallbackInfo ci) {
-        this.doRender(this.voxy$capturedMatrices, renderLayer, x, y, z);
-    }
-//? } else {
     @Inject(method = "drawChunkLayer(Lnet/minecraft/client/renderer/RenderType;Lnet/caffeinemc/mods/sodium/client/render/chunk/ChunkRenderMatrices;DDD)V", at = @At("HEAD"))
     private void voxy$captureMatrices(RenderType renderLayer, ChunkRenderMatrices matrices, double x, double y, double z, CallbackInfo ci) {
         this.voxy$capturedMatrices = matrices;
@@ -42,7 +28,6 @@ public class MixinSodiumWorldRendererVS {
     private void injectRender(RenderType renderLayer, ChunkRenderMatrices matrices, double x, double y, double z, CallbackInfo ci) {
         this.doRender(this.voxy$capturedMatrices, renderLayer, x, y, z);
     }
-//? }
     @Unique
     private void doRender(ChunkRenderMatrices matrices, RenderType renderLayer, double x, double y, double z) {
         if (renderLayer == RenderType.solid()) {

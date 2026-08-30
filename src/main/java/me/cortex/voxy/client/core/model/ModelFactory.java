@@ -38,9 +38,6 @@ import net.minecraft.world.level.material.FluidState;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
 
-//? if forge
-import net.minecraftforge.registries.ForgeRegistries;
-
 import java.lang.invoke.VarHandle;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -808,18 +805,7 @@ public class ModelFactory {
     }
 
     private static BlockColor getColourProvider(Block block) {
-        return Minecraft.getInstance().getBlockColors().blockColors.
-        //? if fabric {
-        byId(BuiltInRegistries.BLOCK.getId(block));
-        //?} else {
-        get(
-        //? if forge {
-            ForgeRegistries.BLOCKS.getDelegateOrThrow(block)
-        //?} else {
-            block
-        //?}
-        );
-        //?}
+        return Minecraft.getInstance().getBlockColors().blockColors.get(block);
     }
 
     //TODO: add a method to detect biome dependent colours (can do by detecting if getColor is ever called)

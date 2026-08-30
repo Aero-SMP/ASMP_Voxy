@@ -231,13 +231,8 @@ public class DHImporter implements IDataImporter {
             {
                 var biomeRes = ResourceLocation.parse(encEntry.substring(0, idx));
                 var biome = this.biomeRegistry.
-                //? if 1.20.1 {
-                getOptional(biomeRes).orElse(this.defaultBiome.value());
-                biomeId = this.engine.getMapper().getIdForBiome(this.biomeRegistry.wrapAsHolder(biome));
-                //?} else {
                 getHolder(biomeRes).orElse(this.defaultBiome);
                 biomeId = this.engine.getMapper().getIdForBiome(biome);
-                //?}
                 
             }
             {

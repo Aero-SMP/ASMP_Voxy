@@ -4,7 +4,6 @@ import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.minecraft.client.Camera;
-//? if 1.21.1
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
@@ -12,16 +11,12 @@ import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
 
 import org.joml.Matrix4f;
-import org.joml.Matrix4fc;
-import org.joml.Vector4f;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-import com.mojang.blaze3d.vertex.PoseStack;
 
 import static org.lwjgl.opengl.GL11C.glViewport;
 
@@ -31,24 +26,14 @@ public class MixinLevelRenderer {
 
     @Inject(method = "renderLevel", at = @At("HEAD"), order = 100)
     private void voxy$injectIrisCompat(
-            //? if 1.21.1
             DeltaTracker tickCounter,
-            //? if 1.20.1 {
-            PoseStack matrices,
-            float tickDelta,
-            long limitTime,
-            //?}
             boolean renderBlockOutline,
             Camera camera,
             GameRenderer gameRenderer,
             LightTexture lightTexture,
-            //? if 1.21.1
             Matrix4f positionMatrix,
             Matrix4f projectionMatrix,
             CallbackInfo ci) {
-        //? if 1.20.1 {
-        Matrix4f positionMatrix = matrices.last().pose();
-        //?}
         if (IrisUtil.irisShaderPackEnabled()) {
             var renderer = ((IGetVoxyRenderSystem) this).voxy$getRenderSystem();
             if (renderer != null) {

@@ -12,7 +12,6 @@ import net.caffeinemc.mods.sodium.client.render.chunk.RenderSectionManager;
 import net.caffeinemc.mods.sodium.client.render.chunk.compile.executor.ChunkBuilder;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.BuiltSectionInfo;
 import net.caffeinemc.mods.sodium.client.render.chunk.map.ChunkTrackerHolder;
-//? if 1.21.1
 import net.caffeinemc.mods.sodium.client.render.chunk.translucent_sorting.SortBehavior;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.SectionPos;
@@ -38,7 +37,6 @@ public class MixinRenderSectionManager {
     private void voxy$resetChunkTracker(
         ClientLevel level,
         int renderDistance,
-        //? if 1.21.1
         SortBehavior sortBehavior,
         CommandList commandList, 
         CallbackInfo ci
@@ -95,45 +93,23 @@ public class MixinRenderSectionManager {
     @Unique private int cachedChunkStatus;
     @Unique private int bottomSectionY;
 
-    // Single Stonecutter-driven redirect: annotation target, return type, and final return are generated
-    // based on the `1.21.1` flag so we only keep one copy of the body.
-    //? if 1.21.1 {
     @Redirect(method = "updateSectionInfo", at = @At(value = "INVOKE", target = "Lnet/caffeinemc/mods/sodium/client/render/chunk/RenderSection;setInfo(Lnet/caffeinemc/mods/sodium/client/render/chunk/data/BuiltSectionInfo;)Z"))
-    //? } else {
-    @Redirect(method = "updateSectionInfo", at = @At(value = "INVOKE", target = "Lme/jellysquid/mods/sodium/client/render/chunk/RenderSection;setInfo(Lme/jellysquid/mods/sodium/client/render/chunk/data/BuiltSectionInfo;)V"))
-    //? }
-    //? if 1.21.1 {
     private boolean
-    //? } else {
-    private void
-    //? }
     voxy$updateOnUpload(RenderSection instance, BuiltSectionInfo info) {
         boolean wasBuilt = instance.getFlags() != 0;
         int flags = instance.getFlags();
         instance.setInfo(info);
         if (wasBuilt == (instance.getFlags() != 0)) { // Only want to do stuff on change
-            //? if 1.21.1 {
             return true;
-            //? } else {
-            return;
-            //? }
         }
 
         flags |= instance.getFlags();
         if (flags == 0) // Only process things with stuff
-            //? if 1.21.1 {
             return true;
-            //? } else {
-            return;
-            //? }
 
         VoxyRenderSystem system = ((IGetVoxyRenderSystem) (this.level.levelRenderer)).voxy$getRenderSystem();
         if (system == null) {
-            //? if 1.21.1 {
             return true;
-            //? } else {
-            return;
-            //? }
         }
         int x = instance.getChunkX(), y = instance.getChunkY(), z = instance.getChunkZ();
 
@@ -181,10 +157,6 @@ public class MixinRenderSectionManager {
         } else {//Add
             system.chunkBoundRenderer.addSection(pos);
         }
-        //? if 1.21.1 {
         return true;
-        //? } else {
-        return;
-        //? }
     }
 }

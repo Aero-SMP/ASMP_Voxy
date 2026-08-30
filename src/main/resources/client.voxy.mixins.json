@@ -6,11 +6,6 @@
   "plugin": "me.cortex.voxy.client.mixin.ClientVoxyMixinPlugin",
   "compatibilityLevel": "JAVA_17",
   "client": [
-//? if fabric {
-    "flashback.MixinFlashbackMeta",
-    "flashback.MixinFlashbackRecorder",
-//? }
-
     "iris.CustomUniformsAccessor",
     "iris.IrisRenderingPipelineAccessor",
     "iris.MixinIris",
@@ -24,13 +19,6 @@
     "iris.MixinStandardMacros",
     // "minecraft.MixinBlockableEventLoop",
     "minecraft.MixinClientChunkCache",
-//? if 1.20.1
-    "sodium.AccessorSodiumOptionsGUI",
-
-//? if 1.20.1
-    "sodium.MixinSodiumOptionsGUI",
-
-//? if 1.21.1
     "minecraft.MixinClientCommonPacketListenerImpl",
 
     "minecraft.MixinClientLevel",
@@ -42,7 +30,6 @@
     "minecraft.MixinLevelRenderer",
     "minecraft.MixinMinecraft",
     "minecraft.MixinRenderSystem",
-//? if 1.21.1
     "minecraft.MixinWindow",
     
     "nvidium.MixinRenderPipeline",

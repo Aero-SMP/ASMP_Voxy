@@ -11,15 +11,9 @@ accessible field net/minecraft/client/gui/components/BossHealthOverlay events Lj
 accessible field net/minecraft/client/multiplayer/MultiPlayerGameMode connection Lnet/minecraft/client/multiplayer/ClientPacketListener;
 
 accessible field net/minecraft/world/level/chunk/PalettedContainer data Lnet/minecraft/world/level/chunk/PalettedContainer$Data;
-#? if fabric {
-accessible field net/minecraft/world/level/chunk/PalettedContainer$Data palette Lnet/minecraft/world/level/chunk/Palette;
-accessible field net/minecraft/world/level/chunk/PalettedContainer$Data storage Lnet/minecraft/util/BitStorage;
-#? }
 
 accessible field net/minecraft/client/renderer/RenderType$CompositeRenderType state Lnet/minecraft/client/renderer/RenderType$CompositeState;
 accessible field net/minecraft/client/renderer/RenderType$CompositeState textureState Lnet/minecraft/client/renderer/RenderStateShard$EmptyTextureStateShard;
-#? if !neoforge
-accessible method net/minecraft/client/renderer/RenderStateShard$EmptyTextureStateShard cutoutTexture ()Ljava/util/Optional;
 
 accessible method net/minecraft/client/renderer/texture/MipmapGenerator alphaBlend (IIIIZ)I
 accessible method net/minecraft/client/renderer/GameRenderer getFov (Lnet/minecraft/client/Camera;FZ)D
@@ -31,8 +25,3 @@ accessible field net/minecraft/world/level/block/StairBlock baseState Lnet/minec
 
 accessible field net/minecraft/client/renderer/LightTexture lightTexture Lnet/minecraft/client/renderer/texture/DynamicTexture;
 accessible field com/mojang/blaze3d/systems/RenderSystem$AutoStorageIndexBuffer name I
-
-#? if forge {
-accessible class net/minecraft/client/multiplayer/ClientChunkCache$Storage
-accessible class com/mojang/blaze3d/platform/GlDebug$LogEntry
-#? }

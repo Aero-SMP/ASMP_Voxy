@@ -14,13 +14,8 @@ import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
-//? if 1.20.1
-import me.jellysquid.mods.sodium.client.gui.options.storage.OptionStorage;
 
-public class VoxyConfig
-//? if 1.20.1
-    implements OptionStorage<VoxyConfig>
-{
+public class VoxyConfig {
     private static final Gson GSON = new GsonBuilder()
             .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .setPrettyPrinting()
@@ -101,13 +96,6 @@ public class VoxyConfig
     private static Path getConfigPath() {
         return VoxyCommon.getPlatformUtil().getConfigDir().resolve("voxy-config.json");
     }
-
-    //? if 1.20.1 {
-    @Override
-    public VoxyConfig getData() {
-        return this;
-    }
-    //? }
 
     public boolean isRenderingEnabled() {
         return VoxyCommon.isAvailable() && this.enabled && this.enableRendering;

@@ -1,4 +1,14 @@
-PLEASE do not join cortex's server and complain/ask for support about this backport, no support will be given there, join https://discord.gg/6rH7nzmfg8 instead
+# Voxy
 
+Voxy is an LoD rendering mod for Minecraft 1.21.1 on NeoForge 21.1.229.
 
-Voxy is an LoD rendering mod for minecraft
+Please do not ask for support for this fork in Cortex's server. Use
+https://discord.gg/6rH7nzmfg8 instead.
+
+## Building
+
+```shell
+./gradlew build
+```
+
+The mod JAR is written to `build/libs/`.

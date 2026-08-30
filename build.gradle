@@ -1,0 +1,207 @@
+import org.gradle.api.tasks.bundling.Jar
+import org.gradle.api.tasks.compile.JavaCompile
+
+plugins {
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+def modVersion = providers.gradleProperty('mod_version').get()
+def minecraftVersion = providers.gradleProperty('minecraft_version').get()
+def neoForgeVersion = providers.gradleProperty('neoforge_version').get()
+def modId = providers.gradleProperty('mod_id').get()
+def modName = providers.gradleProperty('mod_name').get()
+
+group = providers.gradleProperty('maven_group').get()
+version = "${modVersion}+${minecraftVersion}-neoforge"
+
+base {
+    archivesName.set(modId)
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.caffeinemc.net/releases' }
+    maven { url = 'https://maven.shedaniel.me/' }
+    maven { url = 'https://maven.terraformersmc.com/releases/' }
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'Modrinth'
+                url = 'https://api.modrinth.com/maven'
+            }
+        }
+        filter {
+            includeGroup 'maven.modrinth'
+        }
+    }
+
+    exclusiveContent {
+        forRepository {
+            ivy {
+                name = 'GitHub releases'
+                url = 'https://github.com/'
+                patternLayout {
+                    artifact '/[organisation]/[module]/releases/download/[revision]/[module]-[revision]-[classifier].[ext]'
+                }
+                metadataSources {
+                    artifact()
+                }
+            }
+        }
+        filter {
+            includeModuleByRegex '[^\\.]+', 'nvidium'
+        }
+    }
+}
+
+java {
+    withSourcesJar()
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release.set(21)
+}
+
+tasks.named('processResources') {
+    def commit = providers.exec {
+        commandLine 'git', 'rev-parse', '--short', 'HEAD'
+    }.standardOutput.asText.get().trim()
+    if (commit.isEmpty()) {
+        commit = '<UnknownCommit>'
+    }
+
+    def resourceProperties = [
+        version  : modVersion,
+        minecraft: minecraftVersion,
+        commit   : commit,
+        buildtime: (System.currentTimeMillis().intdiv(1000L)).toString(),
+        mod_name : modName,
+        mod_id   : modId,
+    ]
+
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand resourceProperties
+    }
+}
+
+def lwjglVersion = '3.3.3'
+
+def shadedConfiguration = configurations.create('shadedDependencies') {
+    canBeConsumed = false
+    canBeResolved = true
+    transitive = false
+}
+
+dependencies {
+    def sodiumVersion = providers.gradleProperty('sodium_version').get()
+    compileOnly "net.caffeinemc:sodium-neoforge-mod:${sodiumVersion}"
+    compileOnly "net.caffeinemc:sodium-neoforge-api:${sodiumVersion}"
+    runtimeOnly("net.caffeinemc:sodium-neoforge:${sodiumVersion}") {
+        transitive = false
+    }
+
+    implementation "maven.modrinth:lithium:${providers.gradleProperty('lithium_version').get()}"
+    compileOnly "drouarb:nvidium:${providers.gradleProperty('nvidium_version').get()}"
+    compileOnly "maven.modrinth:iris:${providers.gradleProperty('iris_version').get()}"
+    compileOnly files('libs/modmenu-bridge-1.12.1+1.21.1.jar')
+    compileOnly "maven.modrinth:sodium-extra:${providers.gradleProperty('sodium_extra_version').get()}"
+
+    runtimeOnly 'io.github.douira:glsl-transformer:2.0.1'
+    runtimeOnly 'org.anarres:jcpp:1.4.14'
+
+    def chunkyVersion = providers.gradleProperty('chunky_version').get()
+    compileOnly "maven.modrinth:chunky:${chunkyVersion}"
+    runtimeOnly "maven.modrinth:chunky:${chunkyVersion}"
+    runtimeOnly "maven.modrinth:spark:${providers.gradleProperty('spark_version').get()}"
+    compileOnly "maven.modrinth:vivecraft:${providers.gradleProperty('vivecraft_version').get()}"
+    compileOnly "maven.modrinth:flashback:${providers.gradleProperty('flashback_version').get()}"
+
+    implementation platform("org.lwjgl:lwjgl-bom:${lwjglVersion}")
+    implementation 'org.lwjgl:lwjgl'
+    implementation "org.lwjgl:lwjgl-lmdb:${lwjglVersion}"
+    implementation "org.lwjgl:lwjgl-zstd:${lwjglVersion}"
+    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
+    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
+    runtimeOnly "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-windows"
+    runtimeOnly "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux"
+
+    def jedisVersion = providers.gradleProperty('jedis_version').get()
+    def rocksdbVersion = providers.gradleProperty('rocksdb_version').get()
+    def commonsPoolVersion = providers.gradleProperty('commons_pool_version').get()
+    def lz4Version = providers.gradleProperty('lz4_version').get()
+    def xzVersion = providers.gradleProperty('xz_version').get()
+    def sqliteJdbcVersion = providers.gradleProperty('sqlite_jdbc_version').get()
+
+    implementation "redis.clients:jedis:${jedisVersion}"
+    implementation "org.rocksdb:rocksdbjni:${rocksdbVersion}"
+    implementation "org.apache.commons:commons-pool2:${commonsPoolVersion}"
+    implementation "org.lz4:lz4-java:${lz4Version}"
+    implementation "org.tukaani:xz:${xzVersion}"
+    runtimeOnly "org.xerial:sqlite-jdbc:${sqliteJdbcVersion}"
+
+    jarJar "redis.clients:jedis:${jedisVersion}"
+    jarJar "org.rocksdb:rocksdbjni:${rocksdbVersion}"
+    jarJar "org.apache.commons:commons-pool2:${commonsPoolVersion}"
+    jarJar "org.tukaani:xz:${xzVersion}"
+    jarJar "org.xerial:sqlite-jdbc:${sqliteJdbcVersion}"
+    jarJar "org.lwjgl:lwjgl:${lwjglVersion}"
+
+    add shadedConfiguration.name, "org.lwjgl:lwjgl-lmdb:${lwjglVersion}"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl-lmdb:${lwjglVersion}:natives-windows"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-windows"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl-lmdb:${lwjglVersion}:natives-linux"
+    add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux"
+}
+
+tasks.named('jar', Jar) {
+    from({ shadedConfiguration.collect { zipTree(it) } }) {
+        exclude '**/module-info.class', 'META-INF/MANIFEST.MF', 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+afterEvaluate {
+    [
+        "redis.clients:jedis:${providers.gradleProperty('jedis_version').get()}",
+        "org.rocksdb:rocksdbjni:${providers.gradleProperty('rocksdb_version').get()}",
+        "org.apache.commons:commons-pool2:${providers.gradleProperty('commons_pool_version').get()}",
+        "org.lz4:lz4-java:${providers.gradleProperty('lz4_version').get()}",
+        "org.tukaani:xz:${providers.gradleProperty('xz_version').get()}",
+        "org.xerial:sqlite-jdbc:${providers.gradleProperty('sqlite_jdbc_version').get()}",
+        "org.lwjgl:lwjgl-lmdb:${lwjglVersion}",
+        "org.lwjgl:lwjgl-zstd:${lwjglVersion}",
+        "org.lwjgl:lwjgl-lmdb:${lwjglVersion}:natives-linux",
+        "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux",
+    ].each { dependency ->
+        dependencies.add('additionalRuntimeClasspath', dependency)
+    }
+}
+
+neoForge {
+    version = neoForgeVersion
+    accessTransformers.from 'src/main/resources/META-INF/accesstransformer.cfg'
+    validateAccessTransformers = true
+
+    runs {
+        register('client') {
+            gameDirectory = file('run/')
+            client()
+        }
+        register('server') {
+            gameDirectory = file('run/')
+            server()
+        }
+    }
+
+    mods {
+        register(modId) {
+            sourceSet sourceSets.main
+        }
+    }
+}

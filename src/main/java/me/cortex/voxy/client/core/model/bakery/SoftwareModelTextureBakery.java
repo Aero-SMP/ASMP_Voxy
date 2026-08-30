@@ -314,7 +314,7 @@ public class SoftwareModelTextureBakery {
         stack.mulPose(makeQuatFromAxisExact(new Vector3f(0, 0, 1), rotation));
         stack.mulPose(makeQuatFromAxisExact(new Vector3f(1, 0, 0), pitch));
         stack.mulPose(makeQuatFromAxisExact(new Vector3f(0, 1, 0), yaw));
-        stack./*? if 1.20.1 { */mulPoseMatrix/*? } else { */mulPose/*? } */(
+        stack.mulPose(
             new Matrix4f().scale(
                 1 - 2 * (flip & 1),
                 1 - (flip & 2),
