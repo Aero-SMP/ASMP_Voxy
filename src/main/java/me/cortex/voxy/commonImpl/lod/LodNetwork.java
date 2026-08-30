@@ -27,8 +27,6 @@ public class LodNetwork {
     public static final ResourceLocation HANDSHAKE_ID = id("lod_handshake");
     public static final ResourceLocation HANDSHAKE_ACK_ID = id("lod_handshake_ack");
     public static final ResourceLocation LOD_DATA_ID = id("lod_data");
-    public static final ResourceLocation SERVER_CONFIG_ID = id("lod_server_config");
-    public static final ResourceLocation SERVER_CONFIG_PUSH_ID = id("lod_server_config_push");
 
     private static ResourceLocation id(String path) {
         return ResourceLocation.fromNamespaceAndPath(LodStreamingService.NAMESPACE, path);
@@ -76,57 +74,6 @@ public class LodNetwork {
         public Type<? extends CustomPacketPayload> type() {
             return TYPE;
         }
-    }
-
-    // server -> client the live server values plus whether this client may edit them
-    public record ServerConfigPayload(LodStreamingConfig.ServerConfig config, boolean canEdit) implements CustomPacketPayload {
-        public static final Type<ServerConfigPayload> TYPE = new Type<>(SERVER_CONFIG_ID);
-        public static final StreamCodec<FriendlyByteBuf, ServerConfigPayload> CODEC = CustomPacketPayload.codec(ServerConfigPayload::write, ServerConfigPayload::new);
-
-        public ServerConfigPayload(FriendlyByteBuf buf) {
-            this(readConfig(buf), buf.readBoolean());
-        }
-
-        public void write(FriendlyByteBuf buf) {
-            writeConfig(buf, config);
-            buf.writeBoolean(canEdit);
-        }
-
-        @Override
-        public Type<? extends CustomPacketPayload> type() {
-            return TYPE;
-        }
-    }
-
-    // client op pushes new values to apply
-    public record ServerConfigPushPayload(LodStreamingConfig.ServerConfig config) implements CustomPacketPayload {
-        public static final Type<ServerConfigPushPayload> TYPE = new Type<>(SERVER_CONFIG_PUSH_ID);
-        public static final StreamCodec<FriendlyByteBuf, ServerConfigPushPayload> CODEC = CustomPacketPayload.codec(ServerConfigPushPayload::write, ServerConfigPushPayload::new);
-
-        public ServerConfigPushPayload(FriendlyByteBuf buf) {
-            this(readConfig(buf));
-        }
-
-        public void write(FriendlyByteBuf buf) {
-            writeConfig(buf, config);
-        }
-
-        @Override
-        public Type<? extends CustomPacketPayload> type() {
-            return TYPE;
-        }
-    }
-
-    private static LodStreamingConfig.ServerConfig readConfig(FriendlyByteBuf buf) {
-        return new LodStreamingConfig.ServerConfig(buf.readBoolean(), buf.readVarInt(), buf.readVarInt(), buf.readVarInt(), buf.readVarInt());
-    }
-
-    private static void writeConfig(FriendlyByteBuf buf, LodStreamingConfig.ServerConfig c) {
-        buf.writeBoolean(c.enabled());
-        buf.writeVarInt(c.generationRadius());
-        buf.writeVarInt(c.updateInterval());
-        buf.writeVarInt(c.maxQueueSize());
-        buf.writeVarInt(c.maxActiveTasks());
     }
 
     public record LODDataPayload(ResourceKey<Level> dimension, ChunkPos pos, int minY, List<SectionData> sections) implements CustomPacketPayload {
@@ -218,7 +165,6 @@ public class LodNetwork {
         } else {
             registrar.playToClient(HandshakePayload.TYPE, HandshakePayload.CODEC, LodNetwork::ignoreClientbound);
             registrar.playToClient(LODDataPayload.TYPE, LODDataPayload.CODEC, LodNetwork::ignoreClientbound);
-            registrar.playToClient(ServerConfigPayload.TYPE, ServerConfigPayload.CODEC, LodNetwork::ignoreClientbound);
         }
 
         registrar.playToServer(
@@ -226,12 +172,6 @@ public class LodNetwork {
                 HandshakeAckPayload.CODEC,
                 LodNetwork::handleHandshakeAck
         );
-        registrar.playToServer(
-                ServerConfigPushPayload.TYPE,
-                ServerConfigPushPayload.CODEC,
-                LodNetwork::handleServerConfigPush
-        );
-
         LodStreamingService.LOGGER.info("LOD networking initialized");
     }
 
@@ -251,45 +191,7 @@ public class LodNetwork {
                             player.getGameProfile().getName(), payload.protocolVersion(), LodStreamingService.PROTOCOL_VERSION);
                 }
                 LodGenerationService.getInstance().setModded(player.getUUID(), compatible);
-                sendServerConfig(player);
             });
-        }
-    }
-
-    // gamemaster level 2
-    private static final int CONFIG_OP_LEVEL = 2;
-
-    // op level required to edit server config from the client
-    private static boolean canEditConfig(ServerPlayer player) {
-        return player.hasPermissions(CONFIG_OP_LEVEL);
-    }
-
-    private static void handleServerConfigPush(ServerConfigPushPayload payload, IPayloadContext context) {
-        if (!(context.player() instanceof ServerPlayer player)) return;
-        context.enqueueWork(() -> {
-            if (!canEditConfig(player)) {
-                LodStreamingService.LOGGER.warn("ignoring server config push from non-op {}", player.getGameProfile().getName());
-                sendServerConfig(player); // snap their screen back to the real values
-                return;
-            }
-            LodStreamingConfig.applyServerConfig(payload.config());
-            LodStreamingConfig.save();
-            LodGenerationService.getInstance().scheduleConfigReload();
-            LodStreamingService.LOGGER.info("server config updated by op {}", player.getGameProfile().getName());
-            broadcastServerConfig();
-        });
-    }
-
-    // send the live server config to one player (canEdit reflects their op status)
-    public static void sendServerConfig(ServerPlayer player) {
-        if (!LodGenerationService.getInstance().isModded(player.getUUID())) return;
-        boolean canEdit = canEditConfig(player);
-        PacketDistributor.sendToPlayer(player, new ServerConfigPayload(LodStreamingConfig.ServerConfig.snapshot(), canEdit));
-    }
-
-    public static void broadcastServerConfig() {
-        for (ServerPlayer player : LodGenerationService.getInstance().getPlayers()) {
-            sendServerConfig(player);
         }
     }
 

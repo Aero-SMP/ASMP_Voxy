@@ -17,7 +17,6 @@ import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
-import net.neoforged.neoforge.event.entity.player.PermissionsChangedEvent;
 import net.neoforged.neoforge.event.level.ChunkEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
@@ -83,13 +82,6 @@ public final class LodStreamingService {
                 if (manager.isSynced(player.getUUID(), packed)) continue;
                 LodNetwork.sendLODData(player, chunk);
             }
-        }
-    }
-
-    @SubscribeEvent
-    public static void onPermissionsChanged(PermissionsChangedEvent event) {
-        if (event.getEntity() instanceof ServerPlayer player) {
-            player.server.execute(() -> LodNetwork.sendServerConfig(player));
         }
     }
 

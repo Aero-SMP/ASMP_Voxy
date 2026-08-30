@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.commonImpl.lod.LodStreamingService;
-import me.cortex.voxy.commonImpl.lod.LodStreamingConfig;
 import me.cortex.voxy.commonImpl.lod.LodNetwork;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -44,16 +43,11 @@ public class ClientLodNetwork {
     private static double receiveRate, bandwidthRate;
     private static long lastUpdateTime, lastChunkCount, lastByteCount;
 
-    private static volatile LodStreamingConfig.ServerConfig serverConfig;
-    private static volatile boolean canEditServerConfig;
-
     public static void register(PayloadRegistrar registrar) {
         registrar.playToClient(LodNetwork.HandshakePayload.TYPE, LodNetwork.HandshakePayload.CODEC,
                 ClientLodNetwork::handleHandshake);
         registrar.playToClient(LodNetwork.LODDataPayload.TYPE, LodNetwork.LODDataPayload.CODEC,
                 ClientLodNetwork::handleLODData);
-        registrar.playToClient(LodNetwork.ServerConfigPayload.TYPE, LodNetwork.ServerConfigPayload.CODEC,
-                ClientLodNetwork::handleServerConfig);
     }
 
     public static void handleHandshake(LodNetwork.HandshakePayload payload, IPayloadContext context) {
@@ -69,13 +63,6 @@ public class ClientLodNetwork {
             setServerConnected(compatible);
             // reply so the server knows this client can receive lod data
             PacketDistributor.sendToServer(new LodNetwork.HandshakeAckPayload(true, LodStreamingService.PROTOCOL_VERSION));
-        });
-    }
-
-    public static void handleServerConfig(LodNetwork.ServerConfigPayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            serverConfig = payload.config();
-            canEditServerConfig = payload.canEdit();
         });
     }
 
@@ -226,8 +213,6 @@ public class ClientLodNetwork {
 
     public static void disconnect() {
         setServerConnected(false);
-        serverConfig = null;
-        canEditServerConfig = false;
     }
 
     public static boolean isServerConnected() { return serverConnected; }
@@ -235,11 +220,6 @@ public class ClientLodNetwork {
     public static double getBandwidthRate() { return bandwidthRate; }
     public static long getChunksReceived() { return chunksReceived.get(); }
     public static long getBytesReceived() { return bytesReceived.get(); }
-    public static boolean canEditServerConfig() { return canEditServerConfig; }
-    public static LodStreamingConfig.ServerConfig getServerConfig() {
-        LodStreamingConfig.ServerConfig config = serverConfig;
-        return config != null ? config : LodStreamingConfig.ServerConfig.snapshot();
-    }
 
     private static void setServerConnected(boolean connected) {
         serverConnected = connected;

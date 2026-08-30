@@ -12,26 +12,17 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.resources.ResourceLocation;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.ModContainer;
-import net.neoforged.fml.ModList;
 import net.neoforged.neoforge.client.event.RegisterGuiLayersEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
-import net.neoforged.neoforge.client.gui.IConfigScreenFactory;
 import net.neoforged.neoforge.common.NeoForge;
 
 public class ClientLodStreaming {
 
-    public ClientLodStreaming(IEventBus modEventBus, ModContainer modContainer) {
+    public ClientLodStreaming(IEventBus modEventBus) {
         LodStreamingService.LOGGER.info("Client LOD streaming initializing");
 
         modEventBus.addListener(ClientLodStreaming::registerGuiLayers);
-
-        if (ModList.get().isLoaded("cloth_config")) {
-            modContainer.registerExtensionPoint(IConfigScreenFactory.class,
-                    (container, parent) ->
-                            me.cortex.voxy.client.lod.LodConfigScreen.createConfigScreen(parent));
-        }
 
         LodGenerationService.getInstance().setPauseCheck(() -> {
             Minecraft mc = Minecraft.getInstance();

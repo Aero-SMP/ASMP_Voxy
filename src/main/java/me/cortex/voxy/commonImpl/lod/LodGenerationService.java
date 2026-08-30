@@ -67,7 +67,7 @@ public final class LodGenerationService {
     private final long[] rollingHistory = new long[10];
     private int historyIndex;
     private long lastCompletedCount, lastStatsTickTime;
-    private final AtomicBoolean running = new AtomicBoolean(), configReloadScheduled = new AtomicBoolean();
+    private final AtomicBoolean running = new AtomicBoolean();
 
     private final long[] recentTickTimes = new long[20];
     private int tickTimeIndex;
@@ -437,12 +437,6 @@ public final class LodGenerationService {
 
         processPendingTickets();
 
-        if (configReloadScheduled.compareAndSet(true, false)) {
-            LodStreamingConfig.load();
-            updateThrottleCapacity();
-            restartScan();
-        }
-
         tickTpsMonitor();
         tickStats();
         checkPlayerMovement();
@@ -702,10 +696,6 @@ public final class LodGenerationService {
             activeTaskCount.decrementAndGet();
             throttle.release();
         }
-    }
-
-    public void scheduleConfigReload() {
-        configReloadScheduled.set(true);
     }
 
     // returns a new list rotated so element at offset comes first (fair iteration)

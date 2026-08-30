@@ -46,7 +46,6 @@ public final class LodStreamingConfig {
     }
 
     public static class ConfigData {
-        // server side, an op can push these from the client
         public boolean enabled = true;
         public int generationRadius = 128;
         public int update_interval = 20; // legacy field for compat
@@ -57,23 +56,4 @@ public final class LodStreamingConfig {
         public boolean showF3MenuStats = true;
     }
 
-    // immutable snapshot of just the server-side fields, used to sync between server and clients
-    public record ServerConfig(boolean enabled, int generationRadius, int updateInterval, int maxQueueSize, int maxActiveTasks) {
-        public static ServerConfig snapshot() {
-            return new ServerConfig(DATA.enabled, DATA.generationRadius, DATA.update_interval, DATA.maxQueueSize, DATA.maxActiveTasks);
-        }
-    }
-
-    // overwrite the local server-side fields from a snapshot (used on the server when an op pushes)
-    public static void applyServerConfig(ServerConfig sc) {
-        DATA.enabled = sc.enabled();
-        DATA.generationRadius = clamp(sc.generationRadius(), 1, 512);
-        DATA.update_interval = clamp(sc.updateInterval(), 1, 200);
-        DATA.maxQueueSize = Math.max(0, sc.maxQueueSize());
-        DATA.maxActiveTasks = clamp(sc.maxActiveTasks(), 1, 128);
-    }
-
-    private static int clamp(int v, int lo, int hi) {
-        return Math.max(lo, Math.min(hi, v));
-    }
 }

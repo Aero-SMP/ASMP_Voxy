@@ -9,7 +9,6 @@ import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
-import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -24,10 +23,10 @@ public class VoxyClient {
     private static FileLock EXCLUSIVE_LOCK;
     public static boolean inSession;
 
-    public VoxyClient(IEventBus modBus, ModContainer container) {
+    public VoxyClient(IEventBus modBus) {
         NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) ->
                 event.getDispatcher().register(VoxyCommands.register()));
-        new ClientLodStreaming(modBus, container);
+        new ClientLodStreaming(modBus);
     }
 
     public static void initVoxyClient() {
