@@ -11,7 +11,9 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
@@ -147,29 +149,32 @@ public final class LodStreamingService {
                 worldIdentifierOfMethod = lookup.unreflect(ofMethod);
             } catch (NoSuchMethodException ignored) {}
 
-            // find voxy enabled/active state method
-            try {
-                Class<?> voxyConfigClass = Class.forName("me.cortex.voxy.client.config.VoxyConfig");
+            // Client configuration is unavailable on a dedicated server. Loading it
+            // there also initializes client-only LWJGL classes and kills this worker.
+            if (FMLEnvironment.dist == Dist.CLIENT) {
                 try {
-                    Method isEnabledMethod = voxyConfigClass.getMethod("isEnabled");
-                    voxyEnabledMethod = lookup.unreflect(isEnabledMethod);
-                } catch (NoSuchMethodException ignored) {
-                    // try field-based approach
+                    Class<?> voxyConfigClass = Class.forName("me.cortex.voxy.client.config.VoxyConfig");
                     try {
-                        Field enabledField = voxyConfigClass.getDeclaredField("enabled");
-                        enabledField.setAccessible(true);
-                        voxyEnabledMethod = lookup.unreflectGetter(enabledField);
-                    } catch (Exception ignored2) {}
-                }
-            } catch (ClassNotFoundException ignored) {
-                // try alternate class names
-                try {
-                    Class<?> voxyClientClass = Class.forName("me.cortex.voxy.client.VoxyClient");
-                    try {
-                        Method isEnabledMethod = voxyClientClass.getMethod("isEnabled");
+                        Method isEnabledMethod = voxyConfigClass.getMethod("isEnabled");
                         voxyEnabledMethod = lookup.unreflect(isEnabledMethod);
-                    } catch (NoSuchMethodException ignored2) {}
-                } catch (ClassNotFoundException ignored3) {}
+                    } catch (NoSuchMethodException ignored) {
+                        // try field-based approach
+                        try {
+                            Field enabledField = voxyConfigClass.getDeclaredField("enabled");
+                            enabledField.setAccessible(true);
+                            voxyEnabledMethod = lookup.unreflectGetter(enabledField);
+                        } catch (Exception ignored2) {}
+                    }
+                } catch (ClassNotFoundException ignored) {
+                    // try alternate class names
+                    try {
+                        Class<?> voxyClientClass = Class.forName("me.cortex.voxy.client.VoxyClient");
+                        try {
+                            Method isEnabledMethod = voxyClientClass.getMethod("isEnabled");
+                            voxyEnabledMethod = lookup.unreflect(isEnabledMethod);
+                        } catch (NoSuchMethodException ignored2) {}
+                    } catch (ClassNotFoundException ignored3) {}
+                }
             }
 
             LodStreamingService.LOGGER.info("LOD ingestion bridge initialized (enabled: {}, raw: {}, voxyEnabled: {})", enabled, rawIngestMethod != null, voxyEnabledMethod != null);

@@ -1,6 +1,6 @@
 set -eu
-session=$1 window=$2 folder=$3 artifact=$4 prefix=$5 repo_url=$6 branch=$7 repo=$8 artifact_prefix=$9 target="$session:$window.0"
-if [ ! -d "$repo/.git" ]; then
+session=$1 window=$2 folder=$3 artifact=$4 prefix=$5 repo_url=$6 branch=$7 repo=$8 artifact_base=$9 no_commit=${10:-false} target="$session:$window.0"
+if [ "$no_commit" != true ] && [ ! -d "$repo/.git" ]; then
   mkdir -p "$(dirname "$repo")"
   git clone "$repo_url" "$repo" || { echo "Failed to clone $repo_url into $repo" >&2; exit 1; }
 fi
@@ -17,12 +17,16 @@ while foreground_group=$(ps -o tpgid= -p "$pane_pid");
   [ "$attempt" -lt 3000 ] || { echo "Server in tmux target $target did not stop within 5 minutes" >&2; exit 1; }
   sleep .1
 done
-# Remove stale Voxy artifacts before installing the new build.
-find "$folder/mods" -maxdepth 1 -type f -iname "*$artifact_prefix*.jar" -delete
+# Replace only previous builds of this Voxy artifact.
+find "$folder/mods" -maxdepth 1 -type f -name "$artifact_base-*.jar" -delete
 mv "$folder/.$prefix-deploy.jar" "$folder/mods/$artifact"
 tmux send-keys -t "$target" C-u
 tmux send-keys -t "$target" -l "cd $folder && ./run.sh"
 tmux send-keys -t "$target" Enter
-git -C "$repo" fetch origin
-git -C "$repo" switch "$branch"
-git -C "$repo" pull --ff-only origin "$branch"
+if [ "$no_commit" != true ]; then
+  git -C "$repo" fetch origin
+  git -C "$repo" switch "$branch"
+  git -C "$repo" pull --ff-only origin "$branch"
+else
+  echo "Skipping Git synchronization (--no-commit)"
+fi

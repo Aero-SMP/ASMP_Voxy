@@ -15,7 +15,7 @@ group = providers.gradleProperty('maven_group').get()
 version = "${modVersion}+${minecraftVersion}-neoforge"
 
 base {
-    archivesName.set(modId)
+    archivesName.set("ASMP_${modId}")
 }
 
 repositories {
@@ -211,11 +211,19 @@ String deployBranch, deployRepoUrl, deployCheckout
 boolean deployLocal
 List<String> requestedTasks = gradle.startParameter.taskNames
 int deployIndex = requestedTasks.findIndexOf { it == 'deploy' || it.endsWith(':deploy') }
-String deployMessage = deployIndex < 0 ? null : requestedTasks.drop(deployIndex + 1).join(' ')
-if (deployMessage) gradle.startParameter.setTaskNames(requestedTasks.take(deployIndex + 1))
+List<String> deployTail = deployIndex < 0 ? [] : requestedTasks.drop(deployIndex + 1)
+boolean deployNoCommit = deployTail.remove('--no-commit')
+String deployMessage = deployTail.join(' ').trim()
+if (deployIndex >= 0 && requestedTasks.size() > deployIndex + 1) {
+    gradle.startParameter.setTaskNames(requestedTasks.take(deployIndex + 1))
+}
 
 def deployCommit = tasks.register('deployCommit') {
     doLast {
+        if (deployNoCommit) {
+            logger.lifecycle('Skipping Git commit and push (--no-commit)')
+            return
+        }
         Process status = new ProcessBuilder(['git', 'status', '--porcelain']).start()
         String changes = status.inputStream.text
         if (status.waitFor()) throw new GradleException('git status failed')
@@ -239,6 +247,7 @@ def deployCommit = tasks.register('deployCommit') {
 tasks.configureEach { if (name != 'deployCommit') mustRunAfter deployCommit }
 
 def deploy = tasks.register('deploy', Exec) {
+    description = 'Build and deploy; pass --no-commit to skip all Git operations'
     dependsOn deployCommit, jar
 
     doFirst {
@@ -246,9 +255,12 @@ def deploy = tasks.register('deploy', Exec) {
         String folder = deployConfig.getProperty('folder')
         String session = deployConfig.getProperty('session')
         String window = deployConfig.getProperty('window')
-        File artifact = tasks.named('jar', Jar).get().archiveFile.get().asFile
+        Jar jarTask = tasks.named('jar', Jar).get()
+        File artifact = jarTask.archiveFile.get().asFile
+        String artifactBase = jarTask.archiveBaseName.get()
         List<String> deployArguments = [session, window, folder, artifact.name, modId,
-                                        deployRepoUrl, deployBranch, deployCheckout, modId]
+                                        deployRepoUrl, deployBranch, deployCheckout, artifactBase,
+                                        Boolean.toString(deployNoCommit)]
 
         if (deployLocal) {
             providers.exec {
