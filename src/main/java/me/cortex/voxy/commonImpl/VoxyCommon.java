@@ -1,26 +1,32 @@
 package me.cortex.voxy.commonImpl;
 
-import java.nio.file.Path;
-import java.util.Collections;
-import java.util.List;
-
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.config.Serialization;
-import me.cortex.voxy.common.platform.PlatformUtil;
-import me.cortex.voxy.common.platform.PlatformUtilImpl;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.loading.FMLLoader;
+import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.fml.loading.LoadingModList;
 
+import java.nio.file.Path;
+import java.util.function.Supplier;
+
+@Mod("voxy")
 public class VoxyCommon {
     public static final String MOD_VERSION;
     public static final boolean IS_DEDICATED_SERVER;
     public static final boolean IS_IN_MINECRAFT;
-    private static PlatformUtil PLATFORM_UTIL = new PlatformUtilImpl();
+
+    public VoxyCommon() {
+        Serialization.init();
+    }
 
     static {
         String modVersion;
         boolean dedicated;
         boolean inMinecraft;
 
-        var version = PLATFORM_UTIL.getModVersion("voxy");
+        var version = getModVersion("voxy");
         var commit = "<UNKNOWN>";
         if (version == null) {
             inMinecraft = false;
@@ -31,7 +37,7 @@ public class VoxyCommon {
             inMinecraft = true;
             if (commit == null) commit = "unknown";
             modVersion = version + "-" + (commit.length() >= 7 ? commit.substring(0, 7) : commit);
-            dedicated = PLATFORM_UTIL.isDedicatedServer();
+            dedicated = FMLLoader.getDist() == Dist.DEDICATED_SERVER;
         }
 
         MOD_VERSION = modVersion;
@@ -52,19 +58,14 @@ public class VoxyCommon {
         int breakpoint = 0;
     }
 
-    public interface IInstanceFactory {VoxyInstance create();}
     private static VoxyInstance INSTANCE;
-    private static IInstanceFactory FACTORY = null;
+    private static Supplier<VoxyInstance> FACTORY;
 
-    public static void setInstanceFactory(IInstanceFactory factory) {
+    public static void setInstanceFactory(Supplier<VoxyInstance> factory) {
         if (FACTORY != null) {
             throw new IllegalStateException("Cannot set instance factory more than once");
         }
         FACTORY = factory;
-    }
-
-    public static PlatformUtil getPlatformUtil() {
-        return PLATFORM_UTIL;
     }
 
     public static VoxyInstance getInstance() {
@@ -87,12 +88,37 @@ public class VoxyCommon {
         if (INSTANCE != null) {
             throw new IllegalStateException("Cannot create multiple instances");
         }
-        INSTANCE = FACTORY.create();
+        INSTANCE = FACTORY.get();
     }
 
     //Is voxy available in any capacity
     public static boolean isAvailable() {
         return FACTORY != null;
+    }
+
+    public static boolean isModLoaded(String modId) {
+        var mods = LoadingModList.get();
+        return mods != null && mods.getModFileById(modId) != null;
+    }
+
+    public static Path getModRootPath(String modId) {
+        var mods = LoadingModList.get();
+        if (mods == null) return null;
+
+        var info = mods.getModFileById(modId);
+        return info == null ? null : info.getFile().getSecureJar().getRootPath();
+    }
+
+    private static String getModVersion(String modId) {
+        var mods = LoadingModList.get();
+        if (mods == null) return null;
+
+        var info = mods.getModFileById(modId);
+        return info == null ? null : info.versionString();
+    }
+
+    public static Path getConfigDir() {
+        return FMLPaths.CONFIGDIR.get();
     }
 
     public static final boolean IS_MINE_IN_ABYSS = false;

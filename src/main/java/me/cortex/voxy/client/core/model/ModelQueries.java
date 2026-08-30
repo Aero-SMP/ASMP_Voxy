@@ -17,16 +17,8 @@ public abstract class ModelQueries {
         return ((metadata>>(8*face))&0b1000) != 0;
     }
 
-    public static boolean isDoubleSided(long metadata) {
-        return ((metadata>>(8*6))&4) != 0;
-    }
-
     public static long _isDoubleSided(long metadata) {
         return ((metadata>>(8*6+2))&1L);
-    }
-
-    public static boolean isTranslucent(long metadata) {
-        return ((metadata>>(8*6))&2) != 0;
     }
 
     public static long _isTranslucent(long metadata) {
@@ -51,10 +43,6 @@ public abstract class ModelQueries {
 
     public static boolean isBiomeColoured(long metadata) {
         return ((metadata>>(8*6))&1L) != 0;
-    }
-
-    public static long _isBiomeColoured(long metadata) {
-        return ((metadata>>(8*6))&1L);
     }
 
     public static long _notIsBiomeColoured(long metadata) {

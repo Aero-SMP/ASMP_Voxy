@@ -8,13 +8,11 @@ import me.cortex.voxy.client.TimingStatistics;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
-import me.cortex.voxy.client.core.rendering.GeometryCache;
 import me.cortex.voxy.client.core.rendering.SectionUpdateRouter;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicAsyncGeometryManager;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicSectionGeometryData;
-import me.cortex.voxy.client.core.rendering.section.geometry.IGeometryData;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.AllocationArena;
@@ -68,10 +66,8 @@ public class AsyncNodeManager {
 
     private final NodeManager manager;
     private final BasicAsyncGeometryManager geometryManager;
-    private final IGeometryData geometryData;
+    private final BasicSectionGeometryData geometryData;
     private final SectionUpdateRouter router;
-
-    private final GeometryCache geometryCache = new GeometryCache(1L<<32);
 
     private final AtomicInteger workCounter = new AtomicInteger();
 
@@ -86,13 +82,13 @@ public class AsyncNodeManager {
 
     private boolean needsWaitForSync = false;
 
-    public AsyncNodeManager(int maxNodeCount, IGeometryData geometryData, RenderGenerationService renderService) {
-        //Note the current implmentation of ISectionWatcher is threadsafe
+    public AsyncNodeManager(int maxNodeCount, BasicSectionGeometryData geometryData, RenderGenerationService renderService) {
+        //SectionUpdateRouter is thread-safe.
         //Note: geometry data is the data store/source, not the management, it is just a raw store of data
         // it MUST ONLY be accessed on the render thread
         // AsyncNodeManager will use an AsyncGeometryManager as the manager for the data store, and sync the results on the render thread
         this.geometryData = geometryData;
-        this.geometryCapacity = ((BasicSectionGeometryData)geometryData).getGeometryCapacityBytes();
+        this.geometryCapacity = geometryData.getGeometryCapacityBytes();
 
         this.maxNodeCount = maxNodeCount;
 
@@ -118,36 +114,18 @@ public class AsyncNodeManager {
         this.geometryManager = new BasicAsyncGeometryManager(((BasicSectionGeometryData)geometryData).getMaxSectionCount(), this.geometryCapacity);
 
         this.router = new SectionUpdateRouter();
-        this.router.setCallbacks(pos->{//On initial render gen, try get from geometry cache
-            var cachedGeometry = this.geometryCache.remove(pos);
-            if (cachedGeometry != null) {//Use the cached geometry
-                this.submitGeometryResult(cachedGeometry);
-            } else {//Else we need to request it
-                renderService.enqueueTask(pos);
-            }
-        }, renderService::enqueueTask, this::submitChildChange);
+        this.router.setCallbacks(renderService::enqueueTask, renderService::enqueueTask, this::submitChildChange);
         renderService.setResultConsumer(this::submitGeometryResult);
 
         this.manager = new NodeManager(maxNodeCount, this.geometryManager, this.router);
 
         //Dont do the move... is just to much effort
-        this.manager.setClear(new NodeManager.ICleaner() {
-            @Override
-            public void alloc(int id) {
-                AsyncNodeManager.this.cleanerIdResetClear.remove(id);//Remove clear
-                AsyncNodeManager.this.cleanerIdResetClear.add(id|(1<<31));//Add reset
-            }
-
-            @Override
-            public void move(int from, int to) {
-                //noop (sorry :( will cause some perf loss/incorrect cleaning )
-            }
-
-            @Override
-            public void free(int id) {
-                AsyncNodeManager.this.cleanerIdResetClear.remove(id|(1<<31));//Remove reset
-                AsyncNodeManager.this.cleanerIdResetClear.add(id);//Add clear
-            }
+        this.manager.setClear(id -> {
+            this.cleanerIdResetClear.remove(id);//Remove clear
+            this.cleanerIdResetClear.add(id|(1<<31));//Add reset
+        }, id -> {
+            this.cleanerIdResetClear.remove(id|(1<<31));//Remove reset
+            this.cleanerIdResetClear.add(id);//Add clear
         });
         this.manager.setTLNCallbacks(id->{
             if (!this.tlnIdChange.remove(id)) {
@@ -782,7 +760,6 @@ public class AsyncNodeManager {
 
         this.scatterWrite.free();
         this.multiMemcpy.free();
-        this.geometryCache.free();
     }
 
     public void addDebug(List<String> debug) {
@@ -795,9 +772,6 @@ public class AsyncNodeManager {
     }
 
     public void worldEvent(WorldSection section, int flags, int neighborMask) {
-        //If there is any change, we need to clear the geometry cache before emitting update
-        this.geometryCache.clear(section.key);
-
         this.router.forwardEvent(section, flags);
 
         if (neighborMask != 0) {//trigger rebuilds for neighbors

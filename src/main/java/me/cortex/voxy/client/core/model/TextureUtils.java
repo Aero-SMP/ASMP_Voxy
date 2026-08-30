@@ -1,12 +1,27 @@
 package me.cortex.voxy.client.core.model;
 
 import net.caffeinemc.mods.sodium.client.util.color.ColorSRGB;
+import net.minecraft.Util;
 import net.minecraft.client.renderer.texture.MipmapGenerator;
+import net.minecraft.util.Mth;
 
 import java.util.Arrays;
 
 //Texturing utils to manipulate data from the model bakery
 public class TextureUtils {
+    private static final byte[] LINEAR_TO_SRGB = Util.make(new byte[1024], values -> {
+        for (int i = 0; i < values.length; i++) {
+            float value = (float)i / 1023.0F;
+            values[i] = (byte)Math.round((value >= 0.0031308F
+                    ? (float)(1.055 * Math.pow(value, 0.4166666666666667) - 0.055)
+                    : 12.92F * value) * 255.0F);
+        }
+    });
+
+    private static int linearToSrgbChannel(float value) {
+        return LINEAR_TO_SRGB[Mth.floor(value * 1023.0F)] & 255;
+    }
+
     //Returns the number of non pixels not written to
     public static int getWrittenPixelCount(ColourDepthTextureData texture, int checkMode) {
         int count = 0;
@@ -278,7 +293,7 @@ public class TextureUtils {
                 r / 4,
                 g / 4,
                 b / 4,
-                darkend ? ((int) a) / 4 : ARGB.linearToSrgbChannel(a / 4)
+                darkend ? ((int) a) / 4 : linearToSrgbChannel(a / 4)
         );
     }
 

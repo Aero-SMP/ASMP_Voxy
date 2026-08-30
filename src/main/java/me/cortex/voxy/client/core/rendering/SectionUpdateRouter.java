@@ -5,13 +5,13 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 
 import java.util.concurrent.locks.StampedLock;
+import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 
 import static me.cortex.voxy.common.world.WorldEngine.UPDATE_TYPE_BLOCK_BIT;
 
-public class SectionUpdateRouter implements ISectionWatcher {
+public class SectionUpdateRouter {
     private static final int SLICES = 1<<4;
-    public interface IChildUpdate {void accept(WorldSection section);}
 
     private final Long2ByteOpenHashMap[] slices = new Long2ByteOpenHashMap[SLICES];
     private final StampedLock[] locks = new StampedLock[SLICES];
@@ -24,9 +24,9 @@ public class SectionUpdateRouter implements ISectionWatcher {
 
     private LongConsumer initialRenderMeshGen;
     private LongConsumer renderMeshGen;
-    private IChildUpdate childUpdateCallback;
+    private Consumer<WorldSection> childUpdateCallback;
 
-    public void setCallbacks(LongConsumer initialRenderMeshGen, LongConsumer renderMeshGen, IChildUpdate childUpdateCallback) {
+    public void setCallbacks(LongConsumer initialRenderMeshGen, LongConsumer renderMeshGen, Consumer<WorldSection> childUpdateCallback) {
         if (this.renderMeshGen != null) {
             throw new IllegalStateException();
         }

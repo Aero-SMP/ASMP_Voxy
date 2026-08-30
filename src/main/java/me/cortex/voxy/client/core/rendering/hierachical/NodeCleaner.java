@@ -79,27 +79,6 @@ public class NodeCleaner {
                 .ssbo("VISIBILITY_BUFFER_BINDING", this.visibilityBuffer)
                 .ssbo("OUTPUT_BUFFER_BINDING", this.outputBuffer);
 
-        /*
-        this.nodeManager.setClear(new NodeManager.ICleaner() {
-            @Override
-            public void alloc(int id) {
-                NodeCleaner.this.allocIds.add(id);
-                NodeCleaner.this.freeIds.remove(id);
-            }
-
-            @Override
-            public void move(int from, int to) {
-                NodeCleaner.this.allocIds.remove(to);
-                glCopyNamedBufferSubData(NodeCleaner.this.visibilityBuffer.id, NodeCleaner.this.visibilityBuffer.id, 4L*from, 4L*to, 4);
-            }
-
-            @Override
-            public void free(int id) {
-                NodeCleaner.this.freeIds.add(id);
-                NodeCleaner.this.allocIds.remove(id);
-            }
-        });
-         */
     }
 
 
@@ -165,22 +144,6 @@ public class NodeCleaner {
             glDispatchCompute((count+127)/128, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }
-    }
-
-    private void dumpDebugData() {
-        int[] outData = new int[OUTPUT_COUNT*3];
-        ARBDirectStateAccess.glGetNamedBufferSubData(this.outputBuffer.id, 0, outData);
-        for(int i =0;i < OUTPUT_COUNT; i++) {
-            System.out.println(outData[i]);
-        }
-        /*
-        System.out.println("---------------\n");
-        for(int i =0;i < OUTPUT_COUNT; i++) {
-            System.out.println(data[i*2+OUTPUT_COUNT]+", "+data[i*2+OUTPUT_COUNT+1]);
-        }*/
-        int[] visData = new int[(int) (this.visibilityBuffer.size()/4)];
-        ARBDirectStateAccess.glGetNamedBufferSubData(this.visibilityBuffer.id, 0, visData);
-        int a = 0;
     }
 
     public void free() {

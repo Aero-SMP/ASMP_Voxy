@@ -9,11 +9,6 @@ import java.util.function.Supplier;
 
 public class ImportManager {
     //TODO:
-    //Taskbar.INSTANCE.setProgress(0,10000);
-    //Taskbar.INSTANCE.setIsProgression();
-    //Taskbar.INSTANCE.setProgress(a, Math.max(1, b));
-    //Taskbar.INSTANCE.setIsNone();
-
     private final Map<WorldEngine, ImportTask> activeImporters = new HashMap<>();
 
     protected class ImportTask {

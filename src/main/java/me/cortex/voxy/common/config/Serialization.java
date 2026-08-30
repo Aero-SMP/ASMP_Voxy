@@ -5,7 +5,6 @@ import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.platform.PlatformUtil;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 
 import java.io.BufferedReader;
@@ -96,7 +95,7 @@ public class Serialization {
         Map<Class<?>, GsonConfigSerialization<?>> serializers = new HashMap<>();
 
         Set<String> clazzs = new LinkedHashSet<>();
-        var path = VoxyCommon.getPlatformUtil().getModRootPath("voxy");
+        var path = VoxyCommon.getModRootPath("voxy");
         clazzs.addAll(collectAllClasses(path, BASE_SEARCH_PACKAGE));
         clazzs.addAll(collectAllClasses(BASE_SEARCH_PACKAGE));
         int count = 0;
@@ -112,9 +111,6 @@ public class Serialization {
                 continue;//Dont want to load mixins
             }
             if (clzName.contains("ModMenuIntegration")) {
-                continue;//Dont want to modmenu incase it doesnt exist
-            }
-            if (clzName.contains("VoxyConfigScreenPages")) {
                 continue;//Dont want to modmenu incase it doesnt exist
             }
             if (clzName.endsWith("VoxyConfig")) {

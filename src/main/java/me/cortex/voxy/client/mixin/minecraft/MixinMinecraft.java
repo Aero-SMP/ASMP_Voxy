@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
-import me.cortex.voxy.client.ClientSessionEvents;
+import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -11,8 +11,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class MixinMinecraft {
     @Inject(method = {"disconnect", "clearLevel"}, at = @At("TAIL"), require = 1, expect = 1)
     private void voxy$injectWorldClose(CallbackInfo ci) {
-        if (ClientSessionEvents.inSession) {
-            ClientSessionEvents.sessionEnd();
+        if (VoxyClient.inSession) {
+            VoxyClient.sessionEnd();
         }
     }
 }

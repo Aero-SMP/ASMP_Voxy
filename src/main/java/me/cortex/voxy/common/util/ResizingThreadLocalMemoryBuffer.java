@@ -2,7 +2,7 @@ package me.cortex.voxy.common.util;
 
 import java.lang.ref.Cleaner;
 
-import static me.cortex.voxy.common.util.GlobalCleaner.CLEANER;
+import static me.cortex.voxy.common.util.TrackedObject.CLEANER;
 
 public class ResizingThreadLocalMemoryBuffer {
     private static Pair<Cleaner.Cleanable, MemoryBuffer> createMemoryBuffer(long initalSize) {

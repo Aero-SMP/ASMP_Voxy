@@ -120,8 +120,4 @@ public class MipGen {
         /*
          */
     }
-
-    public static void generateMipmaps(long[] textures, int size) {
-
-    }
 }

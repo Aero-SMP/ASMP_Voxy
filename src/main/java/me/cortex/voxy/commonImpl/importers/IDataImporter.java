@@ -2,11 +2,12 @@ package me.cortex.voxy.commonImpl.importers;
 
 import me.cortex.voxy.common.world.WorldEngine;
 
+import java.util.function.IntConsumer;
+
 public interface IDataImporter {
-    interface ICompletionCallback{void onCompletion(int chunks);}
     interface IUpdateCallback{void onUpdate(int finished, int outOf);}
 
-    void runImport(IUpdateCallback updateCallback, ICompletionCallback completionCallback);
+    void runImport(IUpdateCallback updateCallback, IntConsumer completionCallback);
 
     WorldEngine getEngine();
 

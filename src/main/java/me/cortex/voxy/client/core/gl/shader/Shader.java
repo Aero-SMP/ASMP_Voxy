@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -44,37 +45,33 @@ public class Shader extends TrackedObject {
     }
 
 
-    public static Builder<Shader> make(IShaderProcessor... processor) {
+    @SafeVarargs
+    public static Builder<Shader> make(BiFunction<ShaderType, String, String>... processor) {
         return makeInternal((a,b)->new Shader(b), processor);
     }
 
-    public static Builder<AutoBindingShader> makeAuto(IShaderProcessor... processor) {
+    @SafeVarargs
+    public static Builder<AutoBindingShader> makeAuto(BiFunction<ShaderType, String, String>... processor) {
         return makeInternal(AutoBindingShader::new, processor);
     }
 
 
-
-    static <T extends Shader> Builder<T> makeInternal(Builder.IShaderObjectConstructor<T> constructor, IShaderProcessor[] processors) {
-        List<IShaderProcessor> aa = new ArrayList<>(List.of(processors));
-        Collections.reverse(aa);
-        IShaderProcessor applicator = (type,source)->source;
-        for (IShaderProcessor processor : processors) {
-            IShaderProcessor finalApplicator = applicator;
-            applicator = (type, source) -> finalApplicator.process(type, processor.process(type, source));
+    static <T extends Shader> Builder<T> makeInternal(BiFunction<Builder<T>, Integer, T> constructor, BiFunction<ShaderType, String, String>[] processors) {
+        BiFunction<ShaderType, String, String> applicator = (type,source)->source;
+        for (BiFunction<ShaderType, String, String> processor : processors) {
+            BiFunction<ShaderType, String, String> finalApplicator = applicator;
+            applicator = (type, source) -> finalApplicator.apply(type, processor.apply(type, source));
         }
         return new Builder<>(constructor, applicator);
     }
 
     public static class Builder <T extends Shader> {
-        protected interface IShaderObjectConstructor <J extends Shader> {
-            J make(Builder<J> builder, int program);
-        }
         final Map<String, String> defines = new HashMap<>();
         final Map<String, String> replacements = new LinkedHashMap<>();
         private final Map<ShaderType, String> sources = new HashMap<>();
-        private final IShaderProcessor processor;
-        private final IShaderObjectConstructor<T> constructor;
-        private Builder(IShaderObjectConstructor<T> constructor, IShaderProcessor processor) {
+        private final BiFunction<ShaderType, String, String> processor;
+        private final BiFunction<Builder<T>, Integer, T> constructor;
+        private Builder(BiFunction<Builder<T>, Integer, T> constructor, BiFunction<ShaderType, String, String> processor) {
             this.constructor = constructor;
             this.processor = processor;
         }
@@ -133,7 +130,7 @@ public class Shader extends TrackedObject {
         }
 
         public Builder<T> addSource(ShaderType type, String source) {
-            this.sources.put(type, this.processor.process(type, source));
+            this.sources.put(type, this.processor.apply(type, source));
             return this;
         }
 
@@ -181,7 +178,7 @@ public class Shader extends TrackedObject {
         public T compile() {
             this.defineIf("IS_INTEL", Capabilities.INSTANCE.isIntel);
             this.defineIf("IS_WINDOWS", ThreadUtils.isWindows);
-            return this.constructor.make(this, this.compileToProgram());
+            return this.constructor.apply(this, this.compileToProgram());
         }
 
         private static void printProgramLinkLog(int program) {

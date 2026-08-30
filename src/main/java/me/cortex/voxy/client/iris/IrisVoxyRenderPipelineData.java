@@ -7,10 +7,10 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectFunction;
 import kroppeb.stareval.function.FunctionReturn;
 import kroppeb.stareval.function.Type;
 import me.cortex.voxy.client.core.IrisVoxyRenderPipeline;
-import me.cortex.voxy.client.core.rendering.util.LightMapHelper;
 import me.cortex.voxy.client.mixin.iris.CustomUniformsAccessor;
 import me.cortex.voxy.client.mixin.iris.IrisRenderingPipelineAccessor;
 import me.cortex.voxy.common.Logger;
+import net.minecraft.client.Minecraft;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
 import net.irisshaders.iris.gl.image.ImageHolder;
 import net.irisshaders.iris.gl.sampler.GlSampler;
@@ -441,7 +441,7 @@ public class IrisVoxyRenderPipelineData {
 
         //Built up the external samplers list
         Map<String, IntSupplier> externalTextures = new HashMap<>();
-        externalTextures.put("lightmap", LightMapHelper::getLightmapTextureId);
+        externalTextures.put("lightmap", () -> Minecraft.getInstance().gameRenderer.lightTexture().lightTexture.getId());
 
 
         SamplerHolder samplerBuilder = new SamplerHolder() {

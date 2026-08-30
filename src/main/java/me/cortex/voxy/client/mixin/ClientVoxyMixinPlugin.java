@@ -15,8 +15,8 @@ public class ClientVoxyMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public void onLoad(String mixinPackage) {
-        valkyrienSkiesInstalled = VoxyCommon.getPlatformUtil().isModLoaded("valkyrienskies");
-        nvidiumInstalled = VoxyCommon.getPlatformUtil().isModLoaded("nvidium");
+        valkyrienSkiesInstalled = VoxyCommon.isModLoaded("valkyrienskies");
+        nvidiumInstalled = VoxyCommon.isModLoaded("nvidium");
     }
 
     @Override

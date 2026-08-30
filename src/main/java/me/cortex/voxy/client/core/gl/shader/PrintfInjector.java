@@ -7,6 +7,7 @@ import org.lwjgl.system.MemoryUtil;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 
 import static org.lwjgl.opengl.ARBDirectStateAccess.nglClearNamedBufferData;
@@ -17,7 +18,7 @@ import static org.lwjgl.opengl.GL30C.GL_RED_INTEGER;
 import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL45.nglClearNamedBufferSubData;
 
-public class PrintfInjector implements IShaderProcessor {
+public class PrintfInjector implements BiFunction<ShaderType, String, String> {
     private final GlBuffer textBuffer;
     private final HashMap<String, Integer> printfStringMap = new HashMap<>();
     private final HashMap<Integer, String> idToPrintfStringMap = new HashMap<>();
@@ -235,7 +236,7 @@ public class PrintfInjector implements IShaderProcessor {
     }
 
     @Override
-    public String process(ShaderType type, String source) {
+    public String apply(ShaderType type, String source) {
         return this.transformInject(source);
     }
 }

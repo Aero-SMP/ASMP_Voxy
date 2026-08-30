@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 
 //Is basicly the manager for an "undefined" data store, the underlying store is irrelevant
 // this manager serves as an overlay, that is, it allows an implementation to do "async management" of the data store
-public class BasicAsyncGeometryManager implements IGeometryManager {
+public class BasicAsyncGeometryManager {
     public static final int SECTION_METADATA_SIZE = 32;
 
     private static final long GEOMETRY_ELEMENT_SIZE = 8;
@@ -36,12 +36,10 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
         this.allocationHeap.setLimit(geometryCapacity/GEOMETRY_ELEMENT_SIZE);
     }
 
-    @Override
     public int uploadSection(BuiltSection section) {
         return this.uploadReplaceSection(-1, section);
     }
 
-    @Override
     public int uploadReplaceSection(int oldId, BuiltSection section) {
         if (section.isEmpty()) {
             throw new IllegalArgumentException("sectionData is empty, cannot upload nothing");
@@ -87,7 +85,6 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
         return newId;
     }
 
-    @Override
     public void removeSection(int id) {
         if (!this.allocationSet.free(id)) {
             throw new IllegalStateException("Id was not already allocated. id: " + id);
@@ -125,7 +122,6 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
         return new SectionMeta(section.position, section.aabb, addr, size, section.offsets, section.childExistence);
     }
 
-    @Override
     public void downloadAndRemove(int id, Consumer<BuiltSection> callback) {
         throw new IllegalStateException("Not yet implemented");
     }

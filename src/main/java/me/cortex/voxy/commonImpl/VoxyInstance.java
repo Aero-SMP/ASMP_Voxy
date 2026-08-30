@@ -1,7 +1,7 @@
 package me.cortex.voxy.commonImpl;
 
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.section.SectionStorage;
+import me.cortex.voxy.common.config.section.SectionSerializationStorage;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.thread.UnifiedServiceThreadPool;
 import me.cortex.voxy.common.util.MemoryBuffer;
@@ -164,7 +164,7 @@ public abstract class VoxyInstance {
     }
 
 
-    protected abstract SectionStorage createStorage(WorldIdentifier identifier);
+    protected abstract SectionSerializationStorage createStorage(WorldIdentifier identifier);
 
     private WorldEngine createWorld(WorldIdentifier identifier) {
         if (!this.isRunning) {

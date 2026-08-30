@@ -253,15 +253,6 @@ public class RocksDBStorageBackend extends StorageBackend {
         return result;
     }
 
-    private static long bytesToLong(final byte[] b) {
-        long result = 0;
-        for (int i = 0; i < Long.BYTES; i++) {
-            result <<= Byte.SIZE;
-            result |= (b[i] & 0xFF);
-        }
-        return result;
-    }
-
     public static class Config extends StorageConfig {
         @Override
         public StorageBackend build(ConfigBuildCtx ctx) {

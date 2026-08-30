@@ -14,7 +14,6 @@ import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
 
 import java.util.List;
-import java.util.function.BooleanSupplier;
 
 import static org.lwjgl.opengl.GL11C.GL_BLEND;
 import static org.lwjgl.opengl.GL11C.GL_DEPTH_COMPONENT;
@@ -46,8 +45,8 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
 
     private final SSAO ssao;
 
-    protected NormalRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier) {
-        super(properties, nodeManager, nodeCleaner, traversal, frexSupplier, false);
+    protected NormalRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
+        super(properties, nodeManager, nodeCleaner, traversal, false);
         this.useEnvFog = VoxyConfig.CONFIG.useEnvironmentalFog;
         this.finalBlit = new FullscreenBlit(properties, "voxy:post/blit_texture_depth_cutout.frag",
                 a->a.defineIf("USE_ENV_FOG", this.useEnvFog).define("EMIT_COLOUR"));

@@ -5,6 +5,8 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.lmdb.MDBEnvInfo;
 
 import java.nio.IntBuffer;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.util.lmdb.LMDB.*;
@@ -55,15 +57,15 @@ public class LMDBInterface {
         E(mdb_env_set_mapsize(this.env, size));
     }
 
-    public <T> T transaction(TransactionCallback<T> transaction) {
+    public <T> T transaction(BiFunction<MemoryStack, Long, T> transaction) {
         return transaction(0, transaction);
     }
 
-    public <T> T transaction(int flags, TransactionCallback<T> transaction) {
+    public <T> T transaction(int flags, BiFunction<MemoryStack, Long, T> transaction) {
         return transaction(0, flags, transaction);
     }
 
-    public <T> T transaction(long parent, int flags, TransactionCallback<T> transaction) {
+    public <T> T transaction(long parent, int flags, BiFunction<MemoryStack, Long, T> transaction) {
         T ret;
         try (var stack = stackPush()) {
             PointerBuffer pp = stack.mallocPointer(1);
@@ -71,7 +73,7 @@ public class LMDBInterface {
             long txn = pp.get(0);
             int err;
             try {
-                ret = transaction.exec(stack, txn);
+                ret = transaction.apply(stack, txn);
                 err = mdb_txn_commit(txn);
             } catch (Throwable t) {
                 mdb_txn_abort(txn);
@@ -118,13 +120,13 @@ public class LMDBInterface {
         }
 
         //TODO: make a MDB_RDONLY varient
-        public <T> T transaction(TransactionWrappedCallback<T> callback) {
+        public <T> T transaction(Function<TransactionWrapper, T> callback) {
             return this.transaction(0, callback);
         }
 
-        public <T> T transaction(int flags, TransactionWrappedCallback<T> callback) {
+        public <T> T transaction(int flags, Function<TransactionWrapper, T> callback) {
             return LMDBInterface.this.transaction(flags, (stack, transaction) -> {
-                return callback.exec(new TransactionWrapper(transaction, stack).set(this));
+                return callback.apply(new TransactionWrapper(transaction, stack).set(this));
             });
         }
 

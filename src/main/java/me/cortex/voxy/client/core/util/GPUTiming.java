@@ -6,6 +6,7 @@ import me.cortex.voxy.common.util.TrackedObject;
 
 import java.lang.reflect.Array;
 import java.util.Arrays;
+import java.util.function.BiConsumer;
 
 import static org.lwjgl.opengl.ARBTimerQuery.GL_TIMESTAMP;
 import static org.lwjgl.opengl.ARBTimerQuery.glQueryCounter;
@@ -85,12 +86,9 @@ public class GPUTiming {
         this.timingSet.free();
     }
 
-    public interface TimingDataConsumer <T> {
-        void accept(T metadata, long[] timings);
-    }
     private static final class GlTimestampQuerySet <T> extends TrackedObject {
 
-        private record InflightRequest<T>(int[] queries, T[] meta, TimingDataConsumer<T[]> callback) {
+        private record InflightRequest<T>(int[] queries, T[] meta, BiConsumer<T[], long[]> callback) {
             private boolean callbackIfReady(IntArrayFIFOQueue queryPool) {
                 boolean ready = glGetQueryObjecti(this.queries[this.queries.length-1], GL_QUERY_RESULT_AVAILABLE) == GL_TRUE;
                 if (!ready) {
@@ -129,7 +127,7 @@ public class GPUTiming {
 
         }
 
-        public void download(TimingDataConsumer<T[]> consumer) {
+        public void download(BiConsumer<T[], long[]> consumer) {
             if (this.index != 0) {
                 var queries = Arrays.copyOf(this.queries, this.index);
                 var metadata = Arrays.copyOf(this.metadata, this.index);
@@ -191,7 +189,7 @@ public class GPUTiming {
             glMemoryBarrier(-1);
         }
 
-        public void download(TimingDataConsumer consumer) {
+        public void download(BiConsumer<Integer[], long[]> consumer) {
             var meta = Arrays.copyOf(this.metadata, this.index);
             this.index = 0;
             //DownloadStream.INSTANCE.download(this.store, buffer->consumer.accept(meta, buffer));

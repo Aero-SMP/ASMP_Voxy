@@ -94,7 +94,7 @@ public class VoxyConfig {
     }
 
     private static Path getConfigPath() {
-        return VoxyCommon.getPlatformUtil().getConfigDir().resolve("voxy-config.json");
+        return VoxyCommon.getConfigDir().resolve("voxy-config.json");
     }
 
     public boolean isRenderingEnabled() {

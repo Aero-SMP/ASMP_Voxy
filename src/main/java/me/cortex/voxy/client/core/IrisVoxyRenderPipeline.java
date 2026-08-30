@@ -16,7 +16,6 @@ import org.joml.Matrix4f;
 import org.lwjgl.opengl.GL30;
 
 import java.util.List;
-import java.util.function.BooleanSupplier;
 
 import static org.lwjgl.opengl.GL11.GL_DEPTH_BUFFER_BIT;
 import static org.lwjgl.opengl.GL30C.*;
@@ -32,8 +31,8 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
     private final GlBuffer shaderUniforms;
 
-    public IrisVoxyRenderPipeline(RenderProperties properties, IrisVoxyRenderPipelineData data, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier) {
-        super(properties, nodeManager, nodeCleaner, traversal, frexSupplier, data.shouldDeferTranslucency());
+    public IrisVoxyRenderPipeline(RenderProperties properties, IrisVoxyRenderPipelineData data, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
+        super(properties, nodeManager, nodeCleaner, traversal, data.shouldDeferTranslucency());
         this.data = data;
         if (this.data.thePipeline != null) {
             throw new IllegalStateException("Pipeline data already bound");
@@ -221,7 +220,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
     private static final int UNIFORM_BINDING_POINT = 7;//TODO make ths binding point... not randomly 5
 
-    private StringBuilder buildGenericShaderHeader(AbstractSectionRenderer<?, ?> renderer, String input) {
+    private StringBuilder buildGenericShaderHeader(AbstractSectionRenderer<?> renderer, String input) {
         StringBuilder builder = new StringBuilder(input).append("\n\n\n");
 
         if (this.data.getUniforms() != null) {
@@ -246,7 +245,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
 
     @Override
-    public String patchOpaqueShader(AbstractSectionRenderer<?, ?> renderer, String input) {
+    public String patchOpaqueShader(AbstractSectionRenderer<?> renderer, String input) {
         var builder = this.buildGenericShaderHeader(renderer, input);
 
         builder.append(this.data.opaqueFragPatch());
@@ -255,7 +254,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    public String patchTranslucentShader(AbstractSectionRenderer<?, ?> renderer, String input) {
+    public String patchTranslucentShader(AbstractSectionRenderer<?> renderer, String input) {
         if (this.data.translucentFragPatch() == null) return null;
 
         var builder = this.buildGenericShaderHeader(renderer, input);

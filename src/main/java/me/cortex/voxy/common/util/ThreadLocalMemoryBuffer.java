@@ -1,6 +1,6 @@
 package me.cortex.voxy.common.util;
 
-import static me.cortex.voxy.common.util.GlobalCleaner.CLEANER;
+import static me.cortex.voxy.common.util.TrackedObject.CLEANER;
 
 public class ThreadLocalMemoryBuffer {
     private static MemoryBuffer createMemoryBuffer(long size) {

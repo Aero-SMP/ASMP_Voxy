@@ -53,7 +53,7 @@ public class MixinRenderSectionManager {
     @Inject(method = "onChunkRemoved", at = @At("HEAD"))
     private void voxy$injectIngest(int x, int z, CallbackInfo ci) {
         //TODO: Am not quite sure if this is right
-        if (VoxyConfig.CONFIG.ingestEnabled && !VoxyCommon.getPlatformUtil().isModLoaded("bobby")) {
+        if (VoxyConfig.CONFIG.ingestEnabled && !VoxyCommon.isModLoaded("bobby")) {
             var cccm = (ICheekyClientChunkCache)this.level.getChunkSource();
             if (cccm != null) {
                 var chunk = cccm.voxy$cheekyGetChunk(x, z);

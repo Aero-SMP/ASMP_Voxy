@@ -19,7 +19,6 @@ import org.lwjgl.opengl.GL30;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.List;
-import java.util.function.BooleanSupplier;
 
 import static org.lwjgl.opengl.GL11C.GL_ALWAYS;
 import static org.lwjgl.opengl.GL11C.GL_DEPTH_TEST;
@@ -46,13 +45,12 @@ import static org.lwjgl.opengl.GL45C.glBindTextureUnit;
 
 public abstract class AbstractRenderPipeline extends TrackedObject {
     public final RenderProperties properties;
-    private final BooleanSupplier frexStillHasWork;
 
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
     private final HierarchicalOcclusionTraverser traversal;
 
-    protected AbstractSectionRenderer<?,?> sectionRenderer;
+    protected AbstractSectionRenderer<?> sectionRenderer;
 
     private final FullscreenBlit depthStencilSetup;
 
@@ -66,9 +64,8 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         glSamplerParameteri(DEPTH_SAMPLER, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     }
 
-    protected AbstractRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier, boolean deferTranslucency) {
+    protected AbstractRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, boolean deferTranslucency) {
         this.properties = properties;
-        this.frexStillHasWork = frexSupplier;
         this.nodeManager = nodeManager;
         this.nodeCleaner = nodeCleaner;
         this.traversal = traversal;
@@ -80,7 +77,7 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     //Allows pipelines to configure model baking system
     public void setupExtraModelBakeryData(ModelBakerySubsystem modelService) {}
 
-    public final void setSectionRenderer(AbstractSectionRenderer<?,?> sectionRenderer) {//Stupid java ordering not allowing something pre super
+    public final void setSectionRenderer(AbstractSectionRenderer<?> sectionRenderer) {//Stupid java ordering not allowing something pre super
         if (this.sectionRenderer != null) throw new IllegalStateException();
         this.sectionRenderer = sectionRenderer;
     }
@@ -192,29 +189,27 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         //Compute the mip chain
         viewport.hiZBuffer.buildMipChain(depthBuffer, viewport.width, viewport.height);
 
-        do {
-            TimingStatistics.main.stop();
-            TimingStatistics.dynamic.start();
+        TimingStatistics.main.stop();
+        TimingStatistics.dynamic.start();
 
-            TimingStatistics.D.start();
-            //Tick download stream
-            DownloadStream.INSTANCE.tick();
-            TimingStatistics.D.stop();
+        TimingStatistics.D.start();
+        //Tick download stream
+        DownloadStream.INSTANCE.tick();
+        TimingStatistics.D.stop();
 
-            this.nodeManager.tick(this.traversal.getNodeBuffer(), this.nodeCleaner);
-            //glFlush();
+        this.nodeManager.tick(this.traversal.getNodeBuffer(), this.nodeCleaner);
+        //glFlush();
 
-            this.nodeCleaner.tick(this.traversal.getNodeBuffer());//Probably do this here??
+        this.nodeCleaner.tick(this.traversal.getNodeBuffer());//Probably do this here??
 
-            TimingStatistics.dynamic.stop();
-            TimingStatistics.main.start();
+        TimingStatistics.dynamic.stop();
+        TimingStatistics.main.start();
 
-            glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);
+        glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);
 
-            TimingStatistics.F.start();
-            this.traversal.doTraversal(viewport);
-            TimingStatistics.F.stop();
-        } while (this.frexStillHasWork.getAsBoolean());
+        TimingStatistics.F.start();
+        this.traversal.doTraversal(viewport);
+        TimingStatistics.F.stop();
     }
 
     @Override
@@ -257,12 +252,12 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     }
 
     //null means dont transform the shader
-    public String patchOpaqueShader(AbstractSectionRenderer<?,?> renderer, String input) {
+    public String patchOpaqueShader(AbstractSectionRenderer<?> renderer, String input) {
         return null;
     }
 
     //Returning null means apply the same patch as the opaque
-    public String patchTranslucentShader(AbstractSectionRenderer<?,?> renderer, String input) {
+    public String patchTranslucentShader(AbstractSectionRenderer<?> renderer, String input) {
         return null;
     }
 

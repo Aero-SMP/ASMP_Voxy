@@ -5,7 +5,7 @@ import me.cortex.voxy.common.config.section.SectionSerializationStorage;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.ResizingThreadLocalMemoryBuffer;
 
-import static me.cortex.voxy.common.util.GlobalCleaner.CLEANER;
+import static me.cortex.voxy.common.util.TrackedObject.CLEANER;
 import static org.lwjgl.util.zstd.Zstd.*;
 
 public class ZSTDCompressor implements StorageCompressor {

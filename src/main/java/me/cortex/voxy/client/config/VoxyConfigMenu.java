@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.config;
 
-import me.cortex.voxy.client.ClientSessionEvents;
+import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.config.SodiumConfigBuilder.*;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.SSAO;
@@ -47,7 +47,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                                         ()->CFG.enabled, v->{
                                             CFG.enabled=v;
                                             //we need to special case enabled, since the render reload flag runs befor us and its quite important we get it right
-                                            if (v && ClientSessionEvents.inSession) {//We should only load when we are in session
+                                            if (v && VoxyClient.inSession) {//We should only load when we are in session
                                                 VoxyCommon.createInstance();
                                             }
                                         })

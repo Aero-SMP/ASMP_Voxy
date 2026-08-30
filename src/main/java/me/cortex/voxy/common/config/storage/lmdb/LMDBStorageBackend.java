@@ -8,7 +8,6 @@ import me.cortex.voxy.common.config.storage.StorageConfig;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import org.lwjgl.system.MemoryUtil;
-import org.lwjgl.util.lmdb.MDBVal;
 
 import java.nio.ByteBuffer;
 import java.util.Objects;
@@ -138,18 +137,14 @@ public class LMDBStorageBackend extends StorageBackend {
         return this.synchronizedTransaction(() -> {
             Int2ObjectOpenHashMap<byte[]> mapping = new Int2ObjectOpenHashMap<>();
             this.idMappingDatabase.transaction(MDB_RDONLY, transaction -> {
-                try (var cursor = transaction.createCursor()) {
-                    var keyPtr = MDBVal.malloc(transaction.stack);
-                    var valPtr = MDBVal.malloc(transaction.stack);
-                    while (cursor.get(MDB_NEXT, keyPtr, valPtr) != MDB_NOTFOUND) {
-                        int keyVal = keyPtr.mv_data().getInt(0);
-                        byte[] data = new byte[(int) valPtr.mv_size()];
-                        Objects.requireNonNull(valPtr.mv_data()).get(data);
-                        if (mapping.put(keyVal, data) != null) {
-                            throw new IllegalStateException("Multiple mappings to same id");
-                        }
+                transaction.scan((key, value) -> {
+                    int keyVal = key.mv_data().getInt(0);
+                    byte[] data = new byte[(int) value.mv_size()];
+                    Objects.requireNonNull(value.mv_data()).get(data);
+                    if (mapping.put(keyVal, data) != null) {
+                        throw new IllegalStateException("Multiple mappings to same id");
                     }
-                }
+                });
                 return null;
             });
             return mapping;

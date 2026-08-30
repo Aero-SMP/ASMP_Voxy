@@ -45,6 +45,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 import java.util.function.Predicate;
 
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
@@ -63,7 +64,6 @@ import me.cortex.voxy.common.voxelization.VoxelizedSection;
 import me.cortex.voxy.common.voxelization.WorldConversionFactory;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
-import me.cortex.voxy.commonImpl.importers.IDataImporter.ICompletionCallback;
 import me.cortex.voxy.commonImpl.importers.IDataImporter.IUpdateCallback;
 import net.minecraft.core.Holder;
 import net.minecraft.core.IdMap;
@@ -155,12 +155,12 @@ public class WorldImporter implements IDataImporter {
 
 
     @Override
-    public void runImport(IUpdateCallback updateCallback, ICompletionCallback completionCallback) {
+    public void runImport(IUpdateCallback updateCallback, IntConsumer completionCallback) {
         if (this.isRunning) {
             throw new IllegalStateException();
         }
         if (this.worker == null) {//Can happen if no files
-            completionCallback.onCompletion(0);
+            completionCallback.accept(0);
             return;
         }
         this.isRunning = true;
@@ -204,7 +204,7 @@ public class WorldImporter implements IDataImporter {
 
     private volatile Thread worker;
     private IUpdateCallback updateCallback;
-    private ICompletionCallback completionCallback;
+    private IntConsumer completionCallback;
     public void importRegionDirectoryAsync(File directory) {
         var files = directory.listFiles((dir, name) -> {
             var sections = name.split("\\.");
@@ -291,7 +291,7 @@ public class WorldImporter implements IDataImporter {
                 }
                 if (!this.isRunning) {
                     this.service.blockTillEmpty();
-                    this.completionCallback.onCompletion(this.totalChunks.get());
+                    this.completionCallback.accept(this.totalChunks.get());
                     this.worker = null;
                     return;
                 }
@@ -310,7 +310,7 @@ public class WorldImporter implements IDataImporter {
                 this.service.shutdown();
                 this.world.releaseRef();
             }
-            this.completionCallback.onCompletion(this.totalChunks.get());
+            this.completionCallback.accept(this.totalChunks.get());
         });
         this.worker.setName("World importer");
     }

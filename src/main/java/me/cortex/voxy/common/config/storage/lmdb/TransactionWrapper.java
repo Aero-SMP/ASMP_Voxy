@@ -5,6 +5,7 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.lmdb.MDBVal;
 
 import java.nio.ByteBuffer;
+import java.util.function.BiConsumer;
 
 import static me.cortex.voxy.common.config.storage.lmdb.LMDBInterface.E;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -67,11 +68,25 @@ public class TransactionWrapper {
         }
     }
 
-    public Cursor createCursor() {
+    public void scan(BiConsumer<MDBVal, MDBVal> consumer) {
         try (var stack = stackPush()) {
             PointerBuffer pb = stack.mallocPointer(1);
             E(mdb_cursor_open(transaction, dbi, pb));
-            return new Cursor(pb.get(0));
+            long cursor = pb.get(0);
+            try {
+                var key = MDBVal.malloc(this.stack);
+                var value = MDBVal.malloc(this.stack);
+                while (true) {
+                    int result = mdb_cursor_get(cursor, key, value, MDB_NEXT);
+                    if (result == MDB_NOTFOUND) {
+                        return;
+                    }
+                    E(result);
+                    consumer.accept(key, value);
+                }
+            } finally {
+                mdb_cursor_close(cursor);
+            }
         }
     }
 }

@@ -3,6 +3,7 @@ package me.cortex.voxy.common.config.section;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.config.ConfigBuildCtx;
+import me.cortex.voxy.common.config.IMappingStorage;
 import me.cortex.voxy.common.config.storage.StorageBackend;
 import me.cortex.voxy.common.config.storage.StorageConfig;
 import me.cortex.voxy.common.util.ThreadLocalMemoryBuffer;
@@ -14,7 +15,7 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.function.LongConsumer;
 
-public class SectionSerializationStorage extends SectionStorage {
+public class SectionSerializationStorage implements IMappingStorage {
     public static final int BIGGEST_SERIALIZED_SECTION_SIZE = 32 * 32 * 32 * 8 * 2 + 8;
 
     private final StorageBackend backend;
@@ -45,7 +46,6 @@ public class SectionSerializationStorage extends SectionStorage {
     }
 
 
-    @Override
     public void saveSection(WorldSection section) {
         var saveData = SaveLoadSystem3.serialize(section);
         this.backend.setSectionData(section.key, saveData);
@@ -72,7 +72,6 @@ public class SectionSerializationStorage extends SectionStorage {
         this.backend.close();
     }
 
-    @Override
     public void iteratePositions(int level, LongConsumer consumer) {
         this.backend.iteratePositions(level, consumer);
     }
@@ -81,7 +80,7 @@ public class SectionSerializationStorage extends SectionStorage {
         public StorageConfig storage;
 
         @Override
-        public SectionStorage build(ConfigBuildCtx ctx) {
+        public SectionSerializationStorage build(ConfigBuildCtx ctx) {
             return new SectionSerializationStorage(this.storage.build(ctx));
         }
 

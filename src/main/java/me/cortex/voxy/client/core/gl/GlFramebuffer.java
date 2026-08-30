@@ -20,11 +20,6 @@ public class GlFramebuffer extends TrackedObject {
         return this;
     }
 
-    public GlFramebuffer bind(int attachment, GlRenderBuffer buffer) {
-        glNamedFramebufferRenderbuffer(this.id, attachment, GL_RENDERBUFFER, buffer.id);
-        return this;
-    }
-
     public GlFramebuffer setDrawBuffers(int... buffers) {
         glNamedFramebufferDrawBuffers(this.id, buffers);
         return this;

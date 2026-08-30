@@ -323,45 +323,4 @@ public class ActiveSectionTracker {
         return this.lruSecondaryCache.size();
     }
 
-    public static void main(String[] args) throws InterruptedException {
-        var tracker = new ActiveSectionTracker(6, a->0, 2<<10);
-        var bean = tracker.acquire(0, 0, 0, 9, false);
-        var bean2 = tracker.acquire(1, 0, 0, 0, false);
-        System.out.println("Target obj:" + System.identityHashCode(bean2));
-        bean2.release();
-        Thread[] ts = new Thread[10];
-        for (int i = 0; i < ts.length;i++) {
-            int tid = i;
-            ts[i] = new Thread(()->{
-                try {
-                    for (int j = 0; j < 5000; j++) {
-                        if (true) {
-                            var section = tracker.acquire(0, 0, 0, 0, false);
-                            section.acquire();
-                            var section2 = tracker.acquire(1, 0, 0, 0, false);
-                            section.release();
-                            section.release();
-                            section2.release();
-                        }
-                        if (true) {
-
-                            var section = tracker.acquire(0, 0, 0, 0, false);
-                            var section2 = tracker.acquire(1, 0, 0, 0, false);
-                            section2.release();
-                            section.release();
-                        }
-                        if (true) {
-                            tracker.acquire(1, 0, 0, 0, false).release();
-                        }
-                    }
-                } catch (Exception e) {
-                    throw new RuntimeException("Thread " + tid, e);
-                }
-            });
-            ts[i].start();
-        }
-        for (var t : ts) {
-            t.join();
-        }
-    }
 }

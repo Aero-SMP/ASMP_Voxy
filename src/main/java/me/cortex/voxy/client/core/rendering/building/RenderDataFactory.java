@@ -1662,25 +1662,6 @@ public class RenderDataFactory {
         }
     }
 
-    private final void buildOccupancy16() {
-        //We basicly want to record all the points where we go from air to solid or solid to air (this is to just get better compression)
-        for (int i = 0; i < 16*16; i++) {
-            int x = (i&15)*2;
-            int y = (i>>4)*2;
-            int A = this.occupancyBarrier(y*32+x); A = (A|(A>>16))&0xFFFF;
-            int B = this.occupancyBarrier(y*32+x+1); B = (B|(B>>16))&0xFFFF;
-            int C = this.occupancyBarrier((y+1)*32+x); C = (C|(C>>16))&0xFFFF;
-            int D = this.occupancyBarrier((y+1)*32+x+1); D = (D|(D>>16))&0xFFFF;
-            int occ = A|B|C|D;
-
-            //Shink to 16 bit
-            //We now have our occlusion mask, fill in our occupancy set
-            for (;occ!=0;occ&=~Integer.lowestOneBit(occ)) {
-                this.occupancy.set(i*16+Integer.numberOfTrailingZeros(occ));
-            }
-        }
-    }
-
     //section is already acquired and gets released by the parent
     public BuiltSection generateMesh(WorldSection section) {
         //TODO: FIXME: because of the exceptions that are thrown when aquiring modelId

@@ -7,9 +7,9 @@ import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
-import me.cortex.voxy.client.core.rendering.ISectionWatcher;
+import me.cortex.voxy.client.core.rendering.SectionUpdateRouter;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
-import me.cortex.voxy.client.core.rendering.section.geometry.IGeometryManager;
+import me.cortex.voxy.client.core.rendering.section.geometry.BasicAsyncGeometryManager;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.util.ExpandingObjectAllocationList;
 import me.cortex.voxy.common.Logger;
@@ -81,8 +81,8 @@ public class NodeManager {
     private final ExpandingObjectAllocationList<SingleNodeRequest> singleRequests = new ExpandingObjectAllocationList<>(SingleNodeRequest[]::new, NodeStore.REQUEST_ID_MSK);
     private final ExpandingObjectAllocationList<NodeChildRequest> childRequests = new ExpandingObjectAllocationList<>(NodeChildRequest[]::new, NodeStore.REQUEST_ID_MSK);
     private final IntOpenHashSet nodeUpdates = new IntOpenHashSet();
-    private final IGeometryManager geometryManager;
-    private final ISectionWatcher watcher;
+    private final BasicAsyncGeometryManager geometryManager;
+    private final SectionUpdateRouter watcher;
     private final Long2IntOpenHashMap activeSectionMap = new Long2IntOpenHashMap();
     private final NodeStore nodeData;
     public final int maxNodeCount;
@@ -93,23 +93,22 @@ public class NodeManager {
     private IntConsumer topLevelNodeIdAddedCallback;
     private IntConsumer topLevelNodeIdRemovedCallback;
 
-    public interface ICleaner {
-        void alloc(int id);
-        void move(int from, int to);
-        void free(int id);
+    private IntConsumer clearAlloc;
+    private IntConsumer clearFree;
+    public void setClear(IntConsumer onAlloc, IntConsumer onFree) {
+        this.clearAlloc = onAlloc;
+        this.clearFree = onFree;
     }
-    private ICleaner cleanerInterface;
-    public void setClear(ICleaner callback) {this.cleanerInterface = callback;}
-    private void clearAllocId(int id) { if (this.cleanerInterface != null) this.cleanerInterface.alloc(id); }
-    private void clearMoveId(int from, int to) { if (this.cleanerInterface != null) this.cleanerInterface.move(from, to); }
-    private void clearFreeId(int id) { if (this.cleanerInterface != null) this.cleanerInterface.free(id); }
+    private void clearAllocId(int id) { if (this.clearAlloc != null) this.clearAlloc.accept(id); }
+    private void clearMoveId(int from, int to) {}
+    private void clearFreeId(int id) { if (this.clearFree != null) this.clearFree.accept(id); }
 
     public void setTLNCallbacks(IntConsumer onAdd, IntConsumer onRemove) {
         this.topLevelNodeIdAddedCallback = onAdd;
         this.topLevelNodeIdRemovedCallback = onRemove;
     }
 
-    public NodeManager(int maxNodeCount, IGeometryManager geometryManager, ISectionWatcher watcher) {
+    public NodeManager(int maxNodeCount, BasicAsyncGeometryManager geometryManager, SectionUpdateRouter watcher) {
         if ((maxNodeCount&(maxNodeCount-1))!=0) {
             throw new IllegalArgumentException("Max node count must be a power of 2");
         }

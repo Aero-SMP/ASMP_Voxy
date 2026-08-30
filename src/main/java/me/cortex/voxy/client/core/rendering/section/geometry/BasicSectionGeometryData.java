@@ -10,7 +10,7 @@ import static org.lwjgl.opengl.GL11C.*;
 import static org.lwjgl.opengl.GL15C.GL_ARRAY_BUFFER;
 import static org.lwjgl.opengl.GL15C.glBindBuffer;
 
-public class BasicSectionGeometryData implements IGeometryData {
+public class BasicSectionGeometryData {
     public static final int SECTION_METADATA_SIZE = 32;
     private final GlBuffer sectionMetadataBuffer;
     private final GlBuffer geometryBuffer;
@@ -101,7 +101,6 @@ public class BasicSectionGeometryData implements IGeometryData {
         return this.sectionMetadataBuffer;
     }
 
-    @Override
     public int getSectionCount() {
         return this.currentSectionCount;
     }
@@ -118,7 +117,6 @@ public class BasicSectionGeometryData implements IGeometryData {
         return this.geometryBuffer.size();
     }
 
-    @Override
     public void free() {
         this.sectionMetadataBuffer.free();
 
@@ -161,7 +159,6 @@ public class BasicSectionGeometryData implements IGeometryData {
         }
     }
 
-    @Override
     public long getMaxCapacity() {
         return this.geometryBuffer.size();
     }

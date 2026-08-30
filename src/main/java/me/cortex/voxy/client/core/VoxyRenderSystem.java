@@ -15,34 +15,37 @@ import me.cortex.voxy.client.core.model.ModelStore;
 import me.cortex.voxy.client.core.rendering.ChunkBoundRenderer;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.Viewport;
-import me.cortex.voxy.client.core.rendering.ViewportSelector;
 import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
-import me.cortex.voxy.client.core.rendering.section.IUsesMeshlets;
 import me.cortex.voxy.client.core.rendering.section.backend.AbstractSectionRenderer;
 import me.cortex.voxy.client.core.rendering.section.backend.mdic.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicSectionGeometryData;
-import me.cortex.voxy.client.core.rendering.section.geometry.IGeometryData;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.PrintfDebugUtil;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.util.GPUTiming;
 import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
+import net.irisshaders.iris.Iris;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
+import org.vivecraft.api.client.VRRenderingAPI;
 
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Supplier;
 
 import static org.lwjgl.opengl.GL11.GL_VIEWPORT;
 import static org.lwjgl.opengl.GL11.glEnable;
@@ -56,6 +59,7 @@ import static org.lwjgl.opengl.GL30C.*;
 import static org.lwjgl.opengl.GL33.glBindSampler;
 import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
+import static org.vivecraft.api.client.data.RenderPass.VANILLA;
 
 public class VoxyRenderSystem {
     private final WorldEngine worldIn;
@@ -63,7 +67,7 @@ public class VoxyRenderSystem {
 
     private final ModelBakerySubsystem modelService;
     private final RenderGenerationService renderGen;
-    private final IGeometryData geometryData;
+    private final BasicSectionGeometryData geometryData;
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
     private final HierarchicalOcclusionTraverser traversal;
@@ -72,7 +76,10 @@ public class VoxyRenderSystem {
     private final RenderDistanceTracker renderDistanceTracker;
     public final ChunkBoundRenderer chunkBoundRenderer;
 
-    private final ViewportSelector<?> viewportSelector;
+    private static final boolean VIVECRAFT_INSTALLED = VoxyCommon.isModLoaded("vivecraft");
+    private final Supplier<? extends Viewport<?>> viewportCreator;
+    private final Viewport<?> defaultViewport;
+    private final Map<Object, Viewport<?>> extraViewports = new HashMap<>();
 
     private final AbstractRenderPipeline pipeline;
     private final RenderProperties properties;
@@ -91,11 +98,6 @@ public class VoxyRenderSystem {
     public float getCapturedFogStart() { return this.capturedFogStart; }
     public float getCapturedFogEnd()   { return this.capturedFogEnd; }
     public float[] getCapturedFogColor() { return this.capturedFogColor; }
-
-    private static AbstractSectionRenderer.Factory<?,? extends IGeometryData> getRenderBackendFactory() {
-        //TODO: need todo a thing where selects optimal section render based on if supports the pipeline and geometry data type
-        return MDICSectionRenderer.FACTORY;
-    }
 
     public VoxyRenderSystem(WorldEngine world, ServiceManager sm) {
         //Keep the world loaded, NOTE: this is done FIRST, to keep and ensure that even if the rest of loading takes more
@@ -125,10 +127,9 @@ public class VoxyRenderSystem {
             this.worldIn = world;
 
             this.properties = RenderProperties.getRenderProperties();
-            var backendFactory = getRenderBackendFactory();
             {
                 this.modelService = new ModelBakerySubsystem(world.getMapper());
-                this.renderGen = new RenderGenerationService(world, this.modelService, sm, IUsesMeshlets.class.isAssignableFrom(backendFactory.clz()));
+                this.renderGen = new RenderGenerationService(world, this.modelService, sm, false);
 
                 this.geometryData = new BasicSectionGeometryData(1<<20, RenderResourceReuse.getOrCreateGeometryBuffer());
 
@@ -144,16 +145,33 @@ public class VoxyRenderSystem {
                 this.nodeManager.start();
             }
 
-            this.pipeline = RenderPipelineFactory.createPipeline(this.properties, this.nodeManager, this.nodeCleaner, this.traversal, this::frexStillHasWork);
+            AbstractRenderPipeline pipeline = null;
+            if (IrisUtil.IRIS_INSTALLED && IrisUtil.SHADER_SUPPORT) {
+                var irisPipeline = Iris.getPipelineManager().getPipelineNullable();
+                if (irisPipeline instanceof IGetIrisVoxyPipelineData voxyPipeline) {
+                    var data = voxyPipeline.voxy$getPipelineData();
+                    if (data != null) {
+                        Logger.info("Creating voxy iris render pipeline");
+                        try {
+                            pipeline = new IrisVoxyRenderPipeline(this.properties, data, this.nodeManager, this.nodeCleaner, this.traversal);
+                        } catch (Exception e) {
+                            Logger.error("Failed to create iris render pipeline", e);
+                            IrisUtil.disableIrisShaders();
+                        }
+                    }
+                }
+            }
+            this.pipeline = pipeline != null ? pipeline : new NormalRenderPipeline(this.properties, this.nodeManager, this.nodeCleaner, this.traversal);
             this.pipeline.setupExtraModelBakeryData(this.modelService);//Configure the model service
 
             //Late stage traversal compile for shaders with taa
             this.traversal.lateStageCompile(this.pipeline);
 
 
-            var sectionRenderer = backendFactory.create(this.pipeline, this.modelService.getStore(), this.geometryData);
+            var sectionRenderer = new MDICSectionRenderer(this.pipeline, this.modelService.getStore(), this.geometryData);
             this.pipeline.setSectionRenderer(sectionRenderer);
-            this.viewportSelector = new ViewportSelector<>(sectionRenderer::createViewport);
+            this.viewportCreator = sectionRenderer::createViewport;
+            this.defaultViewport = this.viewportCreator.get();
 
             {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
@@ -308,10 +326,10 @@ public class VoxyRenderSystem {
             //Tick upload stream (this is ok to do here as upload ticking is just memory management)
             UploadStream.INSTANCE.tick();
 
-            while (this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ) && VoxyClient.isFrexActive());//While FF is active, run until everything is processed
+            this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);
             TimingStatistics.H.start();
             //Done here as is allows less gl state resetup
-            do { this.modelService.tick(900_000); } while (VoxyClient.isFrexActive() && !this.modelService.areQueuesEmpty());
+            this.modelService.tick(900_000);
             TimingStatistics.H.stop();
         }
         GPUTiming.INSTANCE.marker();
@@ -467,18 +485,6 @@ public class VoxyRenderSystem {
         );
     }
 
-    private boolean frexStillHasWork() {
-        if (!VoxyClient.isFrexActive()) {
-            return false;
-        }
-        //If frex is running we must tick everything to ensure correctness
-        UploadStream.INSTANCE.tick();
-        //Done here as is allows less gl state resetup
-        this.modelService.tick(100_000_000);
-        GL11.glFinish();
-        return this.nodeManager.hasWork() || this.renderGen.getTaskCount()!=0 || !this.modelService.areQueuesEmpty();
-    }
-
     public void setRenderDistance(float renderDistance) {
         this.renderDistanceTracker.setRenderDistance((int) Math.ceil(renderDistance+1));//the +1 is to cover the outer ring of chunks when rendering a circle
     }
@@ -487,7 +493,13 @@ public class VoxyRenderSystem {
         if (IrisUtil.irisShadowActive()) {
             return null;
         }
-        return this.viewportSelector.getViewport();
+        if (VIVECRAFT_INSTALLED) {
+            var pass = VRRenderingAPI.instance().getCurrentRenderPass();
+            if (pass != null && pass != VANILLA) {
+                return this.extraViewports.computeIfAbsent(pass, ignored -> this.viewportCreator.get());
+            }
+        }
+        return this.defaultViewport;
     }
 
     public void addDebugInfo(List<String> debug) {
@@ -531,7 +543,9 @@ public class VoxyRenderSystem {
 
             this.chunkBoundRenderer.free();
 
-            this.viewportSelector.free();
+            this.defaultViewport.delete();
+            this.extraViewports.values().forEach(Viewport::delete);
+            this.extraViewports.clear();
         } catch (Exception e) {Logger.error("Error shutting down renderer components", e);}
         Logger.info("Shutting down render pipeline");
         try {this.pipeline.free();} catch (Exception e){Logger.error("Error releasing render pipeline", e);}

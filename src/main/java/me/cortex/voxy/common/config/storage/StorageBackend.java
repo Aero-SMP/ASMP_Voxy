@@ -1,13 +1,13 @@
 package me.cortex.voxy.common.config.storage;
 
 import me.cortex.voxy.common.config.IMappingStorage;
-import me.cortex.voxy.common.config.IStoredSectionPositionIterator;
 import me.cortex.voxy.common.util.MemoryBuffer;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.LongConsumer;
 
-public abstract class StorageBackend implements IMappingStorage, IStoredSectionPositionIterator {
+public abstract class StorageBackend implements IMappingStorage {
 
     //Implementation may use the scratch buffer as the return value, it MUST NOT free the scratch buffer
     public abstract MemoryBuffer getSectionData(long key, MemoryBuffer scratch);
@@ -19,6 +19,8 @@ public abstract class StorageBackend implements IMappingStorage, IStoredSectionP
     public abstract void flush();
 
     public abstract void close();
+
+    public abstract void iteratePositions(int level, LongConsumer callback);
 
     public List<StorageBackend> getChildBackends() {
         return List.of();

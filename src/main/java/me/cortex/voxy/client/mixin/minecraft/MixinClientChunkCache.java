@@ -20,7 +20,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(ClientChunkCache.class)
 public class MixinClientChunkCache implements ICheekyClientChunkCache {
     @Unique
-    private static final boolean BOBBY_INSTALLED = VoxyCommon.getPlatformUtil().isModLoaded("bobby");
+    private static final boolean BOBBY_INSTALLED = VoxyCommon.isModLoaded("bobby");
 
     @Shadow
     private volatile ClientChunkCache.Storage storage;

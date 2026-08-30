@@ -2,22 +2,32 @@ package me.cortex.voxy.client;
 
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.client.Minecraft;
-import net.minecraft.resources.ResourceLocation;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.ModContainer;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
+import net.neoforged.neoforge.common.NeoForge;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.channels.FileLock;
 import java.nio.channels.NonWritableChannelException;
-import java.util.HashSet;
-import java.util.function.Consumer;
-import java.util.function.Function;
 
-public abstract class VoxyClient {
-    private static final HashSet<String> FREX = new HashSet<>();
+@Mod(value = "voxy", dist = Dist.CLIENT)
+public class VoxyClient {
     private static FileLock EXCLUSIVE_LOCK;
+    public static boolean inSession;
+
+    public VoxyClient(IEventBus modBus, ModContainer container) {
+        NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) ->
+                event.getDispatcher().register(VoxyCommands.register()));
+    }
+
     public static void initVoxyClient() {
         Capabilities.init();//Ensure clinit is called
 
@@ -60,23 +70,27 @@ public abstract class VoxyClient {
         }
     }
 
-    public static boolean isFrexActive() {
-        return !FREX.isEmpty();
-    }
-
-    static void setFrexState(String name, boolean active) {
-        if (active) {
-            FREX.add(name);
-        } else {
-            FREX.remove(name);
-        }
-    }
-
     public static int getOcclusionDebugState() {
         return 0;
     }
 
     public static boolean disableSodiumChunkRender() {
         return false;// getOcclusionDebugState() != 0;
+    }
+
+    public static void sessionStart() {
+        if (inSession) throw new IllegalStateException("Cannot start new session while in a session");
+        inSession = true;
+
+        if (VoxyCommon.getInstance() != null) throw new IllegalStateException();
+        if (VoxyCommon.isAvailable() && VoxyConfig.CONFIG.enabled) {
+            VoxyCommon.createInstance();
+        }
+    }
+
+    public static void sessionEnd() {
+        if (!inSession) throw new IllegalStateException("Cannot end a session while not in a session");
+        inSession = false;
+        VoxyCommon.shutdownInstance();
     }
 }

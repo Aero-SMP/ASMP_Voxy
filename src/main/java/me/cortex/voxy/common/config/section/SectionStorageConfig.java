@@ -8,5 +8,5 @@ public abstract class SectionStorageConfig {
         Serialization.CONFIG_TYPES.add(SectionStorageConfig.class);
     }
 
-    public abstract SectionStorage build(ConfigBuildCtx ctx);
+    public abstract SectionSerializationStorage build(ConfigBuildCtx ctx);
 }

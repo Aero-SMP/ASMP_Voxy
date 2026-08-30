@@ -11,7 +11,6 @@ import me.cortex.voxy.common.voxelization.WorldVoxilizedSectionMipper;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
 import me.cortex.voxy.common.world.other.Mapper;
-import me.cortex.voxy.commonImpl.importers.IDataImporter.ICompletionCallback;
 import me.cortex.voxy.commonImpl.importers.IDataImporter.IUpdateCallback;
 import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
@@ -47,6 +46,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntConsumer;
 
 public class DHImporter implements IDataImporter {
     private final Connection db;
@@ -136,7 +136,7 @@ public class DHImporter implements IDataImporter {
         }, 10, "DH Importer", rateLimiter);
     }
 
-    public void runImport(IUpdateCallback updateCallback, ICompletionCallback completionCallback) {
+    public void runImport(IUpdateCallback updateCallback, IntConsumer completionCallback) {
         if (this.isRunning()) {
             throw new IllegalStateException();
         }
@@ -190,7 +190,7 @@ public class DHImporter implements IDataImporter {
                 }
             }
 
-            completionCallback.onCompletion(this.processedChunks.get());
+            completionCallback.accept(this.processedChunks.get());
             this.shutdown();
         });
         this.isRunning = true;

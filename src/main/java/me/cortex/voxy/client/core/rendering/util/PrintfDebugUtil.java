@@ -1,19 +1,19 @@
 package me.cortex.voxy.client.core.rendering.util;
 
-import me.cortex.voxy.client.core.gl.shader.IShaderProcessor;
 import me.cortex.voxy.client.core.gl.shader.PrintfInjector;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.common.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiFunction;
 
 public final class PrintfDebugUtil {
     public static final boolean ENABLE_PRINTF_DEBUGGING = System.getProperty("voxy.enableShaderDebugPrintf", "false").equals("true");
 
     private static final List<String> printfQueue2 = new ArrayList<>();
     private static final List<String> printfQueue = new ArrayList<>();
-    public static final IShaderProcessor PRINTF_processor;
+    public static final BiFunction<ShaderType, String, String> PRINTF_processor;
     private static final PrintfInjector PRINTF_object;
 
 
@@ -29,14 +29,8 @@ public final class PrintfDebugUtil {
         } else {
             PRINTF_object = null;
             //Todo add a dummy processor that just removes all the printf calls
-            PRINTF_processor = new IShaderProcessor() {
-                @Override
-                public String process(ShaderType type, String src) {
-                    //TODO: replace with https://stackoverflow.com/questions/47162098/is-it-possible-to-match-nested-brackets-with-a-regex-without-using-recursion-or/47162099#47162099
-                    // to match on printf with balanced bracing
-                    return src.replace("printf", "//printf");
-                }
-            };
+            //TODO: replace with a balanced-bracket parser.
+            PRINTF_processor = (type, src) -> src.replace("printf", "//printf");
         }
     }
 

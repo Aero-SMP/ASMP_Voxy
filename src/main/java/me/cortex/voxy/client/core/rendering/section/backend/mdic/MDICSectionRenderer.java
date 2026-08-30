@@ -14,7 +14,6 @@ import me.cortex.voxy.client.core.model.ModelStore;
 import me.cortex.voxy.client.core.rendering.section.backend.AbstractSectionRenderer;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
-import me.cortex.voxy.client.core.rendering.util.LightMapHelper;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.util.GPUTiming;
@@ -43,9 +42,7 @@ import static org.lwjgl.opengl.GL45.glBindTextureUnit;
 import static org.lwjgl.opengl.NVRepresentativeFragmentTest.GL_REPRESENTATIVE_FRAGMENT_TEST_NV;
 
 //Uses MDIC to render the sections
-public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport, BasicSectionGeometryData> {
-    public static final Factory<MDICViewport, BasicSectionGeometryData> FACTORY = AbstractSectionRenderer.Factory.create(MDICSectionRenderer.class);
-
+public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
     public static final int OPAQUE_DRAW_COUNT = 400_000;//in draw calls
     public static final int TRANSLUCENT_DRAW_COUNT = 100_000;//in draw calls
     public static final int TEMPORAL_DRAW_COUNT = 100_000;//in draw calls
@@ -175,7 +172,8 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport, B
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, this.geometryManager.getMetadataBuffer().id);
         this.modelStore.bind(3, 4, 0);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, viewport.positionScratchBuffer.id);
-        LightMapHelper.bind(1);
+        glBindSampler(1, 0);
+        glBindTextureUnit(1, Minecraft.getInstance().gameRenderer.lightTexture().lightTexture.getId());
         glBindTextureUnit(2, viewport.depthBoundingBuffer.getDepthTex().id);
 
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, SharedIndexBuffer.INSTANCE.id());

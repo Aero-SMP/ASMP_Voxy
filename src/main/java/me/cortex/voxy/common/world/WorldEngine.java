@@ -1,7 +1,7 @@
 package me.cortex.voxy.common.world;
 
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.section.SectionStorage;
+import me.cortex.voxy.common.config.section.SectionSerializationStorage;
 import me.cortex.voxy.common.util.TrackedObject;
 import me.cortex.voxy.common.world.other.Mapper;
 import me.cortex.voxy.commonImpl.VoxyInstance;
@@ -24,7 +24,7 @@ public class WorldEngine {
 
     private final TrackedObject thisTracker = TrackedObject.createTrackedObject(this);
 
-    public final SectionStorage storage;
+    public final SectionSerializationStorage storage;
     private final Mapper mapper;
     private final ActiveSectionTracker sectionTracker;
     private ISectionChangeCallback dirtyCallback;
@@ -46,11 +46,11 @@ public class WorldEngine {
     private final AtomicInteger refCount = new AtomicInteger();
     volatile long lastActiveTime = System.currentTimeMillis();//Time in millis the world was last "active" i.e. had a total ref count or active section count of != 0
 
-    public WorldEngine(SectionStorage storage) {
+    public WorldEngine(SectionSerializationStorage storage) {
         this(storage, null);
     }
 
-    public WorldEngine(SectionStorage storage, @Nullable VoxyInstance instance) {
+    public WorldEngine(SectionSerializationStorage storage, @Nullable VoxyInstance instance) {
         this.instanceIn = instance;
 
         int cacheSize = 1024;

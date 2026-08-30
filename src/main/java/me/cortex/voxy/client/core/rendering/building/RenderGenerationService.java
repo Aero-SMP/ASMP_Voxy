@@ -121,11 +121,6 @@ public class RenderGenerationService {
         return this.world.acquireIfExists(pos);
     }
 
-    private static boolean putTaskFirst(long pos) {
-        //Level 3 or 4
-        return WorldEngine.getLevel(pos) > 2;
-    }
-
     //TODO: add a generated render data cache
     private void processJob(RenderDataFactory factory, IntOpenHashSet seenMissedIds) {
         BuildTask task = this.taskQueue.poll();
