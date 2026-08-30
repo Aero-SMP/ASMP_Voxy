@@ -11,7 +11,6 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.other.Mapper;
 
-import java.util.List;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.StampedLock;
@@ -25,7 +24,6 @@ import java.util.function.Consumer;
 public class RenderGenerationService {
     private static final int MAX_HOLDING_SECTION_COUNT = 1000;
 
-    public static final AtomicInteger MESH_FAILED_COUNTER = new AtomicInteger();
     private static final AtomicInteger COUNTER = new AtomicInteger();
     private static final class BuildTask {
         WorldSection section;
@@ -57,24 +55,15 @@ public class RenderGenerationService {
     private final WorldEngine world;
     private final ModelBakerySubsystem modelBakery;
     private Consumer<BuiltSection> resultConsumer;
-    private final boolean emitMeshlets;
-
     private final Service service;
 
-
-    /*
-    public RenderGenerationService(WorldEngine world, ModelBakerySubsystem modelBakery, ServiceManager sm, boolean emitMeshlets) {
-        this(world, modelBakery, sm, emitMeshlets, ()->true);
-    }*/
-
-    public RenderGenerationService(WorldEngine world, ModelBakerySubsystem modelBakery, ServiceManager sm, boolean emitMeshlets) {
-        this.emitMeshlets = emitMeshlets;
+    public RenderGenerationService(WorldEngine world, ModelBakerySubsystem modelBakery, ServiceManager sm) {
         this.world = world;
         this.modelBakery = modelBakery;
 
         this.service = sm.createService(()->{
             //Thread local instance of the factory
-            var factory = new RenderDataFactory(this.world, this.modelBakery.factory, this.emitMeshlets);
+            var factory = new RenderDataFactory(this.world, this.modelBakery.factory);
             IntOpenHashSet seenMissed = new IntOpenHashSet(128);
             return new Pair<>(() -> {
                 this.processJob(factory, seenMissed);
@@ -153,7 +142,6 @@ public class RenderGenerationService {
             }
             return;
         }
-        section.assertNotFree();
         BuiltSection mesh = null;
 
 
@@ -204,7 +192,6 @@ public class RenderGenerationService {
                 }
 
                 if (task.hasDoneModelRequestOuter || task.hasDoneModelRequestInner) {
-                    MESH_FAILED_COUNTER.incrementAndGet();
                 }
 
                 if (task.hasDoneModelRequestInner && task.hasDoneModelRequestOuter) {
@@ -292,12 +279,6 @@ public class RenderGenerationService {
         }
     }
 
-    /*
-    public void enqueueTask(int lvl, int x, int y, int z) {
-        this.enqueueTask(WorldEngine.getWorldSectionId(lvl, x, y, z));
-    }
-    */
-
     public void shutdown() {
         //Steal and free as much work as possible
         while (this.service.numJobs() != 0) {
@@ -341,16 +322,6 @@ public class RenderGenerationService {
         if (this.taskQueueCount.get() != 0) {
             throw new IllegalStateException();
         }
-    }
-
-    private long lastChangedTime = 0;
-    public void addDebugData(List<String> debug) {
-        if (System.currentTimeMillis()-this.lastChangedTime > 100) {
-            MESH_FAILED_COUNTER.set(0);
-            this.lastChangedTime = System.currentTimeMillis();
-        }
-        debug.add("RSSQ/TFC: " + this.taskQueueCount.get() + "/" + MESH_FAILED_COUNTER.get());//render section service queue, Task Fail Counter
-
     }
 
     public int getTaskCount() {

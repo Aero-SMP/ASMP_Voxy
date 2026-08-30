@@ -3,7 +3,6 @@ package me.cortex.voxy.client.mixin.nvidium;
 import me.cortex.nvidium.RenderPipeline;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
-import net.caffeinemc.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
 import net.caffeinemc.mods.sodium.client.render.viewport.Viewport;
 import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;

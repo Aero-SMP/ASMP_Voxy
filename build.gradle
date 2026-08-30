@@ -21,8 +21,6 @@ base {
 repositories {
     mavenCentral()
     maven { url = 'https://maven.caffeinemc.net/releases' }
-    maven { url = 'https://maven.shedaniel.me/' }
-    maven { url = 'https://maven.terraformersmc.com/releases/' }
     exclusiveContent {
         forRepository {
             maven {
@@ -98,8 +96,6 @@ dependencies {
     implementation "maven.modrinth:lithium:${providers.gradleProperty('lithium_version').get()}"
     compileOnly "drouarb:nvidium:${providers.gradleProperty('nvidium_version').get()}"
     compileOnly "maven.modrinth:iris:${providers.gradleProperty('iris_version').get()}"
-    compileOnly files('libs/modmenu-bridge-1.12.1+1.21.1.jar')
-
     runtimeOnly 'io.github.douira:glsl-transformer:2.0.1'
     runtimeOnly 'org.anarres:jcpp:1.4.14'
 
@@ -114,6 +110,9 @@ dependencies {
     implementation "org.rocksdb:rocksdbjni:${rocksdbVersion}"
 
     jarJar "org.rocksdb:rocksdbjni:${rocksdbVersion}"
+    if (findProject(':debug') != null) {
+        jarJar project(':debug')
+    }
 }
 
 afterEvaluate {

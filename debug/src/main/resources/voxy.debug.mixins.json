@@ -1,0 +1,21 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "me.cortex.voxy.debug.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "MixinLodGenerationService",
+    "MixinTrackedObject"
+  ],
+  "client": [
+    "MixinClientLodNetwork",
+    "MixinDebugScreenOverlay",
+    "MixinGlBuffer",
+    "MixinGlObjectLabels",
+    "MixinGlTexture",
+    "MixinVoxyRenderSystem"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

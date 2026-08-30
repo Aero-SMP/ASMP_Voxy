@@ -14,9 +14,6 @@ public class GlBuffer extends TrackedObject {
     private final long size;
     private final int flags;
 
-    private static int COUNT;
-    private static long TOTAL_SIZE;
-
     public GlBuffer(long size) {
         this(size, 0);
     }
@@ -36,18 +33,12 @@ public class GlBuffer extends TrackedObject {
         if ((flags&GL_SPARSE_STORAGE_BIT_ARB)==0 && zero) {
             this.zero();
         }
-
-        COUNT++;
-        TOTAL_SIZE += size;
     }
 
     @Override
     public void free() {
         this.free0();
         glDeleteBuffers(this.id);
-
-        COUNT--;
-        TOTAL_SIZE -= this.size;
     }
 
     public boolean isSparse() {
@@ -77,18 +68,6 @@ public class GlBuffer extends TrackedObject {
         MemoryUtil.memPutInt(SCRATCH, data);
         nglClearNamedBufferData(this.id, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, SCRATCH);
         return this;
-    }
-
-    public static int getCount() {
-        return COUNT;
-    }
-
-    public static long getTotalSize() {
-        return TOTAL_SIZE;
-    }
-
-    public GlBuffer name(String name) {
-        return GlDebug.name(name, this);
     }
 
     private static final long SCRATCH = MemoryUtil.nmemAlloc(4);

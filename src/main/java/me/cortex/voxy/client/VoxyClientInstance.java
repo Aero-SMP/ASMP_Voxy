@@ -44,10 +44,6 @@ public class VoxyClientInstance extends VoxyInstance {
         return new SectionSerializationStorage(new RocksDBStorageBackend(storagePath));
     }
 
-    public Path getStorageBasePath() {
-        return this.basePath;
-    }
-
     @Override
     public boolean isIngestEnabled(WorldIdentifier worldId) {
         return VoxyConfig.CONFIG.ingestEnabled;

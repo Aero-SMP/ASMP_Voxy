@@ -25,7 +25,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
 
 public class ClientLodNetwork {
 
@@ -38,10 +37,6 @@ public class ClientLodNetwork {
     private static final int MAX_QUEUE_SIZE = 8192;
 
     private static boolean serverConnected;
-    private static final AtomicLong chunksReceived = new AtomicLong();
-    private static final AtomicLong bytesReceived = new AtomicLong();
-    private static double receiveRate, bandwidthRate;
-    private static long lastUpdateTime, lastChunkCount, lastByteCount;
 
     public static void register(PayloadRegistrar registrar) {
         registrar.playToClient(LodNetwork.HandshakePayload.TYPE, LodNetwork.HandshakePayload.CODEC,
@@ -139,17 +134,6 @@ public class ClientLodNetwork {
         // drop lod data from another dimension to avoid cross-dimension artifacts
         if (!level.dimension().equals(payload.dimension())) return;
 
-        // approx payload size for the stats hud
-        long bytes = 0;
-        for (LodNetwork.LODDataPayload.SectionData sd : payload.sections()) {
-            bytes += sd.states().length;
-            bytes += sd.biomes().length;
-            if (sd.blockLight() != null) bytes += sd.blockLight().length;
-            if (sd.skyLight() != null) bytes += sd.skyLight().length;
-        }
-        chunksReceived.incrementAndGet();
-        bytesReceived.addAndGet(bytes);
-
         Registry<Biome> biomeRegistry = level.registryAccess().registryOrThrow(Registries.BIOME);
 
         for (LodNetwork.LODDataPayload.SectionData sectionData : payload.sections()) {
@@ -189,26 +173,6 @@ public class ClientLodNetwork {
 
     public static void tick() {
         drainIngestQueue();
-
-        long now = System.currentTimeMillis();
-        if (lastUpdateTime == 0) {
-            lastUpdateTime = now;
-            lastChunkCount = chunksReceived.get();
-            lastByteCount = bytesReceived.get();
-            return;
-        }
-
-        long delta = now - lastUpdateTime;
-        if (delta >= 1000) {
-            long currentChunkCount = chunksReceived.get();
-            long currentByteCount = bytesReceived.get();
-            double seconds = delta / 1000.0;
-            receiveRate = (currentChunkCount - lastChunkCount) / seconds;
-            bandwidthRate = (currentByteCount - lastByteCount) / seconds;
-            lastChunkCount = currentChunkCount;
-            lastByteCount = currentByteCount;
-            lastUpdateTime = now;
-        }
     }
 
     public static void disconnect() {
@@ -216,21 +180,8 @@ public class ClientLodNetwork {
     }
 
     public static boolean isServerConnected() { return serverConnected; }
-    public static double getReceiveRate() { return receiveRate; }
-    public static double getBandwidthRate() { return bandwidthRate; }
-    public static long getChunksReceived() { return chunksReceived.get(); }
-    public static long getBytesReceived() { return bytesReceived.get(); }
 
     private static void setServerConnected(boolean connected) {
         serverConnected = connected;
-        if (!connected) {
-            chunksReceived.set(0);
-            bytesReceived.set(0);
-            receiveRate = 0;
-            bandwidthRate = 0;
-            lastUpdateTime = 0;
-            lastChunkCount = 0;
-            lastByteCount = 0;
-        }
     }
 }

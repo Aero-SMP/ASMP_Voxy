@@ -4,11 +4,9 @@ import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.model.ModelFactory;
-import me.cortex.voxy.client.core.rendering.section.geometry.BasicSectionGeometryData;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.ThreadUtils;
 import me.cortex.voxy.common.util.TrackedObject;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 
 import java.util.ArrayList;
 
@@ -40,8 +38,7 @@ public class RenderResourceReuse {
             atlas = new GlTexture().store(GL_RGBA8,
                         Integer.numberOfTrailingZeros(ModelFactory.MODEL_TEXTURE_SIZE),
                         ModelFactory.MODEL_TEXTURE_SIZE*3*256,
-                        ModelFactory.MODEL_TEXTURE_SIZE*2*256)
-                    .name("ModelTextures");
+                        ModelFactory.MODEL_TEXTURE_SIZE*2*256);
         }
         return atlas;
     }

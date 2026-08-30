@@ -30,7 +30,7 @@ public class MixinWorld implements IWorldGetIdentifier {
                                        Holder<DimensionType> dimensionEntry,
                                        Supplier<ProfilerFiller> profiler,
                                        boolean isClient,
-                                       boolean debugWorld,
+                                       boolean ignored,
                                        long seed,
                                        int maxChainedNeighborUpdates,
                                        CallbackInfo ci) {

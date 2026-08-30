@@ -7,3 +7,10 @@ pluginManagement {
 }
 
 rootProject.name = 'Voxy'
+
+def includeDebug = gradle.startParameter.projectProperties
+        .getOrDefault('includeDebug', 'false')
+        .toBoolean()
+if (includeDebug) {
+    include 'debug'
+}

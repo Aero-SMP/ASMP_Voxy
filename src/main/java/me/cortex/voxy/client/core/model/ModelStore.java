@@ -26,8 +26,8 @@ public class ModelStore {
     public final int blockSampler = glGenSamplers();
 
     public ModelStore() {
-        this.modelBuffer = new GlBuffer(MODEL_SIZE * (1<<16)).name("ModelData");
-        this.modelColourBuffer = new GlBuffer(4 * (1<<16)).name("ModelColour");
+        this.modelBuffer = new GlBuffer(MODEL_SIZE * (1<<16));
+        this.modelColourBuffer = new GlBuffer(4 * (1<<16));
         this.textures = RenderResourceReuse.getOrCreateModelStoreTextureAtlas();
 
         //Limit the mips of the texture to match that of the terrain atlas

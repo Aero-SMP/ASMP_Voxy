@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.core.gl.shader;
 
 import me.cortex.voxy.client.core.gl.GlBuffer;
-import me.cortex.voxy.client.core.gl.GlDebug;
 import me.cortex.voxy.client.core.gl.GlTexture;
 
 import java.util.ArrayList;
@@ -31,17 +30,6 @@ public class AutoBindingShader extends Shader {
     AutoBindingShader(Shader.Builder<AutoBindingShader> builder, int program) {
         super(program);
         this.defines = builder.defines;
-    }
-
-    public AutoBindingShader name(String name) {
-        return GlDebug.name(name, this);
-    }
-
-    public AutoBindingShader ssboIf(String define, GlBuffer buffer) {
-        if (this.defines.containsKey(define)) {
-            return this.ssbo(define, buffer);
-        }
-        return this;
     }
 
     public AutoBindingShader ssbo(int index, GlBuffer binding) {
@@ -113,13 +101,6 @@ public class AutoBindingShader extends Shader {
     @Override
     public void bind() {
         super.bind();
-        //TODO: replace with multibind and use the invalidate flag
-        /*
-        glBindSamplers();
-        glBindTextures();
-        glBindBuffersBase();
-        glBindBuffersRange();
-         */
         if (!this.bindings.isEmpty()) {
             for (var binding : this.bindings) {
                 binding.buffer.assertNotFreed();

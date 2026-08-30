@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.core.rendering.hierachical;
 
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
-import me.cortex.voxy.client.RenderStatistics;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.AbstractRenderPipeline;
 import me.cortex.voxy.client.core.gl.GlBuffer;
@@ -12,16 +11,12 @@ import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
-import me.cortex.voxy.client.core.rendering.util.PrintfDebugUtil;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.world.WorldEngine;
 import org.lwjgl.system.MemoryUtil;
 
-import java.util.List;
-
-import static me.cortex.voxy.client.core.rendering.util.PrintfDebugUtil.PRINTF_processor;
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL12.GL_UNPACK_IMAGE_HEIGHT;
 import static org.lwjgl.opengl.GL12.GL_UNPACK_SKIP_IMAGES;
@@ -33,8 +28,6 @@ import static org.lwjgl.opengl.GL45.*;
 
 // TODO: swap to persistent gpu threads instead of dispatching MAX_ITERATIONS of compute layers
 public class HierarchicalOcclusionTraverser {
-    public static final boolean HIERARCHICAL_SHADER_DEBUG = System.getProperty("voxy.hierarchicalShaderDebug", "false").equals("true");
-
     public static final int MAX_REQUEST_QUEUE_SIZE = 50;
     public static final int MAX_QUEUE_SIZE = 200_000;
 
@@ -50,7 +43,6 @@ public class HierarchicalOcclusionTraverser {
 
     private final GlBuffer nodeBuffer;
     private final GlBuffer uniformBuffer = new GlBuffer(1024).zero();
-    private final GlBuffer statisticsBuffer = new GlBuffer(1024).zero();
 
 
     private int topNodeCount;
@@ -71,7 +63,6 @@ public class HierarchicalOcclusionTraverser {
     private static final int NODE_QUEUE_SOURCE_BINDING = BINDING_COUNTER++;
     private static final int NODE_QUEUE_SINK_BINDING = BINDING_COUNTER++;
     private static final int RENDER_TRACKER_BINDING = BINDING_COUNTER++;
-    private static final int STATISTICS_BUFFER_BINDING = BINDING_COUNTER++;
 
     private final int hizSampler = glGenSamplers();
 
@@ -98,14 +89,13 @@ public class HierarchicalOcclusionTraverser {
 
     public void lateStageCompile(AbstractRenderPipeline pipeline) {
         String taa = pipeline.taaFunction("getTAA");
-        var scr = ShaderLoader.parse("voxy:lod/hierarchical/traversal_dev.comp");
+        var scr = ShaderLoader.parse("voxy:lod/hierarchical/traversal.comp");
         if (taa != null) {
             scr += "\n\n\n" + taa;
             this.pipeline = pipeline;
         }
-        this.traversal = Shader.makeAuto(PRINTF_processor)
-            .apply(pipeline.properties::apply)
-            .defineIf("DEBUG", HIERARCHICAL_SHADER_DEBUG)
+        this.traversal = Shader.makeAuto()
+            .define("USE_ZERO_ONE_DEPTH")
             .define("MAX_ITERATIONS", MAX_ITERATIONS)
             .define("LOCAL_SIZE_BITS", LOCAL_WORK_SIZE_BITS)
             .define("MAX_REQUEST_QUEUE_SIZE", MAX_REQUEST_QUEUE_SIZE)
@@ -124,9 +114,6 @@ public class HierarchicalOcclusionTraverser {
 
             .define("RENDER_TRACKER_BINDING", RENDER_TRACKER_BINDING)
 
-            .defineIf("HAS_STATISTICS", RenderStatistics.enabled)
-            .defineIf("STATISTICS_BUFFER_BINDING", RenderStatistics.enabled, STATISTICS_BUFFER_BINDING)
-
             .defineIf("TAA", taa != null)
 
             .addSource(ShaderType.COMPUTE, scr)
@@ -138,8 +125,7 @@ public class HierarchicalOcclusionTraverser {
                 .ssbo("REQUEST_QUEUE_BINDING", this.requestBuffer)
                 .ssbo("NODE_DATA_BINDING", this.nodeBuffer)
                 .ssbo("NODE_QUEUE_META_BINDING", this.queueMetaBuffer)
-                .ssbo("RENDER_TRACKER_BINDING", this.nodeCleaner.visibilityBuffer)
-                .ssboIf("STATISTICS_BUFFER_BINDING", this.statisticsBuffer);
+                .ssbo("RENDER_TRACKER_BINDING", this.nodeCleaner.visibilityBuffer);
     }
 
     private void addTLN(int id) {
@@ -250,12 +236,6 @@ public class HierarchicalOcclusionTraverser {
         //Bind shader uniforms for taa if we have a pipeline
         if (this.pipeline != null) this.pipeline.bindUniforms();
 
-        PrintfDebugUtil.bind();
-
-        if (RenderStatistics.enabled) {
-            this.statisticsBuffer.zero();
-        }
-
         //Clear the render output counter
         nglClearNamedBufferSubData(viewport.getRenderList().id, GL_R32UI, 0, 4, GL_RED_INTEGER, GL_UNSIGNED_INT, 0);
 
@@ -263,18 +243,6 @@ public class HierarchicalOcclusionTraverser {
         this.traverseInternal();
 
         this.downloadResetRequestQueue();
-
-        if (RenderStatistics.enabled) {
-            DownloadStream.INSTANCE.download(this.statisticsBuffer, down->{
-                for (int i = 0; i < MAX_ITERATIONS; i++) {
-                    RenderStatistics.hierarchicalTraversalCounts[i] = MemoryUtil.memGetInt(down.address+i*4L);
-                }
-
-                for (int i = 0; i < MAX_ITERATIONS; i++) {
-                    RenderStatistics.hierarchicalRenderSections[i] = MemoryUtil.memGetInt(down.address+MAX_ITERATIONS*4L+i*4L);
-                }
-            });
-        }
 
         //Bind the hiz buffer
         glBindSampler(0, 0);
@@ -292,13 +260,6 @@ public class HierarchicalOcclusionTraverser {
         }
 
         int firstDispatchSize = (this.topNodeCount+(1<<LOCAL_WORK_SIZE_BITS)-1)>>LOCAL_WORK_SIZE_BITS;
-        /*
-        //prime the queue Todo: maybe move after the traversal? cause then it is more efficient work since it doesnt need to wait for this before starting?
-        glClearNamedBufferData(this.queueMetaBuffer.id, GL_RGBA32UI, GL_RGBA, GL_UNSIGNED_INT, new int[]{0,1,1,0});//Prime the metadata buffer, which also contains
-
-        //Set the first entry
-        glClearNamedBufferSubData(this.queueMetaBuffer.id, GL_RGBA32UI, 0, 16, GL_RGBA, GL_UNSIGNED_INT, new int[]{firstDispatchSize,1,1,initialQueueSize});
-         */
         {//TODO:FIXME: THIS IS BULLSHIT BY INTEL need to fix the clearing
             long ptr = UploadStream.INSTANCE.upload(this.queueMetaBuffer, 0, 16*MAX_ITERATIONS);
             MemoryUtil.memPutInt(ptr +  0, firstDispatchSize);
@@ -387,7 +348,6 @@ public class HierarchicalOcclusionTraverser {
         this.requestBuffer.free();
         this.nodeBuffer.free();
         this.uniformBuffer.free();
-        this.statisticsBuffer.free();
         this.queueMetaBuffer.free();
         this.topNodeIds.free();
         this.scratchQueueA.free();
@@ -397,10 +357,4 @@ public class HierarchicalOcclusionTraverser {
 
     private static final long SCRATCH = MemoryUtil.nmemAlloc(32);//32 bytes of scratch memory
 
-    public void addDebug(List<String> debug) {
-        //Conditionally add debug
-        if (this.topNodeCount>this.idx2topNodeMapping.length/2) {
-            debug.add("TLN#: " + this.topNodeCount);
-        }
-    }
 }

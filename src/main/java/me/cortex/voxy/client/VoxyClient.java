@@ -10,8 +10,6 @@ import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
-import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
-import net.neoforged.neoforge.common.NeoForge;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -24,9 +22,7 @@ public class VoxyClient {
     public static boolean inSession;
 
     public VoxyClient(IEventBus modBus) {
-        NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) ->
-                event.getDispatcher().register(VoxyCommands.register()));
-        new ClientLodStreaming(modBus);
+        new ClientLodStreaming();
     }
 
     public static void initVoxyClient() {
@@ -69,14 +65,6 @@ public class VoxyClient {
             }
 
         }
-    }
-
-    public static int getOcclusionDebugState() {
-        return 0;
-    }
-
-    public static boolean disableSodiumChunkRender() {
-        return false;// getOcclusionDebugState() != 0;
     }
 
     public static void sessionStart() {

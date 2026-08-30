@@ -1,11 +1,13 @@
 package me.cortex.voxy.common.util;
 
-import static me.cortex.voxy.common.util.TrackedObject.CLEANER;
+import java.lang.ref.Cleaner;
 
 public class ThreadLocalMemoryBuffer {
+    static final Cleaner CLEANER = Cleaner.create();
+
     private static MemoryBuffer createMemoryBuffer(long size) {
         var buffer = new MemoryBuffer(size);
-        var ref = MemoryBuffer.createUntrackedUnfreeableRawFrom(buffer.address, buffer.size);
+        var ref = MemoryBuffer.createUnfreeableRawFrom(buffer.address, buffer.size);
         CLEANER.register(ref, buffer::free);
         return ref;
     }

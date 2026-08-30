@@ -2,13 +2,9 @@ package me.cortex.voxy.common.voxelization;
 
 import it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap;
 import me.cortex.voxy.common.world.other.Mapper;
-import me.cortex.voxy.common.world.other.Mipper;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.lithium.common.world.chunk.LithiumHashPalette;
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
-import net.minecraft.util.LinearCongruentialGenerator;
-import net.minecraft.util.Mth;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.ZeroBitStorage;
 import net.minecraft.world.level.biome.Biome;
@@ -23,13 +19,13 @@ import net.minecraft.world.level.chunk.SingleValuePalette;
 import java.util.WeakHashMap;
 
 public class WorldConversionFactory {
-    private static final boolean LITHIUM_INSTALLED = VoxyCommon.isModLoaded("lithium") || VoxyCommon.isModLoaded("radium") | VoxyCommon.isModLoaded("canary");
+    private static final boolean LITHIUM_INSTALLED = VoxyCommon.isModLoaded("lithium")
+            || VoxyCommon.isModLoaded("radium") || VoxyCommon.isModLoaded("canary");
 
     private static final class Cache {
         private final int[] biomeCache = new int[4*4*4];
         private final WeakHashMap<Mapper, Reference2IntOpenHashMap<BlockState>> localMapping = new WeakHashMap<>();
         private int[] paletteCache = new int[1024];
-        private final long[] zoomCellCache = new long[5*5*5];
         private Reference2IntOpenHashMap<BlockState> getLocalMapping(Mapper mapper) {
             return this.localMapping.computeIfAbsent(mapper, (a_)->new Reference2IntOpenHashMap<>());
         }
@@ -136,7 +132,6 @@ public class WorldConversionFactory {
 
         var biomes = cache.biomeCache;
         var data = section.section;
-        var zoomCells = cache.zoomCellCache;
         var vp = blockContainer.data.palette();
         var pc = cache.getPaletteCache(vp.getSize());
         GlobalPalette<BlockState> bps = null;
@@ -152,20 +147,12 @@ public class WorldConversionFactory {
 
         {
             int i = 0;
-            int inital = -1;
             for (int y = 0; y < 4; y++) {
                 for (int z = 0; z < 4; z++) {
                     for (int x = 0; x < 4; x++) {
-                        int bid = stateMapper.getIdForBiome(biomeContainer.get(x, y, z));
-                        biomes[i++] = bid;
-                        if (inital==-1) inital = bid;
-                        shouldZoom &= inital == bid;//Evil hacky trick, we only need to zoom if on a biome boarder
+                        biomes[i++] = stateMapper.getIdForBiome(biomeContainer.get(x, y, z));
                     }
                 }
-            }
-
-            if (shouldZoom) {
-                computeZoomCells(biomes, zoomSeed, zoomCells);
             }
         }
 
@@ -218,18 +205,6 @@ public class WorldConversionFactory {
         section.lvl0NonAirCount = nonZeroCnt;
         return section;
     }
-
-
-    private static void computeZoomCells(int[] biomes, long zoomSeed, long[] zoomInfo) {
-        for (int cy = 0; cy<4; cy++) {
-            for (int cz = 0; cz<4; cz++) {
-                for (int cx = 0; cx<4; cx++) {
-
-                }
-            }
-        }
-    }
-
     //Support for other mods etc that use this entry point
     @Deprecated(forRemoval = true)
     public static void mipSection(VoxelizedSection section, Mapper mapper) {

@@ -25,15 +25,6 @@ uint getCurrentNode() {
 //TODO: limit the size/writing out of bounds
 uint nodePushIndex = -1;
 void pushNodesInit(uint nodeCount) {
-    //Debug
-    #ifdef DEBUG
-    if (queueIdx >= (MAX_ITERATIONS-1)) {
-        printf("LOG: Traversal tried inserting a node into next iteration, which is outside max iteration bounds. GID: %d, count: %d", gl_GlobalInvocationID.x, nodeCount);
-        nodePushIndex = -1;
-        return;
-    }
-    #endif
-
     uint index = atomicAdd(nodeQueueMetadata[queueIdx+1].w, nodeCount);
     //Increment first metadata value if it changes threash hold
     uint inc = ((index+LOCAL_SIZE)>>LOCAL_SIZE_BITS)-(index>>LOCAL_SIZE_BITS);
@@ -42,12 +33,6 @@ void pushNodesInit(uint nodeCount) {
 }
 
 void pushNode(uint nodeId) {
-    #ifdef DEBUG
-    if (nodePushIndex == -1) {
-        printf("LOG: Tried pushing node when push node wasnt successful. GID: %d, pushing: %d", gl_GlobalInvocationID.x, nodeId);
-        return;
-    }
-    #endif
     nodeQueueSink[nodePushIndex++] = nodeId;
 }
 

@@ -40,15 +40,7 @@ layout(binding = RENDER_TRACKER_BINDING, std430) restrict writeonly buffer rende
     uint[] lastRenderFrame;
 };
 
-#ifdef HAS_STATISTICS
-layout(binding = STATISTICS_BUFFER_BINDING, std430) restrict buffer statisticsBuffer {
-    uint traversalCounts[MAX_ITERATIONS];
-    uint renderCounts[MAX_ITERATIONS];
-};
-#endif
-
 void addRequest(inout UnpackedNode node) {
-    //printf("Put node decend request");
     if (!hasRequested(node)) {
         if (requestQueueIndex.x < requestQueueSize) {//Soft limit
             uint atomRes = atomicAdd(requestQueueIndex.x, 1);
@@ -75,7 +67,6 @@ void enqueueChildren(in UnpackedNode node) {
 }
 
 void enqueueSelfForRender(in UnpackedNode node) {
-    //printf("render %d@[%d,%d,%d]", node.lodLevel, node.pos.x, node.pos.y, node.pos.z);
     if (renderQueueIndex < renderQueueMaxSize) {
         lastRenderFrame[getId(node)] = frameId;
         if (!isEmptyMesh(node)) {
@@ -83,13 +74,6 @@ void enqueueSelfForRender(in UnpackedNode node) {
             if (renderIndex < renderQueueMaxSize) {
                 renderQueue[renderIndex] = getMesh(node);
 
-                #ifdef IS_DEBUG
-                debugRenderNodeQueue[atomicAdd(debugRenderNodeQueueIndex, 1)] = node.nodeId;
-                #endif
-
-                #ifdef HAS_STATISTICS
-                atomicAdd(renderCounts[node.lodLevel], 1);
-                #endif
             }
         }
     }
@@ -117,26 +101,17 @@ bool isWithinRenderDistance(in UnpackedNode node) {
 
 
 void traverse(in UnpackedNode node) {
-    #ifdef HAS_STATISTICS
-    atomicAdd(traversalCounts[node.lodLevel], 1);
-    #endif
-
     //Compute screenspace
     setupScreenspace(node);
-    //debugDumpNode(node);
 
-    if (outsideFrustum() || isCulledByHiz()) {
-        //printf("culled");
-    } else {
+    if (!(outsideFrustum() || isCulledByHiz())) {
         //It is visible, TODO: maybe do a more detailed hiz test? (or make it so that )
 
         //Only decend if not a root node
         if (node.lodLevel!=0 && shouldDecend()) {
             if (hasChildren(node)) {
-                //printf("A");
                 enqueueChildren(node);
             } else {
-                //printf("B");
                 addRequest(node);
                 //TODO: use self mesh (is error state if it doesnt have one since all leaf nodes should have a mesh)
                 // Basicly guarenteed to have a mesh, if it doesnt it is very very bad and incorect since its a violation of the graph properties
@@ -154,10 +129,8 @@ void traverse(in UnpackedNode node) {
             }
         } else {
             if (hasMesh(node)) {
-                //printf("C");
                 enqueueSelfForRender(node);
             } else {
-                //printf("D");
                 //!! not ideal, we want to render this mesh but dont have it. If we havent sent a request
                 // then send a request for a mesh for this node.
                 addRequest(node);
@@ -182,11 +155,5 @@ void main() {
         if (isWithinRenderDistance(node)) {
             traverse(node);
         }
-
-        /*
-        printf("GID:%d, NODE %d, %d, AA, %d, %d, %d, %d", gl_GlobalInvocationID.x, node, queueIdx, nodeQueueMetadata[queueIdx].x, nodeQueueMetadata[queueIdx].y, nodeQueueMetadata[queueIdx].z, nodeQueueMetadata[queueIdx].w);
-        pushNodesInit(1);
-        pushNode(node);
-        */
     }
 }

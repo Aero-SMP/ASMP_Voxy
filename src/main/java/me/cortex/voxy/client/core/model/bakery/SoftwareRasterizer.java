@@ -1,16 +1,12 @@
 package me.cortex.voxy.client.core.model.bakery;
 
-import me.cortex.voxy.client.core.model.ModelFactory;
 import net.caffeinemc.mods.sodium.api.util.ColorABGR;
-import net.caffeinemc.mods.sodium.api.util.ColorARGB;
 import net.caffeinemc.mods.sodium.api.util.ColorMixer;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
-import org.lwjgl.system.MemoryUtil;
 
 import java.util.Arrays;
-import java.util.Random;
 
 public class SoftwareRasterizer {
     private final Vector4f scratch = new Vector4f();
@@ -128,15 +124,6 @@ public class SoftwareRasterizer {
         if (Math.abs(area)<0.001) {
             return;//Degenerate triangle
         }
-
-        //TODO: check this is right?
-        /*
-        if (area < 0) {
-            var t = v1;
-            v1 = v2;
-            v2 = t;
-            area = -area;
-        }*/
 
         int minX = Math.max((int) Math.floor(Math.min(Math.min(v1.x, v2.x), v3.x)), 0);
         int maxX = Math.min((int) Math.ceil(Math.max(Math.max(v1.x, v2.x), v3.x)), this.targetSize-1);

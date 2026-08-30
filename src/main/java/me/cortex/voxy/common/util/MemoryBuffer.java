@@ -1,41 +1,22 @@
 package me.cortex.voxy.common.util;
 
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 public class MemoryBuffer extends TrackedObject {
-    private static final boolean TRACK_MEMORY_BUFFERS = VoxyCommon.isVerificationFlagOn("trackBuffers");
-
     public final long address;
     public final long size;
     private final boolean freeable;
-    private final boolean tracked;
-
-    private static final AtomicInteger COUNT =  new AtomicInteger(0);
-    private static final AtomicLong TOTAL_SIZE = new AtomicLong(0);
-
 
     public MemoryBuffer(long size) {
-        this(true, MemoryUtil.nmemAlloc(size), size, true);
+        this(MemoryUtil.nmemAlloc(size), size, true);
     }
 
-    private MemoryBuffer(boolean track, long address, long size, boolean freeable) {
-        super(track && TRACK_MEMORY_BUFFERS);
-        this.tracked = track;
+    private MemoryBuffer(long address, long size, boolean freeable) {
         this.size = size;
         this.address = address;
         this.freeable = freeable;
-
-        if (track) {
-            COUNT.incrementAndGet();
-        }
-        if (freeable) {
-            TOTAL_SIZE.addAndGet(size);
-        }
     }
 
     public void cpyTo(long dst) {
@@ -52,12 +33,8 @@ public class MemoryBuffer extends TrackedObject {
     @Override
     public void free() {
         super.free0();
-        if (this.tracked) {
-            COUNT.decrementAndGet();
-        }
         if (this.freeable) {
             MemoryUtil.nmemFree(this.address);
-            TOTAL_SIZE.addAndGet(-this.size);
         } else {
             throw new IllegalArgumentException("Tried to free unfreeable buffer");
         }
@@ -77,14 +54,7 @@ public class MemoryBuffer extends TrackedObject {
 
         //Free the current object, but not the memory associated with it
         this.free0();
-        if (this.tracked) {
-            COUNT.decrementAndGet();
-        }
-        if (this.freeable) {
-            TOTAL_SIZE.addAndGet(-this.size);
-        }
-
-        return new MemoryBuffer(this.tracked, this.address, size, this.freeable);
+        return new MemoryBuffer(this.address, size, this.freeable);
     }
 
     public MemoryBuffer zero() {
@@ -100,23 +70,12 @@ public class MemoryBuffer extends TrackedObject {
     // methods for get and set, that way can have a single unifed system to ensure memory access bounds
 
 
-    public static MemoryBuffer createUntrackedRawFrom(long address, long size) {
-        return new MemoryBuffer(false, address, size, true);
-    }
-    public static MemoryBuffer createUntrackedUnfreeableRawFrom(long address, long size) {
-        return new MemoryBuffer(false, address, size, false);
+    public static MemoryBuffer createUnfreeableRawFrom(long address, long size) {
+        return new MemoryBuffer(address, size, false);
     }
 
-    public static int getCount() {
-        return COUNT.get();
-    }
-
-    public static long getTotalSize() {
-        return TOTAL_SIZE.get();
-    }
-
-    public MemoryBuffer createUntrackedUnfreeableReference() {
-        return new MemoryBuffer(false, this.address, this.size, false);
+    public MemoryBuffer createUnfreeableReference() {
+        return new MemoryBuffer(this.address, this.size, false);
     }
 
 }

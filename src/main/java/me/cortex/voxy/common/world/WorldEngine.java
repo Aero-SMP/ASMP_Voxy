@@ -2,13 +2,11 @@ package me.cortex.voxy.common.world;
 
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.config.section.SectionSerializationStorage;
-import me.cortex.voxy.common.util.TrackedObject;
 import me.cortex.voxy.common.world.other.Mapper;
 import me.cortex.voxy.commonImpl.VoxyInstance;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.invoke.VarHandle;
-import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class WorldEngine {
@@ -22,7 +20,6 @@ public class WorldEngine {
     public interface ISectionChangeCallback {void accept(WorldSection section, int updateFlags, int neighborMsk);}
     public interface ISectionSaveCallback {boolean save(WorldEngine engine, WorldSection section, boolean nonBlocking, boolean sectionAlreadyAcquired);}
 
-    private final TrackedObject thisTracker = TrackedObject.createTrackedObject(this);
 
     public final SectionSerializationStorage storage;
     private final Mapper mapper;
@@ -129,14 +126,6 @@ public class WorldEngine {
         }
     }
 
-    public void addDebugData(List<String> debug) {
-        debug.add("ACC/SCC: " + this.sectionTracker.getLoadedCacheCount()+"/"+this.sectionTracker.getSecondaryCacheSize());//Active cache count, Secondary cache counts
-    }
-
-    public int getActiveSectionCount() {
-        return this.sectionTracker.getLoadedCacheCount();
-    }
-
     public void free() {
         if (!this.isLive) throw new IllegalStateException();
         this.isLive = false;
@@ -146,7 +135,6 @@ public class WorldEngine {
             throw new IllegalStateException();
         }
 
-        this.thisTracker.free();
         try {this.mapper.close();} catch (Exception e) {Logger.error(e);}
         try {this.storage.flush();} catch (Exception e) {Logger.error(e);}
         //Shutdown in this order to preserve as much data as possible

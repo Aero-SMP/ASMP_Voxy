@@ -19,7 +19,6 @@ import static org.lwjgl.opengl.GL11.glFinish;
 import static org.lwjgl.opengl.GL42.glMemoryBarrier;
 import static org.lwjgl.opengl.GL42C.GL_BUFFER_UPDATE_BARRIER_BIT;
 import static org.lwjgl.opengl.GL44.GL_CLIENT_STORAGE_BIT;
-import static org.lwjgl.opengl.GL44.GL_MAP_COHERENT_BIT;
 import static org.lwjgl.opengl.GL45C.glFlushMappedNamedBufferRange;
 
 public class UploadStream {
@@ -32,10 +31,8 @@ public class UploadStream {
     private final LongArrayList thisFrameAllocations = new LongArrayList();
     private final Deque<UploadData> uploadList = new ArrayDeque<>();
 
-    private static final boolean USE_COHERENT = false;
-
     public UploadStream(long size) {
-        this.uploadBuffer = new GlPersistentMappedBuffer(size,GL_CLIENT_STORAGE_BIT|GL_MAP_WRITE_BIT|GL_MAP_UNSYNCHRONIZED_BIT|(USE_COHERENT?GL_MAP_COHERENT_BIT:GL_MAP_FLUSH_EXPLICIT_BIT)).name("UploadStream");
+        this.uploadBuffer = new GlPersistentMappedBuffer(size,GL_CLIENT_STORAGE_BIT|GL_MAP_WRITE_BIT|GL_MAP_UNSYNCHRONIZED_BIT|GL_MAP_FLUSH_EXPLICIT_BIT);
         this.allocationArena.setLimit(size);
     }
 
@@ -57,10 +54,6 @@ public class UploadStream {
         return this.uploadBuffer.addr() + addr;
     }
 
-    public long rawUpload(int size) {
-        return this.uploadBuffer.addr() + this.rawUploadAddress(size);
-    }
-
     public long rawUploadAddress(int size) {
         if (size < 0) {
             throw new IllegalStateException("Negative size");
@@ -77,7 +70,7 @@ public class UploadStream {
 
         long addr;
         if (this.caddr == -1 || !this.allocationArena.expand(this.caddr, (int) size)) {
-            if ((!USE_COHERENT)&&this.caddr!=-1) {
+            if (this.caddr!=-1) {
                 glFlushMappedNamedBufferRange(this.uploadBuffer.id, this.caddr, this.offset);
             }
             this.caddr = this.allocationArena.alloc((int) size);//TODO: replace with allocFromLargest
@@ -112,7 +105,7 @@ public class UploadStream {
     }
 
     public void commit() {
-        if ((!USE_COHERENT)&&this.caddr != -1) {
+        if (this.caddr != -1) {
             //Flush this allocation
             glFlushMappedNamedBufferRange(this.uploadBuffer.id, this.caddr, this.offset);
         }

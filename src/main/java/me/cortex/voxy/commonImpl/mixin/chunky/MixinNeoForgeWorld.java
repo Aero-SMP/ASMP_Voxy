@@ -19,17 +19,13 @@ public class MixinNeoForgeWorld {
     @WrapOperation(method = "getChunkAtAsync", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/level/ServerChunkCache;getChunkFutureMainThread(IILnet/minecraft/world/level/chunk/status/ChunkStatus;Z)Ljava/util/concurrent/CompletableFuture;"))
     private CompletableFuture<ChunkResult<ChunkAccess>> captureGeneratedChunk(ServerChunkCache instance, int i, int j, ChunkStatus status, boolean b, Operation<CompletableFuture<ChunkResult<ChunkAccess>>> original) {
         var future = original.call(instance, i, j, status, b);
-        if (false) {//TODO: ADD SERVER CONFIG THING
-            return future;
-        } else {
-            return future.thenApply(res -> {
-                res.ifSuccess(chunk -> {
-                    if (chunk instanceof LevelChunk worldChunk) {
-                        VoxelIngestService.tryAutoIngestChunk(worldChunk);
-                    }
-                });
-                return res;
+        return future.thenApply(res -> {
+            res.ifSuccess(chunk -> {
+                if (chunk instanceof LevelChunk worldChunk) {
+                    VoxelIngestService.tryAutoIngestChunk(worldChunk);
+                }
             });
-        }
+            return res;
+        });
     }
 }

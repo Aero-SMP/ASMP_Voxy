@@ -49,12 +49,6 @@ public class DepthFramebuffer {
         }
     }
 
-    public void clearStencil(int to) {
-        try (var stack = MemoryStack.stackPush()) {
-            nglClearNamedFramebufferiv(this.framebuffer.id, GL_STENCIL, 0, stack.nint(to));
-        }
-    }
-
     public GlTexture getDepthTex() {
         return this.depthBuffer;
     }

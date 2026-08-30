@@ -32,7 +32,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -46,7 +45,6 @@ public final class LodGenerationService {
         final Map<Long, Node> graphRoots = new ConcurrentHashMap<>();
         final Set<Long> trackedBatches = ConcurrentHashMap.newKeySet();
         final Map<Long, AtomicInteger> batchCounters = new ConcurrentHashMap<>();
-        final AtomicInteger remainingInRadius = new AtomicInteger(0);
         // chunks that failed to finish, retry count so we give up instead of looping
         final Map<Long, Integer> failCounts = new ConcurrentHashMap<>();
         boolean loaded;
@@ -62,17 +60,11 @@ public final class LodGenerationService {
     private final Map<ResourceKey<Level>, DimensionState> dimensionStates = new ConcurrentHashMap<>();
 
     private final AtomicInteger activeTaskCount = new AtomicInteger(0);
-    private final AtomicLong chunksQueued = new AtomicLong(), chunksCompleted = new AtomicLong();
-    private final AtomicLong chunksFailed = new AtomicLong(), chunksSkipped = new AtomicLong();
-    private final long[] rollingHistory = new long[10];
-    private int historyIndex;
-    private long lastCompletedCount, lastStatsTickTime;
     private final AtomicBoolean running = new AtomicBoolean();
 
     private final long[] recentTickTimes = new long[20];
     private int tickTimeIndex;
     private long lastTickNanos;
-    private final AtomicBoolean throttled = new AtomicBoolean();
     private volatile double loadFactor = 1.0;
     private static final double MSPT_SOFT = 1000.0 / 22.0;
     private static final double MSPT_HARD = 75.0;
@@ -80,7 +72,6 @@ public final class LodGenerationService {
     private MinecraftServer server;
     private ResourceKey<Level> currentDimensionKey;
     private ServerLevel currentLevel;
-    private final Map<UUID, ChunkPos> lastPlayerPositions = new ConcurrentHashMap<>();
     private BooleanSupplier pauseCheck = () -> false;
 
     private Thread workerThread;
@@ -148,12 +139,10 @@ public final class LodGenerationService {
         dimensionStates.clear();
         pendingTicketOps.clear();
         server = null;
-        resetStats();
         activeTaskCount.set(0);
         resetTpsMonitor();
         currentDimensionKey = null;
         currentLevel = null;
-        lastPlayerPositions.clear();
     }
 
     private void startWorker() {
@@ -376,7 +365,6 @@ public final class LodGenerationService {
             processedCount++;
             if (state.trackedChunks.add(pos.toLong())) {
                 activeTaskCount.incrementAndGet();
-                chunksQueued.incrementAndGet();
                 readyToGenerate.add(pos);
             } else {
                 throttle.release();
@@ -438,8 +426,7 @@ public final class LodGenerationService {
         processPendingTickets();
 
         tickTpsMonitor();
-        tickStats();
-        checkPlayerMovement();
+        updatePlayerDimensions();
 
         // drop far-away synced entries now and then so the set can't grow forever
         if (++syncPruneCounter >= SYNC_PRUNE_INTERVAL_TICKS) {
@@ -456,34 +443,15 @@ public final class LodGenerationService {
         }
     }
 
-    private void checkPlayerMovement() {
+    private void updatePlayerDimensions() {
         var players = getPlayers();
-        if (players.isEmpty()) {
-            if (!lastPlayerPositions.isEmpty()) {
-                lastPlayerPositions.clear();
-            }
-            return;
-        }
+        if (players.isEmpty()) return;
 
-        boolean shouldRescan = false;
         Map<ServerLevel, Integer> levelCounts = new HashMap<>();
 
         for (ServerPlayer player : players) {
             levelCounts.merge((ServerLevel) player.level(), 1, Integer::sum);
-            ChunkPos currentPos = player.chunkPosition();
-            ChunkPos lastPos = lastPlayerPositions.get(player.getUUID());
-
-            // on a dim change, treat it like a big move so we rescan and backfill
-            if (handleDimensionChange(player)) {
-                lastPlayerPositions.put(player.getUUID(), currentPos);
-                shouldRescan = true;
-                continue;
-            }
-
-            if (lastPos == null || distSq(lastPos, currentPos) >= 4) {
-                lastPlayerPositions.put(player.getUUID(), currentPos);
-                shouldRescan = true;
-            }
+            handleDimensionChange(player);
         }
 
         // only switch level when another has strictly more players
@@ -502,16 +470,6 @@ public final class LodGenerationService {
             return;
         }
 
-        Set<UUID> currentPlayerIds = new HashSet<>();
-        for (ServerPlayer p : players) currentPlayerIds.add(p.getUUID());
-        if (lastPlayerPositions.size() > currentPlayerIds.size()) {
-            lastPlayerPositions.keySet().removeIf(uuid -> !currentPlayerIds.contains(uuid));
-            shouldRescan = true;
-        }
-
-        if (shouldRescan) {
-            restartScan();
-        }
     }
 
     // drop synced entries well outside any player range, 2x margin avoids boundary churn
@@ -543,12 +501,6 @@ public final class LodGenerationService {
         }
     }
 
-    private double distSq(ChunkPos a, ChunkPos b) {
-        int dx = a.x - b.x;
-        int dz = a.z - b.z;
-        return (double) dx * dx + dz * dz;
-    }
-
     private void setupLevel(ServerLevel newLevel) {
         if (currentLevel != null && currentDimensionKey != null) {
             DimensionState oldState = dimensionStates.get(currentDimensionKey);
@@ -571,31 +523,6 @@ public final class LodGenerationService {
             state.loaded = true;
         }
 
-        restartScan();
-    }
-
-    private void restartScan() {
-        var players = getPlayers();
-        if (players.isEmpty()) return;
-
-        Map<DimensionState, Integer> maxCounts = new HashMap<>();
-        for (ServerPlayer player : players) {
-            DimensionState state = getOrSetupState((ServerLevel) player.level());
-            int radius = generationRadius();
-            int missing = countMissingInRange(state, player.chunkPosition(), radius);
-            maxCounts.merge(state, missing, Math::max);
-        }
-
-        maxCounts.forEach((state, count) -> state.remainingInRadius.set(count));
-    }
-
-    private void updateThrottleCapacity() {
-        int target = LodStreamingConfig.DATA.maxActiveTasks;
-        int available = throttle.availablePermits();
-        int maxPossible = available + activeTaskCount.get();
-        if (target > maxPossible) {
-            throttle.release(target - maxPossible);
-        }
     }
 
     private void processPendingTickets() {
@@ -659,25 +586,20 @@ public final class LodGenerationService {
         long key = pos.toLong();
         state.failCounts.remove(key);
         if (state.completedChunks.add(key)) {
-            chunksCompleted.incrementAndGet();
             markChunkCompleted(state, pos.x, pos.z);
-            state.remainingInRadius.decrementAndGet();
         } else {
-            chunksSkipped.incrementAndGet();
             markChunkCompleted(state, pos.x, pos.z);
         }
         decrementBatch(state, pos);
     }
 
     private void onFailure(DimensionState state, ChunkPos pos) {
-        chunksFailed.incrementAndGet();
         long key = pos.toLong();
         int fails = state.failCounts.merge(key, 1, Integer::sum);
         // after a few fails mark it done so findWork stops looping on the same batch
         if (fails >= MAX_CHUNK_RETRIES) {
             state.failCounts.remove(key);
             markChunkCompleted(state, pos.x, pos.z);
-            state.remainingInRadius.updateAndGet(v -> Math.max(0, v - 1));
         }
         decrementBatch(state, pos);
     }
@@ -711,15 +633,6 @@ public final class LodGenerationService {
         return out;
     }
 
-    public long getCompleted() { return chunksCompleted.get(); }
-    public long getSkipped() { return chunksSkipped.get(); }
-    public int getActiveTaskCount() { return activeTaskCount.get(); }
-    public int getRemainingInRadius() {
-        if (currentDimensionKey == null) return 0;
-        DimensionState state = dimensionStates.get(currentDimensionKey);
-        return state != null ? state.remainingInRadius.get() : 0;
-    }
-    public boolean isThrottled() { return throttled.get(); }
     public void setPauseCheck(BooleanSupplier check) {
         this.pauseCheck = check;
     }
@@ -745,55 +658,13 @@ public final class LodGenerationService {
         if (mspt <= MSPT_SOFT) loadFactor = 1.0;
         else if (mspt >= MSPT_HARD) loadFactor = 0.0;
         else loadFactor = 1.0 - (mspt - MSPT_SOFT) / (MSPT_HARD - MSPT_SOFT);
-        throttled.set(loadFactor <= 0.0);
     }
 
     private void resetTpsMonitor() {
         lastTickNanos = 0;
         tickTimeIndex = 0;
         Arrays.fill(recentTickTimes, 0);
-        throttled.set(false);
         loadFactor = 1.0;
-    }
-
-    private synchronized void tickStats() {
-        long now = System.currentTimeMillis();
-        long secondsPassed = (now - lastStatsTickTime) / 1000;
-        if (secondsPassed < 1) return;
-
-        long currentTotal = chunksCompleted.get();
-        long delta = currentTotal - lastCompletedCount;
-        long perSecond = delta / secondsPassed;
-        long remainder = delta % secondsPassed;
-        int updateCount = (int) Math.min(secondsPassed, rollingHistory.length);
-        for (int i = 0; i < updateCount; i++) {
-            rollingHistory[historyIndex] = perSecond + (i < remainder ? 1 : 0);
-            historyIndex = (historyIndex + 1) % rollingHistory.length;
-        }
-        lastCompletedCount = currentTotal;
-        lastStatsTickTime += secondsPassed * 1000;
-    }
-
-    public synchronized double getChunksPerSecond() {
-        long sum = 0;
-        int filled = 0;
-        for (long value : rollingHistory) {
-            sum += value;
-            if (value > 0) filled++;
-        }
-        return filled == 0 ? 0.0 : (double) sum / filled;
-    }
-
-    private void resetStats() {
-        chunksQueued.set(0);
-        chunksCompleted.set(0);
-        chunksFailed.set(0);
-        chunksSkipped.set(0);
-        synchronized (this) {
-            Arrays.fill(rollingHistory, 0);
-            lastCompletedCount = 0;
-            lastStatsTickTime = System.currentTimeMillis();
-        }
     }
 
     private static void saveChunks(ServerLevel level, ResourceKey<Level> dimension, Set<Long> completedChunks) {
@@ -1111,27 +982,6 @@ public final class LodGenerationService {
         return lx + (lz << 3);
     }
 
-    private static int countMissingInRange(DimensionState state, ChunkPos center, int radiusChunks) {
-        int cbx = center.x >> BATCH_SIZE_SHIFT;
-        int cbz = center.z >> BATCH_SIZE_SHIFT;
-        int rb = (radiusChunks + 3) >> BATCH_SIZE_SHIFT;
-
-        int rootSize = 1 << ROOT_SIZE_SHIFT;
-        int rbxMin = (cbx - rb) >> ROOT_SIZE_SHIFT;
-        int rbxMax = (cbx + rb) >> ROOT_SIZE_SHIFT;
-        int rbzMin = (cbz - rb) >> ROOT_SIZE_SHIFT;
-        int rbzMax = (cbz + rb) >> ROOT_SIZE_SHIFT;
-
-        int count = 0;
-        for (int rx = rbxMin; rx <= rbxMax; rx++) {
-            for (int rz = rbzMin; rz <= rbzMax; rz++) {
-                Node root = state.graphRoots.get(ChunkPos.asLong(rx, rz));
-                count += recursiveCount(root, 3, rx, rz, cbx, cbz, rb);
-            }
-        }
-        return count;
-    }
-
     private static void collectCompletedInRange(DimensionState state, ChunkPos center, int radiusChunks,
                                                 LongSet alreadySynced, List<ChunkPos> out, int maxResults) {
         int cbx = center.x >> BATCH_SIZE_SHIFT;
@@ -1214,62 +1064,6 @@ public final class LodGenerationService {
                 }
             }
         }
-    }
-
-    private static int recursiveCount(Node node, int level, int nx, int nz, int cbx, int cbz, int rb) {
-        int size = 1 << (3 * level);
-        if (getDistSq(nx, nz, size, cbx, cbz) > (double)rb * rb) return 0;
-        if (node != null && node.isFull()) return 0;
-
-        if (level == 0) return 1; // batch
-
-        if (node == null) {
-            // estimate chunks in circle inside empty node
-            if (level == 1) {
-                int c = 0;
-                for (int i = 0; i < 64; i++) {
-                    int bx = (nx << 3) + (i & 7);
-                    int bz = (nz << 3) + (i >> 3);
-                    if (getDistSq(bx, bz, 1, cbx, cbz) <= (double)rb * rb) c += 16;
-                }
-                return c;
-            }
-            // higher level, recurse null node
-            int c = 0;
-            for (int i = 0; i < 64; i++) {
-                int cx = (nx << 3) + (i & 7);
-                int cz = (nz << 3) + (i >> 3);
-                c += recursiveCount(null, level - 1, cx, cz, cbx, cbz, rb);
-            }
-            return c;
-        }
-
-        // l1 partial
-        if (level == 1) {
-            int c = 0;
-            for (int i = 0; i < 64; i++) {
-                if ((node.fullMask & (1L << i)) != 0) continue;
-                int bx = (nx << 3) + (i & 7);
-                int bz = (nz << 3) + (i >> 3);
-                if (getDistSq(bx, bz, 1, cbx, cbz) <= (double)rb * rb) {
-                    Integer mask = (Integer) node.children.getOrDefault(i, 0);
-                    c += (16 - Integer.bitCount(mask));
-                }
-            }
-            return c;
-        }
-
-        // higher level partial
-        int c = 0;
-        for (int i = 0; i < 64; i++) {
-            if ((node.fullMask & (1L << i)) != 0) continue;
-            int cx = (nx << 3) + (i & 7);
-            int cz = (nz << 3) + (i >> 3);
-            Object child = node.children.get(i);
-            Node childNode = (child instanceof Node) ? (Node) child : null;
-            c += recursiveCount(childNode, level - 1, cx, cz, cbx, cbz, rb);
-        }
-        return c;
     }
 
     private static long getBatchKey(int cx, int cz) {

@@ -9,11 +9,8 @@ import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
 import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
-import me.cortex.voxy.client.core.util.GPUTiming;
 import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
-
-import java.util.List;
 
 import static org.lwjgl.opengl.GL11C.GL_BLEND;
 import static org.lwjgl.opengl.GL11C.GL_DEPTH_COMPONENT;
@@ -45,14 +42,14 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
 
     private final SSAO ssao;
 
-    protected NormalRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
-        super(properties, nodeManager, nodeCleaner, traversal, false);
+    protected NormalRenderPipeline(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
+        super(nodeManager, nodeCleaner, traversal);
         this.useEnvFog = VoxyConfig.CONFIG.useEnvironmentalFog;
-        this.finalBlit = new FullscreenBlit(properties, "voxy:post/blit_texture_depth_cutout.frag",
+        this.finalBlit = new FullscreenBlit("voxy:post/blit_texture_depth_cutout.frag",
                 a->a.defineIf("USE_ENV_FOG", this.useEnvFog).define("EMIT_COLOUR"));
 
 
-        this.ssao = SSAO.createSSAO(properties, VoxyConfig.CONFIG.getSSAOMode());
+        this.ssao = SSAO.createSSAO(VoxyConfig.CONFIG.getSSAOMode());
     }
 
     @Override
@@ -85,7 +82,6 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
 
     @Override
     protected void postOpaquePreTranslucent(Viewport<?> viewport, int sourceFrameBuffer) {
-        GPUTiming.INSTANCE.marker("ao");
         this.ssao.computeSSAO(viewport, this.colourSSAOTex, this.colourTex, this.fb.getDepthTex(), sourceFrameBuffer);
         glBindFramebuffer(GL_FRAMEBUFFER, this.fbSSAO.id);
     }
@@ -155,9 +151,4 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
         super.free0();
     }
 
-    @Override
-    public void addDebug(List<String> debug) {
-        super.addDebug(debug);
-        this.ssao.addDebugInfo(debug);
-    }
 }

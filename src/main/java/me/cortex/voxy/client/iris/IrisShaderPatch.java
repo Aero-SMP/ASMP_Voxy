@@ -18,13 +18,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.function.Function;
-import java.util.function.IntSupplier;
 
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL33.*;
 
 public class IrisShaderPatch {
-    public static final int VERSION = ((IntSupplier)()->1).getAsInt();
+    public static final int VERSION = 1;
     public static final int SHADER_DEFINE_VERSION = 2;
 
 
@@ -178,7 +177,6 @@ public class IrisShaderPatch {
         public float[] renderScale;
         public boolean useViewportDims;
         public boolean skipShaderDepthHackFix;
-        //public boolean deferTranslucentRendering;
         public String checkValid() {
             if (this.blending != null) {
                 int i = 0;
@@ -270,10 +268,6 @@ public class IrisShaderPatch {
             return new float[]{this.patchData.renderScale[0],this.patchData.renderScale[0]};
         }
         return new float[]{Math.max(0.01f,this.patchData.renderScale[0]),Math.max(0.01f,this.patchData.renderScale[1])};
-    }
-
-    public boolean deferedTranslucentRendering() {
-        return false;//this.patchData.deferTranslucentRendering;
     }
 
     public Runnable createBlendSetup() {

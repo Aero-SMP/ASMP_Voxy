@@ -1,12 +1,10 @@
 package me.cortex.voxy.client.core.rendering.post;
 
-import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 
 import java.util.function.Consumer;
-import java.util.function.Function;
 
 import static org.lwjgl.opengl.GL11C.*;
 import static org.lwjgl.opengl.GL15C.GL_ELEMENT_ARRAY_BUFFER;
@@ -18,21 +16,21 @@ public class FullscreenBlit {
     private static final int EMPTY_VAO = glCreateVertexArrays();
 
     private final Shader shader;
-    public FullscreenBlit(RenderProperties properties, String fragId) {
-        this(properties, fragId, b->{});
+    public FullscreenBlit(String fragId) {
+        this(fragId, b->{});
     }
 
-    public FullscreenBlit(RenderProperties properties, String vertId, String fragId) {
-        this(properties, vertId, fragId, b->{});
+    public FullscreenBlit(String vertId, String fragId) {
+        this(vertId, fragId, b->{});
     }
 
-    public <T extends Shader> FullscreenBlit(RenderProperties properties, String fragId, Consumer<Shader.Builder<T>> applyer) {
-        this(properties, "voxy:post/fullscreen.vert", fragId, applyer);
+    public <T extends Shader> FullscreenBlit(String fragId, Consumer<Shader.Builder<T>> applyer) {
+        this("voxy:post/fullscreen.vert", fragId, applyer);
     }
 
-    public <T extends Shader> FullscreenBlit(RenderProperties properties, String vertId, String fragId, Consumer<Shader.Builder<T>> applyer) {
+    public <T extends Shader> FullscreenBlit(String vertId, String fragId, Consumer<Shader.Builder<T>> applyer) {
         this.shader = ((Shader.Builder<T>)Shader.make())
-                .apply(properties::apply)
+                .define("USE_ZERO_ONE_DEPTH")
                 .add(ShaderType.VERTEX, vertId)
                 .add(ShaderType.FRAGMENT, fragId)
                 .apply(applyer)

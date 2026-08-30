@@ -3,7 +3,7 @@ package me.cortex.voxy.common.world.other;
 import com.mojang.serialization.Dynamic;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.IMappingStorage;
+import me.cortex.voxy.common.config.section.SectionSerializationStorage;
 import me.cortex.voxy.common.util.Pair;
 import me.cortex.voxy.common.world.other.Mapper.BiomeEntry;
 import me.cortex.voxy.common.world.other.Mapper.StateEntry;
@@ -46,7 +46,7 @@ public class Mapper {
     private static final int BLOCK_STATE_TYPE = 1;
     private static final int BIOME_TYPE = 2;
 
-    private final IMappingStorage storage;
+    private final SectionSerializationStorage storage;
     public static final long UNKNOWN_MAPPING = -1;
     public static final long AIR = 0;
 
@@ -61,7 +61,7 @@ public class Mapper {
 
     private Consumer<StateEntry> newStateCallback;
     private Consumer<BiomeEntry> newBiomeCallback;
-    public Mapper(IMappingStorage storage) {
+    public Mapper(SectionSerializationStorage storage) {
         this.storage = storage;
         //Insert air since its a special entry (index 0)
         var airEntry = new StateEntry(0, Blocks.AIR.defaultBlockState());
@@ -81,20 +81,12 @@ public class Mapper {
         return (int) ((id>>27)&((1<<20)-1));
     }
 
-    public static int getBiomeId(long id) {
-        return (int) ((id>>47)&0x1FF);
-    }
-
     public static int getLightId(long id) {
         return (int) ((id>>56)&0xFF);
     }
 
     public static long withLight(long id, int light) {
         return (id&(~(0xFFL<<56)))|(Integer.toUnsignedLong(light&0xFF)<<56);
-    }
-
-    public static long withBlockBiome(long id, int block, int biome) {
-        return (id&(0xFFL<<56))|(Integer.toUnsignedLong(block)<<27)|(Integer.toUnsignedLong(biome)<<47);
     }
 
     public static long airWithLight(int light) {
@@ -237,12 +229,6 @@ public class Mapper {
     }
 
 
-    //TODO:FIXME: IS VERY SLOW NEED TO MAKE IT LOCK FREE, or at minimum use a concurrent map
-    public long getBaseId(byte light, BlockState state, Holder<Biome> biome) {
-        if (state.isAir()) return Byte.toUnsignedLong(light) <<56;//Special case and fast return for air, dont care about the biome
-        return composeMappingId(light, this.getIdForBlockState(state), this.getIdForBiome(biome));
-    }
-
     public BlockState getBlockStateFromBlockId(int blockId) {
         return this.blockId2stateEntry.get(blockId).state;
     }
@@ -280,22 +266,6 @@ public class Mapper {
             return Byte.toUnsignedLong(light)<<56;
         }
         return (Byte.toUnsignedLong(light)<<56)|(Integer.toUnsignedLong(biomeId) << 47)|(Integer.toUnsignedLong(blockId)<<27);
-    }
-
-    //TODO: fixme: synchronize access to this.blockId2stateEntry
-    public StateEntry[] getStateEntries() {
-        this.blockLock.lock();
-        var set = new ArrayList<>(this.blockId2stateEntry);
-        StateEntry[] out = new StateEntry[set.size()];
-        int i = 0;
-        for (var entry : set) {
-            if (entry.id != i++) {
-                throw new IllegalStateException();
-            }
-            out[i-1] = entry;
-        }
-        this.blockLock.unlock();
-        return out;
     }
 
     //TODO: fixme: synchronize access to this.biomeId2biomeEntry

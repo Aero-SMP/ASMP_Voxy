@@ -53,7 +53,7 @@ public class DownloadStream {
 
     public void download(GlBuffer buffer, long downloadOffset, long size, Consumer<MemoryBuffer> consumer) {
         this.download(buffer, downloadOffset, size, (ptr,size2)-> {
-            consumer.accept(MemoryBuffer.createUntrackedUnfreeableRawFrom(ptr, size));
+            consumer.accept(MemoryBuffer.createUnfreeableRawFrom(ptr, size));
         });
     }
 
@@ -148,21 +148,6 @@ public class DownloadStream {
         }
     }
 
-    //Synchonize force flushes everything
-    public void waitDiscard() {
-        glFinish();
-        var fence = new GlFence();
-        glFinish();
-        while (!fence.signaled())
-            Thread.onSpinWait();
-        fence.free();
-        while (!this.frames.isEmpty()) {
-            var frame = this.frames.pop();
-            while (!frame.fence.signaled()) Thread.onSpinWait();
-            frame.allocations.forEach(this.allocationArena::free);
-            frame.fence.free();
-        }
-    }
 
     public void flushWaitClear() {
         glFinish();

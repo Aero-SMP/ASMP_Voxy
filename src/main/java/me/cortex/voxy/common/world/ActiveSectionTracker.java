@@ -190,14 +190,11 @@ public class ActiveSectionTracker {
                 //We managed to acquire one of the pre locks, so just return the section
                 return section;
             } else {
-                //lock.lock();
                 {//Dont think need to lock here
                     if (section.tryAcquire()) {
                         return section;
                     }
                 }
-                //lock.unlock();
-
                 //We failed everything, try get it again
                 return this.acquire(key, nullOnEmpty);
             }
@@ -317,10 +314,6 @@ public class ActiveSectionTracker {
 
     public int getLoadedCacheCount() {
         return this.loadedSections.get();
-    }
-
-    public int getSecondaryCacheSize() {
-        return this.lruSecondaryCache.size();
     }
 
 }

@@ -1,6 +1,5 @@
 package me.cortex.voxy.client.core.rendering.util;
 
-import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.gl.GlVertexArray;
@@ -22,28 +21,24 @@ import static org.lwjgl.opengl.GL45C.glTextureBarrier;
 
 public class HiZBuffer {
     private final Shader hiz;
-    private final GlFramebuffer fb = new GlFramebuffer().name("HiZ");
+    private final GlFramebuffer fb = new GlFramebuffer();
     private final int sampler = glGenSamplers();
     private final int type;
     private GlTexture texture;
     private int levels;
     private int width;
     private int height;
-    private final RenderProperties properties;
-
-    public HiZBuffer(RenderProperties properties) {
-        this(properties, GL_DEPTH24_STENCIL8);
+    public HiZBuffer() {
+        this(GL_DEPTH24_STENCIL8);
     }
-    public HiZBuffer(RenderProperties properties, int type) {
+    public HiZBuffer(int type) {
         glNamedFramebufferDrawBuffer(this.fb.id, GL_NONE);
         this.type = type;
         this.hiz = Shader.make()
-                .apply(properties::apply)
+                .define("USE_ZERO_ONE_DEPTH")
                 .add(ShaderType.VERTEX, "voxy:hiz/blit.vsh")
                 .add(ShaderType.FRAGMENT, "voxy:hiz/blit.fsh")
-                .compile()
-                .name("HiZ Builder");
-        this.properties = properties;
+                .compile();
     }
 
     private void alloc(int width, int height) {
@@ -53,7 +48,7 @@ public class HiZBuffer {
         // (could probably increase it to be defined by a max meshlet coverage computation thing)
 
         //GL_DEPTH_COMPONENT32F //Cant use this as it does not match the depth format of the provided depth buffer
-        this.texture = new GlTexture().store(this.type, this.levels, width, height).name("HiZ");
+        this.texture = new GlTexture().store(this.type, this.levels, width, height);
         glTextureParameteri(this.texture.id, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
         glTextureParameteri(this.texture.id, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTextureParameteri(this.texture.id, GL_TEXTURE_COMPARE_MODE, GL_NONE);
@@ -110,7 +105,7 @@ public class HiZBuffer {
         glTextureParameteri(this.texture.id, GL_TEXTURE_BASE_LEVEL, 0);
         glTextureParameteri(this.texture.id, GL_TEXTURE_MAX_LEVEL, 1000);//TODO: CHECK IF ITS -1 or -0
 
-        glDepthFunc(this.properties.closerEqualDepthCompare());
+        glDepthFunc(GL_LEQUAL);
         glDisable(GL_DEPTH_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, boundFB);
         glViewport(0, 0, width, height);

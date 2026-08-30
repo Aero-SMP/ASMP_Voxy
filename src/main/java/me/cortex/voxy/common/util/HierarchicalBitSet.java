@@ -38,10 +38,6 @@ public class HierarchicalBitSet {
         idx =  Long.numberOfTrailingZeros(~dp) + 64*idx;
         int ret = idx;
 
-        //if (this.isSet(ret)) {
-        //    throw new IllegalStateException();
-        //}
-
         dp |= 1L<<(idx&0x3f);
         this.D[idx>>6] = dp;
         if (dp==-1) {
@@ -64,10 +60,6 @@ public class HierarchicalBitSet {
     }
 
     private void set(int idx) {
-        //if (this.isSet(idx)) {
-        //    throw new IllegalStateException();
-        //}
-
         this.endId += idx==(this.endId+1)?1:0;
         long dp = this.D[idx>>6] |= 1L<<(idx&0x3f);
         if (dp==-1) {

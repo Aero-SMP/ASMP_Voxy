@@ -308,7 +308,4 @@ public final class NodeStore {
     public int getEndNodeId() {
         return this.allocationSet.getMaxIndex();
     }
-    public int getNodeCount() {
-        return this.allocationSet.getCount();
-    }
 }

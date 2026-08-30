@@ -2,12 +2,8 @@ package me.cortex.voxy.client.core.model;
 
 
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
-import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.other.Mapper;
-import java.util.List;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -88,19 +84,8 @@ public class ModelBakerySubsystem {
         LockSupport.unpark(this.processingThread);
     }
 
-    public void addDebugData(List<String> debug) {
-        debug.add(String.format("IF/MC: %03d, %04d", this.factory.getInflightCount(),  this.factory.getBakedCount()));//Model bake queue/in flight/model baked count
-    }
-
     public ModelStore getStore() {
         return this.storage;
     }
 
-    public boolean areQueuesEmpty() {
-        return this.factory.getInflightCount() == 0;
-    }
-
-    public int getProcessingCount() {
-        return this.factory.getInflightCount();
-    }
 }

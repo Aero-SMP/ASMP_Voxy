@@ -29,9 +29,7 @@ public class MixinIrisRenderingPipeline implements IGetVoxyPatchData, IGetIrisVo
 
     @Inject(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/pipeline/transform/ShaderPrinter;resetPrintState()V", shift = At.Shift.AFTER))
     private void voxy$injectPatchDataStore(ProgramSet programSet, CallbackInfo ci) {
-        if (IrisUtil.SHADER_SUPPORT) {
-            this.patchData = ((IGetVoxyPatchData) programSet).voxy$getPatchData();
-        }
+        this.patchData = ((IGetVoxyPatchData) programSet).voxy$getPatchData();
     }
 
     @Inject(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/pipeline/IrisRenderingPipeline;createSetupComputes([Lnet/irisshaders/iris/shaderpack/programs/ComputeSource;Lnet/irisshaders/iris/shaderpack/programs/ProgramSet;Lnet/irisshaders/iris/shaderpack/texture/TextureStage;)[Lnet/irisshaders/iris/gl/program/ComputeProgram;"))

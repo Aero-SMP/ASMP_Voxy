@@ -1,11 +1,8 @@
 package me.cortex.voxy.common.world;
 
 
-import me.cortex.voxy.commonImpl.VoxyCommon;
-
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -13,9 +10,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 // holds a 32x32x32 region of detail
 public final class WorldSection {
     public static final int SECTION_VOLUME = 32*32*32;
-    public static final boolean VERIFY_WORLD_SECTION_EXECUTION = VoxyCommon.isVerificationFlagOn("verifyWorldSectionExecution");
-
-
     static final VarHandle ATOMIC_STATE_HANDLE;
     private static final VarHandle NON_EMPTY_CHILD_HANDLE;
     private static final VarHandle NON_EMPTY_BLOCK_HANDLE;
@@ -102,17 +96,7 @@ public final class WorldSection {
             }
             next = prev + 2;
         } while (!ATOMIC_STATE_HANDLE.compareAndSet(this, prev, next));
-        return (next&1) != 0;
-
-
-        /*
-        int prev, next;
-        do {
-            prev = (int) ATOMIC_STATE_HANDLE.get(this);
-            next = ((prev&1) != 0)?prev+2:prev;
-        } while (!ATOMIC_STATE_HANDLE.compareAndSet(this, prev, next));
-        return (next&1) != 0;
-         */
+        return true;
     }
 
     public int acquire() {
@@ -177,9 +161,6 @@ public final class WorldSection {
     }
 
     void _releaseArray() {
-        if (VERIFY_WORLD_SECTION_EXECUTION && this.data == null) {
-            throw new IllegalStateException();
-        }
         if (ARRAY_REUSE_CACHE_COUNT.get() < ARRAY_REUSE_CACHE_SIZE) {
             ARRAY_REUSE_CACHE.add(this.data);
             ARRAY_REUSE_CACHE_COUNT.incrementAndGet();
@@ -188,21 +169,8 @@ public final class WorldSection {
     }
 
 
-    public void assertNotFree() {
-        if (VERIFY_WORLD_SECTION_EXECUTION) {
-            if ((((int) ATOMIC_STATE_HANDLE.get(this)) & 1) == 0) {
-                throw new IllegalStateException();
-            }
-        }
-    }
-
     public static int getIndex(int x, int y, int z) {
         final int M = (1<<5)-1;
-        if (VERIFY_WORLD_SECTION_EXECUTION) {
-            if (x < 0 || x > M || y < 0 || y > M || z < 0 || z > M) {
-                throw new IllegalArgumentException("Out of bounds: " + x + ", " + y + ", " + z);
-            }
-        }
         return ((y&M)<<10)|((z&M)<<5)|(x&M);
     }
 
@@ -212,22 +180,6 @@ public final class WorldSection {
         long old = this.data[idx];
         this.data[idx] = id;
         return old;
-    }
-
-    //Generates a copy of the data array, this is to help with atomic operations like rendering
-    public long[] copyData() {
-        this.assertNotFree();
-        return Arrays.copyOf(this.data, this.data.length);
-    }
-
-    public void copyDataTo(long[] cache) {
-        copyDataTo(cache, 0);
-    }
-
-    public void copyDataTo(long[] cache, int dstOffset) {
-        this.assertNotFree();
-        if ((cache.length-dstOffset) < this.data.length) throw new IllegalArgumentException();
-        System.arraycopy(this.data, 0, cache, dstOffset, this.data.length);
     }
 
     public static int getChildIndex(int x, int y, int z) {
@@ -258,34 +210,16 @@ public final class WorldSection {
 
     public int addNonEmptyBlockCount(int delta) {
         int count = ((int)NON_EMPTY_BLOCK_HANDLE.getAndAdd(this, delta)) + delta;
-        if (VERIFY_WORLD_SECTION_EXECUTION) {
-            if (count < 0) {
-                throw new IllegalStateException("Count is negative!");
-            }
-        }
         return count;
     }
 
     public boolean updateLvl0State() {
-        if (VERIFY_WORLD_SECTION_EXECUTION) {
-            if (this.lvl != 0) {
-                throw new IllegalStateException("Tried updating a level 0 lod when its not level 0: " + WorldEngine.pprintPos(this.key));
-            }
-        }
         byte prev, next;
         do {
             prev = this.getNonEmptyChildren();
             next = (byte) (((int)NON_EMPTY_BLOCK_HANDLE.get(this))==0?0:0xFF);
         } while (!NON_EMPTY_CHILD_HANDLE.compareAndSet(this, prev, next));
         return prev != next;
-    }
-
-    public void _unsafeSetNonEmptyChildren(byte nonEmptyChildren) {
-        NON_EMPTY_CHILD_HANDLE.set(this, nonEmptyChildren);
-    }
-
-    public static WorldSection _createRawUntrackedUnsafeSection(int lvl, int x, int y, int z) {
-        return new WorldSection(lvl, x, y, z, null);
     }
 
     public void markDirty() {

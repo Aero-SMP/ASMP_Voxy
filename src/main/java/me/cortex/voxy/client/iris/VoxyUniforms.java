@@ -56,36 +56,16 @@ public class VoxyUniforms {
                 .uniformMatrix(PER_FRAME, "vxProj", VoxyUniforms::getProjection)
                 .uniformMatrix(PER_FRAME, "vxProjInv", new Inverted(VoxyUniforms::getProjection))
                 .uniformMatrix(PER_FRAME, "vxProjPrev", new PreviousMat(VoxyUniforms::getProjection));
-
-        /*
-        if (IrisShaderPatch.IMPERSONATE_DISTANT_HORIZONS) {
-            uniforms
-                    .uniform1f(PER_FRAME, "dhNearPlane", ()->16)//Presently hardcoded in voxy
-                    .uniform1f(PER_FRAME, "dhFarPlane", ()->16*3000)//Presently hardcoded in voxy
-
-                    .uniform1i(PER_FRAME, "dhRenderDistance", ()->Math.round(VoxyConfig.CONFIG.sectionRenderDistance*32*16))//In blocks
-                    .uniformMatrix(PER_FRAME, "dhProjection", VoxyUniforms::getProjection)
-                    .uniformMatrix(PER_FRAME, "dhProjectionInverse", new Inverted(VoxyUniforms::getProjection))
-                    .uniformMatrix(PER_FRAME, "dhPreviousProjection", new PreviousMat(VoxyUniforms::getProjection));
-        }*/
     }
 
 
 
 
     private record Inverted(Supplier<Matrix4fc> parent) implements Supplier<Matrix4fc> {
-        private Inverted(Supplier<Matrix4fc> parent) {
-            this.parent = parent;
-        }
-
         public Matrix4fc get() {
             Matrix4f copy = new Matrix4f(this.parent.get());
             copy.invert();
             return copy;
-        }
-
-        public Supplier<Matrix4fc> parent() {
-            return this.parent;
         }
     }
 

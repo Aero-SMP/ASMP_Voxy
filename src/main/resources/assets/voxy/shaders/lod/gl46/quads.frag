@@ -12,18 +12,12 @@
 layout(binding = 0) uniform sampler2D blockModelAtlas;
 layout(binding = 2) uniform sampler2D depthTex;
 
-//#define DEBUG_RENDER
-
 //TODO: need to fix when merged quads have discardAlpha set to false but they span multiple tiles
 // however they are not a full block
 
 layout(location = 0) in flat uvec4 interData;
 #ifndef USE_NV_BARRY
 layout(location = 1) in vec2 uv;
-#endif
-
-#ifdef DEBUG_RENDER
-layout(location = 7) in flat uint quadDebug;
 #endif
 
 
@@ -173,10 +167,8 @@ void main() {
     #endif
         //This is stupidly stupidly bad for divergence
         //TODO: FIXME, basicly what this do is sample the exact pixel (no lod) for discarding, this stops mipmapping fucking it over
-        #ifndef DEBUG_RENDER
         discard;
         return;
-        #endif
     }
 
     #ifndef PATCHED_SHADER_ALLOW_DERIVATIVES
@@ -188,15 +180,6 @@ void main() {
     #ifndef PATCHED_SHADER
     colour = computeColour(texPos, colour);
     outColour = colour;
-
-    #ifdef DEBUG_RENDER
-    uint hash = quadDebug*1231421+123141;
-    hash ^= hash>>16;
-    hash = hash*1231421+123141;
-    hash ^= hash>>16;
-    hash = hash * 1827364925 + 123325621;
-    outColour = vec4(float(hash&15u)/15, float((hash>>4)&15u)/15, float((hash>>8)&15u)/15, 0);
-    #endif
 
     #else
     uint modelId = getModelId();
@@ -249,4 +232,3 @@ colour = textureGrad(blockModelAtlas, texPos, dx, dy);
 
 //Undefine the depth stuff
 #import <voxy:util/depthutils.glsl>
-

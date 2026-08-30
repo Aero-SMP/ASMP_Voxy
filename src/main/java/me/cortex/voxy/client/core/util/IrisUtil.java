@@ -21,8 +21,6 @@ public class IrisUtil {
     public static CapturedViewportParameters CAPTURED_VIEWPORT_PARAMETERS;
 
     public static final boolean IRIS_INSTALLED = VoxyCommon.isModLoaded("iris") || VoxyCommon.isModLoaded("oculus");
-    public static final boolean SHADER_SUPPORT = true;//System.getProperty("voxy.enableExperimentalIrisPipeline", "false").equalsIgnoreCase("true");
-
 
     private static boolean irisShadowActive0() {
         return ShadowRenderer.ACTIVE;

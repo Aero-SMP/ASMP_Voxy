@@ -15,8 +15,6 @@ import net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings;
 import org.joml.Matrix4f;
 import org.lwjgl.opengl.GL30;
 
-import java.util.List;
-
 import static org.lwjgl.opengl.GL11.GL_DEPTH_BUFFER_BIT;
 import static org.lwjgl.opengl.GL30C.*;
 import static org.lwjgl.opengl.GL31.GL_UNIFORM_BUFFER;
@@ -31,8 +29,8 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
     private final GlBuffer shaderUniforms;
 
-    public IrisVoxyRenderPipeline(RenderProperties properties, IrisVoxyRenderPipelineData data, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
-        super(properties, nodeManager, nodeCleaner, traversal, data.shouldDeferTranslucency());
+    public IrisVoxyRenderPipeline(IrisVoxyRenderPipelineData data, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
+        super(nodeManager, nodeCleaner, traversal);
         this.data = data;
         if (this.data.thePipeline != null) {
             throw new IllegalStateException("Pipeline data already bound");
@@ -66,12 +64,12 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
         }
 
         if (!this.data.skipShaderDepthHackFix) {
-            this.shaderDepthHackFixTransformBlit = new FullscreenBlit(properties, "voxy:post/fullscreen2.vert", "voxy:post/noop.frag");
+            this.shaderDepthHackFixTransformBlit = new FullscreenBlit("voxy:post/fullscreen2.vert", "voxy:post/noop.frag");
         } else {
             this.shaderDepthHackFixTransformBlit = null;
         }
 
-        this.depthBlit = new FullscreenBlit(properties, "voxy:post/blit_texture_depth_cutout.frag");
+        this.depthBlit = new FullscreenBlit("voxy:post/blit_texture_depth_cutout.frag");
     }
 
     @Override
@@ -116,13 +114,6 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
         this.fb.resize(viewport.width, viewport.height);
         this.fbTranslucent.resize(viewport.width, viewport.height);
 
-        if (false) {//TODO: only do this if shader specifies
-            //Clear the colour component
-            glBindFramebuffer(GL_FRAMEBUFFER, this.fb.framebuffer.id);
-            glClearColor(0, 0, 0, 0);
-            glClear(GL_COLOR_BUFFER_BIT);
-        }
-
         if (!this.data.useViewportDims) {
             srcWidth = viewport.width;
             srcHeight = viewport.height;
@@ -141,23 +132,15 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
             glStencilFunc(GL_EQUAL, 0, 0xFF);//set the depth to 1 where the mask is 0
             this.shaderDepthHackFixTransformBlit.blit();
             glStencilFunc(GL_EQUAL, 1, 0xFF);//revert the mask test
-            glDepthFunc(this.properties.closerEqualDepthCompare());
+            glDepthFunc(GL_LEQUAL);
             glColorMask(true, true, true, true);
         }
 
         glTextureBarrier();
 
-        int msk = GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT;
-        if (true) {//TODO: make shader specified
-            if (false) {//TODO: only do this if shader specifies
-                glBindFramebuffer(GL_FRAMEBUFFER, this.fbTranslucent.framebuffer.id);
-                glClearColor(0, 0, 0, 0);
-                glClear(GL_COLOR_BUFFER_BIT);
-            }
-        } else {
-            msk |= GL_COLOR_BUFFER_BIT;
-        }
-        glBlitNamedFramebuffer(this.fb.framebuffer.id, this.fbTranslucent.framebuffer.id, 0,0, viewport.width, viewport.height, 0,0, viewport.width, viewport.height, msk, GL_NEAREST);
+        glBlitNamedFramebuffer(this.fb.framebuffer.id, this.fbTranslucent.framebuffer.id,
+                0, 0, viewport.width, viewport.height, 0, 0, viewport.width, viewport.height,
+                GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
     }
 
     @Override
@@ -210,12 +193,6 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
         if (this.data.getBlender() != null) {
             this.data.getBlender().run();
         }
-    }
-
-    @Override
-    public void addDebug(List<String> debug) {
-        debug.add("Using: " + this.getClass().getSimpleName());
-        super.addDebug(debug);
     }
 
     private static final int UNIFORM_BINDING_POINT = 7;//TODO make ths binding point... not randomly 5

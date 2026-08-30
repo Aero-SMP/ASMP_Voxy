@@ -16,6 +16,17 @@ https://discord.gg/6rH7nzmfg8 instead.
 
 The mod JAR is written to `build/libs/`.
 
+Commands, repair tools, F3 metrics, and generation/streaming diagnostics live in
+an optional nested mod. Include it in the Voxy JAR with:
+
+```shell
+./gradlew build -PincludeDebug=true
+```
+
+This still produces one distributable Voxy JAR in `build/libs/`; the debug mod is
+embedded inside it. Normal builds do not configure, compile, or package the
+debug mod.
+
 ## Deploying
 
 Configure the ignored `deploy.properties`, then deploy with a commit message:

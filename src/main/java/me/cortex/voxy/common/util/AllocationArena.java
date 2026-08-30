@@ -20,44 +20,16 @@ public class AllocationArena {
 
     private long sizeLimit = Long.MAX_VALUE;
     private long totalSize;
-    //Flags
-    private boolean resized;//If the required memory of the entire buffer grew
-
     public void reset() {
         this.FREE.clear();
         this.TAKEN.clear();
         this.sizeLimit = Long.MAX_VALUE;
         this.totalSize = 0;
-        this.resized = false;
-    }
-
-    //Gets and resets the resized flag
-    public boolean getResetResized() {
-        boolean ret = this.resized;
-        this.resized = false;
-        return ret;
     }
 
     public long getSize() {
         return this.totalSize;
     }
-
-
-    public int numFreeBlocks() {
-        return this.FREE.size();
-    }
-
-    public int getLargestFreeBlockSize(int index) {
-        var iter = this.FREE.tailSet(-1).iterator();
-        for (;index>0&&iter.hasPrevious();index--){iter.previousLong();}
-        long slot = iter.previousLong();
-        return (int) (slot>>ADDR_BITS);
-    }
-
-    /*
-    public long allocFromLargest(int size) {//Allocates from the largest avalible block, this is useful for expanding later on
-
-    }*/
 
     public long alloc(int size) {//TODO: add alignment support
         if (size == 0) throw new IllegalArgumentException();
@@ -65,7 +37,6 @@ public class AllocationArena {
         var iter = this.FREE.iterator(((long) size << ADDR_BITS)-1);
         if (!iter.hasNext()) {//No free space for allocation
             //Create new allocation
-            this.resized = true;
             long addr = this.totalSize;
             if (this.totalSize+size>this.sizeLimit) {
                 return SIZE_LIMIT;
@@ -82,7 +53,6 @@ public class AllocationArena {
                 this.TAKEN.add(((slot&ADDR_MSK)<<SIZE_BITS)|size);
                 this.FREE.add((((slot >>> ADDR_BITS)-size)<<ADDR_BITS)|((slot&ADDR_MSK)+size));
             }
-            //this.resized = false;
             return slot&ADDR_MSK;
         }
     }
@@ -111,7 +81,6 @@ public class AllocationArena {
             iter.nextLong();//Need to reset the iter into its state
         }//If there is no previous it means were at the start of the buffer, we might need to merge with block 0 if we are not block 0
         else if (!this.FREE.isEmpty()) {// if free is not empty it means we must merge with block of free starting at 0
-            //if (addr != 0)//FIXME: this is very dodgy solution, if addr == 0 it means its impossible for there to be a previous element
             if (this.FREE.remove(addr<<ADDR_BITS)) {//Attempt to remove block 0, this is very dodgy as it assumes block zero is 0 addr n size
                 slot = addr + size;//slot at address 0 and size of 0 block + new block
             }
@@ -129,12 +98,10 @@ public class AllocationArena {
             }
         }// if there is no next block it means that we have reached the end of the allocation sections and we can shrink the buffer
         else {
-            this.resized = true;
             this.totalSize -= (slot&SIZE_MSK);
             return (int) size;
         }
 
-        //this.resized = false;
         //Need to swap around the slot to be in FREE format
         slot = (slot>>>SIZE_BITS) | (slot<<ADDR_BITS);
         this.FREE.add(slot);//Add the free slot into segments
@@ -155,7 +122,6 @@ public class AllocationArena {
             throw new IllegalStateException();
         }
         long updatedSlot = (slot & (ADDR_MSK << SIZE_BITS)) | ((slot & SIZE_MSK) + extra);
-        //this.resized = false;
         if (iter.hasNext()) {
             long next = iter.nextLong();
             long endAddr = (slot>>>SIZE_BITS)+(slot&SIZE_MSK);
@@ -180,23 +146,10 @@ public class AllocationArena {
             iter.remove();
             this.TAKEN.add(updatedSlot);
             this.totalSize += extra;
-            //this.resized = true;
             return true;
         }
     }
 
-    public long getSize(long addr) {
-        addr &= ADDR_MSK;
-        var iter = this.TAKEN.iterator(addr << SIZE_BITS);
-        if (!iter.hasNext())
-            throw new IllegalArgumentException();
-        long slot = iter.nextLong();
-        if (slot>>SIZE_BITS != addr) {
-            throw new IllegalStateException();
-        }
-        return slot&SIZE_MSK;
-    }
-    
     public void setLimit(long size) {
         this.sizeLimit = size;
         if (this.sizeLimit < this.totalSize) {

@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.core.gl.shader;
 
 import me.cortex.voxy.client.core.gl.Capabilities;
-import me.cortex.voxy.client.core.gl.GlDebug;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.ThreadUtils;
 import me.cortex.voxy.common.util.TrackedObject;
@@ -38,12 +37,6 @@ public class Shader extends TrackedObject {
         super.free0();
         glDeleteProgram(this.id);
     }
-
-
-    public Shader name(String name) {
-        return GlDebug.name(name, this);
-    }
-
 
     @SafeVarargs
     public static Builder<Shader> make(BiFunction<ShaderType, String, String>... processor) {
@@ -89,7 +82,6 @@ public class Shader extends TrackedObject {
             return this;
         }
 
-        //Useful for inline setting (such as debug)
         public Builder<T> defineIf(String name, boolean condition) {
             if (condition) {
                 this.defines.put(name, "");

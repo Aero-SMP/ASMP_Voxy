@@ -46,19 +46,6 @@ public class VoxyCommon {
         IS_IN_MINECRAFT = inMinecraft;
     }
 
-    //This is hardcoded like this because people do not understand what they are doing
-    public static boolean isVerificationFlagOn(String name) {
-        return isVerificationFlagOn(name, false);
-    }
-
-    public static boolean isVerificationFlagOn(String name, boolean defaultOn) {
-        return System.getProperty("voxy."+name, defaultOn?"true":"false").equals("true");
-    }
-
-    public static void breakpoint() {
-        int breakpoint = 0;
-    }
-
     private static VoxyInstance INSTANCE;
     private static Supplier<VoxyInstance> FACTORY;
 
@@ -100,14 +87,6 @@ public class VoxyCommon {
     public static boolean isModLoaded(String modId) {
         var mods = LoadingModList.get();
         return mods != null && mods.getModFileById(modId) != null;
-    }
-
-    public static Path getModRootPath(String modId) {
-        var mods = LoadingModList.get();
-        if (mods == null) return null;
-
-        var info = mods.getModFileById(modId);
-        return info == null ? null : info.getFile().getSecureJar().getRootPath();
     }
 
     private static String getModVersion(String modId) {

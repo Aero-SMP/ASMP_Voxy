@@ -52,8 +52,6 @@ public final class LodStreamingConfig {
         public int maxQueueSize = 20000;
         public int maxActiveTasks = 20;
 
-        // client side, local to each player
-        public boolean showF3MenuStats = true;
     }
 
 }

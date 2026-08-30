@@ -205,21 +205,6 @@ public class SharedIndexBuffer {
         return buffer;
     }
 
-    public static MemoryBuffer generateQuadIndicesInt(int quadCount) {
-        MemoryBuffer buffer = new MemoryBuffer(quadCount * 6L * 2);
-        long ptr = buffer.address;
-        for(int i = 0; i < quadCount*4; i += 4) {
-            MemoryUtil.memPutInt(ptr + (0*4), i);
-            MemoryUtil.memPutInt(ptr + (1*4), (i + 1));
-            MemoryUtil.memPutInt(ptr + (2*4), (i + 2));
-            MemoryUtil.memPutInt(ptr + (3*4), (i + 1));
-            MemoryUtil.memPutInt(ptr + (4*4), (i + 3));
-            MemoryUtil.memPutInt(ptr + (5*4), (i + 2));
-            ptr += 6 * 4;
-        }
-        return buffer;
-    }
-
     public int id() {
         return this.indexBuffer.id;
     }

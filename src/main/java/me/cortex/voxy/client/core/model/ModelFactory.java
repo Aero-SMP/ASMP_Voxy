@@ -15,11 +15,9 @@ import me.cortex.voxy.common.util.Pair;
 import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColor;
-import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
@@ -32,7 +30,6 @@ import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.material.FluidState;
 import org.jetbrains.annotations.Nullable;
@@ -164,12 +161,6 @@ public class ModelFactory {
 
         var blockState = this.mapper.getBlockStateFromBlockId(blockId);
         if (blockState.getBlock() instanceof StairBlock sb) {
-                /*
-                if (sb.baseState.hasProperty(BlockStateProperties.WATERLOGGED)) {
-                    blockState = sb.baseState.setValue(BlockStateProperties.WATERLOGGED, blockState.getValue(BlockStateProperties.WATERLOGGED));
-                } else {
-                    blockState = sb.baseState;
-                }*/
             blockState = sb.baseState.getBlock().withPropertiesOf(blockState);
         }
 
@@ -975,19 +966,6 @@ public class ModelFactory {
         while (!this.uploadResults.isEmpty()) {
             this.uploadResults.poll().free();
         }
-    }
-
-    public int getBakedCount() {
-        return this.modelTexture2id.size();
-    }
-
-    public int getInflightCount() {
-        //TODO replace all of this with an atomic?
-        int size = this.blockStatesInFlight.size();
-        size += this.uploadResults.size();
-        size += this.biomeQueue.size();
-        size += this.bakeQueue.size();
-        return size;
     }
 
 

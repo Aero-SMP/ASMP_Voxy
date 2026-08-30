@@ -9,7 +9,6 @@ import me.cortex.voxy.common.util.HierarchicalBitSet;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import org.lwjgl.system.MemoryUtil;
 
-import java.util.function.Consumer;
 
 
 //Is basicly the manager for an "undefined" data store, the underlying store is irrelevant
@@ -120,10 +119,6 @@ public class BasicAsyncGeometryManager {
         this.heapRemoveUploads.remove(addr);
         //Create Meta
         return new SectionMeta(section.position, section.aabb, addr, size, section.offsets, section.childExistence);
-    }
-
-    public void downloadAndRemove(int id, Consumer<BuiltSection> callback) {
-        throw new IllegalStateException("Not yet implemented");
     }
 
     public Int2ObjectOpenHashMap<MemoryBuffer> getUploads() {

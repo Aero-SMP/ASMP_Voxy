@@ -8,30 +8,12 @@ import me.cortex.voxy.common.world.other.Mapper;
 import org.lwjgl.system.MemoryUtil;
 
 public class SaveLoadSystem3 {
-    public static final int STORAGE_VERSION = 0;
-
     private record SerializationCache(Long2ShortOpenHashMap lutMapCache, MemoryBuffer memoryBuffer) {
         public SerializationCache() {
             this(new Long2ShortOpenHashMap(1024), ThreadLocalMemoryBuffer.create(WorldSection.SECTION_VOLUME*2+WorldSection.SECTION_VOLUME*8+1024));
             this.lutMapCache.defaultReturnValue((short) -1);
         }
     }
-    public static int lin2z(int i) {//y,z,x
-        int x = i&0x1F;
-        int y = (i>>10)&0x1F;
-        int z = (i>>5)&0x1F;
-        return Integer.expand(x,0b1001001001001)|Integer.expand(y,0b10010010010010)|Integer.expand(z,0b100100100100100);
-
-        //zyxzyxzyxzyxzyx
-    }
-
-    public static int z2lin(int i) {
-        int x = Integer.compress(i, 0b1001001001001);
-        int y = Integer.compress(i, 0b10010010010010);
-        int z = Integer.compress(i, 0b100100100100100);
-        return x|(y<<10)|(z<<5);
-    }
-
     private static final ThreadLocal<SerializationCache> CACHE = ThreadLocal.withInitial(SerializationCache::new);
 
     //TODO: Cache like long2short and the short and other data to stop allocs
@@ -41,7 +23,7 @@ public class SaveLoadSystem3 {
 
         Long2ShortOpenHashMap LUT = cache.lutMapCache; LUT.clear();
 
-        MemoryBuffer buffer = cache.memoryBuffer().createUntrackedUnfreeableReference();
+        MemoryBuffer buffer = cache.memoryBuffer().createUnfreeableReference();
         long ptr = buffer.address;
 
         MemoryUtil.memPutLong(ptr, section.key); ptr += 8;
@@ -61,10 +43,6 @@ public class SaveLoadSystem3 {
             }
             MemoryUtil.memPutShort(blockPtr, mapping); blockPtr+=2;
         }
-        if (LUT.size() >= 1<<16) {
-            throw new IllegalStateException();
-        }
-
         //TODO: note! can actually have the first (last?) byte of metadata be the storage version!
         long metadata = 0;
         metadata |= Integer.toUnsignedLong(LUT.size());//Bottom 2 bytes
@@ -104,7 +82,6 @@ public class SaveLoadSystem3 {
             section.nonEmptyBlockCount = WorldSection.SECTION_VOLUME-emptyBlockCount;
         }
 
-        ptr = lutBasePtr + (metadata & 0xFFFF) * 8L;
         return true;
     }
 }

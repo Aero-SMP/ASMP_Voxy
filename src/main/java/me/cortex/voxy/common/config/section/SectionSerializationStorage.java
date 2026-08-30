@@ -2,7 +2,6 @@ package me.cortex.voxy.common.config.section;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.IMappingStorage;
 import me.cortex.voxy.common.config.storage.rocksdb.RocksDBStorageBackend;
 import me.cortex.voxy.common.util.ThreadLocalMemoryBuffer;
 import me.cortex.voxy.common.world.SaveLoadSystem3;
@@ -13,7 +12,7 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.function.LongConsumer;
 
-public class SectionSerializationStorage implements IMappingStorage {
+public class SectionSerializationStorage {
     public static final int BIGGEST_SERIALIZED_SECTION_SIZE = 32 * 32 * 32 * 8 * 2 + 8;
 
     private final RocksDBStorageBackend backend;
@@ -25,7 +24,7 @@ public class SectionSerializationStorage implements IMappingStorage {
     private static final ThreadLocalMemoryBuffer MEMORY_CACHE = new ThreadLocalMemoryBuffer(BIGGEST_SERIALIZED_SECTION_SIZE + 1024);
 
     public int loadSection(WorldSection into) {
-        var data = this.backend.getSectionData(into.key, MEMORY_CACHE.get().createUntrackedUnfreeableReference());
+        var data = this.backend.getSectionData(into.key, MEMORY_CACHE.get().createUnfreeableReference());
         if (data != null) {
             if (!SaveLoadSystem3.deserialize(into, data)) {
                 this.backend.deleteSectionData(into.key);
@@ -51,22 +50,18 @@ public class SectionSerializationStorage implements IMappingStorage {
         //Note that savedData isnt freed (the save system uses a cache)
     }
 
-    @Override
     public void putIdMapping(int id, ByteBuffer data) {
         this.backend.putIdMapping(id, data);
     }
 
-    @Override
     public Int2ObjectOpenHashMap<byte[]> getIdMappingsData() {
         return this.backend.getIdMappingsData();
     }
 
-    @Override
     public void flush() {
         this.backend.flush();
     }
 
-    @Override
     public void close() {
         this.backend.close();
     }

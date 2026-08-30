@@ -38,10 +38,6 @@ out gl_PerVertex {
 #endif
 #endif
 
-#ifdef DEBUG_RENDER
-layout(location = 7) out flat uint quadDebug;
-#endif
-
 vec2 taaShift();
 
 //TODO: add a mechanism so that some quads can ignore backface culling
@@ -72,11 +68,6 @@ void main() {
     //Note: other data is automatically discarded as it is undefiend and has not been generated
     interData = quad.attributeData;
 
-
-    #ifdef DEBUG_RENDER
-    //quadDebug = uint(extractDetail(pos));
-    quadDebug = uint(gl_VertexID)>>2;
-    #endif
 }
 
 #ifndef TAA_PATCH

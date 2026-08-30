@@ -1,6 +1,5 @@
 package me.cortex.voxy.client.core.model.bakery;
 
-import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
@@ -32,22 +31,10 @@ import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import org.lwjgl.system.MemoryUtil;
 
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
 
-import static org.lwjgl.opengl.ARBDirectStateAccess.glGetTextureImage;
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL11C.GL_RGBA;
-import static org.lwjgl.opengl.GL12.GL_PACK_IMAGE_HEIGHT;
-import static org.lwjgl.opengl.GL15C.glBindBuffer;
-import static org.lwjgl.opengl.GL21.GL_PIXEL_PACK_BUFFER;
-import static org.lwjgl.opengl.GL30C.GL_FRAMEBUFFER;
-import static org.lwjgl.opengl.GL30C.glBindFramebuffer;
 
 public class SoftwareModelTextureBakery {
     // Note: the first bit of metadata is if alpha discard is enabled
@@ -235,14 +222,7 @@ public class SoftwareModelTextureBakery {
             }
         }
 
-        // TODO: support block model entities
-        // BakedBlockEntityModel bbem = null;
-        if (state.hasBlockEntity()) {
-            // bbem = BakedBlockEntityModel.bake(state);
-        }
-
         boolean isAnyShaded = false;
-        boolean isAnyDarkend = false;
         boolean anyTranslucent = false;
         boolean anyDiscard = false;
         if (isBlock) {
@@ -250,7 +230,6 @@ public class SoftwareModelTextureBakery {
             this.translucentVC.reset();
             this.bakeBlockModel(state, blockRenderLayer);
             isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
-            isAnyDarkend |= this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
             anyTranslucent |= !this.translucentVC.isEmpty();
             anyDiscard |= this.opaqueVC.anyDiscard;
             if (!(this.opaqueVC.isEmpty() && this.translucentVC.isEmpty())) {// only render if there... is shit to
@@ -277,7 +256,6 @@ public class SoftwareModelTextureBakery {
                 if (this.opaqueVC.isEmpty() && this.translucentVC.isEmpty())
                     continue;
                 isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
-                isAnyDarkend |= this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
                 anyTranslucent |= !this.translucentVC.isEmpty();
                 anyDiscard |= this.opaqueVC.anyDiscard;
 
@@ -293,7 +271,7 @@ public class SoftwareModelTextureBakery {
             }
         }
 
-        return (isAnyShaded ? 1 : 0) | (isAnyDarkend ? 2 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0);
+        return (isAnyShaded ? 1 : 0) | (anyTranslucent ? 4 : 0) | (anyDiscard ? 8 : 0);
     }
 
     static {

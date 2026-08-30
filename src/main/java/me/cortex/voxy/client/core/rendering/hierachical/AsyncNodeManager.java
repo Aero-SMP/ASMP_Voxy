@@ -4,7 +4,6 @@ import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntConsumer;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
-import me.cortex.voxy.client.TimingStatistics;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
@@ -20,12 +19,10 @@ import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import org.lwjgl.system.MemoryUtil;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
@@ -44,7 +41,6 @@ import static org.lwjgl.opengl.GL43C.*;
 //An "async host" for a NodeManager, has specific synchonius entry and exit points
 // this is done off thread to reduce the amount of work done on the render thread, improving frame stability and reducing runtime overhead
 public class AsyncNodeManager {
-    private static final boolean VERIFY_NODE_MANAGER = VoxyCommon.isVerificationFlagOn("verifyNodeManager");
     private static final VarHandle RESULT_HANDLE;
     private static final VarHandle RESULT_CACHE_1_HANDLE;
     private static final VarHandle RESULT_CACHE_2_HANDLE;
@@ -482,9 +478,6 @@ public class AsyncNodeManager {
             throw new IllegalArgumentException("Should always have null");
         }
 
-        if (VERIFY_NODE_MANAGER) {
-            this.manager.verifyIntegrity();
-        }
     }
 
     private IntConsumer tlnAddCallback; private IntConsumer tlnRemoveCallback;
@@ -520,8 +513,6 @@ public class AsyncNodeManager {
             var upload = results.geometryUpload;
             if (!upload.dataUploadPoints.isEmpty()) {
                 ((BasicSectionGeometryData)this.geometryData).ensureAccessable(upload.maxElementAccess);
-                TimingStatistics.A.start();
-
                 int copies = upload.dataUploadPoints.size();
                 int upCopies = UploadStream.alignUpAlloc(copies*16);
                 int scratchSize = (int) upload.arena.getSize() * 8;
@@ -544,11 +535,9 @@ public class AsyncNodeManager {
                 glDispatchCompute(copies, 1, 1);//Execute the copies
                 glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-                TimingStatistics.A.stop();
             }
         }
 
-        TimingStatistics.B.start();
         if (!results.scatterWriteLocationMap.isEmpty()) {//Scatter write
             int count = results.scatterWriteLocationMap.size();//Number of writes, not chunks or uvec4 count
             int chunks = (count+3)/4;
@@ -566,13 +555,10 @@ public class AsyncNodeManager {
             glDispatchCompute((count+127)/128, 1, 1);
             glMemoryBarrier(GL_UNIFORM_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
         }
-        TimingStatistics.B.stop();
 
-        TimingStatistics.C.start();
         if (!results.cleanerOperations.isEmpty()) {
             cleaner.updateIds(results.cleanerOperations);
         }
-        TimingStatistics.C.stop();
 
         this.currentMaxNodeId = results.currentMaxNodeId;
         this.usedGeometryAmount = results.usedGeometry;
@@ -760,15 +746,6 @@ public class AsyncNodeManager {
 
         this.scatterWrite.free();
         this.multiMemcpy.free();
-    }
-
-    public void addDebug(List<String> debug) {
-        debug.add("UC/GC,#N: " + (this.getUsedGeometryCapacity()/(1<<20))+"/"+(this.getGeometryCapacity()/(1<<20)) + "," + (this.geometryData.getSectionCount()));
-        //debug.add("GUQ/NRC: " + this.geometryUpdateQueue.size()+"/"+this.removeBatchQueue.size());
-    }
-
-    public boolean hasWork() {
-        return this.workCounter.get()!=0 || RESULT_HANDLE.get(this) != null;
     }
 
     public void worldEvent(WorldSection section, int flags, int neighborMask) {

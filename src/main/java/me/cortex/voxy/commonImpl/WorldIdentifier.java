@@ -102,14 +102,6 @@ public class WorldIdentifier {
         return id.getOrCreateEngine();
     }
 
-    public static WorldEngine ofEngineNullable(Level level) {
-        var id = of(level);
-        if (id == null) {
-            return null;
-        }
-        return id.getNullable();
-    }
-
     public static long mixStafford13(long seed) {
         seed += 918759875987111L;
         seed = (seed ^ seed >>> 30) * -4658895280553007687L;

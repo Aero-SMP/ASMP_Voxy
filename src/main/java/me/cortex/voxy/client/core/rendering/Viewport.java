@@ -1,6 +1,5 @@
 package me.cortex.voxy.client.core.rendering;
 
-import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
@@ -39,9 +38,7 @@ public abstract class Viewport <A extends Viewport<A>> {
     public final Vector3i section = new Vector3i();
     public final Vector3f innerTranslation = new Vector3f();
 
-    private final RenderProperties properties;
-
-    protected Viewport(RenderProperties properties) {
+    protected Viewport() {
         Vector4f[] planes = null;
         try {
              planes = (Vector4f[]) planesField.get(this.frustum);
@@ -50,8 +47,7 @@ public abstract class Viewport <A extends Viewport<A>> {
         }
         this.frustumPlanes = planes;
 
-        this.properties = properties;
-        this.hiZBuffer = new HiZBuffer(properties);
+        this.hiZBuffer = new HiZBuffer();
     }
 
     public final void delete() {
@@ -110,7 +106,7 @@ public abstract class Viewport <A extends Viewport<A>> {
                 (float) (this.cameraZ-(sz<<5)));
 
         if (this.depthBoundingBuffer.resize(this.width, this.height)) {
-            this.depthBoundingBuffer.clear(this.properties.inverseClearDepth());
+            this.depthBoundingBuffer.clear(0.0f);
         }
 
         return (A) this;

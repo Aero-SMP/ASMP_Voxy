@@ -1,18 +1,14 @@
 package me.cortex.voxy.client.core.rendering.hierachical;
 
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
-import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.shader.AutoBindingShader;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
-import me.cortex.voxy.client.core.rendering.util.PrintfDebugUtil;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import org.lwjgl.opengl.ARBDirectStateAccess;
 import org.lwjgl.system.MemoryUtil;
 
-import static me.cortex.voxy.client.core.rendering.util.UploadStream.alignUp;
 import static org.lwjgl.opengl.GL30C.glBindBufferRange;
 import static org.lwjgl.opengl.GL42C.glMemoryBarrier;
 import static org.lwjgl.opengl.GL43C.*;
@@ -34,7 +30,7 @@ public class NodeCleaner {
     static final int OUTPUT_COUNT = 256;
 
 
-    private final AutoBindingShader sorter = Shader.makeAuto(PrintfDebugUtil.PRINTF_processor)
+    private final AutoBindingShader sorter = Shader.makeAuto()
             .define("WORK_SIZE", SORTING_WORKER_SIZE)
             .define("ELEMS_PER_THREAD", WORK_PER_THREAD)
             .define("OUTPUT_SIZE", OUTPUT_COUNT)
@@ -114,14 +110,8 @@ public class NodeCleaner {
     }
 
     private boolean shouldCleanGeometry() {
-        if (false) {
-            //If used more than 75% of geometry buffer
-            long used = this.nodeManager.getUsedGeometryCapacity();
-            return 3 < ((double) used) / ((double) (this.nodeManager.getGeometryCapacity() - used));
-        } else {
-            long remaining = this.nodeManager.getGeometryCapacity() - this.nodeManager.getUsedGeometryCapacity();
-            return remaining < 256_000_000;//If less than 256 mb free memory
-        }
+        long remaining = this.nodeManager.getGeometryCapacity() - this.nodeManager.getUsedGeometryCapacity();
+        return remaining < 256_000_000;//If less than 256 mb free memory
     }
 
     public void updateIds(IntOpenHashSet collection) {

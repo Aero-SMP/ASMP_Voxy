@@ -1,14 +1,10 @@
 package me.cortex.voxy.client.mixin.iris;
 
 import com.google.common.collect.ImmutableSet;
-import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import net.irisshaders.iris.shaderpack.properties.PackRenderTargetDirectives;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
-
-import java.util.Set;
 
 @Mixin(value = PackRenderTargetDirectives.class, remap = false)
 public class MixinPackRenderTargetDirectives {

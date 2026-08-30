@@ -354,8 +354,7 @@ public class LodNetwork {
                     blData,
                     sl != null ? sl.getData().clone() : null
                 ));
-            } catch (Throwable t) {
-                LodStreamingService.LOGGER.debug("skipped section {} of chunk {}: {}", sectionY, pos, t.toString());
+            } catch (Throwable ignored) {
             } finally {
                 statesRaw.release();
                 biomesRaw.release();
