@@ -87,14 +87,6 @@ tasks.named('processResources') {
     }
 }
 
-def lwjglVersion = '3.3.3'
-
-def shadedConfiguration = configurations.create('shadedDependencies') {
-    canBeConsumed = false
-    canBeResolved = true
-    transitive = false
-}
-
 dependencies {
     def sodiumVersion = providers.gradleProperty('sodium_version').get()
     compileOnly "net.caffeinemc:sodium-neoforge-mod:${sodiumVersion}"
@@ -118,44 +110,15 @@ dependencies {
     runtimeOnly "maven.modrinth:spark:${providers.gradleProperty('spark_version').get()}"
     compileOnly "maven.modrinth:vivecraft:${providers.gradleProperty('vivecraft_version').get()}"
 
-    implementation platform("org.lwjgl:lwjgl-bom:${lwjglVersion}")
-    implementation 'org.lwjgl:lwjgl'
-    implementation "org.lwjgl:lwjgl-zstd:${lwjglVersion}"
-    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
-    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
-    runtimeOnly "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-windows"
-    runtimeOnly "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux"
-
     def rocksdbVersion = providers.gradleProperty('rocksdb_version').get()
-    def lz4Version = providers.gradleProperty('lz4_version').get()
 
     implementation "org.rocksdb:rocksdbjni:${rocksdbVersion}"
-    implementation "org.lz4:lz4-java:${lz4Version}"
 
     jarJar "org.rocksdb:rocksdbjni:${rocksdbVersion}"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-windows"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
-    add shadedConfiguration.name, "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux"
-}
-
-tasks.named('jar', Jar) {
-    from({ shadedConfiguration.collect { zipTree(it) } }) {
-        exclude '**/module-info.class', 'META-INF/MANIFEST.MF', 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
-    }
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
 afterEvaluate {
-    [
-        "org.rocksdb:rocksdbjni:${providers.gradleProperty('rocksdb_version').get()}",
-        "org.lz4:lz4-java:${providers.gradleProperty('lz4_version').get()}",
-        "org.lwjgl:lwjgl-zstd:${lwjglVersion}",
-        "org.lwjgl:lwjgl-zstd:${lwjglVersion}:natives-linux",
-    ].each { dependency ->
-        dependencies.add('additionalRuntimeClasspath', dependency)
-    }
+    dependencies.add('additionalRuntimeClasspath', "org.rocksdb:rocksdbjni:${providers.gradleProperty('rocksdb_version').get()}")
 }
 
 neoForge {

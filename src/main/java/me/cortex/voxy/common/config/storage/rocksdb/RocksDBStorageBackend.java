@@ -1,16 +1,13 @@
 package me.cortex.voxy.common.config.storage.rocksdb;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
-import me.cortex.voxy.common.config.ConfigBuildCtx;
-import me.cortex.voxy.common.config.storage.StorageBackend;
-import me.cortex.voxy.common.config.storage.StorageConfig;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.world.WorldEngine;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.rocksdb.*;
 
-import java.io.File;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -19,7 +16,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.function.LongConsumer;
 
-public class RocksDBStorageBackend extends StorageBackend {
+public class RocksDBStorageBackend {
     private final RocksDB db;
     private final ColumnFamilyHandle worldSections;
     private final ColumnFamilyHandle idMappings;
@@ -29,38 +26,23 @@ public class RocksDBStorageBackend extends StorageBackend {
     //NOTE: closes in order
     private final List<AbstractImmutableNativeReference> closeList = new ArrayList<>();
 
-    public RocksDBStorageBackend(String path) {
-        /*
-        var lockPath = new File(path).toPath().resolve("LOCK");
-        if (Files.exists(lockPath)) {
-            System.err.println("WARNING, deleting rocksdb LOCK file");
-            int attempts = 10;
-            while (attempts-- != 0) {
-                try {
-                    Files.delete(lockPath);
-                    break;
-                } catch (IOException e) {
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException ex) {
-                        throw new RuntimeException(ex);
-                    }
-                }
-            }
-            if (Files.exists(lockPath)) {
-                throw new RuntimeException("Unable to delete rocksdb lock file");
-            }
-        }
-         */
+    public RocksDBStorageBackend(Path path) {
         RocksDB.loadLibrary();
 
-        //TODO: FIXME: DONT USE THE SAME options PER COLUMN FAMILY
+        try {
+            Files.createDirectories(path);
+        } catch (IOException e) {
+            throw new RuntimeException("Unable to create Voxy storage directory " + path, e);
+        }
+
         final ColumnFamilyOptions cfOpts = new ColumnFamilyOptions()
-                .setCompressionType(CompressionType.ZSTD_COMPRESSION)
-                .optimizeForSmallDb();
+                .optimizeForSmallDb()
+                .setCompressionType(CompressionType.LZ4_COMPRESSION)
+                .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION);
 
         final ColumnFamilyOptions cfWorldSecOpts = new ColumnFamilyOptions()
-                .setCompressionType(CompressionType.NO_COMPRESSION)
+                .setCompressionType(CompressionType.LZ4_COMPRESSION)
+                .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
                 .setCompactionPriority(CompactionPriority.MinOverlappingRatio)
                 .setLevelCompactionDynamicLevelBytes(true)
                 .optimizeForPointLookup(128);
@@ -95,7 +77,7 @@ public class RocksDBStorageBackend extends StorageBackend {
         try {
 
             this.db = RocksDB.open(options,
-                    path, cfDescriptors,
+                    path.toString(), cfDescriptors,
                     handles);
 
             this.sectionReadOps = new ReadOptions();
@@ -119,7 +101,6 @@ public class RocksDBStorageBackend extends StorageBackend {
         }
     }
 
-    @Override
     public void iteratePositions(int level, LongConsumer consumer) {
         try (var stack = MemoryStack.stackPush()) {
             try (var iter = this.db.newIterator(this.worldSections, this.sectionReadOps)) {
@@ -148,14 +129,10 @@ public class RocksDBStorageBackend extends StorageBackend {
         }
     }
 
-    @Override
     public MemoryBuffer getSectionData(long key, MemoryBuffer scratch) {
         try (var stack = MemoryStack.stackPush()){
             var buffer = stack.malloc(8);
-            //HATE JAVA HATE JAVA HATE JAVA, Long.reverseBytes()
-            //THIS WILL ONLY WORK ON LITTLE ENDIAN SYSTEM AAAAAAAAA ;-;
-
-            MemoryUtil.memPutLong(MemoryUtil.memAddress(buffer), Long.reverseBytes(swizzlePos(key)));
+            MemoryUtil.memPutLong(MemoryUtil.memAddress(buffer), Long.reverseBytes(key));
 
             var result = this.db.get(this.worldSections,
                     this.sectionReadOps,
@@ -172,27 +149,24 @@ public class RocksDBStorageBackend extends StorageBackend {
         }
     }
 
-    @Override
     public void setSectionData(long key, MemoryBuffer data) {
         try (var stack = MemoryStack.stackPush()) {
             var keyBuff = stack.calloc(8);
-            MemoryUtil.memPutLong(MemoryUtil.memAddress(keyBuff), Long.reverseBytes(swizzlePos(key)));
+            MemoryUtil.memPutLong(MemoryUtil.memAddress(keyBuff), Long.reverseBytes(key));
             this.db.put(this.worldSections, this.sectionWriteOps, keyBuff, data.asByteBuffer());
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
     }
 
-    @Override
     public void deleteSectionData(long key) {
         try {
-            this.db.delete(this.worldSections, longToBytes(swizzlePos(key)));
+            this.db.delete(this.worldSections, longToBytes(key));
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         }
     }
 
-    @Override
     public void putIdMapping(int id, ByteBuffer data) {
         try {
             var buffer = new byte[data.remaining()];
@@ -205,7 +179,6 @@ public class RocksDBStorageBackend extends StorageBackend {
         }
     }
 
-    @Override
     public Int2ObjectOpenHashMap<byte[]> getIdMappingsData() {
         var out = new Int2ObjectOpenHashMap<byte[]>();
         try (var iterator = this.db.newIterator(this.idMappings)) {
@@ -216,7 +189,6 @@ public class RocksDBStorageBackend extends StorageBackend {
         return out;
     }
 
-    @Override
     public void flush() {
         try {
             this.db.flushWal(true);
@@ -225,10 +197,8 @@ public class RocksDBStorageBackend extends StorageBackend {
         }
     }
 
-    @Override
     public void close() {
         this.flush();
-        //this.db.cancelAllBackgroundWork(true);//Rocksdb does this automatically (afak)
         this.closeList.forEach(AbstractImmutableNativeReference::close);
         try {
             this.db.closeE();
@@ -251,27 +221,5 @@ public class RocksDBStorageBackend extends StorageBackend {
             l >>= Byte.SIZE;
         }
         return result;
-    }
-
-    public static class Config extends StorageConfig {
-        @Override
-        public StorageBackend build(ConfigBuildCtx ctx) {
-            return new RocksDBStorageBackend(ctx.ensurePathExists(ctx.substituteString(ctx.resolvePath())));
-        }
-
-        public static String getConfigTypeName() {
-            return "RocksDB";
-        }
-    }
-
-    private static long swizzlePos(long key) {
-        if (true) {
-            return key;
-        }
-        if (WorldEngine.POS_FORMAT_VERSION != 1) throw new IllegalStateException("TODO: UPDATE THIS");
-        return  (key&(0xFL<<60)) |
-                Long.expand((key>>> 4)&((1L<<24)-1), 0b01010101010101010101010101010101_001001001001001001001001L) |
-                Long.expand((key>>>52)&0xFF,         0b00000000000000000000000000000000_100100100100100100100100L) |
-                Long.expand((key>>>28)&((1L<<24)-1), 0b10101010101010101010101010101010_010010010010010010010010L);
     }
 }

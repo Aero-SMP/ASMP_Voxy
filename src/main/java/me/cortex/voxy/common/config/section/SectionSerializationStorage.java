@@ -2,10 +2,8 @@ package me.cortex.voxy.common.config.section;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.ConfigBuildCtx;
 import me.cortex.voxy.common.config.IMappingStorage;
-import me.cortex.voxy.common.config.storage.StorageBackend;
-import me.cortex.voxy.common.config.storage.StorageConfig;
+import me.cortex.voxy.common.config.storage.rocksdb.RocksDBStorageBackend;
 import me.cortex.voxy.common.util.ThreadLocalMemoryBuffer;
 import me.cortex.voxy.common.world.SaveLoadSystem3;
 import me.cortex.voxy.common.world.WorldSection;
@@ -18,8 +16,9 @@ import java.util.function.LongConsumer;
 public class SectionSerializationStorage implements IMappingStorage {
     public static final int BIGGEST_SERIALIZED_SECTION_SIZE = 32 * 32 * 32 * 8 * 2 + 8;
 
-    private final StorageBackend backend;
-    public SectionSerializationStorage(StorageBackend storageBackend) {
+    private final RocksDBStorageBackend backend;
+
+    public SectionSerializationStorage(RocksDBStorageBackend storageBackend) {
         this.backend = storageBackend;
     }
 
@@ -74,18 +73,5 @@ public class SectionSerializationStorage implements IMappingStorage {
 
     public void iteratePositions(int level, LongConsumer consumer) {
         this.backend.iteratePositions(level, consumer);
-    }
-
-    public static class Config extends SectionStorageConfig {
-        public StorageConfig storage;
-
-        @Override
-        public SectionSerializationStorage build(ConfigBuildCtx ctx) {
-            return new SectionSerializationStorage(this.storage.build(ctx));
-        }
-
-        public static String getConfigTypeName() {
-            return "Serializer";
-        }
     }
 }
