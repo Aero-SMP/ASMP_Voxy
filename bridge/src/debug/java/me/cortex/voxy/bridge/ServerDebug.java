@@ -1,0 +1,130 @@
+package me.cortex.voxy.bridge;
+
+import me.cortex.voxy.network.DebugPayload;
+import me.cortex.voxy.network.TransportPayload;
+import net.minecraft.server.level.ServerPlayer;
+import net.neoforged.neoforge.network.registration.PayloadRegistrar;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Server-side telemetry compiled only into the debug bridge JAR. */
+final class ServerDebug {
+    private static final Logger LOGGER = LoggerFactory.getLogger("Voxy Minecraft Bridge");
+    private static final Path LOG = Path.of("logs", "voxy-debug.log").toAbsolutePath();
+    private static final ConcurrentHashMap<UUID, Stats> SESSIONS = new ConcurrentHashMap<>();
+    private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(action -> {
+        Thread thread = new Thread(action, "Voxy debug log writer");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    private ServerDebug() {}
+
+    static void register(PayloadRegistrar registrar) {
+        registrar.playBidirectional(DebugPayload.TYPE, DebugPayload.CODEC,
+                (payload, context) -> receive((ServerPlayer) context.player(), payload));
+    }
+
+    static void serverStart(byte transport) {
+        append("server-start transport="
+                + (transport == TransportPayload.MINECRAFT ? "minecraft" : "direct"));
+    }
+
+    static void sessionOpened(ServerPlayer player, Object session) {
+        SESSIONS.put(player.getUUID(), new Stats(session));
+    }
+
+    static void sessionClosed(ServerPlayer player, Object session) {
+        Stats stats = current(player.getUUID(), session);
+        if (stats != null) SESSIONS.remove(player.getUUID(), stats);
+    }
+
+    static void fromClient(ServerPlayer player, Object session, int bytes) {
+        Stats stats = current(player.getUUID(), session);
+        if (stats == null) return;
+        stats.fromClientBytes.addAndGet(bytes);
+        stats.fromClientPackets.incrementAndGet();
+    }
+
+    static void dequeued(ServerPlayer player, Object session) {
+        Stats stats = current(player.getUUID(), session);
+        if (stats != null) stats.dequeuedPackets.incrementAndGet();
+    }
+
+    static void toClient(ServerPlayer player, Object session, int bytes) {
+        Stats stats = current(player.getUUID(), session);
+        if (stats == null) return;
+        stats.toClientBytes.addAndGet(bytes);
+        stats.toClientPackets.incrementAndGet();
+    }
+
+    private static Stats current(UUID player, Object session) {
+        Stats stats = SESSIONS.get(player);
+        return stats != null && stats.session == session ? stats : null;
+    }
+
+    private static void receive(ServerPlayer player, DebugPayload payload) {
+        if (payload.message().isEmpty()) return;
+        Stats stats = SESSIONS.get(player.getUUID());
+        var channel = player.connection.getConnection().channel();
+        append("player=" + player.getScoreboardName()
+                + " uuid=" + player.getUUID()
+                + " sequence=" + payload.sequence()
+                + " mcLatencyMs=" + player.connection.latency()
+                + " mcWritable=" + channel.isWritable()
+                + " mcBytesBeforeWritable=" + channel.bytesBeforeWritable()
+                + " mcBytesBeforeUnwritable=" + channel.bytesBeforeUnwritable()
+                + (stats == null ? " bridge=closed" : stats.describe())
+                + " client={" + payload.message().replace('\n', ' ').replace('\r', ' ') + '}');
+        if (player.connection.isAcceptingMessages()
+                && player.connection.hasChannel(DebugPayload.TYPE)) {
+            player.connection.send(new DebugPayload(payload.sequence(), payload.sentNanos(), ""));
+        }
+    }
+
+    private static void append(String message) {
+        WRITER.execute(() -> {
+            try {
+                Files.createDirectories(LOG.getParent());
+                Files.writeString(LOG, Instant.now() + " " + message + System.lineSeparator(),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException exception) {
+                LOGGER.error("Could not write Voxy debug log", exception);
+            }
+        });
+    }
+
+    private static final class Stats {
+        private final Object session;
+        private final AtomicLong toClientBytes = new AtomicLong();
+        private final AtomicLong toClientPackets = new AtomicLong();
+        private final AtomicLong fromClientBytes = new AtomicLong();
+        private final AtomicLong fromClientPackets = new AtomicLong();
+        private final AtomicLong dequeuedPackets = new AtomicLong();
+
+        private Stats(Object session) {
+            this.session = session;
+        }
+
+        private String describe() {
+            long queued = Math.max(0, this.fromClientPackets.get() - this.dequeuedPackets.get());
+            return " bridgeOpen=true"
+                    + " bridgeQueue=" + queued
+                    + " bridgeToClientPackets=" + this.toClientPackets.get()
+                    + " bridgeToClientBytes=" + this.toClientBytes.get()
+                    + " bridgeFromClientPackets=" + this.fromClientPackets.get()
+                    + " bridgeFromClientBytes=" + this.fromClientBytes.get();
+        }
+    }
+}

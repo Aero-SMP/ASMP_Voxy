@@ -1,6 +1,6 @@
 package me.cortex.voxy.client;
 
-import me.cortex.voxy.client.lod.ClientLodStreaming;
+import me.cortex.voxy.client.lod.ClientLodNetwork;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.config.VoxyConfig;
@@ -22,7 +22,7 @@ public class VoxyClient {
     public static boolean inSession;
 
     public VoxyClient(IEventBus modBus) {
-        new ClientLodStreaming();
+        ClientLodNetwork.init(modBus);
     }
 
     public static void initVoxyClient() {
@@ -58,7 +58,7 @@ public class VoxyClient {
 
             SharedIndexBuffer.INSTANCE.id();
 
-            VoxyCommon.setInstanceFactory(VoxyClientInstance::new);
+            VoxyCommon.setAvailable();
 
             if (!Capabilities.INSTANCE.subgroup) {
                 Logger.warn("GPU does not support subgroup operations, expect some performance degradation");
@@ -69,17 +69,33 @@ public class VoxyClient {
 
     public static void sessionStart() {
         if (inSession) throw new IllegalStateException("Cannot start new session while in a session");
-        inSession = true;
-
-        if (VoxyCommon.getInstance() != null) throw new IllegalStateException();
-        if (VoxyCommon.isAvailable() && VoxyConfig.CONFIG.enabled) {
-            VoxyCommon.createInstance();
+        try {
+            ClientLodNetwork.resetDemand();
+            inSession = true;
+            if (VoxyCommon.getInstance() != null) throw new IllegalStateException();
+            if (VoxyCommon.isAvailable() && VoxyConfig.CONFIG.enabled) {
+                VoxyCommon.createInstance();
+            }
+        } catch (RuntimeException exception) {
+            ClientLodNetwork.disconnect();
+            try {
+                VoxyCommon.shutdownInstance();
+            } catch (RuntimeException cleanupException) {
+                exception.addSuppressed(cleanupException);
+            } finally {
+                inSession = false;
+            }
+            throw exception;
         }
     }
 
     public static void sessionEnd() {
         if (!inSession) throw new IllegalStateException("Cannot end a session while not in a session");
-        inSession = false;
-        VoxyCommon.shutdownInstance();
+        ClientLodNetwork.disconnect();
+        try { VoxyCommon.shutdownInstance(); }
+        finally {
+            ClientLodNetwork.resetDemand();
+            inSession = false;
+        }
     }
 }

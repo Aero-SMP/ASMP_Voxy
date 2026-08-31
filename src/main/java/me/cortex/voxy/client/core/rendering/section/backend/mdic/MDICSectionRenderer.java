@@ -9,12 +9,14 @@ import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.model.ModelStore;
-import me.cortex.voxy.client.core.rendering.section.backend.AbstractSectionRenderer;
+import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.common.Logger;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.Direction;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryUtil;
 
@@ -34,7 +36,7 @@ import static org.lwjgl.opengl.GL45.glBindTextureUnit;
 import static org.lwjgl.opengl.NVRepresentativeFragmentTest.GL_REPRESENTATIVE_FRAGMENT_TEST_NV;
 
 //Uses MDIC to render the sections
-public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
+public final class MDICSectionRenderer {
     public static final int OPAQUE_DRAW_COUNT = 400_000;//in draw calls
     public static final int TRANSLUCENT_DRAW_COUNT = 100_000;//in draw calls
     public static final int TEMPORAL_DRAW_COUNT = 100_000;//in draw calls
@@ -42,6 +44,8 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
     private static final int TEMPORAL_OFFSET = TRANSLUCENT_OFFSET+TRANSLUCENT_DRAW_COUNT;//in draw calls
     private final Shader terrainShader;
     private final Shader translucentTerrainShader;
+    private final BasicSectionGeometryData geometryManager;
+    private final ModelStore modelStore;
 
     private final Shader commandGenShader = Shader.make()
             .define("TRANSLUCENT_WRITE_BASE", 1024)
@@ -79,7 +83,8 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
 
     private final AbstractRenderPipeline pipeline;
     public MDICSectionRenderer(AbstractRenderPipeline pipeline, ModelStore modelStore, BasicSectionGeometryData geometryData) {
-        super(modelStore, geometryData);
+        this.modelStore = modelStore;
+        this.geometryManager = geometryData;
         this.pipeline = pipeline;
         //The pipeline can be used to transform the renderer in abstract ways
 
@@ -103,13 +108,13 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
 
         String frag = ShaderLoader.parse("voxy:lod/gl46/quads.frag");
 
-        String opaqueFrag = pipeline.patchOpaqueShader(this, frag);
+        String opaqueFrag = pipeline.patchOpaqueShader(frag);
         opaqueFrag = opaqueFrag==null?frag:opaqueFrag;
 
         //TODO: find a more robust/nicer way todo this
         this.terrainShader = tryCompilePatchedOrNormal(builder, opaqueFrag, frag);
 
-        String translucentFrag = pipeline.patchTranslucentShader(this, frag);
+        String translucentFrag = pipeline.patchTranslucentShader(frag);
         translucentFrag = translucentFrag==null?frag:translucentFrag;
 
         this.translucentTerrainShader = tryCompilePatchedOrNormal(builder.define("TRANSLUCENT"), translucentFrag, frag);
@@ -130,7 +135,7 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
         }
     }
 
-    private void uploadUniformBuffer(MDICViewport viewport) {
+    private void uploadUniformBuffer(Viewport viewport) {
         long ptr = UploadStream.INSTANCE.upload(this.uniform, 0, 1024);
         
         var mat = new Matrix4f(viewport.MVP);
@@ -150,7 +155,7 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
     }
 
 
-    private void bindRenderingBuffers(MDICViewport viewport) {
+    private void bindRenderingBuffers(Viewport viewport) {
         glBindBufferBase(GL_UNIFORM_BUFFER, 0, this.uniform.id);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, this.geometryManager.getGeometryBuffer().id);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, this.geometryManager.getMetadataBuffer().id);
@@ -165,8 +170,7 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
         glBindBuffer(GL_PARAMETER_BUFFER_ARB, viewport.drawCountCallBuffer.id);
     }
 
-    private void renderTerrain(MDICViewport viewport, long indirectOffset, long drawCountOffset, int maxDrawCount) {
-        //RenderLayer.getCutoutMipped().startDrawing();
+    private void renderTerrain(Viewport viewport, long indirectOffset, long drawCountOffset, int maxDrawCount) {
 
 
         glDisable(GL_CULL_FACE);
@@ -190,11 +194,9 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
         glBindSampler(1, 0);
         glBindTextureUnit(1, 0);
 
-        //RenderLayer.getCutoutMipped().endDrawing();
     }
 
-    @Override
-    public void renderOpaque(MDICViewport viewport) {
+    public void renderOpaque(Viewport viewport) {
         if (this.geometryManager.getSectionCount() == 0) return;
 
         this.uploadUniformBuffer(viewport);
@@ -202,8 +204,7 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
         this.renderTerrain(viewport, 0, 4*3, Math.min((int)(this.geometryManager.getSectionCount()*4.4+128), OPAQUE_DRAW_COUNT));
     }
 
-    @Override
-    public void renderTranslucent(MDICViewport viewport) {
+    public void renderTranslucent(Viewport viewport) {
         if (this.geometryManager.getSectionCount() == 0) return;
 
         glEnable(GL_BLEND);
@@ -231,8 +232,7 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
         glDisable(GL_BLEND);
     }
 
-    @Override
-    public void buildDrawCalls(MDICViewport viewport) {
+    public void buildDrawCalls(Viewport viewport) {
         if (this.geometryManager.getSectionCount() == 0) return;
         this.uploadUniformBuffer(viewport);
         //Can do a sneeky trick, since the sectionRenderList is a list to things to render, it invokes the culler
@@ -318,19 +318,16 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
 
     }
 
-    @Override
-    public void renderTemporal(MDICViewport viewport) {
+    public void renderTemporal(Viewport viewport) {
         if (this.geometryManager.getSectionCount() == 0) return;
         //Render temporal
         this.renderTerrain(viewport, TEMPORAL_OFFSET*5*4, 4*5, Math.min(this.geometryManager.getSectionCount(), TEMPORAL_DRAW_COUNT));
     }
 
-    @Override
-    public MDICViewport createViewport() {
-        return new MDICViewport(this.geometryManager.getMaxSectionCount());
+    public Viewport createViewport() {
+        return new Viewport(this.geometryManager.getMaxSectionCount());
     }
 
-    @Override
     public void free() {
         this.uniform.free();
         this.distanceCountBuffer.free();
@@ -341,5 +338,25 @@ public class MDICSectionRenderer extends AbstractSectionRenderer<MDICViewport> {
         this.prepShader.free();
         this.translucentGenShader.free();
         this.prefixSumShader.free();
+    }
+
+    private static void addDirectionalFaceTint(Shader.Builder<?> builder, ClientLevel level) {
+        builder.define("NO_SHADE_FACE_TINT", level.getShade(Direction.UP, false));
+        builder.define("UP_FACE_TINT", level.getShade(Direction.UP, true));
+        builder.define("DOWN_FACE_TINT", level.getShade(Direction.DOWN, true));
+        builder.define("Z_AXIS_FACE_TINT", level.getShade(Direction.NORTH, true));
+        builder.define("X_AXIS_FACE_TINT", level.getShade(Direction.EAST, true));
+    }
+
+    private static Shader tryCompilePatchedOrNormal(Shader.Builder<?> builder, String shader, String original) {
+        boolean patched = shader != original;
+        try {
+            return builder.clone().defineIf("PATCHED_SHADER", patched)
+                    .addSource(ShaderType.FRAGMENT, shader).compile();
+        } catch (RuntimeException exception) {
+            if (!patched) throw exception;
+            Logger.error("Failed to compile shader patch, using normal pipeline", exception);
+            return tryCompilePatchedOrNormal(builder, original, original);
+        }
     }
 }

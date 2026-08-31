@@ -118,7 +118,7 @@ public class SSAO {
 
     }
 
-    public void computeSSAO(Viewport<?> viewport, GlTexture colourOut, GlTexture colourIn, GlTexture baseDepthTex, int sourceFramebuffer) {
+    public void computeSSAO(Viewport viewport, GlTexture colourOut, GlTexture colourIn, GlTexture baseDepthTex, int sourceFramebuffer) {
         this.ssaoCompute.bind();
         //The matrices
         try (var stack = MemoryStack.stackPush()) {

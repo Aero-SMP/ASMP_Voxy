@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.rendering;
 
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
+import me.cortex.voxy.client.lod.ClientLodNetwork;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 
@@ -73,6 +74,7 @@ public class SectionUpdateRouter {
             //If we added it, immediately invoke for an update
             this.initialRenderMeshGen.accept(position);
         }
+        if (delta != 0) ClientLodNetwork.subscribe(position);
         return delta!=0;
     }
 
@@ -117,6 +119,7 @@ public class SectionUpdateRouter {
             }
         }
         lock.unlock(stamp);
+        if (removed) ClientLodNetwork.unsubscribe(position);
         return removed;
     }
 

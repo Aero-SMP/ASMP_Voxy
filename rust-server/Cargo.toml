@@ -1,0 +1,24 @@
+[package]
+name = "voxy-rust-server"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone Voxy LOD storage and streaming server"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+crc32c = "0.6"
+fastnbt = "2.5"
+flate2 = "1.1"
+lz4-java-wrc = "0.2"
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

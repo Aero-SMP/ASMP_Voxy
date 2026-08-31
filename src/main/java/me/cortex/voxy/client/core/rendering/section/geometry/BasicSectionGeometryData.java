@@ -62,7 +62,6 @@ public class BasicSectionGeometryData {
                     buffer.free();
                 }
                 buffer = new GlBuffer(geometryCapacity, GL_SPARSE_STORAGE_BIT_ARB);
-                //buffer.zero();
                 error = glGetError();
                 if (error != GL_NO_ERROR) {
                     buffer.free();
@@ -87,7 +86,6 @@ public class BasicSectionGeometryData {
                 size += 65536L*1024;//increase size by 64mb to prevent driver allocation thrashing
                 glBufferPageCommitmentARB(GL_ARRAY_BUFFER, this.sparseCommitment, size-this.sparseCommitment, true);
                 glBindBuffer(GL_ARRAY_BUFFER, 0);
-                //Logger.info("Resizing sparse: " + this.sparseCommitment + ", " + (size-this.sparseCommitment));
                 this.sparseCommitment = size;
             }
         }

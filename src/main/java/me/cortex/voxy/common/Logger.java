@@ -52,8 +52,8 @@ public class Logger {
 
         String error = (INSERT_CLASS?("["+callClsName()+"]: "):"") + Stream.of(args).map(Logger::objToString).collect(Collectors.joining(" "));
         LOGGER.error(error, throwable);
-        if (VoxyCommon.IS_IN_MINECRAFT && !VoxyCommon.IS_DEDICATED_SERVER) {
-            showInHUD(error);//This is done so that on dedicated server, the Minecraft client class isnt loaded
+        if (VoxyCommon.IS_IN_MINECRAFT) {
+            showInHUD(error);
         }
     }
 

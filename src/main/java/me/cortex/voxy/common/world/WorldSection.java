@@ -52,6 +52,8 @@ public final class WorldSection {
     final ActiveSectionTracker tracker;
     volatile boolean inSaveQueue;
     volatile boolean isDirty;
+    private long storageRevision;
+    private long remoteRevision = -1;
 
     //When the first bit is set it means its loaded
     @SuppressWarnings("all")
@@ -234,6 +236,22 @@ public final class WorldSection {
     //Should only be called by the saving service
     public boolean setNotDirty() {
         return (boolean) IS_DIRTY_HANDLE.getAndSet(this, false);
+    }
+
+    public long getStorageRevision() {
+        return this.storageRevision;
+    }
+
+    public void advanceStorageRevision() {
+        this.storageRevision++;
+    }
+
+    public long getRemoteRevision() {
+        return this.remoteRevision;
+    }
+
+    void setRemoteRevision(long revision) {
+        this.remoteRevision = revision;
     }
 
     public boolean shouldSave() {

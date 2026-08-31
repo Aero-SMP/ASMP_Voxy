@@ -15,7 +15,7 @@ public class SectionSavingService {
     private static final int SOFT_MAX_QUEUE_SIZE = 5_000;
 
     private final Service service;
-    private record SaveEntry(WorldEngine engine, WorldSection section) {}
+    private record SaveEntry(WorldEngine engine, WorldSection section, long revision) {}
     private final ConcurrentLinkedDeque<SaveEntry> saveQueue = new ConcurrentLinkedDeque<>();
 
     public SectionSavingService(ServiceManager sm) {
@@ -25,13 +25,26 @@ public class SectionSavingService {
     private void processJob() {
         var task = this.saveQueue.pop();
         var section = task.section;
+        boolean saveAttempted = false;
         try {
-            //Unmark it dirty here (if it wasnt or w/e) so that it doesnt pointlessly resave (in theory this should be safe to do)
-            section.setNotDirty();
-            if (section.exchangeIsInSaveQueue(false)) {
-                task.engine.storage.saveSection(section);
+            synchronized (section) {
+                if (section.exchangeIsInSaveQueue(false)
+                        && section.getStorageRevision() == task.revision) {
+                    section.setNotDirty();
+                    saveAttempted = true;
+                    task.engine.storage.saveSection(section);
+                }
             }
         } catch (Exception e) {
+            if (saveAttempted) {
+                synchronized (section) {
+                    // Retry only the snapshot that failed. A newer invalidation may already
+                    // have durably deleted the key and must never be resurrected by this task.
+                    if (section.getStorageRevision() == task.revision && task.engine.isLive()) {
+                        section.markDirty();
+                    }
+                }
+            }
             Logger.error("Voxy saver had an exception while executing please check logs and report error", e);
         }
         section.release();
@@ -39,29 +52,31 @@ public class SectionSavingService {
 
     public boolean enqueueSave(WorldEngine in, WorldSection section, boolean nonBlocking, boolean sectionAlreadyAcquired) {
         //If its not enqueued for saving then enqueue it
-        if (section.exchangeIsInSaveQueue(true)) {
+        long revision;
+        synchronized (section) {
+            if (!section.exchangeIsInSaveQueue(true)) return false;
+            revision = section.getStorageRevision();
             if (!sectionAlreadyAcquired) {
                 section.acquire(); //Acquire the section for use
             }
-
-            //Hard limit the save count to prevent OOM
-            if ((!nonBlocking) && this.getTaskCount() > SOFT_MAX_QUEUE_SIZE) {
-                //wait a bit
-                Thread.yield();
-                //If we are still full, process entries in the queue ourselves instead of waiting for the service
-                while (this.getTaskCount() > SOFT_MAX_QUEUE_SIZE && this.service.isLive()) {
-                    if (!this.service.steal()) {
-                        break;
-                    }
-                    this.processJob();
-                }
-            }
-
-            this.saveQueue.add(new SaveEntry(in, section));
-            this.service.execute();
-            return true;
         }
-        return false;
+
+        //Hard limit the save count to prevent OOM
+        if ((!nonBlocking) && this.getTaskCount() > SOFT_MAX_QUEUE_SIZE) {
+            //wait a bit
+            Thread.yield();
+            //If we are still full, process entries in the queue ourselves instead of waiting for the service
+            while (this.getTaskCount() > SOFT_MAX_QUEUE_SIZE && this.service.isLive()) {
+                if (!this.service.steal()) {
+                    break;
+                }
+                this.processJob();
+            }
+        }
+
+        this.saveQueue.add(new SaveEntry(in, section, revision));
+        this.service.execute();
+        return true;
     }
 
     public void shutdown() {

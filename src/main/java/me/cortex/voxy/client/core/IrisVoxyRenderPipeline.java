@@ -7,7 +7,6 @@ import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
 import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
-import me.cortex.voxy.client.core.rendering.section.backend.AbstractSectionRenderer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.iris.IrisVoxyRenderPipelineData;
@@ -99,7 +98,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    public void preSetup(Viewport<?> viewport) {
+    public void preSetup(Viewport viewport) {
         super.preSetup(viewport);
         if (this.shaderUniforms != null) {
             //Update the uniforms
@@ -110,7 +109,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    protected int setup(Viewport<?> viewport, int sourceFramebuffer, int srcWidth, int srcHeight) {
+    protected int setup(Viewport viewport, int sourceFramebuffer, int srcWidth, int srcHeight) {
         this.fb.resize(viewport.width, viewport.height);
         this.fbTranslucent.resize(viewport.width, viewport.height);
 
@@ -123,7 +122,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    protected void postOpaquePreTranslucent(Viewport<?> viewport, int sourceFrameBuffer) {
+    protected void postOpaquePreTranslucent(Viewport viewport, int sourceFrameBuffer) {
         if (this.shaderDepthHackFixTransformBlit != null) {
             this.fb.bind();
             glEnable(GL_DEPTH_TEST);
@@ -144,7 +143,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
+    protected void finish(Viewport viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
         if (this.data.renderToVanillaDepth && srcWidth == viewport.width  && srcHeight == viewport.height) {//We can only depthblit out if destination size is the same
             glColorMask(false, false, false, false);
             AbstractRenderPipeline.transformBlitDepth(this.depthBlit,
@@ -181,13 +180,13 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
         }
     }
     @Override
-    public void setupAndBindOpaque(Viewport<?> viewport) {
+    public void setupAndBindOpaque(Viewport viewport) {
         this.fb.bind();
         this.doBindings();
     }
 
     @Override
-    public void setupAndBindTranslucent(Viewport<?> viewport) {
+    public void setupAndBindTranslucent(Viewport viewport) {
         this.fbTranslucent.bind();
         this.doBindings();
         if (this.data.getBlender() != null) {
@@ -197,7 +196,7 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
     private static final int UNIFORM_BINDING_POINT = 7;//TODO make ths binding point... not randomly 5
 
-    private StringBuilder buildGenericShaderHeader(AbstractSectionRenderer<?> renderer, String input) {
+    private StringBuilder buildGenericShaderHeader(String input) {
         StringBuilder builder = new StringBuilder(input).append("\n\n\n");
 
         if (this.data.getUniforms() != null) {
@@ -222,8 +221,8 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
 
     @Override
-    public String patchOpaqueShader(AbstractSectionRenderer<?> renderer, String input) {
-        var builder = this.buildGenericShaderHeader(renderer, input);
+    public String patchOpaqueShader(String input) {
+        var builder = this.buildGenericShaderHeader(input);
 
         builder.append(this.data.opaqueFragPatch());
 
@@ -231,10 +230,10 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    public String patchTranslucentShader(AbstractSectionRenderer<?> renderer, String input) {
+    public String patchTranslucentShader(String input) {
         if (this.data.translucentFragPatch() == null) return null;
 
-        var builder = this.buildGenericShaderHeader(renderer, input);
+        var builder = this.buildGenericShaderHeader(input);
         builder.append(this.data.translucentFragPatch());
         return builder.toString();
     }

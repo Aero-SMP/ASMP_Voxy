@@ -75,7 +75,7 @@ public class ChunkBoundRenderer {
     }
 
     //Bind and render, changing as little gl state as possible so that the caller may configure how it wants to render
-    public void render(Viewport<?> viewport) {
+    public void render(Viewport viewport) {
         if (!this.remQueue.isEmpty()) {
             boolean wasEmpty = this.chunk2idx.isEmpty();
             this.remQueue.forEach(this::_remPos);//TODO: REPLACE WITH SCATTER COMPUTE

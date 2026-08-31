@@ -148,7 +148,6 @@ public class ActiveSectionTracker {
 
                 if (status < 0) {
                     //TODO: Instead if throwing an exception do something better, like attempting to regen
-                    //throw new IllegalStateException("Unable to load section: ");
                     Logger.error("Unable to load section " + section.key + " setting to air");
                     status = 1;
                 }

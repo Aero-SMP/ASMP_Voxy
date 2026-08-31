@@ -3,7 +3,7 @@ package me.cortex.voxy.common.world.other;
 import com.mojang.serialization.Dynamic;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.section.SectionSerializationStorage;
+import me.cortex.voxy.common.storage.SectionStorage;
 import me.cortex.voxy.common.util.Pair;
 import me.cortex.voxy.common.world.other.Mapper.BiomeEntry;
 import me.cortex.voxy.common.world.other.Mapper.StateEntry;
@@ -45,8 +45,10 @@ import java.util.function.Consumer;
 public class Mapper {
     private static final int BLOCK_STATE_TYPE = 1;
     private static final int BIOME_TYPE = 2;
+    private static final int MAX_BLOCK_STATES = 1 << 20;
+    private static final int MAX_BIOMES = 1 << 9;
 
-    private final SectionSerializationStorage storage;
+    private final SectionStorage storage;
     public static final long AIR = 0;
 
     private final ReentrantLock blockLock = new ReentrantLock();
@@ -60,7 +62,7 @@ public class Mapper {
 
     private Consumer<StateEntry> newStateCallback;
     private Consumer<BiomeEntry> newBiomeCallback;
-    public Mapper(SectionSerializationStorage storage) {
+    public Mapper(SectionStorage storage) {
         this.storage = storage;
         //Insert air since its a special entry (index 0)
         var airEntry = new StateEntry(0, Blocks.AIR.defaultBlockState());
@@ -78,6 +80,10 @@ public class Mapper {
 
     public static int getBlockId(long id) {
         return (int) ((id>>27)&((1<<20)-1));
+    }
+
+    public static int getBiomeId(long id) {
+        return (int) ((id >> 47) & ((1 << 9) - 1));
     }
 
     public static int getLightId(long id) {
@@ -177,48 +183,48 @@ public class Mapper {
         return this.blockId2stateEntry.size();
     }
 
-    private StateEntry registerNewBlockState(BlockState state) {
+    private StateEntry registerNewBlockState(BlockState state, boolean durable) {
         this.blockLock.lock();
-        var entry = this.block2stateEntry.get(state);
-        if (entry != null) {
+        StateEntry entry;
+        try {
+            entry = this.block2stateEntry.get(state);
+            if (entry != null) return entry;
+
+            entry = new StateEntry(this.blockId2stateEntry.size(), state);
+            if (entry.id >= MAX_BLOCK_STATES) {
+                throw new IllegalStateException("Voxy block catalog exceeds its 20-bit format");
+            }
+            // Append the mapping before publishing its ID to another worker. SectionStorage
+            // performs one batched durability barrier before any dependent section is saved.
+            this.storage.putIdMapping(entry.id | (BLOCK_STATE_TYPE << 30),
+                    ByteBuffer.wrap(entry.serialize()), durable);
+            this.blockId2stateEntry.add(entry);
+            this.block2stateEntry.put(state, entry);
+        } finally {
             this.blockLock.unlock();
-            return entry;
         }
-
-        entry = new StateEntry(this.blockId2stateEntry.size(), state);
-        this.blockId2stateEntry.add(entry);
-        this.block2stateEntry.put(state, entry);
-        this.blockLock.unlock();
-
-        byte[] serialized = entry.serialize();
-        ByteBuffer buffer = MemoryUtil.memAlloc(serialized.length);
-        buffer.put(serialized);
-        buffer.rewind();
-        this.storage.putIdMapping(entry.id | (BLOCK_STATE_TYPE<<30), buffer);
-        MemoryUtil.memFree(buffer);
 
         if (this.newStateCallback!=null)this.newStateCallback.accept(entry);
         return entry;
     }
 
-    private BiomeEntry registerNewBiome(String biome) {
+    private BiomeEntry registerNewBiome(String biome, boolean durable) {
         this.biomeLock.lock();
-        var entry = this.biome2biomeEntry.get(biome);
-        if (entry != null) {
+        BiomeEntry entry;
+        try {
+            entry = this.biome2biomeEntry.get(biome);
+            if (entry != null) return entry;
+            entry = new BiomeEntry(this.biomeId2biomeEntry.size(), biome);
+            if (entry.id >= MAX_BIOMES) {
+                throw new IllegalStateException("Voxy biome catalog exceeds its 9-bit format");
+            }
+            this.storage.putIdMapping(entry.id | (BIOME_TYPE << 30),
+                    ByteBuffer.wrap(entry.serialize()), durable);
+            this.biomeId2biomeEntry.add(entry);
+            this.biome2biomeEntry.put(biome, entry);
+        } finally {
             this.biomeLock.unlock();
-            return entry;
         }
-        entry = new BiomeEntry(this.biomeId2biomeEntry.size(), biome);
-        this.biomeId2biomeEntry.add(entry);
-        this.biome2biomeEntry.put(biome, entry);
-        this.biomeLock.unlock();
-
-        byte[] serialized = entry.serialize();
-        ByteBuffer buffer = MemoryUtil.memAlloc(serialized.length);
-        buffer.put(serialized);
-        buffer.rewind();
-        this.storage.putIdMapping(entry.id | (BIOME_TYPE<<30), buffer);
-        MemoryUtil.memFree(buffer);
 
         if (this.newBiomeCallback!=null)this.newBiomeCallback.accept(entry);
         return entry;
@@ -230,12 +236,16 @@ public class Mapper {
     }
 
     public int getIdForBlockState(BlockState state) {
+        return this.getIdForBlockState(state, false);
+    }
+
+    public int getIdForBlockState(BlockState state, boolean durable) {
         if (state.isAir()) {
             return 0;
         }
         var mapping = this.block2stateEntry.get(state);
         if (mapping == null) {
-            mapping = this.registerNewBlockState(state);
+            mapping = this.registerNewBlockState(state, durable);
         }
         return mapping.id;
     }
@@ -250,14 +260,29 @@ public class Mapper {
 
     public int getIdForBiome(Holder<Biome> biome) {
         String biomeId = biome.unwrapKey().get().location().toString();
+        return this.getIdForBiome(biomeId);
+    }
+
+    public int getIdForBiome(String biomeId) {
+        return this.getIdForBiome(biomeId, false);
+    }
+
+    public int getIdForBiome(String biomeId, boolean durable) {
         var entry = this.biome2biomeEntry.get(biomeId);
         if (entry == null) {
-            entry = this.registerNewBiome(biomeId);
+            entry = this.registerNewBiome(biomeId, durable);
         }
         return entry.id;
     }
 
+    public void flushMappings() {
+        this.storage.flushMappings();
+    }
+
     public static long composeMappingId(byte light, int blockId, int biomeId) {
+        if (blockId < 0 || blockId >= MAX_BLOCK_STATES || biomeId < 0 || biomeId >= MAX_BIOMES) {
+            throw new IllegalArgumentException("Mapping ID exceeds Voxy's packed format");
+        }
         if (blockId == AIR) {//Dont care about biome for air
             return Byte.toUnsignedLong(light)<<56;
         }
@@ -296,7 +321,7 @@ public class Mapper {
             ByteBuffer buffer = MemoryUtil.memAlloc(serialized.length);
             buffer.put(serialized);
             buffer.rewind();
-            this.storage.putIdMapping(entry.id | (BLOCK_STATE_TYPE<<30), buffer);
+            this.storage.putIdMapping(entry.id | (BLOCK_STATE_TYPE<<30), buffer, false);
             MemoryUtil.memFree(buffer);
         }
 
@@ -309,7 +334,7 @@ public class Mapper {
             ByteBuffer buffer = MemoryUtil.memAlloc(serialized.length);
             buffer.put(serialized);
             buffer.rewind();
-            this.storage.putIdMapping(entry.id | (BIOME_TYPE<<30), buffer);
+            this.storage.putIdMapping(entry.id | (BIOME_TYPE<<30), buffer, false);
             MemoryUtil.memFree(buffer);
         }
 

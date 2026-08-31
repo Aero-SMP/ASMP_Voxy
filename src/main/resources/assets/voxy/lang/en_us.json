@@ -13,8 +13,6 @@
   "voxy.config.general.useSodiumBuilder": "Use sodium threads",
   "voxy.config.general.useSodiumBuilder.tooltip": "Uses sodium builder threads as part of voxys thread pool, can reduce stuttering and lag when moving quickly at high render distance",
 
-  "voxy.config.general.ingest": "Chunk Ingest",
-  "voxy.config.general.ingest.tooltip": "Enables or disables voxies ability to convert new chunks into LoDs",
 
   "voxy.config.general.rendering": "Voxy Rendering",
   "voxy.config.general.rendering.tooltip": "Enables or disables voxy rendering",

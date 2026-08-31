@@ -140,9 +140,6 @@ public class SoftwareModelTextureBakery {
                 // if this is uncommented, that issue is fixed but e.g. stacking water layers ontop of eachother
                 //  doesnt fill the side of the block
 
-                //if (pos.getY() == 1) {
-                //    return Blocks.AIR.getDefaultState();
-                //}
                 return state;
             }
 

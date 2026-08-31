@@ -1,0 +1,24 @@
+[Unit]
+Description=Voxy Rust LOD storage and streaming server
+After=network.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/opt/voxy-rust
+ExecStart=/opt/voxy-rust/voxy-rust-server --config /etc/voxy-rust.toml
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=120
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+RuntimeDirectory=voxy
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/minecraft/world
+ReadWritePaths=/srv/minecraft/voxy-rust
+
+[Install]
+WantedBy=multi-user.target

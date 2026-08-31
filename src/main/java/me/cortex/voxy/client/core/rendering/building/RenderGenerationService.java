@@ -115,7 +115,6 @@ public class RenderGenerationService {
         BuildTask task = this.taskQueue.poll();
         this.taskQueueCount.decrementAndGet();
 
-        //long time = BuiltSection.getTime();
         boolean shouldFreeSection = true;
 
         WorldSection section;

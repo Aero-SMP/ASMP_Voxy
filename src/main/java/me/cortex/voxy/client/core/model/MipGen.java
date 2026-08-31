@@ -69,7 +69,6 @@ public class MipGen {
     }
 
     public static void putTextures(boolean darkened, ColourDepthTextureData[] textures, MemoryBuffer into) {
-        //if (MODEL_TEXTURE_SIZE != 16) {throw new IllegalStateException("THIS METHOD MUST BE REDONE IF THIS CONST CHANGES");}
 
         //TODO: need to use a write mask to see what pixels must be used to contribute to mipping
         // as in, using the depth/stencil info, check if pixel was written to, if so, use that pixel when blending, else dont
@@ -84,7 +83,6 @@ public class MipGen {
             boolean anyTransparent = false;
             for (int t : textures[i].colour()) {
                 int o = ((y+(j>>LAYERS))*LENGTH_B + ((j&(MODEL_TEXTURE_SIZE-1))+x))*4; j++;//LAYERS here is just cause faster
-                //t = ((t&0xFF000000)==0)?0x00_FF_00_FF:t;//great for testing
                 MemoryUtil.memPutInt(addr+o, t);
                 anyTransparent |= ((t&0xFF000000)==0);
             }

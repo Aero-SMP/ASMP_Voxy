@@ -15,3 +15,7 @@ bin/
 
 .vscode/
 *.xml
+
+# Rust server build output and local state
+rust-server/target/
+rust-server/voxy-server.toml

@@ -6,7 +6,7 @@ import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
 import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
-import me.cortex.voxy.client.core.rendering.section.backend.AbstractSectionRenderer;
+import me.cortex.voxy.client.core.rendering.section.backend.mdic.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.common.util.TrackedObject;
@@ -40,7 +40,7 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     private final NodeCleaner nodeCleaner;
     private final HierarchicalOcclusionTraverser traversal;
 
-    protected AbstractSectionRenderer<?> sectionRenderer;
+    protected MDICSectionRenderer sectionRenderer;
 
     private final FullscreenBlit depthStencilSetup;
 
@@ -62,33 +62,31 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     //Allows pipelines to configure model baking system
     public void setupExtraModelBakeryData(ModelBakerySubsystem modelService) {}
 
-    public final void setSectionRenderer(AbstractSectionRenderer<?> sectionRenderer) {//Stupid java ordering not allowing something pre super
+    public final void setSectionRenderer(MDICSectionRenderer sectionRenderer) {//Stupid java ordering not allowing something pre super
         if (this.sectionRenderer != null) throw new IllegalStateException();
         this.sectionRenderer = sectionRenderer;
     }
 
     //Called before the pipeline starts running, used to update uniforms etc
-    public void preSetup(Viewport<?> viewport) {
+    public void preSetup(Viewport viewport) {
 
     }
 
-    protected abstract int setup(Viewport<?> viewport, int sourceFramebuffer, int srcWidth, int srcHeight);
-    protected abstract void postOpaquePreTranslucent(Viewport<?> viewport, int sourceFrameBuffer);
-    protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
+    protected abstract int setup(Viewport viewport, int sourceFramebuffer, int srcWidth, int srcHeight);
+    protected abstract void postOpaquePreTranslucent(Viewport viewport, int sourceFrameBuffer);
+    protected void finish(Viewport viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
         glDisable(GL_STENCIL_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, sourceFrameBuffer);
     }
 
-    public void runPipeline(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
+    public void runPipeline(Viewport viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
         int depthTexture = this.setup(viewport, sourceFrameBuffer, srcWidth, srcHeight);
 
-        var rs = ((AbstractSectionRenderer)this.sectionRenderer);
+        var rs = this.sectionRenderer;
         rs.renderOpaque(viewport);
         this.innerPrimaryWork(viewport, depthTexture);
         rs.buildDrawCalls(viewport);
         rs.renderTemporal(viewport);
-
-        rs.postOpaquePreperation(viewport);
 
         this.postOpaquePreTranslucent(viewport, sourceFrameBuffer);
 
@@ -133,7 +131,7 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     }
 
     private static final long SCRATCH = MemoryUtil.nmemAlloc(4*4*4);
-    protected static void transformBlitDepth(FullscreenBlit blitShader, int srcDepthTex, int dstFB, Viewport<?> viewport, Matrix4f targetTransform) {
+    protected static void transformBlitDepth(FullscreenBlit blitShader, int srcDepthTex, int dstFB, Viewport viewport, Matrix4f targetTransform) {
         // at this point the dst frame buffer doesn't have a stencil attachment so we don't need to keep the stencil test on for the blit
         // in the worst case the dstFB does have a stencil attachment causing this pass to become 'corrupted'
         glDisable(GL_STENCIL_TEST);
@@ -152,7 +150,7 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         glDisable(GL_DEPTH_TEST);
     }
 
-    protected void innerPrimaryWork(Viewport<?> viewport, int depthBuffer) {
+    protected void innerPrimaryWork(Viewport viewport, int depthBuffer) {
 
         //Compute the mip chain
         viewport.hiZBuffer.buildMipChain(depthBuffer, viewport.width, viewport.height);
@@ -160,7 +158,6 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         DownloadStream.INSTANCE.tick();
 
         this.nodeManager.tick(this.traversal.getNodeBuffer(), this.nodeCleaner);
-        //glFlush();
 
         this.nodeCleaner.tick(this.traversal.getNodeBuffer());//Probably do this here??
 
@@ -178,8 +175,8 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     }
 
     //Binds the framebuffer and any other bindings needed for rendering
-    public abstract void setupAndBindOpaque(Viewport<?> viewport);
-    public abstract void setupAndBindTranslucent(Viewport<?> viewport);
+    public abstract void setupAndBindOpaque(Viewport viewport);
+    public abstract void setupAndBindTranslucent(Viewport viewport);
 
 
     public void bindUniforms() {
@@ -203,12 +200,12 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     }
 
     //null means dont transform the shader
-    public String patchOpaqueShader(AbstractSectionRenderer<?> renderer, String input) {
+    public String patchOpaqueShader(String input) {
         return null;
     }
 
     //Returning null means apply the same patch as the opaque
-    public String patchTranslucentShader(AbstractSectionRenderer<?> renderer, String input) {
+    public String patchTranslucentShader(String input) {
         return null;
     }
 

@@ -363,7 +363,6 @@ public class IrisVoxyRenderPipelineData {
             @Override
             public DynamicLocationalUniformHolder addDynamicUniform(Uniform uniform, ValueUpdateNotifier valueUpdateNotifier) {
                 throw new IllegalStateException("Type not implemented for uniform: " + uniform);
-                //return this;
             }
             //TODO: override the uniform1b call to specialcase booleans
 

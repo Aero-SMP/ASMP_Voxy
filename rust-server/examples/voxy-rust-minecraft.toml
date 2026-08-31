@@ -1,0 +1,8 @@
+world = "/srv/minecraft/world"
+data = "/srv/minecraft/voxy-rust"
+transport = "minecraft"
+poll_ms = 2000
+rayon_threads = 4
+
+[minecraft]
+socket = "/run/voxy/bridge.sock"

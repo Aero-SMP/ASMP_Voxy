@@ -1,4 +1,3 @@
-import org.gradle.api.tasks.bundling.Jar
 import org.gradle.api.tasks.compile.JavaCompile
 
 plugins {
@@ -53,9 +52,18 @@ repositories {
 }
 
 java {
-    withSourcesJar()
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+sourceSets.main.java.srcDir 'bridge-shared/src/main/java'
+
+sourceSets {
+    debug {
+        java.srcDirs = ['src/debug/java', 'bridge-shared/src/debug/java']
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + sourceSets.main.runtimeClasspath
     }
 }
 
@@ -87,36 +95,45 @@ tasks.named('processResources') {
 
 dependencies {
     def sodiumVersion = providers.gradleProperty('sodium_version').get()
+    def testOs = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+    def testPlatform = testOs.contains('win') ? 'windows' : testOs.contains('mac') ? 'macos' : 'linux'
+    def testArch = System.getProperty('os.arch').toLowerCase(Locale.ROOT)
+    def lwjglNatives = "natives-${testPlatform}${testArch in ['aarch64', 'arm64'] ? '-arm64' : ''}"
     compileOnly "net.caffeinemc:sodium-neoforge-mod:${sodiumVersion}"
     compileOnly "net.caffeinemc:sodium-neoforge-api:${sodiumVersion}"
     runtimeOnly("net.caffeinemc:sodium-neoforge:${sodiumVersion}") {
         transitive = false
     }
 
-    implementation "maven.modrinth:lithium:${providers.gradleProperty('lithium_version').get()}"
     compileOnly "drouarb:nvidium:${providers.gradleProperty('nvidium_version').get()}"
     compileOnly "maven.modrinth:iris:${providers.gradleProperty('iris_version').get()}"
     runtimeOnly 'io.github.douira:glsl-transformer:2.0.1'
     runtimeOnly 'org.anarres:jcpp:1.4.14'
-
-    def chunkyVersion = providers.gradleProperty('chunky_version').get()
-    compileOnly "maven.modrinth:chunky:${chunkyVersion}"
-    runtimeOnly "maven.modrinth:chunky:${chunkyVersion}"
-    runtimeOnly "maven.modrinth:spark:${providers.gradleProperty('spark_version').get()}"
-    compileOnly "maven.modrinth:vivecraft:${providers.gradleProperty('vivecraft_version').get()}"
-
-    def rocksdbVersion = providers.gradleProperty('rocksdb_version').get()
-
-    implementation "org.rocksdb:rocksdbjni:${rocksdbVersion}"
-
-    jarJar "org.rocksdb:rocksdbjni:${rocksdbVersion}"
-    if (findProject(':debug') != null) {
-        jarJar project(':debug')
-    }
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'it.unimi.dsi:fastutil:8.5.12'
+    testRuntimeOnly 'org.lwjgl:lwjgl:3.3.3'
+    testRuntimeOnly "org.lwjgl:lwjgl:3.3.3:${lwjglNatives}"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
-afterEvaluate {
-    dependencies.add('additionalRuntimeClasspath', "org.rocksdb:rocksdbjni:${providers.gradleProperty('rocksdb_version').get()}")
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+tasks.register('debugJar', Jar) {
+    description = 'Build the client JAR with bounded remote diagnostics enabled'
+    archiveClassifier.set('debug')
+    dependsOn tasks.named('debugClasses')
+    from(sourceSets.main.output) {
+        exclude 'me/cortex/voxy/client/lod/ClientLodDebug.class'
+    }
+    from sourceSets.debug.output
+    from layout.projectDirectory.dir('debug-marker')
+}
+
+tasks.named('assemble') {
+    dependsOn tasks.named('debugJar')
 }
 
 neoForge {
@@ -129,10 +146,6 @@ neoForge {
             gameDirectory = file('run/')
             client()
         }
-        register('server') {
-            gameDirectory = file('run/')
-            server()
-        }
     }
 
     mods {
@@ -142,112 +155,16 @@ neoForge {
     }
 }
 
-File deployConfigFile = file('deploy.properties')
-Properties deployConfig = new Properties()
-String deployBranch, deployRepoUrl, deployCheckout
-boolean deployLocal
-List<String> requestedTasks = gradle.startParameter.taskNames
-int deployIndex = requestedTasks.findIndexOf { it == 'deploy' || it.endsWith(':deploy') }
-List<String> deployTail = deployIndex < 0 ? [] : requestedTasks.drop(deployIndex + 1)
-boolean deployNoCommit = deployTail.remove('--no-commit')
-String deployMessage = deployTail.join(' ').trim()
-if (deployIndex >= 0 && requestedTasks.size() > deployIndex + 1) {
-    gradle.startParameter.setTaskNames(requestedTasks.take(deployIndex + 1))
+tasks.register('buildRustServer', Exec) {
+    description = 'Build the standalone Rust LOD server'
+    workingDir 'rust-server'
+    commandLine 'cargo', 'build', '--release', '--locked'
+    inputs.files 'rust-server/Cargo.toml', 'rust-server/Cargo.lock'
+    inputs.dir 'rust-server/src'
+    outputs.file 'rust-server/target/release/voxy-rust-server'
 }
 
-def deployCommit = tasks.register('deployCommit') {
-    doLast {
-        if (deployNoCommit) {
-            logger.lifecycle('Skipping Git commit and push (--no-commit)')
-            return
-        }
-        Process status = new ProcessBuilder(['git', 'status', '--porcelain']).start()
-        String changes = status.inputStream.text
-        if (status.waitFor()) throw new GradleException('git status failed')
-        List commands = []
-        if (changes) {
-            if (!deployMessage) {
-                print 'Please write a commit message to continue the build: '
-                System.out.flush()
-            }
-            String message = deployMessage ?: System.in.newReader().readLine()?.trim()
-            if (!message) throw new GradleException('Commit message cannot be empty')
-            commands.addAll([['add', '.'], ['commit', '-m', message]])
-        }
-        commands.add(['push', 'origin', deployBranch])
-        commands.each { arguments ->
-            Process git = new ProcessBuilder(['git'] + arguments).inheritIO().start()
-            if (git.waitFor()) throw new GradleException("git ${arguments[0]} failed")
-        }
-    }
-}
-tasks.configureEach { if (name != 'deployCommit') mustRunAfter deployCommit }
-
-def deploy = tasks.register('deploy', Exec) {
-    description = 'Build and deploy; pass --no-commit to skip all Git operations'
-    dependsOn deployCommit, jar
-
-    doFirst {
-        String host = deployConfig.getProperty('host')
-        String folder = deployConfig.getProperty('folder')
-        String session = deployConfig.getProperty('session')
-        String window = deployConfig.getProperty('window')
-        Jar jarTask = tasks.named('jar', Jar).get()
-        File artifact = jarTask.archiveFile.get().asFile
-        String artifactBase = jarTask.archiveBaseName.get()
-        List<String> deployArguments = [session, window, folder, artifact.name, modId,
-                                        deployRepoUrl, deployBranch, deployCheckout, artifactBase,
-                                        Boolean.toString(deployNoCommit)]
-
-        if (deployLocal) {
-            providers.exec {
-                commandLine 'cp', artifact.absolutePath, "$folder/.${modId}-deploy.jar"
-            }.result.get().assertNormalExitValue()
-            commandLine(['sh', '-s', '--'] + deployArguments)
-        } else {
-            providers.exec {
-                commandLine 'scp', artifact.absolutePath, "${host}:${folder}/.${modId}-deploy.jar"
-            }.result.get().assertNormalExitValue()
-            List<String> quotedArguments = deployArguments.collect {
-                "'${it.replace("'", "'\"'\"'")}'"
-            }
-            commandLine(['ssh', host, 'sh', '-s', '--'] + quotedArguments)
-        }
-        standardInput = new ByteArrayInputStream(file('gradle/deploy.sh').getText('UTF-8').replace('\r\n', '\n').getBytes('UTF-8'))
-    }
-}
-
-gradle.taskGraph.whenReady {
-    if (!it.hasTask(deploy.get())) return
-    if (!deployConfigFile.exists()) deployConfigFile.setText('''configured=false
-host=printer@ssh.aerosmp.com
-folder=/home/printer/Desktop/Mod_Testing
-session=printer_session
-window=Mod_Testing
-''', 'UTF-8')
-    deployConfigFile.withInputStream { deployConfig.load(it) }
-    if (!deployConfig.getProperty('repo')) {
-        String repo = "/home/${deployConfig.getProperty('host').split('@')[0]}/Desktop"
-        deployConfigFile.append("repo=$repo\n", 'UTF-8')
-        deployConfig.setProperty('repo', repo)
-    }
-    if (deployConfig.getProperty('configured') != 'true')
-        throw new GradleException("Set configured=true in ${deployConfigFile} before deploying")
-    deployBranch = providers.exec { commandLine 'git', 'branch', '--show-current' }.standardOutput.asText.get().trim()
-    deployRepoUrl = providers.exec { commandLine 'git', 'remote', 'get-url', 'origin' }.standardOutput.asText.get().trim()
-    if (!deployBranch) throw new GradleException('deploy requires a local branch')
-    String host = deployConfig.getProperty('host')
-    String folder = deployConfig.getProperty('folder')
-    String repoName = deployRepoUrl.tokenize('/').last().replaceFirst(/\.git$/, '')
-    deployCheckout = "${deployConfig.getProperty('repo')}/$repoName"
-    String targetUser = host.contains('@') ? host.substring(0, host.indexOf('@')) : System.getProperty('user.name')
-    String targetHost = host.contains('@') ? host.substring(host.indexOf('@') + 1) : host
-    Set<String> localHosts = ['localhost', '127.0.0.1', '::1', System.getenv('HOSTNAME'),
-                              InetAddress.localHost.hostName, InetAddress.localHost.canonicalHostName]
-            .findAll { it }*.toLowerCase() as Set
-    deployLocal = targetUser == System.getProperty('user.name') &&
-            (localHosts.contains(targetHost.toLowerCase()) ||
-                    (file(folder).isDirectory() && file(deployCheckout).canonicalFile == projectDir.canonicalFile))
-    logger.lifecycle(deployLocal ? "Deploy target detected locally at $folder" :
-            "Deploy target detected remotely at $host:$folder")
+tasks.register('buildAll') {
+    description = 'Build the Java client mod and Rust server'
+    dependsOn tasks.named('build'), tasks.named('buildRustServer'), ':bridge:build'
 }

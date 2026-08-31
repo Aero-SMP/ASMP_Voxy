@@ -53,7 +53,7 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    protected int setup(Viewport<?> viewport, int sourceFB, int srcWidth, int srcHeight) {
+    protected int setup(Viewport viewport, int sourceFB, int srcWidth, int srcHeight) {
         if (this.colourTex == null || this.colourTex.getHeight() != viewport.height || this.colourTex.getWidth() != viewport.width) {
             if (this.colourTex != null) {
                 this.colourTex.free();
@@ -81,13 +81,13 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     }
 
     @Override
-    protected void postOpaquePreTranslucent(Viewport<?> viewport, int sourceFrameBuffer) {
+    protected void postOpaquePreTranslucent(Viewport viewport, int sourceFrameBuffer) {
         this.ssao.computeSSAO(viewport, this.colourSSAOTex, this.colourTex, this.fb.getDepthTex(), sourceFrameBuffer);
         glBindFramebuffer(GL_FRAMEBUFFER, this.fbSSAO.id);
     }
 
     @Override
-    protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
+    protected void finish(Viewport viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
         this.finalBlit.bind();
         var vrs = IGetVoxyRenderSystem.getNullable();
         float fogStart = vrs != null ? vrs.getCapturedFogStart() : RenderSystem.getShaderFogStart();
@@ -126,16 +126,15 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
             glDisable(GL_STENCIL_TEST);
             glDisable(GL_DEPTH_TEST);
         }
-        //glBlitNamedFramebuffer(this.fbSSAO.id, sourceFrameBuffer, 0,0, viewport.width, viewport.height, 0,0, viewport.width, viewport.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
 
     @Override
-    public void setupAndBindOpaque(Viewport<?> viewport) {
+    public void setupAndBindOpaque(Viewport viewport) {
         this.fb.bind();
     }
 
     @Override
-    public void setupAndBindTranslucent(Viewport<?> viewport) {
+    public void setupAndBindTranslucent(Viewport viewport) {
         glBindFramebuffer(GL_FRAMEBUFFER, this.fbSSAO.id);
     }
 

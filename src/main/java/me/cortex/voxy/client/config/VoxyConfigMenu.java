@@ -61,16 +61,10 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 value -> CFG.dontUseSodiumBuilderThreads = !value, UPDATE_THREADS, RENDER_RELOAD)
                 .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
 
-        var ingest = option(builder.createBooleanOption(id("ingest_enabled")),
-                "voxy.config.general.ingest", () -> CFG.ingestEnabled,
-                value -> CFG.ingestEnabled = value)
-                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
-
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.general"))
                 .addOptionGroup(group(builder, enabled))
-                .addOptionGroup(group(builder, threadCount, sodiumThreads))
-                .addOptionGroup(group(builder, ingest)));
+                .addOptionGroup(group(builder, threadCount, sodiumThreads)));
 
         var rendering = option(builder.createBooleanOption(RENDERING),
                 "voxy.config.general.rendering", () -> CFG.enableRendering,
@@ -118,7 +112,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
 
         var fogIntensity = option(builder.createIntegerOption(id("fog_intensity")),
                 "voxy.config.general.fogIntensity", () -> Math.round(CFG.fogIntensity * 100),
-                value -> CFG.fogIntensity = value / 100, RENDER_RELOAD)
+                value -> CFG.fogIntensity = value / 100.0f, RENDER_RELOAD)
                 .setRange(new Range(0, 100, 1))
                 .setImpact(OptionImpact.LOW)
                 .setEnabledProvider(VoxyConfigMenu::fogOptionsEnabled,
@@ -126,7 +120,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
 
         var fogDensity = option(builder.createIntegerOption(id("fog_density")),
                 "voxy.config.general.fogDensity", () -> Math.round(CFG.fogDensity * 100),
-                value -> CFG.fogDensity = value / 100, RENDER_RELOAD)
+                value -> CFG.fogDensity = value / 100.0f, RENDER_RELOAD)
                 .setRange(new Range(0, 100, 1))
                 .setImpact(OptionImpact.LOW)
                 .setEnabledProvider(VoxyConfigMenu::fogOptionsEnabled,

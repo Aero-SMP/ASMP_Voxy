@@ -62,7 +62,6 @@ public class UploadStream {
         //Force natural size alignment, this should ensure that _all_ allocations are aligned to this size, note, this only effects the allocation block
         // not how much data is moved or copied
         size = alignUp(size, BASE_ALLOCATION_ALIGNEMENT);
-        //size = (size+15)&~15;//Alignment to 16 bytes
 
         if (size > this.uploadBuffer.size()) {
             throw new IllegalArgumentException();

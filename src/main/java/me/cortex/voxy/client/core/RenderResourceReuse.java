@@ -74,7 +74,6 @@ public class RenderResourceReuse {
                         buffer.free();
                     }
                     buffer = new GlBuffer(capacity, GL_SPARSE_STORAGE_BIT_ARB);
-                    //buffer.zero();
                     error = glGetError();
                     if (error != GL_NO_ERROR) {
                         buffer.free();
@@ -117,8 +116,6 @@ public class RenderResourceReuse {
 
             geometryCapacity = Math.min(geometryCapacity, limit);
         }
-        //geometryCapacity = 1<<28;
-        //geometryCapacity = 1<<30;//1GB test
         var override = System.getProperty("voxy.geometryBufferSizeOverrideMB", "");
         if (!override.isEmpty()) {
             geometryCapacity = Long.parseLong(override)*1024L*1024L;

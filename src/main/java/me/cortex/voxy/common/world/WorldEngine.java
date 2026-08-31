@@ -1,12 +1,13 @@
 package me.cortex.voxy.common.world;
 
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.section.SectionSerializationStorage;
+import me.cortex.voxy.common.storage.SectionStorage;
 import me.cortex.voxy.common.world.other.Mapper;
 import me.cortex.voxy.commonImpl.VoxyInstance;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.invoke.VarHandle;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class WorldEngine {
@@ -21,7 +22,7 @@ public class WorldEngine {
     public interface ISectionSaveCallback {boolean save(WorldEngine engine, WorldSection section, boolean nonBlocking, boolean sectionAlreadyAcquired);}
 
 
-    public final SectionSerializationStorage storage;
+    public final SectionStorage storage;
     private final Mapper mapper;
     private final ActiveSectionTracker sectionTracker;
     private ISectionChangeCallback dirtyCallback;
@@ -43,11 +44,7 @@ public class WorldEngine {
     private final AtomicInteger refCount = new AtomicInteger();
     volatile long lastActiveTime = System.currentTimeMillis();//Time in millis the world was last "active" i.e. had a total ref count or active section count of != 0
 
-    public WorldEngine(SectionSerializationStorage storage) {
-        this(storage, null);
-    }
-
-    public WorldEngine(SectionSerializationStorage storage, @Nullable VoxyInstance instance) {
+    public WorldEngine(SectionStorage storage, @Nullable VoxyInstance instance) {
         this.instanceIn = instance;
 
         int cacheSize = 1024;
@@ -121,6 +118,69 @@ public class WorldEngine {
         }
         if ((changeState&UPDATE_TYPE_DONT_SAVE)==0) {
             section.markDirty();
+        }
+    }
+
+    /** Replaces one complete native Voxy section received from the authoritative Rust service. */
+    public void replaceRemoteSection(long key, long revision, long[] data, byte nonEmptyChildren) {
+        if (data.length != WorldSection.SECTION_VOLUME || getLevel(key) > MAX_LOD_LAYER || (key & 0xf) != 0) {
+            throw new IllegalArgumentException("Invalid remote section");
+        }
+        WorldSection section = this.acquire(key);
+        try {
+            synchronized (section) {
+                boolean blocksChanged = !Arrays.equals(section.data, data);
+                boolean childrenChanged = section.nonEmptyChildren != nonEmptyChildren;
+                boolean revisionChanged = section.getRemoteRevision() != revision;
+                if (!blocksChanged && !childrenChanged && !revisionChanged) return;
+
+                section.advanceStorageRevision();
+                section.setRemoteRevision(revision);
+                System.arraycopy(data, 0, section.data, 0, data.length);
+                section.nonEmptyChildren = nonEmptyChildren;
+                if (section.lvl == 0) {
+                    int count = 0;
+                    for (long value : data) if (!Mapper.isAir(value)) count++;
+                    section.nonEmptyBlockCount = count;
+                }
+                int flags = (blocksChanged ? UPDATE_TYPE_BLOCK_BIT : 0)
+                        | (childrenChanged ? UPDATE_TYPE_CHILD_EXISTENCE_BIT : 0);
+                this.markDirty(section, flags, blocksChanged ? 0x3f : 0);
+            }
+        } finally {
+            section.release();
+        }
+    }
+
+    /** Makes stale or corrupt remote data absent and durably remembers its server revision. */
+    public void invalidateRemoteSection(long key, long revision) {
+        if (getLevel(key) > MAX_LOD_LAYER || (key & 0xf) != 0) throw new IllegalArgumentException("Invalid remote section key");
+        WorldSection section = this.acquire(key);
+        try {
+            synchronized (section) {
+                section.advanceStorageRevision();
+                section.setRemoteRevision(revision);
+                long air = Mapper.airWithLight(15);
+                boolean blocksChanged = false;
+                for (long value : section.data) blocksChanged |= value != air;
+                boolean childrenChanged = section.nonEmptyChildren != 0;
+                Arrays.fill(section.data, air);
+                section.nonEmptyChildren = 0;
+                section.nonEmptyBlockCount = 0;
+
+                // Keep a compact all-air record instead of deleting the key. Its remote
+                // revision is the durable client tombstone, so reconnects do not request and
+                // reapply the same server tombstone forever.
+                this.storage.saveSection(section);
+                section.setNotDirty();
+                if (!blocksChanged && !childrenChanged) return;
+
+                int flags = (blocksChanged ? UPDATE_TYPE_BLOCK_BIT : 0)
+                        | (childrenChanged ? UPDATE_TYPE_CHILD_EXISTENCE_BIT : 0);
+                this.markDirty(section, flags | UPDATE_TYPE_DONT_SAVE, blocksChanged ? 0x3f : 0);
+            }
+        } finally {
+            section.release();
         }
     }
 

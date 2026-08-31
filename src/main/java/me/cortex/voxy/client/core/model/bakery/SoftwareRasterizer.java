@@ -81,7 +81,6 @@ public class SoftwareRasterizer {
         for (int i = 0; i < quadCount; i++) {
             this.rasterQuad(mvp, verticesAddr+ReuseVertexConsumer.VERTEX_FORMAT_SIZE*4L*i);
         }
-        //Arrays.fill(this.framebuffer, -1);
     }
 
     private void rasterQuad(Matrix4f transform, long addr) {
@@ -201,7 +200,6 @@ public class SoftwareRasterizer {
     }
 
 
-    // ARBDrawBuffersBlend.glBlendFuncSeparateiARB(0, GL_ONE_MINUS_DST_ALPHA, GL_DST_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     private static int doBlending(int scr, int dst) {
         int srcAlpha = (scr>>>24)&0xFF;
         if (srcAlpha == 0) {

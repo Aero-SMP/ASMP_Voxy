@@ -1,6 +1,5 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
-import me.cortex.voxy.client.VoxyClientInstance;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
@@ -8,6 +7,7 @@ import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.VoxyCommon;
+import me.cortex.voxy.commonImpl.VoxyInstance;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.LevelRenderer;
@@ -72,7 +72,7 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
             Logger.error("Not creating renderer due to null world");
             return;
         }
-        var instance = (VoxyClientInstance)VoxyCommon.getInstance();
+        VoxyInstance instance = VoxyCommon.getInstance();
         if (instance == null) {
             Logger.error("Not creating renderer due to null instance");
             return;

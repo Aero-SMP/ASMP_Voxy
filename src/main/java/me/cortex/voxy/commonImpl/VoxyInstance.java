@@ -1,35 +1,52 @@
 package me.cortex.voxy.commonImpl;
 
+import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.core.RenderResourceReuse;
+import me.cortex.voxy.client.mixin.sodium.AccessorSodiumWorldRenderer;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.config.section.SectionSerializationStorage;
+import me.cortex.voxy.common.storage.SectionStorage;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.thread.UnifiedServiceThreadPool;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.service.SectionSavingService;
-import me.cortex.voxy.common.world.service.VoxelIngestService;
+import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.level.storage.LevelResource;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.locks.StampedLock;
+import java.util.zip.CRC32C;
 
 //TODO: add thread access verification (I.E. only accessible on a single thread)
-public abstract class VoxyInstance {
+public class VoxyInstance {
+    private static final long SERVER_ID_MAGIC = 0x5658595345525633L; // VXYSERV3
     private volatile boolean isRunning = true;
     private final Thread worldCleaner;
+    private final Path basePath;
     protected final UnifiedServiceThreadPool threadPool;
     protected final SectionSavingService savingService;
-    protected final VoxelIngestService ingestService;
 
     private final StampedLock activeWorldLock = new StampedLock();
     private final HashMap<WorldIdentifier, WorldEngine> activeWorlds = new HashMap<>();
 
     public VoxyInstance() {
         Logger.info("Initializing voxy instance");
+        this.basePath = getBasePath().normalize();
         this.threadPool = new UnifiedServiceThreadPool();
         this.savingService = new SectionSavingService(this.getServiceManager());
-        this.ingestService = new VoxelIngestService(this.getServiceManager());
         this.worldCleaner = new Thread(()->{
             try {
                 while (this.isRunning) {
@@ -47,6 +64,7 @@ public abstract class VoxyInstance {
         this.worldCleaner.setName("Active world cleaner");
         this.worldCleaner.setDaemon(true);
         this.worldCleaner.start();
+        this.updateDedicatedThreads();
     }
 
     protected void setNumThreads(int threads) {
@@ -57,7 +75,18 @@ public abstract class VoxyInstance {
     }
 
     public void updateDedicatedThreads() {
-        this.setNumThreads(3);
+        int target = VoxyConfig.CONFIG.serviceThreads;
+        if (!VoxyConfig.CONFIG.dontUseSodiumBuilderThreads) {
+            var renderer = SodiumWorldRenderer.instanceNullable();
+            if (renderer != null) {
+                var manager = ((AccessorSodiumWorldRenderer) renderer).getRenderSectionManager();
+                if (manager != null) {
+                    this.setNumThreads(Math.max(1, target - manager.getBuilder().getTotalThreadCount()));
+                    return;
+                }
+            }
+        }
+        this.setNumThreads(target);
     }
 
     public ServiceManager getServiceManager() {
@@ -65,9 +94,6 @@ public abstract class VoxyInstance {
     }
     public UnifiedServiceThreadPool getThreadPool() {
         return this.threadPool;
-    }
-    public VoxelIngestService getIngestService() {
-        return this.ingestService;
     }
     //TODO: reference count the world object
     // have automatic world cleanup after ~1 minute of inactivity and the reference count equaling zero possibly
@@ -148,7 +174,9 @@ public abstract class VoxyInstance {
     }
 
 
-    protected abstract SectionSerializationStorage createStorage(WorldIdentifier identifier);
+    private SectionStorage createStorage(WorldIdentifier identifier) {
+        return new SectionStorage(this.basePath.resolve(identifier.getWorldId()).resolve("storage-v3-log"));
+    }
 
     private WorldEngine createWorld(WorldIdentifier identifier) {
         if (!this.isRunning) {
@@ -202,7 +230,6 @@ public abstract class VoxyInstance {
         }
         this.cleanIdle();
 
-        try {this.ingestService.shutdown();} catch (Exception e) {Logger.error(e);}
         try {this.savingService.shutdown();} catch (Exception e) {Logger.error(e);}
 
 
@@ -241,13 +268,129 @@ public abstract class VoxyInstance {
         }
         Logger.info("Instance shutdown");
         this.activeWorldLock.unlockWrite(stamp);
-    }
-
-    public boolean isIngestEnabled(WorldIdentifier worldId) {
-        return true;
+        RenderResourceReuse.clearResources();
     }
 
     public boolean isRunning() {
         return this.isRunning;
+    }
+
+    public static Path getStoragePath(WorldIdentifier identifier) {
+        return getBasePath().normalize().resolve(identifier.getWorldId()).resolve("storage-v3-log");
+    }
+
+    public static boolean serverCacheNeedsReset(WorldIdentifier identifier, long serverId) {
+        Path root = getStoragePath(identifier);
+        Path marker = root.resolve("server-id.vxy");
+        try {
+            if (Files.exists(marker)) return readServerId(marker) != serverId;
+            Path sections = root.resolve("sections");
+            if (!Files.isDirectory(sections)) return false;
+            try (var files = Files.list(sections)) {
+                return files.anyMatch(path -> path.getFileName().toString().endsWith(".vxl"));
+            }
+        } catch (IOException | RuntimeException e) {
+            Logger.warn("Voxy server identity is unreadable; resetting only cached sections", e);
+            return true;
+        }
+    }
+
+    /** Called only after the renderer and Voxy instance have released this world's storage. */
+    public static void resetServerCache(WorldIdentifier identifier, long serverId) {
+        Path root = getStoragePath(identifier);
+        Path sections = root.resolve("sections");
+        try {
+            Files.createDirectories(sections);
+            try (var files = Files.list(sections)) {
+                for (Path path : files.toList()) {
+                    String name = path.getFileName().toString();
+                    if (Files.isRegularFile(path) && (name.endsWith(".vxl") || name.endsWith(".idx")
+                            || name.endsWith(".tmp") || name.endsWith(".compact"))) Files.deleteIfExists(path);
+                }
+            }
+            forceDirectory(sections);
+            writeServerId(root.resolve("server-id.vxy"), serverId);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Unable to reset stale Voxy section cache " + root, e);
+        }
+    }
+
+    public static void recordServerIdentity(WorldIdentifier identifier, long serverId) {
+        Path marker = getStoragePath(identifier).resolve("server-id.vxy");
+        try {
+            if (!Files.exists(marker) || readServerId(marker) != serverId) writeServerId(marker, serverId);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Unable to persist Voxy server identity " + marker, e);
+        }
+    }
+
+    private static long readServerId(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        if (bytes.length != 20) throw new IOException("invalid Voxy server identity length");
+        ByteBuffer data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        long magic = data.getLong();
+        long id = data.getLong();
+        int expected = data.getInt();
+        CRC32C crc = new CRC32C();
+        crc.update(bytes, 0, 16);
+        if (magic != SERVER_ID_MAGIC || (int) crc.getValue() != expected) {
+            throw new IOException("invalid Voxy server identity checksum");
+        }
+        return id;
+    }
+
+    private static void writeServerId(Path path, long serverId) throws IOException {
+        Files.createDirectories(path.getParent());
+        ByteBuffer data = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN);
+        data.putLong(SERVER_ID_MAGIC).putLong(serverId);
+        CRC32C crc = new CRC32C();
+        crc.update(data.array(), 0, 16);
+        data.putInt((int) crc.getValue()).flip();
+        Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
+        try (FileChannel output = FileChannel.open(temporary, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            while (data.hasRemaining()) output.write(data);
+            output.force(false);
+        }
+        try {
+            Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+        }
+        forceDirectory(path.getParent());
+    }
+
+    private static void forceDirectory(Path directory) {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch (IOException | UnsupportedOperationException ignored) {
+            // Some client filesystems do not expose directory fsync; atomic replacement still
+            // prevents a partially written identity marker.
+        }
+    }
+
+    private static Path getBasePath() {
+        Path basePath = Minecraft.getInstance().gameDirectory.toPath().resolve(".voxy").resolve("saves");
+        var server = Minecraft.getInstance().getSingleplayerServer();
+        if (server != null) {
+            basePath = server.getWorldPath(LevelResource.ROOT).resolve("voxy");
+        } else {
+            var gameMode = Minecraft.getInstance().gameMode;
+            if (gameMode == null) {
+                Logger.error("Network handle null");
+                basePath = basePath.resolve("UNKNOWN");
+            } else {
+                var info = gameMode.connection.getServerData();
+                if (info == null) {
+                    Logger.error("Server info null");
+                    basePath = basePath.resolve("UNKNOWN");
+                } else if (info.isRealm()) {
+                    basePath = basePath.resolve("realms");
+                } else {
+                    basePath = basePath.resolve(info.ip.replace(":", "_"));
+                }
+            }
+        }
+        return basePath.toAbsolutePath();
     }
 }

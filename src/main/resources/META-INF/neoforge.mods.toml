@@ -14,24 +14,22 @@ authors="Cortex"
 
 [[mixins]]
 config="client.voxy.mixins.json"
-[[mixins]]
-config="common.voxy.mixins.json"
 
 [[dependencies.${mod_id}]]
 modId="neoforge"
 type="required"
 versionRange="[21.1.228,)"
 ordering="NONE"
-side="BOTH"
+side="CLIENT"
 [[dependencies.${mod_id}]]
 modId="minecraft"
 type="required"
 versionRange="[$minecraft]"
 ordering="NONE"
-side="BOTH"
+side="CLIENT"
 [[dependencies.${mod_id}]]
 modId="sodium"
-type="optional"
+type="required"
 versionRange="[0.6.0,)"
 ordering="NONE"
 side="CLIENT"

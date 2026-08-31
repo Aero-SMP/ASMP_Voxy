@@ -22,19 +22,14 @@ import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.world.WorldEngine;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.irisshaders.iris.Iris;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
-import org.vivecraft.api.client.VRRenderingAPI;
 
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.function.Supplier;
 
 import static org.lwjgl.opengl.GL11.GL_VIEWPORT;
 import static org.lwjgl.opengl.GL11.glEnable;
@@ -48,7 +43,6 @@ import static org.lwjgl.opengl.GL30C.*;
 import static org.lwjgl.opengl.GL33.glBindSampler;
 import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
-import static org.vivecraft.api.client.data.RenderPass.VANILLA;
 
 public class VoxyRenderSystem {
     private final WorldEngine worldIn;
@@ -65,10 +59,7 @@ public class VoxyRenderSystem {
     private final RenderDistanceTracker renderDistanceTracker;
     public final ChunkBoundRenderer chunkBoundRenderer;
 
-    private static final boolean VIVECRAFT_INSTALLED = VoxyCommon.isModLoaded("vivecraft");
-    private final Supplier<? extends Viewport<?>> viewportCreator;
-    private final Viewport<?> defaultViewport;
-    private final Map<Object, Viewport<?>> extraViewports = new HashMap<>();
+    private final Viewport viewport;
 
     private final AbstractRenderPipeline pipeline;
 
@@ -154,8 +145,7 @@ public class VoxyRenderSystem {
 
             var sectionRenderer = new MDICSectionRenderer(this.pipeline, this.modelService.getStore(), this.geometryData);
             this.pipeline.setSectionRenderer(sectionRenderer);
-            this.viewportCreator = sectionRenderer::createViewport;
-            this.defaultViewport = this.viewportCreator.get();
+            this.viewport = sectionRenderer.createViewport();
 
             {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
@@ -190,7 +180,7 @@ public class VoxyRenderSystem {
     }
 
 
-    public Viewport<?> setupViewport(Matrix4fc vanillaProjection, Matrix4fc modelView, double cameraX, double cameraY, double cameraZ) {
+    public Viewport setupViewport(Matrix4fc vanillaProjection, Matrix4fc modelView, double cameraX, double cameraY, double cameraZ) {
         var viewport = this.getViewport();
         if (viewport == null) {
             return null;
@@ -230,7 +220,7 @@ public class VoxyRenderSystem {
         return viewport;
     }
 
-    public void renderOpaque(Viewport<?> viewport) {
+    public void renderOpaque(Viewport viewport) {
         if (viewport == null) {
             return;
         }
@@ -332,17 +322,11 @@ public class VoxyRenderSystem {
         this.renderDistanceTracker.setRenderDistance((int) Math.ceil(renderDistance+1));//the +1 is to cover the outer ring of chunks when rendering a circle
     }
 
-    public Viewport<?> getViewport() {
+    public Viewport getViewport() {
         if (IrisUtil.irisShadowActive()) {
             return null;
         }
-        if (VIVECRAFT_INSTALLED) {
-            var pass = VRRenderingAPI.instance().getCurrentRenderPass();
-            if (pass != null && pass != VANILLA) {
-                return this.extraViewports.computeIfAbsent(pass, ignored -> this.viewportCreator.get());
-            }
-        }
-        return this.defaultViewport;
+        return this.viewport;
     }
 
     public void shutdown() {
@@ -368,9 +352,7 @@ public class VoxyRenderSystem {
 
             this.chunkBoundRenderer.free();
 
-            this.defaultViewport.delete();
-            this.extraViewports.values().forEach(Viewport::delete);
-            this.extraViewports.clear();
+            this.viewport.delete();
         } catch (Exception e) {Logger.error("Error shutting down renderer components", e);}
         Logger.info("Shutting down render pipeline");
         try {this.pipeline.free();} catch (Exception e){Logger.error("Error releasing render pipeline", e);}

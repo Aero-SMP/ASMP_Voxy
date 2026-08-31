@@ -1,0 +1,10 @@
+world = "/srv/minecraft/world"
+data = "/srv/minecraft/voxy-rust"
+transport = "direct"
+poll_ms = 2000
+rayon_threads = 16
+
+[direct]
+listen = "0.0.0.0:25587"
+# Empty means that clients reuse the Minecraft server hostname.
+advertise_host = ""

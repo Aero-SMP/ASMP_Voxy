@@ -171,26 +171,24 @@ public class HierarchicalOcclusionTraverser {
         nglClearNamedBufferSubData(this.topNodeIds.id, GL_R32UI, idx*4L, 4, GL_RED_INTEGER, GL_UNSIGNED_INT, SCRATCH);
     }
 
-    private static void setFrustum(Viewport<?> viewport, long ptr) {
+    private static void setFrustum(Viewport viewport, long ptr) {
         for (int i = 0; i < 6; i++) {
             var plane = viewport.frustumPlanes[i];
             plane.getToAddress(ptr); ptr += 4*4;
         }
     }
 
-    private void uploadUniform(Viewport<?> viewport) {
+    private void uploadUniform(Viewport viewport) {
         long ptr = UploadStream.INSTANCE.upload(this.uniformBuffer, 0, 1024);
 
         viewport.MVP.getToAddress(ptr); ptr += 4*4*4;
 
         viewport.section.getToAddress(ptr); ptr += 4*3;
 
-        //MemoryUtil.memPutFloat(ptr, viewport.width); ptr += 4;
         MemoryUtil.memPutInt(ptr, viewport.hiZBuffer.getPackedLevels()); ptr += 4;
 
         viewport.innerTranslation.getToAddress(ptr); ptr += 4*3;
 
-        //MemoryUtil.memPutFloat(ptr, viewport.height); ptr += 4;
 
         final float screenspaceAreaDecreasingSize = VoxyConfig.CONFIG.subDivisionSize*VoxyConfig.CONFIG.subDivisionSize;
         //Screen space size for descending
@@ -217,7 +215,7 @@ public class HierarchicalOcclusionTraverser {
 
     }
 
-    private void bindings(Viewport<?> viewport) {
+    private void bindings(Viewport viewport) {
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, this.queueMetaBuffer.id);
 
         //Bind the hiz buffer
@@ -226,9 +224,8 @@ public class HierarchicalOcclusionTraverser {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, RENDER_QUEUE_BINDING, viewport.getRenderList().id);
     }
 
-    public void doTraversal(Viewport<?> viewport) {
+    public void doTraversal(Viewport viewport) {
         this.uploadUniform(viewport);
-        //UploadStream.INSTANCE.commit(); //Done inside traversal
 
         this.traversal.bind();
         this.bindings(viewport);
@@ -324,16 +321,12 @@ public class HierarchicalOcclusionTraverser {
             //This should not break the synchonization between gpu and cpu as in the traversal shader is
             // `if (atomRes < REQUEST_QUEUE_SIZE) {` which forcefully clamps to the request size
 
-            //Logger.warn("Count over max buffer size, clamping, got count: " + count + ".");
 
             count = (int) ((this.requestBuffer.size()>>3)-1);
 
             //Write back the clamped count
             MemoryUtil.memPutInt(ptr-8, count);
         }
-        //if (count > REQUEST_QUEUE_SIZE) {
-        //    Logger.warn("Count larger than 'maxRequestCount', overflow captured. Overflowed by " + (count-REQUEST_QUEUE_SIZE));
-        //}
         if (count != 0) {
             this.nodeManager.submitRequestBatch(new MemoryBuffer(count*8L+8).cpyFrom(ptr-8));// the -8 is because we incremented it by 8
         }

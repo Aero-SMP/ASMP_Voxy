@@ -230,7 +230,6 @@ public class RenderDataFactory {
         neighborMsk += packedEmpty&1;//-x
         neighborMsk += (packedEmpty>>>30)&0b10;//+x
 
-        //notEmpty = (notEmpty != 0)?1:0;
         neighborMsk += ((((i - 1) >> 10) == 0) ? 0b100 : 0)*(packedEmpty!=0?1:0);//-y
         neighborMsk += ((((i - 1) >> 10) == 31) ? 0b1000 : 0)*(packedEmpty!=0?1:0);//+y
         neighborMsk += (((((i - 33) >> 5) & 0x1F) == 0) ? 0b10000 : 0)*(((int) notEmpty)!=0?1:0);//-z
@@ -538,9 +537,6 @@ public class RenderDataFactory {
                         }
 
                         long lighter = this.sectionData[bi];
-                        //if (!ModelQueries.faceUsesSelfLighting(Am, facingForward|(axis*2))) {//TODO: check this is right
-                        //    lighter = this.sectionData[bi];
-                        //}
 
                         this.blockMesher.putNext(applyQuadLight(
                                 ((long) facingForward) |//Facing
@@ -1139,9 +1135,6 @@ public class RenderDataFactory {
                         }
 
                         long lighter = this.sectionData[bi];
-                        //if (!ModelQueries.faceUsesSelfLighting(Am, facingForward|(axis*2))) {//TODO: check this is right
-                        //    lighter = this.sectionData[bi];
-                        //}
 
                         //Example thing thats just wrong but as example
                         mesher.putNext(applyQuadLight(
@@ -1244,9 +1237,6 @@ public class RenderDataFactory {
 
                         //TODO: LIGHTING
                         long lightData = ((neighborId&(0xFFL<<56))>>>1);//A;
-                        //if (!ModelQueries.faceUsesSelfLighting(Am, facingForward|(axis*2))) {//TODO: check this is right
-                        //    lighter = this.sectionData[bi];
-                        //}
 
                         ma.putNext(applyQuadLight(
                                 0L |
@@ -1306,9 +1296,6 @@ public class RenderDataFactory {
 
                         //TODO: LIGHTING
                         long lightData = ((neighborId&(0xFFL<<56))>>>1);//A;
-                        //if (!ModelQueries.faceUsesSelfLighting(Am, facingForward|(axis*2))) {//TODO: check this is right
-                        //    lighter = this.sectionData[bi];
-                        //}
 
                         mb.putNext(applyQuadLight(
                                 1L |
@@ -1559,7 +1546,6 @@ public class RenderDataFactory {
         //THE EXCEPTION THAT THIS THROWS CAUSES MAJOR ISSUES
 
         //Copy section data to end of array so that can mutate array while reading safely
-        //section.copyDataTo(this.sectionData, 32*32*32);
 
         //We must reset _everything_ that could have changed as we dont exactly know the state due to how the model id exception
         // throwing system works
@@ -1645,9 +1631,6 @@ public class RenderDataFactory {
         aabb |= Math.max(0,this.maxY-this.minY-1)<<20;
         aabb |= Math.max(0,this.maxZ-this.minZ-1)<<25;
 
-        //if (this.maxX<=this.minX||this.maxY<=this.minY||this.maxZ<=this.minZ) {
-        //    throw new IllegalStateException("AABB bounds are not valid");
-        //}
 
         return new BuiltSection(section.key, section.getNonEmptyChildren(), aabb, buff, offsets);
     }

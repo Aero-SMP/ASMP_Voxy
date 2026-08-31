@@ -221,7 +221,6 @@ public class ModelFactory {
 
         {//Create texture data
             long ptr = this.bakeScratchBuffer;
-            //long ptr = result.rawData.address;
             final int FACE_SIZE = MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
             for (int face = 0; face < 6; face++) {
                 long faceDataPtr = ptr + (FACE_SIZE * 4) * face * 2;
@@ -495,8 +494,6 @@ public class ModelFactory {
 
             if (allFalse == allTrue) {//If only some sides where self culled then abort
                 cullsSame = false;
-                //if (LOGGED_SELF_CULLING_WARNING.add(blockState))
-                //    Logger.info("Warning! blockstate: " + blockState + " only culled against its self some of the time");
             }
 
             if (allTrue) {
@@ -670,7 +667,6 @@ public class ModelFactory {
 
         MipGen.putTextures(darkenedTinting, textureData, uploadResult.texture);
 
-        //glGenerateTextureMipmap(this.textures.id);
 
         //Set the mapping at the very end
         this.idMappings[blockId] = modelId;
@@ -920,7 +916,6 @@ public class ModelFactory {
         for (var dir : Direction.values()) {
             var data = textures[dir.get3DDataValue()];
             float fd = TextureUtils.computeDepth(data, computeMode, checkMode);//Compute the min float depth, smaller means closer to the camera, range 0-1
-            //int depth = Math.round(fd * MODEL_TEXTURE_SIZE);
             //If fd is -1, it means that there was nothing rendered on that face and it should be discarded
             if (fd < -0.1) {
                 res[dir.ordinal()] = -1;

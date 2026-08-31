@@ -1,0 +1,66 @@
+plugins {
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+group = rootProject.group
+version = rootProject.version
+
+base {
+    archivesName.set('voxy-minecraft-bridge')
+}
+
+java {
+    toolchain.languageVersion.set(JavaLanguageVersion.of(21))
+}
+
+sourceSets.main.java.srcDir rootProject.file('bridge-shared/src/main/java')
+
+sourceSets {
+    debug {
+        java.srcDirs = [
+                project.file('src/debug/java'),
+                rootProject.file('bridge-shared/src/debug/java')
+        ]
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + sourceSets.main.runtimeClasspath
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release.set(21)
+}
+
+tasks.named('processResources') {
+    dependsOn rootProject.tasks.named('buildRustServer')
+    inputs.property('version', project.version)
+    from(rootProject.file('rust-server/target/release/voxy-rust-server')) {
+        into 'native/linux-x86_64'
+    }
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand(version: project.version)
+    }
+}
+
+tasks.register('debugJar', Jar) {
+    description = 'Build the bundled server JAR with client telemetry logging enabled'
+    archiveClassifier.set('debug')
+    dependsOn tasks.named('debugClasses')
+    from(sourceSets.main.output) {
+        exclude 'me/cortex/voxy/bridge/ServerDebug.class'
+    }
+    from sourceSets.debug.output
+    from rootProject.layout.projectDirectory.dir('debug-marker')
+}
+
+tasks.named('assemble') {
+    dependsOn tasks.named('debugJar')
+}
+
+neoForge {
+    version = providers.gradleProperty('neoforge_version').get()
+    mods {
+        register('voxy_minecraft_bridge') {
+            sourceSet sourceSets.main
+        }
+    }
+}

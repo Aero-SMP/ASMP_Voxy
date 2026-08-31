@@ -28,6 +28,7 @@ public class SaveLoadSystem3 {
 
         MemoryUtil.memPutLong(ptr, section.key); ptr += 8;
         long metadataPtr = ptr; ptr += 8;
+        MemoryUtil.memPutLong(ptr, section.getRemoteRevision()); ptr += 8;
 
         long blockPtr = ptr; ptr += WorldSection.SECTION_VOLUME*2;
         long prev = data[0]; MemoryUtil.memPutLong(ptr, prev); ptr+=8; LUT.put(prev, (short) 0);
@@ -44,7 +45,7 @@ public class SaveLoadSystem3 {
             MemoryUtil.memPutShort(blockPtr, mapping); blockPtr+=2;
         }
         //TODO: note! can actually have the first (last?) byte of metadata be the storage version!
-        long metadata = 0;
+        long metadata = 1L<<56;
         metadata |= Integer.toUnsignedLong(LUT.size());//Bottom 2 bytes
         metadata |= Byte.toUnsignedLong(section.getNonEmptyChildren())<<16;//Next byte
         //5 bytes free
@@ -65,7 +66,9 @@ public class SaveLoadSystem3 {
         }
 
         final long metadata = MemoryUtil.memGetLong(ptr); ptr += 8;
+        if ((metadata>>>56) != 1) return false;
         section.nonEmptyChildren = (byte) ((metadata>>>16)&0xFF);
+        section.setRemoteRevision(MemoryUtil.memGetLong(ptr)); ptr += 8;
         final long lutBasePtr = ptr + WorldSection.SECTION_VOLUME * 2;
 
         final var blockData = section.data;

@@ -1,6 +1,8 @@
 package me.cortex.voxy.client.core.rendering;
 
 import me.cortex.voxy.client.core.gl.GlBuffer;
+import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
+import me.cortex.voxy.client.core.rendering.section.backend.mdic.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import net.minecraft.util.Mth;
@@ -8,9 +10,15 @@ import org.joml.*;
 
 import java.lang.reflect.Field;
 
-public abstract class Viewport <A extends Viewport<A>> {
+public final class Viewport {
     public final HiZBuffer hiZBuffer;
     public final DepthFramebuffer depthBoundingBuffer = new DepthFramebuffer();
+    public final GlBuffer drawCountCallBuffer = new GlBuffer(1024).zero();
+    public final GlBuffer drawCallBuffer = new GlBuffer(5 * 4 * (MDICSectionRenderer.OPAQUE_DRAW_COUNT
+            + MDICSectionRenderer.TRANSLUCENT_DRAW_COUNT + MDICSectionRenderer.TEMPORAL_DRAW_COUNT)).zero();
+    public final GlBuffer positionScratchBuffer = new GlBuffer(8 * 400_000).zero();
+    public final GlBuffer indirectLookupBuffer = new GlBuffer(HierarchicalOcclusionTraverser.MAX_QUEUE_SIZE * 4 + 4);
+    public final GlBuffer visibilityBuffer;
 
     private static final Field planesField;
     static {
@@ -38,7 +46,7 @@ public abstract class Viewport <A extends Viewport<A>> {
     public final Vector3i section = new Vector3i();
     public final Vector3f innerTranslation = new Vector3f();
 
-    protected Viewport() {
+    public Viewport(int maxSectionCount) {
         Vector4f[] planes = null;
         try {
              planes = (Vector4f[]) planesField.get(this.frustum);
@@ -48,46 +56,48 @@ public abstract class Viewport <A extends Viewport<A>> {
         this.frustumPlanes = planes;
 
         this.hiZBuffer = new HiZBuffer();
+        this.visibilityBuffer = new GlBuffer(maxSectionCount * 4L);
     }
 
     public final void delete() {
-        this.delete0();
-    }
-
-    protected void delete0() {
         this.hiZBuffer.free();
         this.depthBoundingBuffer.free();
+        this.visibilityBuffer.free();
+        this.indirectLookupBuffer.free();
+        this.drawCountCallBuffer.free();
+        this.drawCallBuffer.free();
+        this.positionScratchBuffer.free();
     }
 
-    public A setVanillaProjection(Matrix4fc projection) {
+    public Viewport setVanillaProjection(Matrix4fc projection) {
         this.vanillaProjection.set(projection);
-        return (A) this;
+        return this;
     }
 
-    public A setProjection(Matrix4f projection) {
+    public Viewport setProjection(Matrix4f projection) {
         this.projection = projection;
-        return (A) this;
+        return this;
     }
 
-    public A setModelView(Matrix4fc modelView) {
+    public Viewport setModelView(Matrix4fc modelView) {
         this.modelView.set(modelView);
-        return (A) this;
+        return this;
     }
 
-    public A setCamera(double x, double y, double z) {
+    public Viewport setCamera(double x, double y, double z) {
         this.cameraX = x;
         this.cameraY = y;
         this.cameraZ = z;
-        return (A) this;
+        return this;
     }
 
-    public A setScreenSize(int width, int height) {
+    public Viewport setScreenSize(int width, int height) {
         this.width = width;
         this.height = height;
-        return (A) this;
+        return this;
     }
 
-    public A update() {
+    public Viewport update() {
         //MVP
         this.projection.mul(this.modelView, this.MVP);
 
@@ -109,8 +119,10 @@ public abstract class Viewport <A extends Viewport<A>> {
             this.depthBoundingBuffer.clear(0.0f);
         }
 
-        return (A) this;
+        return this;
     }
 
-    public abstract GlBuffer getRenderList();
+    public GlBuffer getRenderList() {
+        return this.indirectLookupBuffer;
+    }
 }

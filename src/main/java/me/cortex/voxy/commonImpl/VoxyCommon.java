@@ -1,59 +1,41 @@
 package me.cortex.voxy.commonImpl;
 
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.commonImpl.lod.LodStreamingService;
-import net.neoforged.api.distmarker.Dist;
-import net.neoforged.bus.api.IEventBus;
-import net.neoforged.fml.common.Mod;
-import net.neoforged.fml.loading.FMLLoader;
 import net.neoforged.fml.loading.FMLPaths;
 import net.neoforged.fml.loading.LoadingModList;
 
 import java.nio.file.Path;
-import java.util.function.Supplier;
 
-@Mod("voxy")
 public class VoxyCommon {
     public static final String MOD_VERSION;
-    public static final boolean IS_DEDICATED_SERVER;
     public static final boolean IS_IN_MINECRAFT;
-
-    public VoxyCommon(IEventBus modBus) {
-        new LodStreamingService(modBus);
-    }
 
     static {
         String modVersion;
-        boolean dedicated;
         boolean inMinecraft;
 
         var version = getModVersion("voxy");
-        var commit = "<UNKNOWN>";
         if (version == null) {
             inMinecraft = false;
             Logger.error("Running voxy without minecraft");
             modVersion = "<UNKNOWN>";
-            dedicated = false;
         } else {
             inMinecraft = true;
-            if (commit == null) commit = "unknown";
-            modVersion = version + "-" + (commit.length() >= 7 ? commit.substring(0, 7) : commit);
-            dedicated = FMLLoader.getDist() == Dist.DEDICATED_SERVER;
+            modVersion = version;
         }
 
         MOD_VERSION = modVersion;
-        IS_DEDICATED_SERVER = dedicated;
         IS_IN_MINECRAFT = inMinecraft;
     }
 
     private static VoxyInstance INSTANCE;
-    private static Supplier<VoxyInstance> FACTORY;
+    private static boolean available;
 
-    public static void setInstanceFactory(Supplier<VoxyInstance> factory) {
-        if (FACTORY != null) {
-            throw new IllegalStateException("Cannot set instance factory more than once");
+    public static void setAvailable() {
+        if (available) {
+            throw new IllegalStateException("Cannot make Voxy available more than once");
         }
-        FACTORY = factory;
+        available = true;
     }
 
     public static VoxyInstance getInstance() {
@@ -69,18 +51,18 @@ public class VoxyCommon {
     }
 
     public static void createInstance() {
-        if (FACTORY == null) {
+        if (!available) {
             return;
         }
         if (INSTANCE != null) {
             throw new IllegalStateException("Cannot create multiple instances");
         }
-        INSTANCE = FACTORY.get();
+        INSTANCE = new VoxyInstance();
     }
 
     //Is voxy available in any capacity
     public static boolean isAvailable() {
-        return FACTORY != null;
+        return available;
     }
 
     public static boolean isModLoaded(String modId) {
