@@ -13,6 +13,7 @@ import net.caffeinemc.mods.sodium.api.config.option.OptionFlag;
 import net.caffeinemc.mods.sodium.api.config.option.OptionImpact;
 import net.caffeinemc.mods.sodium.api.config.option.Range;
 import net.caffeinemc.mods.sodium.api.config.structure.ConfigBuilder;
+import net.caffeinemc.mods.sodium.api.config.structure.IntegerOptionBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.ModOptionsBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.OptionBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.OptionGroupBuilder;
@@ -196,6 +197,9 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         builder.setBinding(setter, getter);
         builder.setStorageHandler(CFG::save);
         builder.setDefaultValue(getter.get());
+        if (builder instanceof IntegerOptionBuilder integer) {
+            integer.setValueFormatter(value -> Component.literal(Integer.toString(value)));
+        }
         return builder;
     }
 
