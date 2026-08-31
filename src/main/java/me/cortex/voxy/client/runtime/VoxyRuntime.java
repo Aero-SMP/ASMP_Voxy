@@ -1,8 +1,9 @@
-package me.cortex.voxy.commonImpl;
+package me.cortex.voxy.client.runtime;
 
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.mixin.sodium.AccessorSodiumWorldRenderer;
+import me.cortex.voxy.client.world.WorldIdentifier;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.storage.SectionStorage;
 import me.cortex.voxy.common.thread.ServiceManager;
@@ -15,7 +16,6 @@ import net.minecraft.world.level.storage.LevelResource;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -31,7 +31,7 @@ import java.util.concurrent.locks.StampedLock;
 import java.util.zip.CRC32C;
 
 //TODO: add thread access verification (I.E. only accessible on a single thread)
-public class VoxyInstance {
+public final class VoxyRuntime {
     private static final long SERVER_ID_MAGIC = 0x5658595345525633L; // VXYSERV3
     private volatile boolean isRunning = true;
     private final Thread worldCleaner;
@@ -42,7 +42,7 @@ public class VoxyInstance {
     private final StampedLock activeWorldLock = new StampedLock();
     private final HashMap<WorldIdentifier, WorldEngine> activeWorlds = new HashMap<>();
 
-    public VoxyInstance() {
+    public VoxyRuntime() {
         Logger.info("Initializing voxy instance");
         this.basePath = getBasePath().normalize();
         this.threadPool = new UnifiedServiceThreadPool();
@@ -101,76 +101,41 @@ public class VoxyInstance {
     // a world is no longer active once it has no reference counts and no active chunks associated with it
     public WorldEngine getNullable(WorldIdentifier identifier) {
         if (!this.isRunning) return null;
-        var cache = identifier.cachedEngineObject;
-        WorldEngine world;
-        if (cache == null) {
-            world = null;
-        } else {
-            world = cache.get();
-            if (world == null) {
-                identifier.cachedEngineObject = null;
-            } else {
-                if (world.isLive()) {
-                    if (world.instanceIn != this) {
-                        throw new IllegalStateException("World cannot be in identifier cache, alive and not part of this instance");
-                    }
-                    //Successful cache hit
-                } else {
-                    identifier.cachedEngineObject = null;
-                    world = null;
-                }
+        long stamp = this.activeWorldLock.readLock();
+        try {
+            WorldEngine world = this.activeWorlds.get(identifier);
+            if (world != null) {
+                // Keep the world protected from the cleaner until it is marked active.
+                world.markActive();
             }
-        }
-        if (world == null) {//If the cached world is null, try get from the active worlds
-            long stamp = this.activeWorldLock.readLock();
-            world = this.activeWorlds.get(identifier);
+            return world;
+        } finally {
             this.activeWorldLock.unlockRead(stamp);
-            if (world != null) {//Setup cache
-                identifier.cachedEngineObject = new WeakReference<>(world);
-            }
         }
-        if (world != null) {
-            //Mark the world as active
-            world.markActive();
-        }
-        return world;
     }
 
     public WorldEngine getOrCreate(WorldIdentifier identifier) {
-        return this.getOrCreate(identifier, false);
-    }
-
-    public WorldEngine getOrCreate(WorldIdentifier identifier, boolean incrementRef) {
         if (!this.isRunning) {
             Logger.error("Tried getting world object on voxy instance but its not running");
             return null;
         }
         var world = this.getNullable(identifier);
         if (world != null) {
-            world.markActive();
-            if (incrementRef) world.acquireRef();
             return world;
         }
         long stamp = this.activeWorldLock.writeLock();
-
-        if (!this.isRunning) {
-            Logger.error("Tried getting world object on voxy instance but its not running");
+        try {
+            if (!this.isRunning) {
+                Logger.error("Tried getting world object on voxy instance but its not running");
+                return null;
+            }
+            world = this.activeWorlds.get(identifier);
+            if (world == null) world = this.createWorld(identifier);
+            world.markActive();
+            return world;
+        } finally {
             this.activeWorldLock.unlockWrite(stamp);
-            return null;
         }
-
-        world = this.activeWorlds.get(identifier);
-        if (world == null) {
-            //Create world here
-            world = this.createWorld(identifier);
-        }
-        world.markActive();
-
-        if (incrementRef) world.acquireRef();
-
-        this.activeWorldLock.unlockWrite(stamp);
-        identifier.cachedEngineObject = new WeakReference<>(world);
-        return world;
     }
 
 
@@ -186,7 +151,7 @@ public class VoxyInstance {
             throw new IllegalStateException("Existing world with identifier");
         }
         Logger.info("Creating new world engine: " + identifier.getLongHash() + "@" + System.identityHashCode(this));
-        var world = new WorldEngine(this.createStorage(identifier), this);
+        var world = new WorldEngine(this.createStorage(identifier));
         world.setSaveCallback(this.savingService::enqueueSave);
         this.activeWorlds.put(identifier, world);
         return world;

@@ -71,7 +71,10 @@ pub struct ParsedChunk {
     pub z: i32,
     pub sections: BTreeMap<i32, ChunkSection>,
     pub source_fingerprint: u64,
+    pub terrain_fingerprint: TerrainFingerprint,
 }
+
+pub type TerrainFingerprint = [u64; 2];
 
 #[derive(Clone, Debug)]
 pub struct BuiltLevelZero {
@@ -574,6 +577,7 @@ fn parse_chunk(
             z: decoded.z,
             sections: BTreeMap::new(),
             source_fingerprint: 0,
+            terrain_fingerprint: terrain_fingerprint(&BTreeMap::new()),
         });
     }
     let mut sections = BTreeMap::new();
@@ -694,12 +698,32 @@ fn parse_chunk(
             );
         }
     }
+    let terrain_fingerprint = terrain_fingerprint(&sections);
     Ok(ParsedChunk {
         x: decoded.x,
         z: decoded.z,
         sections,
         source_fingerprint: 0,
+        terrain_fingerprint,
     })
+}
+
+/// Hashes only the normalized inputs consumed by LOD generation. Palette order, unrelated NBT,
+/// compression, and region-file placement have already disappeared at this boundary.
+fn terrain_fingerprint(sections: &BTreeMap<i32, ChunkSection>) -> TerrainFingerprint {
+    const SEED_A: u64 = 0x5658_5932_5445_5252;
+    const SEED_B: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut bytes = Vec::with_capacity(4 + sections.len() * (4 + 4096 * 9));
+    bytes.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+    for (&y, section) in sections {
+        bytes.extend_from_slice(&y.to_le_bytes());
+        for cell in &section.cells {
+            bytes.extend_from_slice(&cell.block.to_le_bytes());
+            bytes.extend_from_slice(&cell.biome.to_le_bytes());
+            bytes.push(cell.light);
+        }
+    }
+    [xxh64(&bytes, SEED_A), xxh64(&bytes, SEED_B)]
 }
 
 fn canonical_block_state(entry: &BlockPaletteNbt) -> String {
@@ -777,6 +801,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unrelated_chunk_metadata_does_not_change_terrain_fingerprint() {
+        use fastnbt::Value;
+        use std::collections::HashMap;
+
+        let root = std::env::temp_dir().join(format!(
+            "voxy-terrain-fingerprint-test-{}",
+            std::process::id()
+        ));
+        let registry = Arc::new(RwLock::new(Registry::open(&root).unwrap()));
+        let chunk = |inhabited_time| {
+            HashMap::from([
+                ("xPos".to_owned(), Value::Int(0)),
+                ("zPos".to_owned(), Value::Int(0)),
+                ("Status".to_owned(), Value::String("full".to_owned())),
+                ("sections".to_owned(), Value::List(Vec::new())),
+                ("InhabitedTime".to_owned(), Value::Long(inhabited_time)),
+                (
+                    "entities".to_owned(),
+                    Value::List(if inhabited_time == 1 {
+                        Vec::new()
+                    } else {
+                        vec![Value::Compound(HashMap::from([(
+                            "id".to_owned(),
+                            Value::String("minecraft:pig".to_owned()),
+                        )]))]
+                    }),
+                ),
+            ])
+        };
+        let first = parse_chunk(&fastnbt::to_bytes(&chunk(1)).unwrap(), &registry, 0).unwrap();
+        let second = parse_chunk(&fastnbt::to_bytes(&chunk(2)).unwrap(), &registry, 0).unwrap();
+
+        assert_eq!(first.terrain_fingerprint, second.terrain_fingerprint);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn anvil_palette_does_not_straddle_longs() {
         let bits = 5usize;
         let per = 64 / bits;
@@ -808,6 +869,63 @@ mod tests {
         assert_eq!(
             canonical_block_state(&entry),
             "minecraft:oak_log[axis=y,waterlogged=false]"
+        );
+    }
+
+    #[test]
+    fn terrain_fingerprint_uses_normalized_sections_and_every_lod_input() {
+        let cells = vec![
+            Cell {
+                block: 7,
+                biome: 3,
+                light: 0xa5,
+            };
+            4096
+        ];
+        // Distinct source palettes that decode to these same cells reach this exact normalized
+        // representation, so their fingerprints are necessarily identical.
+        let sections = BTreeMap::from([(
+            -2,
+            ChunkSection {
+                y: -2,
+                cells: cells.clone(),
+            },
+        )]);
+        assert_eq!(
+            terrain_fingerprint(&sections),
+            terrain_fingerprint(&sections.clone())
+        );
+
+        for mutation in [
+            Cell {
+                block: 8,
+                ..cells[0]
+            },
+            Cell {
+                biome: 4,
+                ..cells[0]
+            },
+            Cell {
+                light: 0xa4,
+                ..cells[0]
+            },
+        ] {
+            let mut changed = sections.clone();
+            changed.get_mut(&-2).unwrap().cells[0] = mutation;
+            assert_ne!(
+                terrain_fingerprint(&sections),
+                terrain_fingerprint(&changed)
+            );
+        }
+
+        let shifted = BTreeMap::from([(-1, ChunkSection { y: -1, cells })]);
+        assert_ne!(
+            terrain_fingerprint(&sections),
+            terrain_fingerprint(&shifted)
+        );
+        assert_ne!(
+            terrain_fingerprint(&sections),
+            terrain_fingerprint(&BTreeMap::new())
         );
     }
 

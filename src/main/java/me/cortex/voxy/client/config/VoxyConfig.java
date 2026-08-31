@@ -3,10 +3,10 @@ package me.cortex.voxy.client.config;
 import com.google.gson.FieldNamingPolicy;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 
 import java.io.FileReader;
 import java.io.IOException;
@@ -52,7 +52,7 @@ public class VoxyConfig {
     }
 
     private static VoxyConfig loadOrCreate() {
-        if (VoxyCommon.isAvailable()) {
+        if (VoxyClient.isAvailable()) {
             var path = getConfigPath();
             if (Files.exists(path)) {
                 try (FileReader reader = new FileReader(path.toFile())) {
@@ -80,7 +80,7 @@ public class VoxyConfig {
     }
 
     public void save() {
-        if (!VoxyCommon.isAvailable()) {
+        if (!VoxyClient.isAvailable()) {
             Logger.info("Not saving config since voxy is unavalible");
             return;
         }
@@ -93,10 +93,10 @@ public class VoxyConfig {
     }
 
     private static Path getConfigPath() {
-        return VoxyCommon.getConfigDir().resolve("voxy-config.json");
+        return VoxyClient.getConfigDir().resolve("voxy-config.json");
     }
 
     public boolean isRenderingEnabled() {
-        return VoxyCommon.isAvailable() && this.enabled && this.enableRendering;
+        return VoxyClient.isAvailable() && this.enabled && this.enableRendering;
     }
 }

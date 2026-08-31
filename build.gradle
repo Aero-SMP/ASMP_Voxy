@@ -153,6 +153,11 @@ neoForge {
             sourceSet sourceSets.main
         }
     }
+
+    unitTest {
+        testedMod = mods.getByName(modId)
+        enable()
+    }
 }
 
 tasks.register('buildRustServer', Exec) {

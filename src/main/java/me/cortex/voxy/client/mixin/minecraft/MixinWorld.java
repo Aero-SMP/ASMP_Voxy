@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
-import me.cortex.voxy.commonImpl.IWorldGetIdentifier;
-import me.cortex.voxy.commonImpl.WorldIdentifier;
+import me.cortex.voxy.client.world.LevelIdentifierAccess;
+import me.cortex.voxy.client.world.WorldIdentifier;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.ResourceKey;
@@ -18,7 +18,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.util.function.Supplier;
 
 @Mixin(Level.class)
-public class MixinWorld implements IWorldGetIdentifier {
+public class MixinWorld implements LevelIdentifierAccess {
     @Unique
     private WorldIdentifier identifier;
 

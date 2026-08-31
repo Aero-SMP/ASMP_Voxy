@@ -1,14 +1,14 @@
 package me.cortex.voxy.client.lod;
 
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
+import me.cortex.voxy.client.runtime.VoxyRuntime;
+import me.cortex.voxy.client.world.WorldIdentifier;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.other.Mapper;
-import me.cortex.voxy.commonImpl.VoxyCommon;
-import me.cortex.voxy.commonImpl.VoxyInstance;
-import me.cortex.voxy.commonImpl.WorldIdentifier;
 import me.cortex.voxy.network.TransportPayload;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -43,6 +43,7 @@ import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -75,6 +76,8 @@ public final class ClientLodNetwork {
     private static final int MAX_CANONICAL_LENGTH = 4096;
     private static final int MAX_MAPPINGS_PER_FRAME = 256;
     private static final int SUBSCRIPTION_BATCH = 256;
+    private static final int PREPARED_SECTION_KIB =
+            ((WorldSection.SECTION_VOLUME * Long.BYTES + 1023) >>> 10) + 1;
     private static final long BRIDGE_CREDIT = 512L * 1024;
     private static final long DIRECT_CREDIT = 32L * 1024 * 1024;
 
@@ -86,7 +89,7 @@ public final class ClientLodNetwork {
     private static final AtomicLong CONNECTION_SEQUENCE = new AtomicLong();
     private static final Object LIFECYCLE_LOCK = new Object();
 
-    private static final ArrayDeque<long[]> SECTION_SCRATCH = new ArrayDeque<>();
+    private static final ArrayBlockingQueue<long[]> SECTION_BUFFERS = new ArrayBlockingQueue<>(16);
     /** Latest revisions observed in this client process; durable revisions live on WorldSection. */
     private static final Long2LongOpenHashMap SECTION_REVISIONS = new Long2LongOpenHashMap();
     private static int[] blockTranslations = new int[256];
@@ -137,7 +140,7 @@ public final class ClientLodNetwork {
             try {
                 IGetVoxyRenderSystem renderer = (IGetVoxyRenderSystem) minecraft.levelRenderer;
                 renderer.voxy$shutdownRenderer();
-                if (VoxyCommon.getInstance() == null) VoxyCommon.createInstance();
+                if (VoxyClient.getRuntime() == null) VoxyClient.createRuntime();
                 renderer.voxy$createRenderer();
                 recoveryNeeded = false;
             } catch (RuntimeException exception) {
@@ -145,7 +148,7 @@ public final class ClientLodNetwork {
                 return;
             }
         }
-        if (level == null || minecraft.player == null || VoxyCommon.getInstance() == null) {
+        if (level == null || minecraft.player == null || VoxyClient.getRuntime() == null) {
             if (networkThread != null) disconnect();
             return;
         }
@@ -251,7 +254,8 @@ public final class ClientLodNetwork {
 
     private static void drainInbound(ClientLevel level) {
         WorldIdentifier identifier = WorldIdentifier.of(level);
-        WorldEngine world = identifier == null ? null : identifier.getOrCreateEngine();
+        VoxyRuntime runtime = VoxyClient.getRuntime();
+        WorldEngine world = identifier == null || runtime == null ? null : runtime.getOrCreate(identifier);
         if (world == null) return;
         activeWorld = world;
         activeDimension = level.dimension().location().toString();
@@ -275,7 +279,7 @@ public final class ClientLodNetwork {
                     // Mapping registration touches Minecraft registries and the durable local
                     // catalog. Keep it to one bounded server batch per client tick.
                     return;
-                } else if (message instanceof SectionUpdate section) {
+                } else if (message instanceof PreparedSection section) {
                     applySection(world, section);
                     updates++;
                 } else if (message instanceof Invalidation invalidation) {
@@ -290,13 +294,7 @@ public final class ClientLodNetwork {
                 closeCurrentConnection();
                 return;
             } finally {
-                INBOUND_MEMORY.release(queued.memoryKib);
-                Connection current = connection;
-                if (queued.creditBytes != 0 && current != null
-                        && queued.message.session() == current.generation) {
-                    current.grantCredit(queued.creditBytes);
-                    ClientLodDebug.credit(queued.creditBytes);
-                }
+                releaseInbound(queued);
             }
         }
     }
@@ -306,11 +304,11 @@ public final class ClientLodNetwork {
         boolean restartInstance = !authorityPrepared;
         boolean resetSections = false;
         if (hello.serverInstance != helloServerInstance) {
-            if (VoxyInstance.serverCacheNeedsReset(identifier, hello.serverInstance)) {
+            if (VoxyRuntime.serverCacheNeedsReset(identifier, hello.serverInstance)) {
                 restartInstance = true;
                 resetSections = true;
             } else {
-                VoxyInstance.recordServerIdentity(identifier, hello.serverInstance);
+                VoxyRuntime.recordServerIdentity(identifier, hello.serverInstance);
             }
         }
         if (restartInstance) {
@@ -319,15 +317,15 @@ public final class ClientLodNetwork {
             recoveryNeeded = true;
             try {
                 renderer.voxy$shutdownRenderer();
-                VoxyCommon.shutdownInstance();
+                VoxyClient.shutdownRuntime();
                 if (resetSections) {
-                    VoxyInstance.resetServerCache(identifier, hello.serverInstance);
+                    VoxyRuntime.resetServerCache(identifier, hello.serverInstance);
                     Logger.warn("Reset stale Voxy sections for a new Rust server catalog");
                 }
                 authorityPrepared = true;
             } finally {
                 // Always restore the client even if cache cleanup fails.
-                if (VoxyCommon.getInstance() == null) VoxyCommon.createInstance();
+                if (VoxyClient.getRuntime() == null) VoxyClient.createRuntime();
                 renderer.voxy$createRenderer();
                 recoveryNeeded = false;
             }
@@ -396,7 +394,7 @@ public final class ClientLodNetwork {
         ClientLodDebug.mappingDelta(delta.blocks.size(), delta.biomes.size(), started);
     }
 
-    private static void applySection(WorldEngine world, SectionUpdate update) {
+    private static void applySection(WorldEngine world, PreparedSection update) {
         if (!validWorldKey(update.key) || !DESIRED_SECTIONS.contains(update.key)) {
             ClientLodDebug.droppedUnsubscribed();
             return;
@@ -406,49 +404,13 @@ public final class ClientLodNetwork {
             return;
         }
 
-        long[] palette = new long[update.palette.length];
-        for (int i = 0; i < palette.length; i++) {
-            PaletteEntry entry = update.palette[i];
-            int blockId = translated(blockTranslations, entry.blockId);
-            int biomeId = translated(biomeTranslations, entry.biomeId);
-            if (blockId < 0 || biomeId < 0) {
-                rejectConnection("LOD section references an unknown server mapping: "
-                        + WorldEngine.pprintPos(update.key));
-            }
-            palette[i] = Mapper.composeMappingId(entry.light, blockId, biomeId);
-        }
-
-        long[] data = SECTION_SCRATCH.pollFirst();
-        if (data == null) data = new long[WorldSection.SECTION_VOLUME];
+        long started = ClientLodDebug.timer();
         try {
-            if (update.bitsPerIndex == 0) {
-                Arrays.fill(data, palette[0]);
-            } else {
-                long mask = (1L << update.bitsPerIndex) - 1;
-                for (int i = 0; i < data.length; i++) {
-                    long bit = (long) i * update.bitsPerIndex;
-                    int word = (int) (bit >>> 6);
-                    int shift = (int) (bit & 63);
-                    long index = update.words[word] >>> shift;
-                    if (shift + update.bitsPerIndex > 64) {
-                        index |= update.words[word + 1] << (64 - shift);
-                    }
-                    int paletteIndex = (int) (index & mask);
-                    if (paletteIndex >= palette.length) {
-                        rejectConnection("LOD section contains an invalid packed palette index");
-                    }
-                    data[i] = palette[paletteIndex];
-                }
-            }
-
-            world.replaceRemoteSection(update.key, update.revision, data, update.nonEmptyChildren);
+            world.replaceRemoteSection(update.key, update.revision, update.data,
+                    update.nonEmptyChildren, update.nonEmptyBlockCount);
             SECTION_REVISIONS.put(update.key, update.revision);
             ClientLodDebug.sectionApplied();
-        } finally {
-            // WorldEngine copies the values; one main-thread scratch array avoids hundreds of
-            // megabytes per second of allocation during a large initial stream.
-            SECTION_SCRATCH.addFirst(data);
-        }
+        } finally { ClientLodDebug.sectionInstalled(started); }
     }
 
     private static void applyInvalidation(WorldEngine world, Invalidation invalidation) {
@@ -597,9 +559,33 @@ public final class ClientLodNetwork {
         activeWorld = null;
         SECTION_REVISIONS.clear();
         QueuedInbound queued;
-        while ((queued = INBOUND.poll()) != null) INBOUND_MEMORY.release(queued.memoryKib);
+        while ((queued = INBOUND.poll()) != null) releaseInbound(queued);
         resetMappings();
         ClientLodDebug.reset();
+    }
+
+    private static long[] borrowSectionBuffer() {
+        long[] data = SECTION_BUFFERS.poll();
+        return data == null ? new long[WorldSection.SECTION_VOLUME] : data;
+    }
+
+    private static void recycleSectionBuffer(long[] data) {
+        if (data.length == WorldSection.SECTION_VOLUME) SECTION_BUFFERS.offer(data);
+    }
+
+    private static void releaseInbound(QueuedInbound queued) {
+        Inbound message = queued.message;
+        if (message instanceof PreparedSection section) recycleSectionBuffer(section.data);
+        INBOUND_MEMORY.release(queued.memoryKib);
+
+        if (message instanceof ServerHello hello) hello.completion.countDown();
+        else if (message instanceof MappingDelta mappings) mappings.completion.countDown();
+
+        Connection current = connection;
+        if (queued.creditBytes != 0 && current != null && message.session() == current.generation) {
+            current.grantCredit(queued.creditBytes);
+            ClientLodDebug.credit(queued.creditBytes);
+        }
     }
 
     private static void resetMappings() {
@@ -657,20 +643,44 @@ public final class ClientLodNetwork {
                 if (!receivedHello && frame.type != S_HELLO && frame.type != S_ERROR) {
                     throw new ProtocolException("Server did not begin with HELLO");
                 }
-                Inbound decoded = decode(this.generation, frame);
-                if (decoded instanceof ServerHello) receivedHello = true;
-                if (decoded != null) {
-                    int memoryKib = Math.min(MAX_INBOUND_KIB,
-                            Math.max(1, (frame.payload.length * 2 + 1023) >>> 10));
-                    INBOUND_MEMORY.acquire(memoryKib);
-                    boolean queued = false;
-                    try {
-                        int creditBytes = frame.type == S_SECTION || frame.type == S_INVALIDATE
-                                ? frame.payload.length + 16 : 0;
-                        INBOUND.put(new QueuedInbound(decoded, memoryKib, creditBytes));
-                        queued = true;
-                    } finally {
-                        if (!queued) INBOUND_MEMORY.release(memoryKib);
+                boolean sectionFrame = frame.type == S_SECTION;
+                int memoryKib = 0;
+                long[] sectionData = null;
+                boolean memoryReserved = false;
+                boolean transferred = false;
+                try {
+                    if (sectionFrame) {
+                        memoryKib = PREPARED_SECTION_KIB;
+                        INBOUND_MEMORY.acquire(memoryKib);
+                        memoryReserved = true;
+                        sectionData = borrowSectionBuffer();
+                    }
+
+                    int[] blocks = sectionFrame ? blockTranslations : null;
+                    int[] biomes = sectionFrame ? biomeTranslations : null;
+                    long started = sectionFrame ? ClientLodDebug.timer() : 0;
+                    Inbound decoded = decode(this.generation, frame, blocks, biomes, sectionData);
+                    if (sectionFrame) ClientLodDebug.sectionPrepared(started);
+                    if (decoded == null) continue;
+                    if (decoded instanceof ServerHello) receivedHello = true;
+
+                    if (!sectionFrame) {
+                        memoryKib = Math.min(MAX_INBOUND_KIB,
+                                Math.max(1, (frame.payload.length * 2 + 1023) >>> 10));
+                        INBOUND_MEMORY.acquire(memoryKib);
+                        memoryReserved = true;
+                    }
+                    int creditBytes = frame.type == S_SECTION || frame.type == S_INVALIDATE
+                            ? frame.payload.length + 16 : 0;
+                    INBOUND.put(new QueuedInbound(decoded, memoryKib, creditBytes));
+                    transferred = true;
+
+                    if (decoded instanceof ServerHello hello) hello.completion.await();
+                    else if (decoded instanceof MappingDelta mappings) mappings.completion.await();
+                } finally {
+                    if (!transferred && memoryReserved) {
+                        if (sectionData != null) recycleSectionBuffer(sectionData);
+                        INBOUND_MEMORY.release(memoryKib);
                     }
                 }
             }
@@ -783,7 +793,8 @@ public final class ClientLodNetwork {
         return new Frame(type, payload);
     }
 
-    private static Inbound decode(long session, Frame frame) throws ProtocolException {
+    private static Inbound decode(long session, Frame frame, int[] blocks, int[] biomes,
+                                  long[] sectionData) throws ProtocolException {
         ByteBuffer input = littleBuffer(frame.payload);
         Inbound result;
         switch (frame.type) {
@@ -796,10 +807,16 @@ public final class ClientLodNetwork {
                 int blockEpoch = input.getInt();
                 int biomeEpoch = input.getInt();
                 if (maxLod != WorldEngine.MAX_LOD_LAYER) throw new ProtocolException("Server max LOD is incompatible");
-                result = new ServerHello(session, server, flags, blockEpoch, biomeEpoch);
+                result = new ServerHello(session, server, flags, blockEpoch, biomeEpoch,
+                        new CountDownLatch(1));
             }
             case S_MAPPING_DELTA -> result = decodeMappings(session, input);
-            case S_SECTION -> result = decodeSection(session, input);
+            case S_SECTION -> {
+                if (blocks == null || biomes == null || sectionData == null) {
+                    throw new IllegalStateException("Section decoder has no prepared output buffer");
+                }
+                result = decodeSection(session, input, blocks, biomes, sectionData);
+            }
             case S_INVALIDATE -> {
                 requireRemaining(input, 24);
                 long key = input.getLong();
@@ -858,10 +875,11 @@ public final class ClientLodNetwork {
             if (rawId >= MAX_BIOME_ID) throw new ProtocolException("Invalid biome mapping");
             biomes.add(new RemoteBiome((int) rawId, getString(input, length, MAX_CANONICAL_LENGTH)));
         }
-        return new MappingDelta(session, blocks, biomes);
+        return new MappingDelta(session, blocks, biomes, new CountDownLatch(1));
     }
 
-    private static SectionUpdate decodeSection(long session, ByteBuffer input) throws ProtocolException {
+    static PreparedSection decodeSection(long session, ByteBuffer input, int[] blockMap,
+                                         int[] biomeMap, long[] data) throws ProtocolException {
         requireRemaining(input, 24);
         long key = input.getLong();
         long revision = input.getLong();
@@ -878,20 +896,52 @@ public final class ClientLodNetwork {
         if (bits != expectedBits || rawWordCount != expectedWords) throw new ProtocolException("Invalid packed palette dimensions");
         long expectedRemaining = (long) paletteLength * 12 + rawWordCount * 8;
         if (expectedRemaining != input.remaining()) throw new ProtocolException("Invalid section payload length");
+        if (data.length != WorldSection.SECTION_VOLUME) throw new IllegalArgumentException("Invalid section output buffer");
 
-        PaletteEntry[] palette = new PaletteEntry[paletteLength];
+        long[] palette = new long[paletteLength];
         for (int i = 0; i < palette.length; i++) {
             long block = Integer.toUnsignedLong(input.getInt());
             long biome = Integer.toUnsignedLong(input.getInt());
             byte light = input.get();
             requireZero(input.get(), input.get(), input.get());
             if (block >= MAX_BLOCK_ID || biome >= MAX_BIOME_ID) throw new ProtocolException("Palette mapping ID out of range");
-            palette[i] = new PaletteEntry((int) block, (int) biome, light);
+            int localBlock = translated(blockMap, (int) block);
+            int localBiome = translated(biomeMap, (int) biome);
+            if (localBlock < 0 || localBiome < 0) {
+                throw new ProtocolException("LOD section references an unknown server mapping: "
+                        + WorldEngine.pprintPos(key));
+            }
+            palette[i] = Mapper.composeMappingId(light, localBlock, localBiome);
         }
-        long[] words = new long[(int) rawWordCount];
-        for (int i = 0; i < words.length; i++) words[i] = input.getLong();
-        return new SectionUpdate(session, key, revision,
-                nonEmptyChildren, bits, palette, words);
+
+        boolean countNonAir = WorldEngine.getLevel(key) == 0;
+        int nonEmptyBlockCount = 0;
+        if (bits == 0) {
+            long value = palette[0];
+            Arrays.fill(data, value);
+            if (countNonAir && !Mapper.isAir(value)) nonEmptyBlockCount = WorldSection.SECTION_VOLUME;
+        } else {
+            int wordsOffset = input.position();
+            long mask = (1L << bits) - 1;
+            for (int i = 0; i < data.length; i++) {
+                long bit = (long) i * bits;
+                int word = (int) (bit >>> 6);
+                int shift = (int) (bit & 63);
+                long index = input.getLong(wordsOffset + word * Long.BYTES) >>> shift;
+                if (shift + bits > 64) {
+                    index |= input.getLong(wordsOffset + (word + 1) * Long.BYTES) << (64 - shift);
+                }
+                int paletteIndex = (int) (index & mask);
+                if (paletteIndex >= palette.length) {
+                    throw new ProtocolException("LOD section contains an invalid packed palette index");
+                }
+                long value = palette[paletteIndex];
+                data[i] = value;
+                if (countNonAir && !Mapper.isAir(value)) nonEmptyBlockCount++;
+            }
+        }
+        input.position(input.limit());
+        return new PreparedSection(session, key, revision, nonEmptyChildren, nonEmptyBlockCount, data);
     }
 
     private static byte[] encodeSubscriptions(String name, List<Subscription> additions,
@@ -949,29 +999,27 @@ public final class ClientLodNetwork {
         return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
     }
 
-    private sealed interface Inbound permits ServerHello, MappingDelta, SectionUpdate, Invalidation, ServerError {
+    private sealed interface Inbound permits ServerHello, MappingDelta, PreparedSection, Invalidation, ServerError {
         long session();
     }
 
     private record ServerHello(long session, long serverInstance, int flags, int blockEpoch,
-                               int biomeEpoch) implements Inbound {}
+                               int biomeEpoch, CountDownLatch completion) implements Inbound {}
     private record MappingDelta(long session, List<RemoteBlock> blocks,
-                                List<RemoteBiome> biomes) implements Inbound {}
-    private record SectionUpdate(long session, long key, long revision,
-                                 byte nonEmptyChildren, int bitsPerIndex, PaletteEntry[] palette,
-                                 long[] words) implements Inbound {}
+                                List<RemoteBiome> biomes, CountDownLatch completion) implements Inbound {}
+    record PreparedSection(long session, long key, long revision, byte nonEmptyChildren,
+                           int nonEmptyBlockCount, long[] data) implements Inbound {}
     private record Invalidation(long session, long key, long revision,
                                 byte reason) implements Inbound {}
     private record ServerError(long session, int code, String text) implements Inbound {}
     private record RemoteBlock(int id, byte opacity, String canonical) {}
     private record RemoteBiome(int id, String name) {}
-    private record PaletteEntry(int blockId, int biomeId, byte light) {}
     private record BlockProperty(int id, byte opacity) {}
     private record Subscription(long key, long knownRevision) {}
     private record Frame(short type, byte[] payload) {}
     private record QueuedInbound(Inbound message, int memoryKib, int creditBytes) {}
 
-    private static final class ProtocolException extends Exception {
+    static final class ProtocolException extends Exception {
         private ProtocolException(String message) { super(message); }
     }
 }

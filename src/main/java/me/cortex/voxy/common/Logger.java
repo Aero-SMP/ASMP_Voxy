@@ -1,11 +1,10 @@
 package me.cortex.voxy.common;
 
-import me.cortex.voxy.commonImpl.VoxyCommon;
-import net.minecraft.client.Minecraft;
-import net.minecraft.network.chat.Component;
 import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
+import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -14,7 +13,11 @@ public class Logger {
     public static boolean SHUTUP = false;
     public static boolean SHUTUP_INFO = false;
     private static final org.slf4j.Logger LOGGER = LoggerFactory.getLogger("Voxy");
+    private static volatile Consumer<String> errorSink = ignored -> {};
 
+    public static void setErrorSink(Consumer<String> sink) {
+        errorSink = Objects.requireNonNull(sink);
+    }
 
     private static String callClsName() {
         String className = "";
@@ -52,19 +55,7 @@ public class Logger {
 
         String error = (INSERT_CLASS?("["+callClsName()+"]: "):"") + Stream.of(args).map(Logger::objToString).collect(Collectors.joining(" "));
         LOGGER.error(error, throwable);
-        if (VoxyCommon.IS_IN_MINECRAFT) {
-            showInHUD(error);
-        }
-    }
-
-    public static void showInHUD(String msg) {
-        var instance = Minecraft.getInstance();
-        if (instance != null) {
-            instance.executeIfPossible(() -> {
-                var player = Minecraft.getInstance().player;
-                if (player != null) instance.getChatListener().handleSystemMessage(Component.literal(msg), true);
-            });
-        }
+        errorSink.accept(error);
     }
 
     public static void warn(Object... args) {

@@ -1,9 +1,9 @@
 package me.cortex.voxy.client.core.util;
 
+import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.api.v0.IrisApi;
 import net.irisshaders.iris.gl.IrisRenderSystem;
@@ -20,7 +20,7 @@ public class IrisUtil {
 
     public static CapturedViewportParameters CAPTURED_VIEWPORT_PARAMETERS;
 
-    public static final boolean IRIS_INSTALLED = VoxyCommon.isModLoaded("iris") || VoxyCommon.isModLoaded("oculus");
+    public static final boolean IRIS_INSTALLED = VoxyClient.isModLoaded("iris") || VoxyClient.isModLoaded("oculus");
 
     private static boolean irisShadowActive0() {
         return ShadowRenderer.ACTIVE;

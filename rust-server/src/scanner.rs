@@ -1,5 +1,5 @@
 use crate::{
-    anvil::AnvilWorld,
+    anvil::{AnvilWorld, TerrainFingerprint},
     crc::crc32c,
     key::SectionKey,
     lod::{Section, build_parent},
@@ -23,7 +23,8 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-const STATE_VERSION: u32 = 8;
+const STATE_VERSION: u32 = 9;
+const LEGACY_STATE_VERSION: u32 = 8;
 const STATE_MAGIC: &[u8; 8] = b"VXYREGS1";
 const META_MAGIC: &[u8; 8] = b"VXYMETA1";
 const DIRTY_MAGIC: &[u8; 8] = b"VXYDIRR1";
@@ -87,6 +88,8 @@ struct ScanMeta {
 struct ChunkState {
     header_marker: u64,
     fingerprint: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terrain_fingerprint: Option<TerrainFingerprint>,
     mip_generation: u64,
     level_zero_keys: Vec<u64>,
 }
@@ -109,6 +112,7 @@ struct GroupWork {
 struct ChunkAdvance {
     id: String,
     marker: Option<(u64, u64)>,
+    terrain_fingerprint: Option<TerrainFingerprint>,
     level_zero_keys: Vec<u64>,
 }
 
@@ -337,6 +341,8 @@ impl DimensionRuntime {
                 let id = chunk_id(x, z);
                 let old = state.chunks.get(&id);
                 let needs_mip = old.is_none_or(|old| old.mip_generation != mip_generation);
+                let needs_terrain_fingerprint =
+                    old.is_none_or(|old| old.terrain_fingerprint.is_none());
                 if entry.location == 0 {
                     if let Some(old) = old {
                         pending.push(PendingChunk {
@@ -354,16 +360,19 @@ impl DimensionRuntime {
                 let fingerprint = if old.is_some_and(|old| old.header_marker == header_marker)
                     && !region_changed
                     && !needs_mip
+                    && !needs_terrain_fingerprint
                 {
                     continue;
                 } else if needs_mip
                     && old.is_some_and(|old| old.header_marker == header_marker)
                     && !region_changed
+                    && !needs_terrain_fingerprint
                 {
                     let old = old.expect("checked");
                     mip_advances.push(ChunkAdvance {
                         id,
                         marker: Some((header_marker, old.fingerprint)),
+                        terrain_fingerprint: old.terrain_fingerprint,
                         level_zero_keys: old.level_zero_keys.clone(),
                     });
                     continue;
@@ -397,17 +406,22 @@ impl DimensionRuntime {
                     }
                 };
                 if !needs_mip
+                    && !needs_terrain_fingerprint
                     && old.is_some_and(|old| {
                         old.header_marker == header_marker && old.fingerprint == fingerprint
                     })
                 {
                     continue;
                 }
-                if needs_mip && old.is_some_and(|old| old.fingerprint == fingerprint) {
+                if needs_mip
+                    && !needs_terrain_fingerprint
+                    && old.is_some_and(|old| old.fingerprint == fingerprint)
+                {
                     let old = old.expect("checked");
                     mip_advances.push(ChunkAdvance {
                         id,
                         marker: Some((header_marker, fingerprint)),
+                        terrain_fingerprint: old.terrain_fingerprint,
                         level_zero_keys: old.level_zero_keys.clone(),
                     });
                     continue;
@@ -579,6 +593,32 @@ impl DimensionRuntime {
                     );
                     continue;
                 }
+                if group_semantically_unchanged(&group, &work, &state, mip_generation) {
+                    if let Err(error) = self.anvil.verify_sources(&group.sources()) {
+                        record_failure(&self.reconcile_required, &mut failures);
+                        failed_regions.insert(group_region(group_id));
+                        eprintln!(
+                            "{} chunk group {group_id:?} changed during semantic verification; retrying: {error:#}",
+                            self.anvil.dimension
+                        );
+                        continue;
+                    }
+                    advances.extend(work.pending.into_iter().map(|pending| {
+                        let old = state
+                            .chunks
+                            .get(&pending.id)
+                            .expect("semantic match requires prior chunk state");
+                        let terrain_fingerprint = loaded_chunk(&group, pending.x, pending.z)
+                            .map(|chunk| chunk.terrain_fingerprint);
+                        ChunkAdvance {
+                            id: pending.id,
+                            marker: pending.marker,
+                            terrain_fingerprint,
+                            level_zero_keys: old.level_zero_keys.clone(),
+                        }
+                    }));
+                    continue;
+                }
                 let new_keys = group.keys().into_iter().collect::<BTreeSet<_>>();
                 let affected = old_keys.union(&new_keys).copied().collect::<BTreeSet<_>>();
                 prepared.push((group_id, group, work, new_keys, affected));
@@ -642,11 +682,15 @@ impl DimensionRuntime {
                         &live_keys,
                     ));
                 }
-                batch_advances.extend(work.pending.into_iter().map(|chunk| ChunkAdvance {
-                    level_zero_keys: live_keys.clone(),
-                    id: chunk.id,
-                    marker: chunk.marker,
-                }));
+                for pending in work.pending {
+                    batch_advances.push(ChunkAdvance {
+                        terrain_fingerprint: loaded_chunk(&group, pending.x, pending.z)
+                            .map(|chunk| chunk.terrain_fingerprint),
+                        level_zero_keys: live_keys.clone(),
+                        id: pending.id,
+                        marker: pending.marker,
+                    });
+                }
             }
             let fine_candidates = fine_candidates.into_iter().collect::<Vec<_>>();
             generated += publish_replacements(
@@ -704,6 +748,7 @@ impl DimensionRuntime {
                     ChunkState {
                         header_marker,
                         fingerprint,
+                        terrain_fingerprint: advance.terrain_fingerprint,
                         mip_generation,
                         level_zero_keys: advance.level_zero_keys,
                     },
@@ -775,8 +820,43 @@ fn loaded_sibling_advance(
     ChunkAdvance {
         id: chunk_id(chunk.x, chunk.z),
         marker: Some(marker),
+        terrain_fingerprint: Some(chunk.terrain_fingerprint),
         level_zero_keys: live_keys.to_vec(),
     }
+}
+
+fn loaded_chunk(
+    group: &crate::anvil::LevelZeroGroup,
+    x: i32,
+    z: i32,
+) -> Option<&crate::anvil::ParsedChunk> {
+    group
+        .chunks
+        .iter()
+        .filter_map(Option::as_ref)
+        .find(|chunk| chunk.x == x && chunk.z == z)
+}
+
+/// A raw Anvil rewrite can be ignored only when every changed member of the shared 2x2 group
+/// has known, identical normalized terrain and no mip or repair work is pending.
+fn group_semantically_unchanged(
+    group: &crate::anvil::LevelZeroGroup,
+    work: &GroupWork,
+    state: &ScanState,
+    mip_generation: u64,
+) -> bool {
+    work.repair_keys.is_empty()
+        && !work.pending.is_empty()
+        && work.pending.iter().all(|pending| {
+            pending.marker.is_some()
+                && state.chunks.get(&pending.id).is_some_and(|old| {
+                    old.mip_generation == mip_generation
+                        && old.terrain_fingerprint.is_some_and(|expected| {
+                            loaded_chunk(group, pending.x, pending.z)
+                                .is_some_and(|chunk| chunk.terrain_fingerprint == expected)
+                        })
+                })
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -834,22 +914,29 @@ fn publish_replacements(
             Ok((key, store.revision(section.key)?.unwrap_or(0)))
         })
         .collect::<Result<HashMap<_, _>>>()?;
-    let entries = if durable {
+    let result = if durable {
         store.put_many_checked(sections, &expected)?
     } else {
         store.put_many_checked_deferred(sections, &expected)?
     };
-    if entries.len() != sections.len() {
+    if result.accepted() + result.rejected != sections.len() {
         anyhow::bail!(
-            "{} stale worker results were rejected",
-            sections.len() - entries.len()
+            "store accounted for {} of {} completed sections",
+            result.accepted() + result.rejected,
+            sections.len()
         );
     }
-    for &entry in &entries {
+    // Publish every committed replacement even if another shard rejected stale work. On retry,
+    // these entries compare unchanged and will not be returned again, so delaying their events
+    // could otherwise leave an already-subscribed client on the older revision indefinitely.
+    for &entry in &result.written {
         let _ = updates.send(UpdateEvent {
             dimension: dimension.to_owned(),
             change: Update::Section(entry),
         });
+    }
+    if result.rejected != 0 {
+        anyhow::bail!("{} stale worker results were rejected", result.rejected);
     }
 
     let live = sections
@@ -867,7 +954,7 @@ fn publish_replacements(
         store.remove_many_deferred(&removed, 1)?
     };
     send_invalidations(updates, dimension, &invalidations);
-    Ok(entries.len())
+    Ok(result.written.len())
 }
 
 fn add_affected(level_zero: &BTreeSet<SectionKey>, levels: &mut [BTreeSet<SectionKey>; 5]) {
@@ -966,7 +1053,7 @@ fn load_state(dir: &Path, catalog_id: u64, store_epoch: u64) -> ScanState {
     let meta_path = dir.join("meta.state");
     if let Ok(bytes) = read_file_bounded(&meta_path, 4096) {
         match decode_envelope::<ScanMeta>(&bytes, META_MAGIC, 2048) {
-            Ok(meta) if meta.version == STATE_VERSION && meta.catalog_id == catalog_id => {
+            Ok(meta) if compatible_state_version(meta.version) && meta.catalog_id == catalog_id => {
                 state.store_epoch = meta.store_epoch;
                 state.mip_generation = meta.mip_generation;
                 state.meta_trusted = true;
@@ -1205,7 +1292,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn validate_region_state(state: &RegionState, region: (i32, i32), catalog_id: u64) -> Result<()> {
-    if state.version != STATE_VERSION
+    if !compatible_state_version(state.version)
         || state.catalog_id != catalog_id
         || (state.region_x, state.region_z) != region
         || state.chunks.len() > 1024
@@ -1232,6 +1319,10 @@ fn validate_region_state(state: &RegionState, region: (i32, i32), catalog_id: u6
         }
     }
     Ok(())
+}
+
+fn compatible_state_version(version: u32) -> bool {
+    version == STATE_VERSION || version == LEGACY_STATE_VERSION
 }
 
 fn region_chunks(state: &ScanState, region: (i32, i32)) -> Result<HashMap<String, ChunkState>> {
@@ -1353,11 +1444,12 @@ pub fn safe_dimension_name(dimension: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkState, GroupWork, PendingChunk, STATE_VERSION, ScanState, Update, chunk_region,
-        clear_dirty_regions_except, dirty_region_path, group_region, load_dirty_regions,
-        load_state, loaded_sibling_advance, pending_sources_match, publish_replacements,
-        record_failure, region_state_path, safe_dimension_name, save_dirty_regions,
-        save_state_regions,
+        ChunkState, GroupWork, LEGACY_STATE_VERSION, META_MAGIC, PendingChunk, RegionState,
+        STATE_MAGIC, STATE_VERSION, ScanMeta, ScanState, Update, chunk_region,
+        clear_dirty_regions_except, dirty_region_path, encode_envelope, group_region,
+        group_semantically_unchanged, load_dirty_regions, load_state, loaded_sibling_advance,
+        pending_sources_match, publish_replacements, record_failure, region_state_path,
+        safe_dimension_name, save_dirty_regions, save_state_regions,
     };
     use crate::{
         anvil::{AnvilWorld, LevelZeroGroup, ParsedChunk},
@@ -1410,6 +1502,7 @@ mod tests {
                     ChunkState {
                         header_marker: 1,
                         fingerprint: 2,
+                        terrain_fingerprint: Some([20, 21]),
                         mip_generation: 3,
                         level_zero_keys: vec![first_key],
                     },
@@ -1419,6 +1512,7 @@ mod tests {
                     ChunkState {
                         header_marker: 4,
                         fingerprint: 5,
+                        terrain_fingerprint: Some([50, 51]),
                         mip_generation: 6,
                         level_zero_keys: vec![second_key],
                     },
@@ -1486,6 +1580,53 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_is_loaded_without_discarding_lod_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "voxy-legacy-state-test-{}-{}",
+            std::process::id(),
+            safe_dimension_name("test:legacy-state")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let key = crate::key::SectionKey::new(0, 0, 1, 0).unwrap().packed();
+        let chunk = ChunkState {
+            header_marker: 3,
+            fingerprint: 4,
+            terrain_fingerprint: None,
+            mip_generation: 5,
+            level_zero_keys: vec![key],
+        };
+        let region = RegionState {
+            version: LEGACY_STATE_VERSION,
+            catalog_id: 77,
+            region_x: 0,
+            region_z: 0,
+            file_marker: Some(6),
+            chunks: HashMap::from([("0,0".into(), chunk)]),
+        };
+        let region_bytes = encode_envelope(&region, STATE_MAGIC).unwrap();
+        assert!(!String::from_utf8_lossy(&region_bytes).contains("terrain_fingerprint"));
+        fs::write(region_state_path(&root, (0, 0)), region_bytes).unwrap();
+        let meta = ScanMeta {
+            version: LEGACY_STATE_VERSION,
+            catalog_id: 77,
+            store_epoch: 9,
+            mip_generation: 5,
+        };
+        fs::write(
+            root.join("meta.state"),
+            encode_envelope(&meta, META_MAGIC).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_state(&root, 77, 9);
+        assert!(loaded.meta_trusted);
+        assert!(loaded.known_regions.contains("0,0"));
+        assert_eq!(loaded.chunks["0,0"].level_zero_keys, vec![key]);
+        assert_eq!(loaded.chunks["0,0"].terrain_fingerprint, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pre_serve_recovery_retains_last_good_sections_until_repair_finishes() {
         let root = std::env::temp_dir().join(format!(
             "voxy-local-recovery-test-{}-{}",
@@ -1529,6 +1670,7 @@ mod tests {
                     ChunkState {
                         header_marker: 1,
                         fingerprint: 1,
+                        terrain_fingerprint: Some([10, 11]),
                         mip_generation: 0,
                         level_zero_keys: vec![first.packed()],
                     },
@@ -1538,6 +1680,7 @@ mod tests {
                     ChunkState {
                         header_marker: 2,
                         fingerprint: 2,
+                        terrain_fingerprint: Some([20, 21]),
                         mip_generation: 0,
                         level_zero_keys: vec![second.packed()],
                     },
@@ -1630,6 +1773,25 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         assert_eq!(store.get(key).unwrap().unwrap().section.cells[0].block, 2);
+        let revision = store.revision(key).unwrap();
+
+        assert_eq!(
+            publish_replacements(
+                &store,
+                &updates,
+                "test:staged-publish",
+                &[section(2)],
+                &[key],
+                true,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(store.revision(key).unwrap(), revision);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
 
         publish_replacements(&store, &updates, "test:staged-publish", &[], &[key], true).unwrap();
         assert!(matches!(
@@ -1669,6 +1831,7 @@ mod tests {
                     z: 0,
                     sections: BTreeMap::new(),
                     source_fingerprint: 99,
+                    terrain_fingerprint: [100, 101],
                 }),
                 None,
                 None,
@@ -1678,6 +1841,80 @@ mod tests {
         assert!(pending_sources_match(&group, &work));
         group.chunks[0] = None;
         assert!(!pending_sources_match(&group, &work));
+    }
+
+    #[test]
+    fn shared_group_skips_only_when_every_pending_chunk_is_semantically_unchanged() {
+        let parsed = |x, source, terrain| ParsedChunk {
+            x,
+            z: 0,
+            sections: BTreeMap::new(),
+            source_fingerprint: source,
+            terrain_fingerprint: terrain,
+        };
+        let mut group = LevelZeroGroup {
+            x: 0,
+            z: 0,
+            chunks: vec![
+                Some(parsed(0, 20, [100, 101])),
+                Some(parsed(1, 40, [200, 201])),
+                None,
+                None,
+            ],
+        };
+        let mut work = GroupWork {
+            pending: vec![
+                PendingChunk {
+                    id: "0,0".into(),
+                    x: 0,
+                    z: 0,
+                    marker: Some((2, 20)),
+                    old_keys: Vec::new(),
+                },
+                PendingChunk {
+                    id: "1,0".into(),
+                    x: 1,
+                    z: 0,
+                    marker: Some((4, 40)),
+                    old_keys: Vec::new(),
+                },
+            ],
+            ..GroupWork::default()
+        };
+        let state = ScanState {
+            chunks: HashMap::from([
+                (
+                    "0,0".into(),
+                    ChunkState {
+                        header_marker: 1,
+                        fingerprint: 10,
+                        terrain_fingerprint: Some([100, 101]),
+                        mip_generation: 7,
+                        level_zero_keys: Vec::new(),
+                    },
+                ),
+                (
+                    "1,0".into(),
+                    ChunkState {
+                        header_marker: 3,
+                        fingerprint: 30,
+                        terrain_fingerprint: Some([200, 201]),
+                        mip_generation: 7,
+                        level_zero_keys: Vec::new(),
+                    },
+                ),
+            ]),
+            ..ScanState::default()
+        };
+        assert!(group_semantically_unchanged(&group, &work, &state, 7));
+
+        group.chunks[1].as_mut().unwrap().terrain_fingerprint[0] ^= 1;
+        assert!(!group_semantically_unchanged(&group, &work, &state, 7));
+        group.chunks[1].as_mut().unwrap().terrain_fingerprint[0] ^= 1;
+        assert!(!group_semantically_unchanged(&group, &work, &state, 8));
+        work.repair_keys
+            .insert(crate::key::SectionKey::new(0, 0, 0, 0).unwrap());
+        assert!(!group_semantically_unchanged(&group, &work, &state, 7));
     }
 
     #[test]
@@ -1696,6 +1933,7 @@ mod tests {
             z: -2,
             sections: BTreeMap::new(),
             source_fingerprint: 77,
+            terrain_fingerprint: [770, 771],
         };
         let advance = loaded_sibling_advance(&chunk, None, &[11, 12]);
         assert_eq!(advance.id, "3,-2");
@@ -1705,6 +1943,7 @@ mod tests {
         let unchanged = ChunkState {
             header_marker: 99,
             fingerprint: 77,
+            terrain_fingerprint: Some([770, 771]),
             mip_generation: 1,
             level_zero_keys: vec![5],
         };

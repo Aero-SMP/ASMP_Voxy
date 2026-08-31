@@ -9,6 +9,8 @@ final class ServerDebug {
 
     static void register(PayloadRegistrar registrar) {}
     static void serverStart(byte transport) {}
+    static void serverStop() {}
+    static void playerLogout(ServerPlayer player) {}
     static void sessionOpened(ServerPlayer player, Object session) {}
     static void sessionClosed(ServerPlayer player, Object session) {}
     static void fromClient(ServerPlayer player, Object session, int bytes) {}

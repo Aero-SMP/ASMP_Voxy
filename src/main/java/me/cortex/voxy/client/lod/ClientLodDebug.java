@@ -20,6 +20,8 @@ final class ClientLodDebug {
     static void bridgeIn(int bytes) {}
     static void bridgeOut(int bytes) {}
     static void rustFrame(short type, int bytes) {}
+    static void sectionPrepared(long startedNanos) {}
+    static void sectionInstalled(long startedNanos) {}
     static void sectionApplied() {}
     static void invalidationApplied() {}
     static void droppedUnsubscribed() {}

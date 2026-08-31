@@ -2,8 +2,8 @@ package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.compat.SemaphoreBlockImpersonator;
 import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.common.thread.MultiThreadPrioritySemaphore;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -19,9 +19,9 @@ public class MixinChunkJobQueue {
 
     @Redirect(method = "<init>", at = @At(value = "NEW", target = "(I)Ljava/util/concurrent/Semaphore;"))
     private Semaphore voxy$injectUnifiedPool(int permits) {
-        var instance = VoxyCommon.getInstance();
-        if (instance != null && !VoxyConfig.CONFIG.dontUseSodiumBuilderThreads) {
-            this.voxy$semaphoreBlock = instance.getThreadPool().groupSemaphore.createBlock();
+        var runtime = VoxyClient.getRuntime();
+        if (runtime != null && !VoxyConfig.CONFIG.dontUseSodiumBuilderThreads) {
+            this.voxy$semaphoreBlock = runtime.getThreadPool().groupSemaphore.createBlock();
             return new SemaphoreBlockImpersonator(this.voxy$semaphoreBlock);
         }
         return new Semaphore(permits);

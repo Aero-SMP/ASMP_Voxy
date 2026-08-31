@@ -41,6 +41,25 @@ pub struct EntryMeta {
     payload_crc: u32,
 }
 
+#[derive(Debug, Default)]
+pub struct PutResult {
+    pub written: Vec<EntryMeta>,
+    pub unchanged: usize,
+    pub rejected: usize,
+}
+
+impl PutResult {
+    pub fn accepted(&self) -> usize {
+        self.written.len() + self.unchanged
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.written.extend(other.written);
+        self.unchanged += other.unchanged;
+        self.rejected += other.rejected;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Invalidation {
     pub key: u64,
@@ -372,7 +391,7 @@ impl Store {
         Ok(out)
     }
 
-    pub fn put_many(&self, sections: &[Section]) -> Result<Vec<EntryMeta>> {
+    pub fn put_many(&self, sections: &[Section]) -> Result<PutResult> {
         let mut expected = HashMap::with_capacity(sections.len());
         for section in sections {
             expected.insert(
@@ -389,7 +408,7 @@ impl Store {
         &self,
         sections: &[Section],
         expected: &HashMap<u64, u64>,
-    ) -> Result<Vec<EntryMeta>> {
+    ) -> Result<PutResult> {
         self.put_many_checked_inner(sections, expected, true)
     }
 
@@ -397,7 +416,7 @@ impl Store {
         &self,
         sections: &[Section],
         expected: &HashMap<u64, u64>,
-    ) -> Result<Vec<EntryMeta>> {
+    ) -> Result<PutResult> {
         self.put_many_checked_inner(sections, expected, false)
     }
 
@@ -406,23 +425,29 @@ impl Store {
         sections: &[Section],
         expected: &HashMap<u64, u64>,
         durable: bool,
-    ) -> Result<Vec<EntryMeta>> {
-        let mut groups = BTreeMap::<ShardId, Vec<(u64, u64, Vec<u8>)>>::new();
+    ) -> Result<PutResult> {
+        let mut groups = BTreeMap::<ShardId, Vec<(u64, u64, Vec<u8>, u32)>>::new();
         for section in sections {
             let key = section.key.packed();
             let expected = *expected
                 .get(&key)
                 .with_context(|| format!("missing expected revision for section {key}"))?;
-            groups
-                .entry(section.key.shard())
-                .or_default()
-                .push((key, expected, section.encode()?));
+            let payload = section.encode()?;
+            let payload_crc = crc32c(&payload);
+            groups.entry(section.key.shard()).or_default().push((
+                key,
+                expected,
+                payload,
+                payload_crc,
+            ));
         }
-        let mut out = Vec::with_capacity(sections.len());
+        let mut out = PutResult::default();
         for (id, mut values) in groups {
             values.sort_unstable_by_key(|entry| entry.0);
             let shard = self.get_or_create(id)?;
-            out.extend(lock(&shard)?.put(&values, durable)?);
+            let mut shard = lock(&shard)?;
+            out.merge(shard.put(&values, durable)?);
+            self.observe_destructive_reset(&mut shard)?;
         }
         Ok(out)
     }
@@ -768,24 +793,53 @@ impl Shard {
             .collect())
     }
 
-    fn put(&mut self, values: &[(u64, u64, Vec<u8>)], durable: bool) -> Result<Vec<EntryMeta>> {
-        let values = values
-            .iter()
-            .filter(|(key, expected, _)| self.revisions.get(key).copied().unwrap_or(0) == *expected)
-            .collect::<Vec<_>>();
-        if values.is_empty() {
-            return Ok(Vec::new());
+    fn put(&mut self, values: &[(u64, u64, Vec<u8>, u32)], durable: bool) -> Result<PutResult> {
+        let mut out = PutResult::default();
+        let mut changed = Vec::with_capacity(values.len());
+        for value in values {
+            let (key, expected, payload, payload_crc) = value;
+            if self.revisions.get(key).copied().unwrap_or(0) != *expected {
+                out.rejected += 1;
+                continue;
+            }
+            let identical = self.index.get(key).copied().is_some_and(|current| {
+                current.length == payload.len() as u32 && current.payload_crc == *payload_crc
+            });
+            if identical {
+                match self.read_payload(self.index[key]) {
+                    Ok(current) if current == *payload => {
+                        out.unchanged += 1;
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "damaged section {key} in {} while comparing replacement: {error:#}",
+                            self.path.display()
+                        );
+                        self.reset_corrupt()?;
+                        return Ok(PutResult {
+                            rejected: values.len(),
+                            ..PutResult::default()
+                        });
+                    }
+                }
+            }
+            changed.push(value);
+        }
+        if changed.is_empty() {
+            return Ok(out);
         }
         let generation = self.next_generation()?;
-        let mut pending = Vec::with_capacity(values.len());
-        for (key, _, payload) in values {
+        let mut pending = Vec::with_capacity(changed.len());
+        for (key, _, payload, payload_crc) in changed {
             let offset = self.append_record(KIND_PUT, generation, *key, payload)?;
             pending.push(EntryMeta {
                 key: *key,
                 revision: generation,
                 offset,
                 length: payload.len() as u32,
-                payload_crc: crc32c(payload),
+                payload_crc: *payload_crc,
             });
         }
         self.append_record(KIND_COMMIT, generation, 0, &[])?;
@@ -799,7 +853,8 @@ impl Shard {
             self.index.insert(entry.key, *entry);
         }
         self.after_transaction(durable)?;
-        Ok(pending)
+        out.written = pending;
+        Ok(out)
     }
 
     fn read(&mut self, key: SectionKey) -> Result<Option<StoredSection>> {
@@ -1729,13 +1784,43 @@ mod tests {
         let first = store.invalidate_many(&[key], 1).unwrap()[0];
         store.invalidate_many(&[key], 1).unwrap();
         let expected = HashMap::from([(key.packed(), first.revision)]);
-        assert!(
-            store
-                .put_many_checked(&[sample(key, 3)], &expected)
-                .unwrap()
-                .is_empty()
-        );
+        let result = store
+            .put_many_checked(&[sample(key, 3)], &expected)
+            .unwrap();
+        assert!(result.written.is_empty());
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(result.rejected, 1);
         assert!(store.get(key).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identical_output_keeps_its_revision_and_writes_no_record() {
+        let root = temp();
+        let key = SectionKey::new(0, -4, 1, 6).unwrap();
+        let store = Store::open(&root, 22).unwrap();
+
+        let first = store.put_many(&[sample(key, 7)]).unwrap();
+        assert_eq!(first.written.len(), 1);
+        assert_eq!(first.unchanged, 0);
+        assert_eq!(first.rejected, 0);
+        let revision = store.revision(key).unwrap().unwrap();
+        let log = store.root.join(key.shard().filename());
+        let length = fs::metadata(&log).unwrap().len();
+
+        let identical = store.put_many(&[sample(key, 7)]).unwrap();
+        assert!(identical.written.is_empty());
+        assert_eq!(identical.unchanged, 1);
+        assert_eq!(identical.rejected, 0);
+        assert_eq!(store.revision(key).unwrap(), Some(revision));
+        assert_eq!(fs::metadata(&log).unwrap().len(), length);
+
+        let changed = store.put_many(&[sample(key, 8)]).unwrap();
+        assert_eq!(changed.written.len(), 1);
+        assert_eq!(changed.unchanged, 0);
+        assert_eq!(changed.rejected, 0);
+        assert_ne!(store.revision(key).unwrap(), Some(revision));
+        assert!(fs::metadata(&log).unwrap().len() > length);
         fs::remove_dir_all(root).unwrap();
     }
 

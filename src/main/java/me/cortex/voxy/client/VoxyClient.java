@@ -4,25 +4,44 @@ import me.cortex.voxy.client.lod.ClientLodNetwork;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.runtime.VoxyRuntime;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.fml.loading.LoadingModList;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.channels.FileLock;
 import java.nio.channels.NonWritableChannelException;
+import java.nio.file.Path;
 
 @Mod(value = "voxy", dist = Dist.CLIENT)
 public class VoxyClient {
+    public static final String MOD_VERSION = getModVersion("voxy");
     private static FileLock EXCLUSIVE_LOCK;
+    private static VoxyRuntime runtime;
+    private static boolean available;
     public static boolean inSession;
 
     public VoxyClient(IEventBus modBus) {
+        Logger.setErrorSink(VoxyClient::showErrorInHud);
         ClientLodNetwork.init(modBus);
+    }
+
+    private static void showErrorInHud(String message) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft != null) {
+            minecraft.executeIfPossible(() -> {
+                if (minecraft.player != null) {
+                    minecraft.getChatListener().handleSystemMessage(Component.literal(message), true);
+                }
+            });
+        }
     }
 
     public static void initVoxyClient() {
@@ -58,7 +77,7 @@ public class VoxyClient {
 
             SharedIndexBuffer.INSTANCE.id();
 
-            VoxyCommon.setAvailable();
+            setAvailable();
 
             if (!Capabilities.INSTANCE.subgroup) {
                 Logger.warn("GPU does not support subgroup operations, expect some performance degradation");
@@ -72,14 +91,14 @@ public class VoxyClient {
         try {
             ClientLodNetwork.resetDemand();
             inSession = true;
-            if (VoxyCommon.getInstance() != null) throw new IllegalStateException();
-            if (VoxyCommon.isAvailable() && VoxyConfig.CONFIG.enabled) {
-                VoxyCommon.createInstance();
+            if (getRuntime() != null) throw new IllegalStateException();
+            if (isAvailable() && VoxyConfig.CONFIG.enabled) {
+                createRuntime();
             }
         } catch (RuntimeException exception) {
             ClientLodNetwork.disconnect();
             try {
-                VoxyCommon.shutdownInstance();
+                shutdownRuntime();
             } catch (RuntimeException cleanupException) {
                 exception.addSuppressed(cleanupException);
             } finally {
@@ -92,10 +111,53 @@ public class VoxyClient {
     public static void sessionEnd() {
         if (!inSession) throw new IllegalStateException("Cannot end a session while not in a session");
         ClientLodNetwork.disconnect();
-        try { VoxyCommon.shutdownInstance(); }
+        try { shutdownRuntime(); }
         finally {
             ClientLodNetwork.resetDemand();
             inSession = false;
         }
+    }
+
+    public static VoxyRuntime getRuntime() {
+        return runtime;
+    }
+
+    public static void createRuntime() {
+        if (!available) return;
+        if (runtime != null) throw new IllegalStateException("Cannot create multiple runtimes");
+        runtime = new VoxyRuntime();
+    }
+
+    public static void shutdownRuntime() {
+        if (runtime != null) {
+            VoxyRuntime closing = runtime;
+            runtime = null;
+            closing.shutdown();
+        }
+    }
+
+    public static boolean isAvailable() {
+        return available;
+    }
+
+    public static boolean isModLoaded(String modId) {
+        LoadingModList mods = LoadingModList.get();
+        return mods != null && mods.getModFileById(modId) != null;
+    }
+
+    public static Path getConfigDir() {
+        return FMLPaths.CONFIGDIR.get();
+    }
+
+    private static void setAvailable() {
+        if (available) throw new IllegalStateException("Cannot make Voxy available more than once");
+        available = true;
+    }
+
+    private static String getModVersion(String modId) {
+        LoadingModList mods = LoadingModList.get();
+        if (mods == null) return "<UNKNOWN>";
+        var info = mods.getModFileById(modId);
+        return info == null ? "<UNKNOWN>" : info.versionString();
     }
 }

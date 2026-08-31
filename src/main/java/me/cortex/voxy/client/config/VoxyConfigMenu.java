@@ -5,7 +5,6 @@ import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
-import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPointForge;
 import net.caffeinemc.mods.sodium.api.config.ConfigState;
@@ -37,16 +36,16 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
 
     @Override
     public void registerConfigLate(ConfigBuilder builder) {
-        if (!VoxyCommon.isAvailable()) return;
+        if (!VoxyClient.isAvailable()) return;
 
-        var options = builder.registerModOptions("voxy", "Voxy", VoxyCommon.MOD_VERSION)
+        var options = builder.registerModOptions("voxy", "Voxy", VoxyClient.MOD_VERSION)
                 .setIcon(ResourceLocation.parse("voxy:icon.png"));
 
         var enabled = option(builder.createBooleanOption(ENABLED), "voxy.config.general.enabled",
                 () -> CFG.enabled, value -> {
                     CFG.enabled = value;
                     if (value && VoxyClient.inSession) {
-                        VoxyCommon.createInstance();
+                        VoxyClient.createRuntime();
                     }
                 }, ENABLED, RENDER_RELOAD, IRIS_RELOAD);
 
@@ -150,8 +149,8 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
             for (var identifier : identifiers) {
                 if (identifier.equals(UPDATE_THREADS)) {
                     if (!identifiers.contains(ENABLED)) {
-                        var instance = VoxyCommon.getInstance();
-                        if (instance != null) instance.updateDedicatedThreads();
+                        var runtime = VoxyClient.getRuntime();
+                        if (runtime != null) runtime.updateDedicatedThreads();
                     }
                 } else if (identifier.equals(IRIS_RELOAD)) {
                     IrisUtil.reload();
@@ -159,7 +158,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                     if (!CFG.enabled) {
                         var renderer = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
                         if (renderer != null) renderer.voxy$shutdownRenderer();
-                        VoxyCommon.shutdownInstance();
+                        VoxyClient.shutdownRuntime();
                     }
                 } else if (identifier.equals(RENDERING)) {
                     if (!identifiers.contains(ENABLED) && !identifiers.contains(RENDER_RELOAD)) {

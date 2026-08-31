@@ -1,14 +1,14 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
+import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.runtime.VoxyRuntime;
+import me.cortex.voxy.client.world.WorldIdentifier;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
-import me.cortex.voxy.commonImpl.VoxyCommon;
-import me.cortex.voxy.commonImpl.VoxyInstance;
-import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.LevelRenderer;
 import org.jetbrains.annotations.Nullable;
@@ -72,18 +72,19 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
             Logger.error("Not creating renderer due to null world");
             return;
         }
-        VoxyInstance instance = VoxyCommon.getInstance();
-        if (instance == null) {
-            Logger.error("Not creating renderer due to null instance");
+        VoxyRuntime runtime = VoxyClient.getRuntime();
+        if (runtime == null) {
+            Logger.error("Not creating renderer due to null runtime");
             return;
         }
-        WorldEngine world = WorldIdentifier.ofEngine(this.level);
+        WorldIdentifier identifier = WorldIdentifier.of(this.level);
+        WorldEngine world = identifier == null ? null : runtime.getOrCreate(identifier);
         if (world == null) {
             Logger.error("Null world selected");
             return;
         }
         try {
-            this.renderer = new VoxyRenderSystem(world, instance.getServiceManager());
+            this.renderer = new VoxyRenderSystem(world, runtime.getServiceManager());
         } catch (RuntimeException e) {
             if (IrisUtil.irisShaderPackEnabled()) {
                 IrisUtil.disableIrisShaders();
@@ -91,6 +92,6 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
                 throw e;
             }
         }
-        instance.updateDedicatedThreads();
+        runtime.updateDedicatedThreads();
     }
 }

@@ -52,6 +52,7 @@ public final class VoxyMinecraftBridge {
 
     private static void serverStopping(ServerStoppingEvent event) {
         SESSIONS.values().forEach(session -> session.close(false));
+        ServerDebug.serverStop();
         RustBackend.stop();
     }
 
@@ -109,6 +110,7 @@ public final class VoxyMinecraftBridge {
     }
 
     private static void logout(PlayerEvent.PlayerLoggedOutEvent event) {
+        ServerDebug.playerLogout((ServerPlayer) event.getEntity());
         Session session = SESSIONS.remove(event.getEntity().getUUID());
         if (session != null) session.close(false);
     }
