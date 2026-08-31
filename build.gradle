@@ -206,7 +206,14 @@ void voxyAuditHash(uvec2 rawPos) {
 void voxyAuditAnomaly(in UnpackedNode node, uint reason, float ratio) {
     uint index = atomicAdd(voxyAuditCounters[31], 1u);
     if (index < VOXY_AUDIT_ANOMALY_CAPACITY) {
-        voxyAuditAnomalies[index] = uvec4(node.rawPos, reason | (node.lodLevel << 16), floatBitsToUint(ratio));
+        uint flags = (hasRequested(node) ? 1u : 0u)
+                | (isTerminal(node) ? 2u : 0u)
+                | (hasChildren(node) ? 4u : 0u)
+                | (hasMesh(node) ? 8u : 0u)
+                | (isEmptyMesh(node) ? 16u : 0u);
+        voxyAuditAnomalies[index] = uvec4(node.rawPos,
+                (reason & 0xffu) | ((node.lodLevel & 0xfu) << 8) | (flags << 12),
+                floatBitsToUint(ratio));
     }
 }
 

@@ -27,6 +27,12 @@ abstract class MixinClientLodNetworkDebug {
         LodAudit.unwatched(key);
     }
 
+    @Inject(method = "publishResolution", at = @At("RETURN"))
+    private static void voxy$debugResolution(WorldEngine world, long key, boolean requireCached,
+                                             CallbackInfoReturnable<Boolean> cir) {
+        LodAudit.networkResolution(key, cir.getReturnValue());
+    }
+
     @Inject(method = "decodeSection", at = @At("HEAD"))
     private static void voxy$debugSectionBytes(long session, ByteBuffer input, int[] blockMap,
                                                 int[] biomeMap, long[] data,

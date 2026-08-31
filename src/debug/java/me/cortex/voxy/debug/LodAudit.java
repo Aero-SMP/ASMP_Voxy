@@ -62,6 +62,7 @@ public final class LodAudit {
 
     private static final int MAX_PENDING_FRAMES = 96;
     private static final int MAX_LIFECYCLES = 16_384;
+    private static final int MAX_KEY_STATES = 65_536;
     private static final long TRACE_LIMIT = 64L * 1024 * 1024;
     private static final long REMOTE_EVENT_INTERVAL = TimeUnit.SECONDS.toNanos(1);
 
@@ -85,7 +86,16 @@ public final class LodAudit {
                               int activeRoots, long[] missingRoots, boolean rootListOverflow,
                               boolean forensic) {}
 
-    private record Anomaly(long key, int lod, int reason, float ratio) {}
+    private record Anomaly(long key, int lod, int reason, int gpuFlags, float ratio) {}
+
+    private record CpuNodeState(String phase, int encodedType, int nodeId, int watcherFlags,
+                                boolean resolved, boolean topLevel, int childMask,
+                                int geometry, int childPtr, int childCount,
+                                boolean requestInFlight, int requestId,
+                                boolean geometryInFlight, int requiredMask,
+                                int meshMask, int existenceMask) {}
+
+    private record NetworkKeyState(String event, boolean watched, boolean resolved) {}
 
     private record TraversalAudit(long[] counters, List<Anomaly> anomalies,
                                   long[] frontier, boolean overflow) {}
@@ -129,6 +139,10 @@ public final class LodAudit {
     private static final WeakHashMap<Viewport, FrameTicket> VIEWPORT_TICKETS = new WeakHashMap<>();
     private static final LinkedHashMap<Long, PendingFrame> PENDING = new LinkedHashMap<>();
     private static final LinkedHashMap<Long, Lifecycle> LIFECYCLES =
+            new LinkedHashMap<>(1024, 0.75f, true);
+    private static final LinkedHashMap<Long, CpuNodeState> CPU_NODE_STATES =
+            new LinkedHashMap<>(1024, 0.75f, true);
+    private static final LinkedHashMap<Long, NetworkKeyState> NETWORK_KEY_STATES =
             new LinkedHashMap<>(1024, 0.75f, true);
     private static final Map<String, Long> LAST_REMOTE_EVENT = new HashMap<>();
     private static final TraceWriter TRACE = new TraceWriter();
@@ -230,6 +244,8 @@ public final class LodAudit {
         VIEWPORT_TICKETS.clear();
         PENDING.clear();
         LIFECYCLES.clear();
+        CPU_NODE_STATES.clear();
+        NETWORK_KEY_STATES.clear();
         mutationEpoch++;
         lastViewSignature = 0;
         lastMutationEpoch = 0;
@@ -339,7 +355,7 @@ public final class LodAudit {
             long base = anomalyBase + i * 16L;
             long key = rawKey(base);
             int packed = MemoryUtil.memGetInt(base + 8);
-            anomalies.add(new Anomaly(key, packed >>> 16, packed & 0xffff,
+            anomalies.add(new Anomaly(key, (packed >>> 8) & 0xf, packed & 0xff, packed >>> 12,
                     Float.intBitsToFloat(MemoryUtil.memGetInt(base + 12))));
         }
         long frontierBase = anomalyBase + ANOMALY_CAPACITY * 16L;
@@ -423,6 +439,7 @@ public final class LodAudit {
                     + " uncoveredBranches=" + coverageHoles);
         }
         if (tc[C_BLOCKED_DESCENT] > 0 || tc[C_MISSING_MESH] > 0) detailErrorFrames++;
+        if (tc[C_BLOCKED_DESCENT] > 0) reportBlockedDetails(ticket, traversal.anomalies);
 
         lastMissingRoots = tc[C_MISSING_VISIBLE_ROOTS];
         lastBlockedDescents = tc[C_BLOCKED_DESCENT];
@@ -558,6 +575,7 @@ public final class LodAudit {
                 json.append("{\"key\":").append(quote(Long.toUnsignedString(anomaly.key)))
                         .append(",\"lod\":").append(anomaly.lod)
                         .append(",\"reason\":").append(anomaly.reason)
+                        .append(",\"gpuFlags\":").append(anomaly.gpuFlags)
                         .append(",\"ratio\":").append(anomaly.ratio).append('}');
             }
             json.append(']');
@@ -602,11 +620,52 @@ public final class LodAudit {
     }
 
     public static void watched(long key) {
+        if (!enabled()) return;
+        synchronized (LOCK) {
+            NetworkKeyState previous = NETWORK_KEY_STATES.get(key);
+            NETWORK_KEY_STATES.put(key, new NetworkKeyState("watch", true,
+                    previous != null && previous.resolved));
+            trimKeyStates(NETWORK_KEY_STATES);
+        }
         if (forensic()) lifecycleEvent("watch", key, -1, 0, null);
     }
 
     public static void unwatched(long key) {
+        if (!enabled()) return;
+        synchronized (LOCK) {
+            NetworkKeyState previous = NETWORK_KEY_STATES.get(key);
+            NETWORK_KEY_STATES.put(key, new NetworkKeyState("unwatch", false,
+                    previous != null && previous.resolved));
+            trimKeyStates(NETWORK_KEY_STATES);
+        }
         if (forensic()) lifecycleEvent("unwatch", key, -1, 0, null);
+    }
+
+    public static void networkResolution(long key, boolean published) {
+        if (!enabled()) return;
+        synchronized (LOCK) {
+            NetworkKeyState previous = NETWORK_KEY_STATES.get(key);
+            NETWORK_KEY_STATES.put(key, new NetworkKeyState(
+                    published ? "resolution-published" : "resolution-retry",
+                    previous != null && previous.watched, published));
+            trimKeyStates(NETWORK_KEY_STATES);
+        }
+    }
+
+    public static void cpuNodeState(long key, String phase, int encodedType, int nodeId,
+                                    int watcherFlags, boolean resolved, boolean topLevel,
+                                    int childMask, int geometry, int childPtr, int childCount,
+                                    boolean requestInFlight, int requestId,
+                                    boolean geometryInFlight, int requiredMask,
+                                    int meshMask, int existenceMask) {
+        if (!enabled()) return;
+        synchronized (LOCK) {
+            CPU_NODE_STATES.put(key, new CpuNodeState(phase, encodedType, nodeId,
+                    watcherFlags, resolved, topLevel, childMask, geometry, childPtr,
+                    childCount, requestInFlight, requestId, geometryInFlight,
+                    requiredMask, meshMask, existenceMask));
+            trimKeyStates(CPU_NODE_STATES);
+        }
     }
 
     public static void sectionPrepared(long key, long revision, long[] data) {
@@ -662,6 +721,10 @@ public final class LodAudit {
     public static void sectionInstalled(long key, long revision, long[] data) {
         long now = System.nanoTime();
         synchronized (LOCK) {
+            NetworkKeyState previousNetwork = NETWORK_KEY_STATES.get(key);
+            NETWORK_KEY_STATES.put(key, new NetworkKeyState("section-installed",
+                    previousNetwork != null && previousNetwork.watched, true));
+            trimKeyStates(NETWORK_KEY_STATES);
             Lifecycle lifecycle = forensic() ? lifecycle(key) : LIFECYCLES.get(key);
             if (lifecycle == null) {
                 mutationEpoch++;
@@ -693,6 +756,10 @@ public final class LodAudit {
     public static void sectionInvalidated(long key, long revision) {
         long now = System.nanoTime();
         synchronized (LOCK) {
+            NetworkKeyState previousNetwork = NETWORK_KEY_STATES.get(key);
+            NETWORK_KEY_STATES.put(key, new NetworkKeyState("section-invalidated",
+                    previousNetwork != null && previousNetwork.watched, true));
+            trimKeyStates(NETWORK_KEY_STATES);
             Lifecycle lifecycle = lifecycle(key);
             lifecycle.revision = revision;
             lifecycle.invalidatedNanos = now;
@@ -774,6 +841,57 @@ public final class LodAudit {
             LIFECYCLES.remove(eldest);
         }
         return lifecycle;
+    }
+
+    private static void trimKeyStates(LinkedHashMap<Long, ?> states) {
+        while (states.size() > MAX_KEY_STATES) states.remove(states.keySet().iterator().next());
+    }
+
+    private static void reportBlockedDetails(FrameTicket ticket, List<Anomaly> anomalies) {
+        HashSet<Long> reported = new HashSet<>();
+        for (Anomaly anomaly : anomalies) {
+            if (anomaly.reason != 1 || !reported.add(anomaly.key)) continue;
+            CpuNodeState cpu = CPU_NODE_STATES.get(anomaly.key);
+            NetworkKeyState network = NETWORK_KEY_STATES.get(anomaly.key);
+            StringBuilder message = new StringBuilder(512)
+                    .append("blocked-detail frame=").append(ticket.sequence)
+                    .append(" key=").append(Long.toUnsignedString(anomaly.key))
+                    .append(" lod=").append(anomaly.lod)
+                    .append(" ratio=").append(String.format(Locale.ROOT, "%.3f", anomaly.ratio))
+                    .append(" gpuFlags=").append(anomaly.gpuFlags);
+            if (cpu == null) {
+                message.append(" cpu=missing");
+            } else {
+                message.append(" cpuPhase=").append(cpu.phase)
+                        .append(" cpuType=").append(cpu.encodedType)
+                        .append(" nodeId=").append(cpu.nodeId)
+                        .append(" watcher=").append(cpu.watcherFlags)
+                        .append(" cpuResolved=").append(cpu.resolved)
+                        .append(" top=").append(cpu.topLevel)
+                        .append(" childMask=").append(hex(cpu.childMask))
+                        .append(" geometry=").append(cpu.geometry)
+                        .append(" childPtr=").append(cpu.childPtr)
+                        .append(" childCount=").append(cpu.childCount)
+                        .append(" requestInFlight=").append(cpu.requestInFlight)
+                        .append(" requestId=").append(cpu.requestId)
+                        .append(" geometryInFlight=").append(cpu.geometryInFlight)
+                        .append(" required=").append(hex(cpu.requiredMask))
+                        .append(" mesh=").append(hex(cpu.meshMask))
+                        .append(" existence=").append(hex(cpu.existenceMask));
+            }
+            if (network == null) {
+                message.append(" network=missing");
+            } else {
+                message.append(" networkEvent=").append(network.event)
+                        .append(" networkWatched=").append(network.watched)
+                        .append(" networkResolved=").append(network.resolved);
+            }
+            remote("blocked-detail-" + Long.toUnsignedString(anomaly.key), message.toString());
+        }
+    }
+
+    private static String hex(int value) {
+        return "0x" + Integer.toHexString(value & 0xff);
     }
 
     private static void lifecycle(String event, long key, long revision, String fields) {
