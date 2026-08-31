@@ -39,7 +39,12 @@ layout(binding = RENDER_TRACKER_BINDING, std430) restrict writeonly buffer rende
 };
 
 void addRequest(inout UnpackedNode node) {
-    if (!hasRequested(node)) {
+    // The requested bit protects nodes from the cleaner, but it cannot be a permanent
+    // delivery acknowledgement: GPU readback is asynchronous and may be lost while the
+    // hierarchy is changing. Retry on a node-staggered lease until children arrive.
+    bool previouslyRequested = hasRequested(node);
+    bool retry = previouslyRequested && ((frameId + getId(node)) & 31u) == 0u;
+    if (!previouslyRequested || retry) {
         if (requestQueueIndex.x < requestQueueSize) {//Soft limit
             uint atomRes = atomicAdd(requestQueueIndex.x, 1);
             if (atomRes < MAX_REQUEST_QUEUE_SIZE) {//Hard limit

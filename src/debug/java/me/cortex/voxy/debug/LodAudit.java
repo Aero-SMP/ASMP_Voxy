@@ -173,6 +173,8 @@ public final class LodAudit {
     private static long deliveredSections;
     private static long offscreenSections;
     private static long lastDeliveryTraceNanos;
+    private static long lastBlockedDetailReportNanos;
+    private static int blockedDetailCursor;
 
     private LodAudit() {}
 
@@ -258,6 +260,8 @@ public final class LodAudit {
         deliveredSections = 0;
         offscreenSections = 0;
         lastDeliveryTraceNanos = 0;
+        lastBlockedDetailReportNanos = 0;
+        blockedDetailCursor = 0;
     }
 
     public static void rendererCreated() {
@@ -848,9 +852,20 @@ public final class LodAudit {
     }
 
     private static void reportBlockedDetails(FrameTicket ticket, List<Anomaly> anomalies) {
-        HashSet<Long> reported = new HashSet<>();
+        long now = System.nanoTime();
+        if (now - lastBlockedDetailReportNanos < REMOTE_EVENT_INTERVAL) return;
+        ArrayList<Anomaly> blocked = new ArrayList<>();
+        HashSet<Long> unique = new HashSet<>();
         for (Anomaly anomaly : anomalies) {
-            if (anomaly.reason != 1 || !reported.add(anomaly.key)) continue;
+            if (anomaly.reason == 1 && unique.add(anomaly.key)) blocked.add(anomaly);
+        }
+        if (blocked.isEmpty()) return;
+        lastBlockedDetailReportNanos = now;
+        int count = Math.min(4, blocked.size());
+        int start = Math.floorMod(blockedDetailCursor, blocked.size());
+        blockedDetailCursor = (start + count) % blocked.size();
+        for (int offset = 0; offset < count; offset++) {
+            Anomaly anomaly = blocked.get((start + offset) % blocked.size());
             CpuNodeState cpu = CPU_NODE_STATES.get(anomaly.key);
             NetworkKeyState network = NETWORK_KEY_STATES.get(anomaly.key);
             StringBuilder message = new StringBuilder(512)
@@ -886,7 +901,7 @@ public final class LodAudit {
                         .append(" networkWatched=").append(network.watched)
                         .append(" networkResolved=").append(network.resolved);
             }
-            remote("blocked-detail-" + Long.toUnsignedString(anomaly.key), message.toString());
+            emitRemote(message.toString());
         }
     }
 
@@ -981,6 +996,10 @@ public final class LodAudit {
         long previous = LAST_REMOTE_EVENT.getOrDefault(category, 0L);
         if (now - previous < REMOTE_EVENT_INTERVAL) return;
         LAST_REMOTE_EVENT.put(category, now);
+        emitRemote(message);
+    }
+
+    private static void emitRemote(String message) {
         try {
             remoteSink.accept(message);
         } catch (RuntimeException failure) {

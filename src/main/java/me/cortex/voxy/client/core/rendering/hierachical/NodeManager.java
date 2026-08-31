@@ -930,7 +930,9 @@ public class NodeManager {
 
             //Check if the node is already in-flight, if it is, dont do any processing
             if (this.nodeData.isNodeRequestInFlight(nodeId)) {
-                Logger.warn("Tried processing a node that already has a request in flight: " + nodeId + " pos: " + WorldEngine.pprintPos(pos) + " ignoring");
+                // GPU requests use a bounded retry lease so a lost asynchronous readback
+                // cannot suppress refinement forever. A retry that reaches an active CPU
+                // request is expected and requires no additional work.
                 return;
             }
 
