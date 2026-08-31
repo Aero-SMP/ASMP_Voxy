@@ -145,7 +145,7 @@ public class VoxyRenderSystem {
 
             var sectionRenderer = new MDICSectionRenderer(this.pipeline, this.modelService.getStore(), this.geometryData);
             this.pipeline.setSectionRenderer(sectionRenderer);
-            this.viewport = sectionRenderer.createViewport();
+            this.viewport = new Viewport(this.geometryData.getMaxSectionCount());
 
             {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
@@ -162,7 +162,7 @@ public class VoxyRenderSystem {
 
             this.chunkBoundRenderer = new ChunkBoundRenderer(this.pipeline);
 
-            Logger.info("Voxy render system created with " + this.geometryData.getMaxCapacity() + " geometry capacity, using pipeline '" + this.pipeline.getClass().getSimpleName() + "' with renderer '" + sectionRenderer.getClass().getSimpleName() + "'");
+            Logger.info("Voxy render system created with " + this.geometryData.getGeometryCapacityBytes() + " geometry capacity, using pipeline '" + this.pipeline.getClass().getSimpleName() + "' with renderer '" + sectionRenderer.getClass().getSimpleName() + "'");
         } catch (RuntimeException e) {
             world.releaseRef();//If something goes wrong, we must release the world first
             throw e;
@@ -367,7 +367,4 @@ public class VoxyRenderSystem {
         Logger.info("Render shutdown completed");
     }
 
-    public WorldEngine getEngine() {
-        return this.worldIn;
-    }
 }

@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.rendering.building;
 import me.cortex.voxy.client.core.model.IdNotYetComputedException;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.client.core.model.ModelQueries;
-import me.cortex.voxy.client.core.util.ScanMesher2D;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.UnsafeUtil;
@@ -53,14 +52,120 @@ public class RenderDataFactory {
     private int quadCount = 0;
 
     //Wont work for double sided quads
-    private final class Mesher extends ScanMesher2D {
+    private final class Mesher {
+        private static final int MAX_SIZE = 16;
+        private final long[] rowData = new long[32];
+        private final int[] rowLength = new int[32];
+        private final int[] rowDepth = new int[32];
+        private int rowBitset;
+        private int currentIndex;
+        private int currentSum;
+        private long currentData;
+
+        public void putNext(long data) {
+            int idx = this.currentIndex++ & 31;
+            if (idx == 0) {
+                if (this.currentData != 0) {
+                    if ((this.rowBitset & (1 << 31)) != 0) {
+                        this.emitQuad(31, ((this.currentIndex - 1) >> 5) - 1,
+                                this.rowLength[31], this.rowDepth[31], this.rowData[31]);
+                    }
+                    this.rowBitset |= 1 << 31;
+                    this.rowLength[31] = this.currentSum;
+                    this.rowDepth[31] = 1;
+                    this.rowData[31] = this.currentData;
+                }
+                this.currentData = data;
+                this.currentSum = 0;
+            }
+
+            if (data != this.currentData || this.currentSum == MAX_SIZE) {
+                if (this.currentData != 0) {
+                    int previous = idx - 1;
+                    this.rowDepth[previous] = 1;
+                    this.rowLength[previous] = this.currentSum;
+                    this.rowData[previous] = this.currentData;
+                    this.rowBitset |= 1 << previous;
+                }
+                this.currentData = data;
+                this.currentSum = 0;
+            }
+            this.currentSum++;
+
+            boolean isSet = (this.rowBitset & (1 << idx)) != 0;
+            boolean depthLimit = false;
+            if (this.currentData != 0 && isSet
+                    && this.rowLength[idx] == this.currentSum
+                    && this.rowData[idx] == this.currentData) {
+                int depth = ++this.rowDepth[idx];
+                this.currentSum = 0;
+                this.currentData = 0;
+                if (depth != MAX_SIZE) {
+                    return;
+                }
+                depthLimit = true;
+            }
+
+            if (isSet) {
+                this.emitQuad(idx, ((this.currentIndex - 1) >> 5) - (depthLimit ? 0 : 1),
+                        this.rowLength[idx], this.rowDepth[idx], this.rowData[idx]);
+                this.rowBitset &= ~(1 << idx);
+            }
+        }
+
+        private void emitRanged(int mask) {
+            int rows = this.rowBitset & mask;
+            this.rowBitset &= ~mask;
+            while (rows != 0) {
+                int index = Integer.numberOfTrailingZeros(rows);
+                rows &= ~Integer.lowestOneBit(rows);
+                this.emitQuad(index, (this.currentIndex >> 5) - 1,
+                        this.rowLength[index], this.rowDepth[index], this.rowData[index]);
+            }
+        }
+
+        public void skip(int count) {
+            if (count == 0) {
+                return;
+            }
+            if (this.currentData != 0) {
+                this.putNext(0);
+                count--;
+            }
+            if (count > 0) {
+                int mask = (int) ((1L << Math.min(32, count)) - 1) << (this.currentIndex & 31);
+                this.emitRanged(mask);
+                this.currentIndex += count;
+            }
+        }
+
+        public void reset() {
+            this.rowBitset = 0;
+            this.currentSum = 0;
+            this.currentData = 0;
+            this.currentIndex = 0;
+        }
+
+        public void endRow() {
+            if ((this.currentIndex & 31) != 0) {
+                this.skip(32 - (this.currentIndex & 31));
+            }
+        }
+
+        public void finish() {
+            if (this.currentIndex != 0) {
+                this.skip(32 - (this.currentIndex & 31));
+                this.emitRanged(-1);
+            }
+            this.reset();
+        }
+
         public int auxiliaryPosition = 0;
         public boolean doAuxiliaryFaceOffset = true;
         public int axis = 0;//Y,Z,X
 
         //Note x, z are in top right
-        @Override
-        protected void emitQuad(int x, int z, int length, int width, long data) {
+        private void emitQuad(int x, int z, int length, int width, long data) {
             RenderDataFactory.this.quadCount++;
 
             x -= length-1;

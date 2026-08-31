@@ -4,12 +4,10 @@ import it.unimi.dsi.fastutil.ints.IntConsumer;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
-import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.lod.ClientLodNetwork;
 import me.cortex.voxy.client.core.rendering.SectionUpdateRouter;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicAsyncGeometryManager;
-import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.util.ExpandingObjectAllocationList;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -46,6 +44,7 @@ public class NodeManager {
     private final BasicAsyncGeometryManager geometryManager;
     private final SectionUpdateRouter watcher;
     private final Long2IntOpenHashMap activeSectionMap = new Long2IntOpenHashMap();
+    private final LongOpenHashSet pendingLeafTransitions = new LongOpenHashSet();
     private final NodeStore nodeData;
     public final int maxNodeCount;
     private final IntOpenHashSet topLevelNodeIds = new IntOpenHashSet();
@@ -165,6 +164,7 @@ public class NodeManager {
             }
             this.finishRequestIfSatisfied(requestId, request, nodeId&REQUEST_TYPE_MSK);
         } else if ((nodeId&NODE_TYPE_MSK)==NODE_TYPE_INNER || (nodeId&NODE_TYPE_MSK)==NODE_TYPE_LEAF) {
+            int nodeType = nodeId&NODE_TYPE_MSK;
             nodeId&=NODE_ID_MSK;
 
 
@@ -178,11 +178,13 @@ public class NodeManager {
                 return;
             }
 
-            //Unmark geometry inflight
+            byte generatedChildExistence = sectionResult.childExistence;
             this.nodeData.unmarkNodeGeometryInFlight(nodeId);
-            // Just doing a geometry update
             if (this.updateNodeGeometry(nodeId, sectionResult) != 0) {
                 this.invalidateNode(nodeId);
+            }
+            if (nodeType == NODE_TYPE_INNER && this.pendingLeafTransitions.remove(pos)) {
+                this.updateChildSectionsInner(pos, nodeId, generatedChildExistence);
             }
         } else {
             throw new IllegalStateException();
@@ -272,196 +274,78 @@ public class NodeManager {
     }
 
     private void updateChildSectionsInner(long pos, int nodeId, byte childExistence) {
-        //Very complex and painful operation
-
-        if (childExistence == 0) {
-            Logger.warn("Inner node child existence is changing to 0, this is mild bad");
+        if (childExistence == 0 && this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) {
+            this.pendingLeafTransitions.add(pos);
+            this.processInnerRequest(pos, nodeId);
+            return;
         }
-
-        //This works in 2 parts, adding and removing, adding is (surprisingly) much easier than removing
-        // adding, either adds to a request, or creates a new request
-        byte existence = this.nodeData.getNodeChildExistence(nodeId);
-
-        byte add = (byte) ((existence^childExistence)&childExistence);
-        if (add != 0) {//We have nodes to add
-            if (!this.nodeData.isNodeRequestInFlight(nodeId)) {//If there is not an existing request, create it
-                this.beginChildRequest(nodeId, pos);
-            }
-            //It is guaranteed that at this point the node has a request
-            // so add the new nodes to it
-            int requestId = this.nodeData.getNodeRequest(nodeId);
-            var request = this.childRequests.get(requestId);
-            if (request.position() != pos)
-                throw new IllegalStateException("Request is not at pos: got " + WorldEngine.pprintPos(pos) + " expected: " + WorldEngine.pprintPos(request.position()));
-
-            this.setRequestedChildren(requestId, request, request.requiredMask()|Byte.toUnsignedInt(add));
+        this.pendingLeafTransitions.remove(pos);
+        int existence = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(nodeId));
+        int target = Byte.toUnsignedInt(childExistence);
+        int added = target&~existence;
+        if (added != 0) {
+            NodeRequest request = this.nodeData.isNodeRequestInFlight(nodeId)
+                    ? this.childRequests.get(this.nodeData.getNodeRequest(nodeId))
+                    : this.beginChildRequest(nodeId, pos);
+            this.requireRequestOwner(request, pos);
+            this.setRequestedChildren(this.nodeData.getNodeRequest(nodeId), request, request.requiredMask()|added);
         }
-
-        //Update the nodes existence msk to the new one
-        // this needs to be before the removal since that may invoke requestFinish, which expects updated node masks
-        //TODO: verify this
         this.nodeData.setNodeChildExistence(nodeId, childExistence);
 
-        // Do removals
-        int rem = ((existence^childExistence)&existence)&0xFF;
-        if (rem != 0) {
-            //If there is an inflight request, update it w.r.t removals
-            if (this.nodeData.isNodeRequestInFlight(nodeId)) {
-                int requestId = this.nodeData.getNodeRequest(nodeId);
-                var request = this.childRequests.get(requestId);
-                if (request.position() != pos) throw new IllegalStateException("Request is not at pos");
+        int removed = existence&~target;
+        if (removed != 0 && this.nodeData.isNodeRequestInFlight(nodeId)) {
+            int requestId = this.nodeData.getNodeRequest(nodeId);
+            NodeRequest request = this.childRequests.get(requestId);
+            this.requireRequestOwner(request, pos);
+            int cancelled = request.requiredMask()&removed;
+            this.setRequestedChildren(requestId, request, request.requiredMask()&~cancelled);
+            removed &= ~cancelled;
+        }
+        if (removed != 0) this.removeLoadedChildren(pos, nodeId, removed);
 
+        if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+            int requestId = this.nodeData.getNodeRequest(nodeId);
+            NodeRequest request = this.childRequests.get(requestId);
+            this.requireRequestOwner(request, pos);
+            if (request.isSatisfied()) this.finishRequest(requestId, request);
+        }
+        if (childExistence == 0) this.transitionToLeaf(pos, nodeId);
+    }
 
-                int reqRem = request.requiredMask()&rem;
-                this.setRequestedChildren(requestId, request, request.requiredMask()&~reqRem);
-                rem ^= reqRem;
-            }
+    private void removeLoadedChildren(long position, int parentId, int removed) {
+        int oldPtr = this.nodeData.getChildPtr(parentId);
+        int oldCount = this.nodeData.getChildPtrCount(parentId);
+        if (oldPtr < 0 || oldPtr == SENTINEL_EMPTY_CHILD_PTR) {
+            throw new IllegalStateException("Inner node has no loaded children");
+        }
+        int oldMask = 0;
+        for (int i = 0; i < oldCount; i++) {
+            if (!this.nodeData.nodeExists(oldPtr+i)) throw new IllegalStateException("Missing child node");
+            oldMask |= 1<<getChildIdx(this.nodeData.nodePosition(oldPtr+i));
+        }
+        if ((oldMask&removed) != removed) throw new IllegalStateException("Removing unloaded children");
 
-            if (rem != 0) {
-                //There are child node entries that need removing
-                // and of course still delete all the old data
-
-
-
-                //Compact the node data with respect to what has been removed
-                int oldPtr = this.nodeData.getChildPtr(nodeId);
-                int oldCount = this.nodeData.getChildPtrCount(nodeId);
-                if (oldPtr == -1) {
-                    throw new IllegalStateException();
-                }
-                int oldExistence = 0;
-                for (int i = 0; i < oldCount; i++) {
-                    if (!this.nodeData.nodeExists(i+oldPtr)) throw new IllegalStateException();
-                    oldExistence |= 1<<getChildIdx(this.nodeData.nodePosition(i+oldPtr));
-                }
-
-                if ((rem&oldExistence)!=rem) {//If rem contains stuff that does not exist, is illegal
-                    throw new IllegalStateException();
-                }
-
-                int remaining = rem^oldExistence;
-
-                if (remaining == 0) {
-                    //This state should only ever occur when a node is inflight, or... if an inner node has existance mask of 0... sigh
-                    if (childExistence != 0 && !this.nodeData.isNodeRequestInFlight(nodeId)) {
-                        throw new IllegalStateException();
-                    }
-                    //TODO: TRIPPLY CHECK THIS IS RIGHT
-                    //TODO: make new SENTINAL value for this!!! NodeStore.NODE_ID_MSK-1
-                    // check in shader aswell!!!
-
-                    this.nodeData.setAllChildrenAreLeaf(nodeId, false);//Children dont exist, therefor set them to false
-                    this.nodeData.setChildPtr(nodeId, SENTINEL_EMPTY_CHILD_PTR);
-                    this.nodeData.setChildPtrCount(nodeId, 8);
-                    for (int i = 0; i < 8; i++) {
-                        if ((rem&(1<<i))==0) continue;
-                        long cPos = makeChildPos(pos, i);
-                        this.recurseRemoveNode(cPos);
-                    }
-
-                } else {
-
-                    int newCnt = Integer.bitCount(remaining);
-                    int newPtr = this.nodeData.allocate(newCnt);
-                    int prevChildId = oldPtr - 1;
-                    int newChildId = newPtr - 1;
-
-                    boolean allChildNodesLeaf = true;
-                    //Need to compact the old into the new
-                    for (int i = 0; i < 8; i++) {
-                        if ((oldExistence & (1 << i)) == 0) continue;
-                        prevChildId++;
-                        if ((rem & (1 << i)) != 0) {//If we removing
-                            long cPos = makeChildPos(pos, i);
-                            this.recurseRemoveNode(cPos);
-                        } else {//We are compacting
-                            newChildId++;
-                            long cPos = this.nodeData.nodePosition(prevChildId);
-                            if (cPos != makeChildPos(pos, i)) {
-                                throw new IllegalStateException();
-                            }
-
-                            //copy the previous entry to its new location
-                            this.nodeData.copyNode(prevChildId, newChildId);
-
-                            this.clearAllocId(newChildId);
-                            this.clearFreeId(prevChildId);
-
-                            int prevNodeId = this.activeSectionMap.get(cPos);
-                            if ((prevNodeId & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
-                                throw new IllegalStateException();
-                            }
-                            if ((prevNodeId & NODE_ID_MSK) != prevChildId) {
-                                throw new IllegalStateException("State inconsistency");
-                            }
-                            allChildNodesLeaf &= (prevNodeId & NODE_TYPE_MSK) == NODE_TYPE_LEAF;
-                            this.activeSectionMap.put(cPos, (prevNodeId & NODE_TYPE_MSK) | newChildId);
-
-                            //Release the old entry
-                            this.nodeData.free(prevChildId);
-                            //Need to invalidate the old and the new
-                            this.invalidateNode(prevChildId);
-                            this.invalidateNode(newChildId);
-                        }
-                    }
-                    this.nodeData.setAllChildrenAreLeaf(nodeId, allChildNodesLeaf);
-
-                    //Put the new childPtr into the map
-                    this.nodeData.setChildPtr(nodeId, newPtr);
-                    this.nodeData.setChildPtrCount(nodeId, newCnt);
-
-                }
-
-                //Invalidate the node as data has changed
-                this.invalidateNode(nodeId);
-            }
-
-            //TODO: reuse requestId and obj from before (its faster)
-            //Only finish the request after so that compaction of the child msk is correct
-            if (this.nodeData.isNodeRequestInFlight(nodeId)) {//Also only need to do this after/if there are removals to be done
-                int requestId = this.nodeData.getNodeRequest(nodeId);
-                var request = this.childRequests.get(requestId);
-                if (request.position() != pos) throw new IllegalStateException("Request is not at pos");
-
-                if (request.isSatisfied()) {
-                    this.finishRequest(requestId, request);
-                }
+        int remaining = oldMask&~removed;
+        int newPtr = remaining == 0 ? SENTINEL_EMPTY_CHILD_PTR : this.nodeData.allocate(Integer.bitCount(remaining));
+        int oldId = oldPtr-1;
+        int newId = newPtr-1;
+        boolean allLeaf = remaining != 0;
+        for (int child = 0; child < 8; child++) {
+            int bit = 1<<child;
+            if ((oldMask&bit) == 0) continue;
+            oldId++;
+            if ((removed&bit) != 0) {
+                this.recurseRemoveNode(makeChildPos(position, child));
+            } else {
+                newId++;
+                allLeaf &= this.relocateNode(oldId, newId);
+                this.nodeData.free(oldId);
             }
         }
-
-
-        if (childExistence == 0) {
-            //We need to change the node from inner to leaf as it does not have any children
-            if (this.nodeData.isNodeRequestInFlight(nodeId))//Leaf nodes cannot have requests associated to them
-                throw new IllegalStateException();
-
-            if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) {
-                Logger.error("Transforming inner node to leaf node while it has null geometry");
-                if (!this.nodeData.isNodeGeometryInFlight(nodeId)) {
-                    if ((this.watcher.get(pos) & UPDATE_TYPE_BLOCK_BIT) != 0) {
-                        throw new IllegalStateException("Watcher was already watching for geometry update, but geometry was null");
-                    }
-                    this.processRequest(pos);//Force geometry request
-                    if (((this.watcher.get(pos) & UPDATE_TYPE_BLOCK_BIT) == 0)||!this.nodeData.isNodeGeometryInFlight(nodeId)) {
-                        throw new IllegalStateException("Watcher must be watching for geometry update");
-                    }
-                }
-                //Set the geometry to EMPTY while the geometry update request is executing
-                Logger.error("Setting geometry to EMPTY while request is inflight");
-                //TODO: figure out a better way to mark this for tracing verificaction and like less confusion
-                // (instead of like EMPTY_GEOMETRY_ID do like INFLIGHT_GEOMETRY_ID)
-                this.nodeData.setNodeGeometry(nodeId, EMPTY_GEOMETRY_ID);
-            }
-
-            if (this.nodeData.getChildPtr(nodeId) != SENTINEL_EMPTY_CHILD_PTR) {//This should only ever be the sentinal ptr
-                throw new IllegalStateException();
-            }
-
-            this.nodeData.setChildPtr(nodeId, -1);
-            this.activeSectionMap.put(pos, NODE_TYPE_LEAF|nodeId);
-            this.nodeData.setAllChildrenAreLeaf(nodeId, false);//Node is leaf so is not all child leaf
-            this.invalidateNode(nodeId);
-        }
+        this.nodeData.setChildPtr(parentId, newPtr);
+        this.nodeData.setChildPtrCount(parentId, remaining == 0 ? 8 : Integer.bitCount(remaining));
+        this.nodeData.setAllChildrenAreLeaf(parentId, allLeaf);
+        this.invalidateNode(parentId);
     }
 
     private void recurseRemoveChildNodes(long pos) {
@@ -479,13 +363,63 @@ public class NodeManager {
                 : this.childRequests.get(requestId);
     }
 
+    private void transition(long position, int expected, int replacement) {
+        int current = this.activeSectionMap.get(position);
+        if (current != expected) {
+            throw new IllegalStateException("Hierarchy state changed at " + WorldEngine.pprintPos(position)
+                    + ": expected " + expected + ", found " + current);
+        }
+        this.activeSectionMap.put(position, replacement);
+    }
+
+    private void removeState(long position, int expected) {
+        if (this.activeSectionMap.get(position) != expected) {
+            throw new IllegalStateException("Hierarchy owner changed at " + WorldEngine.pprintPos(position));
+        }
+        this.activeSectionMap.remove(position);
+    }
+
+    private void transitionToLeaf(long position, int nodeId) {
+        if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+            throw new IllegalStateException("Cannot make a requested node a leaf");
+        }
+        int childPtr = this.nodeData.getChildPtr(nodeId);
+        if (childPtr != -1 && childPtr != SENTINEL_EMPTY_CHILD_PTR) {
+            throw new IllegalStateException("Cannot make a node with children a leaf");
+        }
+        if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) {
+            throw new IllegalStateException("Leaf nodes require geometry");
+        }
+        this.nodeData.setChildPtr(nodeId, -1);
+        this.nodeData.setAllChildrenAreLeaf(nodeId, false);
+        this.transition(position, NODE_TYPE_INNER|nodeId, NODE_TYPE_LEAF|nodeId);
+        this.invalidateNode(nodeId);
+        this.refreshParentLeafState(position);
+    }
+
+    private void refreshParentLeafState(long position) {
+        if (this.topLevelNodes.contains(position)) return;
+        int parentState = this.activeSectionMap.get(makeParentPos(position));
+        if ((parentState&NODE_TYPE_MSK) != NODE_TYPE_INNER) return;
+        int parentId = parentState&NODE_ID_MSK;
+        int ptr = this.nodeData.getChildPtr(parentId);
+        boolean allLeaf = ptr >= 0 && ptr != SENTINEL_EMPTY_CHILD_PTR;
+        for (int i = 0; allLeaf && i < this.nodeData.getChildPtrCount(parentId); i++) {
+            int childState = this.activeSectionMap.get(this.nodeData.nodePosition(ptr+i));
+            allLeaf = childState == (NODE_TYPE_LEAF|(ptr+i));
+        }
+        this.nodeData.setAllChildrenAreLeaf(parentId, allLeaf);
+        this.invalidateNode(parentId);
+    }
+
 
     private void addRequestedChild(int requestId, NodeRequest request, int child) {
         request.require(child);
         long childPos = makeChildPos(request.position(), child);
-        if (this.activeSectionMap.put(childPos, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD) != -1) {
+        if (this.activeSectionMap.get(childPos) != -1) {
             throw new IllegalStateException("Requested child was already active: " + WorldEngine.pprintPos(childPos));
         }
+        this.activeSectionMap.put(childPos, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD);
         ClientLodNetwork.prioritizeVisible(childPos);
         if (!this.watcher.watch(childPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
             throw new IllegalStateException("Requested child was already watched: " + WorldEngine.pprintPos(childPos));
@@ -524,13 +458,16 @@ public class NodeManager {
         return request;
     }
 
+    private void requireRequestOwner(NodeRequest request, long position) {
+        if (request.position() != position) {
+            throw new IllegalStateException("Request owner changed: " + WorldEngine.pprintPos(position));
+        }
+    }
+
     private int removeRequestedChild(int requestId, NodeRequest request, int child) {
         long childPos = makeChildPos(request.position(), child);
         int expected = requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD;
-        int actual = this.activeSectionMap.remove(childPos);
-        if (actual != expected) {
-            throw new IllegalStateException("Requested child has wrong owner: " + actual + " != " + expected);
-        }
+        this.removeState(childPos, expected);
         if (!this.watcher.unwatch(childPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
             throw new IllegalStateException("Requested child was not being watched: " + WorldEngine.pprintPos(childPos));
         }
@@ -560,6 +497,7 @@ public class NodeManager {
         if (onlyRemoveChildren) {
             nodeId = this.activeSectionMap.get(pos);
         } else {
+            this.pendingLeafTransitions.remove(pos);
             nodeId = this.activeSectionMap.remove(pos);
         }
         if (nodeId == -1) {
@@ -670,10 +608,7 @@ public class NodeManager {
         this.nodeData.setNodePosition(id, request.position());
         this.nodeData.setNodeGeometry(id, request.mesh(0));
         this.nodeData.setNodeChildExistence(id, request.childExistence(0));
-        int previous = this.activeSectionMap.put(request.position(), id|NODE_TYPE_LEAF);
-        if (previous != (requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_SINGLE)) {
-            throw new IllegalStateException("Top-level request has wrong owner: " + previous);
-        }
+        this.transition(request.position(), requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_SINGLE, id|NODE_TYPE_LEAF);
         this.topLevelRequests.release(requestId);
         this.invalidateNode(id);
 
@@ -686,198 +621,97 @@ public class NodeManager {
     }
 
     private void finishRequest(int requestId, NodeRequest request) {
-        int parentNodeId = this.activeSectionMap.get(request.position());
-        if (parentNodeId == -1 || (parentNodeId&NODE_TYPE_MSK)==NODE_TYPE_REQUEST) {
-            throw new IllegalStateException("Request parent is no longer a node: " + WorldEngine.pprintPos(request.position()) + " " + parentNodeId);
+        int parentState = this.activeSectionMap.get(request.position());
+        int parentType = parentState&NODE_TYPE_MSK;
+        if (parentState == -1 || (parentType != NODE_TYPE_LEAF && parentType != NODE_TYPE_INNER)) {
+            throw new IllegalStateException("Request parent is no longer a node: "
+                    + WorldEngine.pprintPos(request.position()) + " " + parentState);
         }
-        int parentNodeType = parentNodeId&NODE_TYPE_MSK;
-        parentNodeId &= NODE_ID_MSK;
+        int parentNodeId = parentState&NODE_ID_MSK;
         if (!this.nodeData.isNodeRequestInFlight(parentNodeId) || this.nodeData.getNodeRequest(parentNodeId) != requestId) {
             throw new IllegalStateException("Request is not owned by its parent: " + requestId);
         }
 
-        if (request.requiredMask() == 0) {
+        int requested = request.requiredMask();
+        if (requested == 0) {
             this.releaseChildRequest(parentNodeId, requestId);
             this.invalidateNode(parentNodeId);
             return;
         }
-        if (parentNodeType==NODE_TYPE_LEAF) {
-            int msk = request.requiredMask();
-            int base = this.nodeData.allocate(Integer.bitCount(msk));
-            int offset = -1;
-            for (int childIdx = 0; childIdx < 8; childIdx++) {
-                if ((msk&(1<<childIdx)) == 0) {
-                    continue;
-                }
-                offset++;
 
-                long childPos = makeChildPos(request.position(), childIdx);
-                int childNodeId = base+offset;
-                //Fill in node
-                this.nodeData.setNodePosition(childNodeId, childPos);
-                byte childExistence = request.childExistence(childIdx);
-                if (childExistence == 0) {
-                    //This is an ok error if it happens the request with a child state should never be zero
-
-
-                    //TODO: make into warning or log error
-                    Logger.warn("Request result with child existence of 0, for child pos " + WorldEngine.pprintPos(childPos));
-                }
-                this.nodeData.setNodeChildExistence(childNodeId, childExistence);
-                this.nodeData.setNodeGeometry(childNodeId, request.mesh(childIdx));
-                //Mark for update
-                this.invalidateNode(childNodeId);
-
-                //Put in map
-                int pid = this.activeSectionMap.put(childPos, childNodeId|NODE_TYPE_LEAF);
-                if (pid != (requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD)) {
-                    throw new IllegalStateException("Put node in map from request but type was not request: " + pid + " " + WorldEngine.pprintPos(childPos));
-                }
-
-                this.clearAllocId(childNodeId);
-            }
-            //Update the parent
-            this.nodeData.setChildPtr(parentNodeId, base);
-            this.nodeData.setChildPtrCount(parentNodeId, Integer.bitCount(msk));
-            this.releaseChildRequest(parentNodeId, requestId);
-
-            //Change it from a leaf to an inner node
-            //Set the type from leaf to inner node
-            if (this.activeSectionMap.put(request.position(), NODE_TYPE_INNER|parentNodeId) != (NODE_TYPE_LEAF|parentNodeId)) {
-                throw new IllegalStateException();
-            }
-            this.invalidateNode(parentNodeId);
-            this.nodeData.setAllChildrenAreLeaf(parentNodeId, true);
-
-            //TODO: Need to set AllChildrenAreLeaf of the parent of the parent to false
-            //Update the parentParent that all the children are leaf
-            if (!this.topLevelNodes.contains(request.position())) {
-                int ppnId = this.activeSectionMap.get(makeParentPos(request.position()));
-                if ((ppnId&NODE_TYPE_MSK) != NODE_TYPE_INNER) {
-                    throw new IllegalStateException();
-                }
-                //Since this node isnt a leaf node anymore
-                this.nodeData.setAllChildrenAreLeaf(ppnId&NODE_ID_MSK, false);
-            }
-        } else if (parentNodeType==NODE_TYPE_INNER) {
-            //For this, only need to add the nodes to the existing child set thing (shuffle around whatever) dont ever have to remove nodes
-
-            int oldChildPtr = this.nodeData.getChildPtr(parentNodeId);
-            int oldChildCnt = this.nodeData.getChildPtrCount(parentNodeId);
-            if (oldChildPtr == -1) {
-                throw new IllegalStateException();
-            }
-
-            int existingChildMsk = 0;
-
-            //If the pointer is the empty ptr, dont check the count
-            if (oldChildPtr != SENTINEL_EMPTY_CHILD_PTR) {
-                //Ok so technically, it _is ok_ to just add to the end of the childPtr, however, imo that is stupid
-                // and it should follow the logical allocation with respect to the 8 child indices
-                // this means, need to extract the child indices already in the ptr (or technically could use the child existance? but having both and doing verification would be good)
-
-                for (int i = 0; i < oldChildCnt; i++) {
-                    if (!this.nodeData.nodeExists(i + oldChildPtr)) {
-                        throw new IllegalStateException();
-                    }
-                    existingChildMsk |= 1 << getChildIdx(this.nodeData.nodePosition(i + oldChildPtr));
+        int oldPtr = -1;
+        int oldCount = 0;
+        int existing = 0;
+        if (parentType == NODE_TYPE_INNER) {
+            oldPtr = this.nodeData.getChildPtr(parentNodeId);
+            oldCount = this.nodeData.getChildPtrCount(parentNodeId);
+            if (oldPtr == -1) throw new IllegalStateException("Inner node has no child allocation");
+            if (oldPtr != SENTINEL_EMPTY_CHILD_PTR) {
+                for (int i = 0; i < oldCount; i++) {
+                    if (!this.nodeData.nodeExists(oldPtr+i)) throw new IllegalStateException("Missing child node");
+                    existing |= 1 << getChildIdx(this.nodeData.nodePosition(oldPtr+i));
                 }
             }
-            int reqMsk = request.requiredMask();
-            if ((byte) (existingChildMsk|reqMsk) != this.nodeData.getNodeChildExistence(parentNodeId)) {
-                    throw new IllegalStateException("node data existence state does not match pointer mask");
-            }
-
-
-            if ((reqMsk&existingChildMsk)!=0) {
-                throw new IllegalStateException("Overlapping child data!!! BAD");
-            }
-
-            //Create the new allocation
-            int newMsk = reqMsk | existingChildMsk;
-            int newChildPtr = this.nodeData.allocate(Integer.bitCount(newMsk));
-
-            //Need to interlace the old and new data into the new allocation
-            // FOR OLD ALLOCATIONS, NEED TO UPDATE POINTERS
-            int childId = newChildPtr-1;
-            int prevChildId = oldChildPtr-1;
-
-            for (int i = 0; i < 8; i++) {
-                if ((newMsk&(1<<i))==0) continue;
-                childId++;
-
-                if ((reqMsk&(1<<i))!=0) {
-
-                    //Its an entry from the request
-                    long childPos = makeChildPos(request.position(), i);
-
-                    this.nodeData.setNodePosition(childId, childPos);
-                    byte childExistence = request.childExistence(i);
-                    if (childExistence == 0) {
-
-                        //TODO: make into warning or log error
-
-
-                    }
-                    this.nodeData.setNodeChildExistence(childId, childExistence);
-                    this.nodeData.setNodeGeometry(childId, request.mesh(i));
-
-                    //Mark for update
-                    this.invalidateNode(childId);
-
-                    //Put in map
-                    int pid = this.activeSectionMap.put(childPos, childId|NODE_TYPE_LEAF);
-                    if (pid != (requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD)) {
-                        throw new IllegalStateException("Put node in map from request but type was not request: " + pid + " " + WorldEngine.pprintPos(childPos));
-                    }
-                    this.clearAllocId(childId);
-                } else {
-                    prevChildId++;
-
-                    long pos = this.nodeData.nodePosition(prevChildId);
-
-                    //Its a previous entry, copy it to its new location
-                    this.nodeData.copyNode(prevChildId, childId);
-
-                    this.clearAllocId(childId);
-                    this.clearFreeId(prevChildId);
-
-                    int prevNodeId = this.activeSectionMap.get(pos);
-                    if ((prevNodeId&NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
-                        throw new IllegalStateException();
-                    }
-                    if ((prevNodeId&NODE_ID_MSK) != prevChildId) {
-                        throw new IllegalStateException("State inconsistency");
-                    }
-                    this.activeSectionMap.put(pos, (prevNodeId&NODE_TYPE_MSK)|childId);
-                    //Need to invalidate the old and the new
-                    this.invalidateNode(prevChildId);
-                    this.invalidateNode(childId);
-                }
-            }
-
-            //Do final steps
-
-            //Free the old child data
-            if (oldChildPtr != SENTINEL_EMPTY_CHILD_PTR) {
-                this.nodeData.free(oldChildPtr, oldChildCnt);
-            }
-
-            //If the old ptr was sentinal null, this node is now pure leaf children
-            if (oldChildPtr == SENTINEL_EMPTY_CHILD_PTR) {
-                this.nodeData.setAllChildrenAreLeaf(parentNodeId, true);
-            }
-
-            //Update the parent
-            this.nodeData.setChildPtr(parentNodeId, newChildPtr);
-            this.nodeData.setChildPtrCount(parentNodeId, Integer.bitCount(newMsk));
-            this.releaseChildRequest(parentNodeId, requestId);
-
-            //Invalidate parent
-            this.invalidateNode(parentNodeId);
-        } else {
-            throw new IllegalStateException();
         }
+
+        int combined = existing|requested;
+        if ((existing&requested) != 0) throw new IllegalStateException("Requested children already exist");
+        if (combined != Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(parentNodeId))) {
+            throw new IllegalStateException("Child allocation does not match the existence mask");
+        }
+
+        int newPtr = this.nodeData.allocate(Integer.bitCount(combined));
+        int oldId = oldPtr-1;
+        int newId = newPtr-1;
+        boolean allLeaf = true;
+        for (int child = 0; child < 8; child++) {
+            int bit = 1<<child;
+            if ((combined&bit) == 0) continue;
+            newId++;
+            if ((requested&bit) != 0) {
+                this.installRequestedChild(requestId, request, child, newId);
+            } else {
+                oldId++;
+                allLeaf &= this.relocateNode(oldId, newId);
+            }
+        }
+
+        if (oldPtr != -1 && oldPtr != SENTINEL_EMPTY_CHILD_PTR) this.nodeData.free(oldPtr, oldCount);
+        this.nodeData.setChildPtr(parentNodeId, newPtr);
+        this.nodeData.setChildPtrCount(parentNodeId, Integer.bitCount(combined));
+        this.nodeData.setAllChildrenAreLeaf(parentNodeId, allLeaf);
+        this.releaseChildRequest(parentNodeId, requestId);
+        if (parentType == NODE_TYPE_LEAF) {
+            this.transition(request.position(), parentState, NODE_TYPE_INNER|parentNodeId);
+            this.refreshParentLeafState(request.position());
+        }
+        this.invalidateNode(parentNodeId);
+    }
+
+    private void installRequestedChild(int requestId, NodeRequest request, int child, int nodeId) {
+        long position = makeChildPos(request.position(), child);
+        this.nodeData.setNodePosition(nodeId, position);
+        this.nodeData.setNodeChildExistence(nodeId, request.childExistence(child));
+        this.nodeData.setNodeGeometry(nodeId, request.mesh(child));
+        this.transition(position, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD, NODE_TYPE_LEAF|nodeId);
+        this.clearAllocId(nodeId);
+        this.invalidateNode(nodeId);
+    }
+
+    private boolean relocateNode(int oldId, int newId) {
+        long position = this.nodeData.nodePosition(oldId);
+        int oldState = this.activeSectionMap.get(position);
+        int type = oldState&NODE_TYPE_MSK;
+        if ((type != NODE_TYPE_LEAF && type != NODE_TYPE_INNER) || (oldState&NODE_ID_MSK) != oldId) {
+            throw new IllegalStateException("Child allocation does not own " + WorldEngine.pprintPos(position));
+        }
+        this.nodeData.copyNode(oldId, newId);
+        this.transition(position, oldState, type|newId);
+        this.clearAllocId(newId);
+        this.clearFreeId(oldId);
+        this.invalidateNode(oldId);
+        this.invalidateNode(newId);
+        return type == NODE_TYPE_LEAF;
     }
 
     //==================================================================================================================
@@ -1034,18 +868,8 @@ public class NodeManager {
             //We cannot make the parent a leaf node with null geometry
             this.processRequest(pPos);//Request geometry
         } else {
-            //Convert to leaf node
-            this.recurseRemoveChildNodes(pPos);//TODO: make this download/fetch the data instead of just deleting it
-
-            //Make node a leaf
-            int old = this.activeSectionMap.put(pPos, NODE_TYPE_LEAF|pId);
-            if (old == -1)
-                throw new IllegalStateException();
-            if ((old&NODE_TYPE_MSK)!=NODE_TYPE_INNER || (old&NODE_ID_MSK)!=pId)
-                throw new IllegalStateException();
-
-            //Mark all children as not leaf (as this is a leaf node)
-            this.nodeData.setAllChildrenAreLeaf(pId, false);
+            this.recurseRemoveChildNodes(pPos);
+            this.transitionToLeaf(pPos, pId);
         }
     }
 
@@ -1066,19 +890,6 @@ public class NodeManager {
             this.invalidateNode(nodeId);//Only need to invalidate on change
             this.nodeData.unmarkNodeGeometryInFlight(nodeId);//Remove geometry inflight as well, its removed
         }
-    }
-
-    //==================================================================================================================
-    public boolean writeChanges(GlBuffer nodeBuffer) {
-        //TODO: use like compute based copy system or something
-        // since microcopies are bad
-        if (this.nodeUpdates.isEmpty()) {
-            return false;
-        }
-        this.nodeUpdates.forEach((int i) -> this.writeNodeData(
-                UploadStream.INSTANCE.upload(nodeBuffer, i * 16L, 16L), i));
-        this.nodeUpdates.clear();
-        return true;
     }
 
     //Used for raw access to the update map, internal (used in async)

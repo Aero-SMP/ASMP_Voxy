@@ -1,10 +1,11 @@
-use crate::{crc::crc32c, read_file_bounded};
+use crate::{
+    crc::crc32c, quarantine, read_file_bounded, replace_synced, take, take_u16, take_u32, take_u64,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -428,17 +429,7 @@ fn read_snapshot(path: &Path) -> Result<Option<RegistrySnapshot>> {
 fn write_snapshot(path: &Path, snapshot: &RegistrySnapshot) -> Result<()> {
     let bytes = encode_snapshot(snapshot)?;
     let tmp = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    sync_parent(path)?;
-    Ok(())
+    replace_synced(path, &tmp, &bytes)
 }
 
 fn new_catalog_id() -> u64 {
@@ -449,56 +440,11 @@ fn new_catalog_id() -> u64 {
     nanos.rotate_left(17) ^ u64::from(std::process::id()) ^ 0x5658_5932_4341_5441
 }
 
-fn quarantine(path: &Path) {
-    if !path.exists() {
-        return;
-    }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("registry");
-    let target = path.with_file_name(format!("{name}.corrupt.{stamp}"));
-    if let Err(error) = fs::rename(path, &target) {
-        eprintln!("could not quarantine {}: {error}", path.display());
-    }
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
-    if input.len() < count {
-        bail!("truncated registry snapshot");
-    }
-    let (head, tail) = input.split_at(count);
-    *input = tail;
-    Ok(head)
-}
-
-fn take_u16(input: &mut &[u8]) -> Result<u16> {
-    Ok(u16::from_le_bytes(take(input, 2)?.try_into().unwrap()))
-}
-
-fn take_u32(input: &mut &[u8]) -> Result<u32> {
-    Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
-}
-
-fn take_u64(input: &mut &[u8]) -> Result<u64> {
-    Ok(u64::from_le_bytes(take(input, 8)?.try_into().unwrap()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Seek};
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, Write};
 
     #[test]
     fn snapshot_round_trip_and_crc() {

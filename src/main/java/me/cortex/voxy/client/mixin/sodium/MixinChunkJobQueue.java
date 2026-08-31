@@ -1,6 +1,5 @@
 package me.cortex.voxy.client.mixin.sodium;
 
-import me.cortex.voxy.client.compat.SemaphoreBlockImpersonator;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.common.thread.MultiThreadPrioritySemaphore;
@@ -31,6 +30,35 @@ public class MixinChunkJobQueue {
     private void voxy$injectAtShutdown(CallbackInfoReturnable ci) {
         if (this.voxy$semaphoreBlock != null) {
             this.voxy$semaphoreBlock.free();
+        }
+    }
+
+    private static final class SemaphoreBlockImpersonator extends Semaphore {
+        private final MultiThreadPrioritySemaphore.Block block;
+
+        private SemaphoreBlockImpersonator(MultiThreadPrioritySemaphore.Block block) {
+            super(0);
+            this.block = block;
+        }
+
+        @Override
+        public void release(int permits) {
+            this.block.release(permits);
+        }
+
+        @Override
+        public void acquire() throws InterruptedException {
+            this.block.acquire();
+        }
+
+        @Override
+        public boolean tryAcquire() {
+            return this.block.tryAcquire();
+        }
+
+        @Override
+        public int availablePermits() {
+            return this.block.availablePermits();
         }
     }
 }

@@ -5,15 +5,16 @@ use crate::{
     lod::{Section, build_parent},
     read_file_bounded,
     registry::Registry,
+    replace_synced,
     store::{EntryMeta, Invalidation, Store},
+    write_synced,
 };
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -1178,10 +1179,7 @@ fn save_meta(dir: &Path, state: &ScanState) -> Result<()> {
         return Ok(());
     }
     let tmp = dir.join("meta.state.tmp");
-    write_synced(&tmp, &bytes)?;
-    fs::rename(tmp, path)?;
-    File::open(dir)?.sync_all()?;
-    Ok(())
+    replace_synced(&path, &tmp, &bytes)
 }
 
 fn save_dirty_regions(dir: &Path, regions: &BTreeSet<(i32, i32)>) -> Result<()> {
@@ -1285,17 +1283,6 @@ fn decode_envelope<T: for<'de> Deserialize<'de>>(
         anyhow::bail!("checksummed JSON CRC mismatch");
     }
     Ok(serde_json::from_slice(&bytes[16..bytes.len() - 4])?)
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
 }
 
 fn validate_region_state(state: &RegionState, region: (i32, i32), catalog_id: u64) -> Result<()> {

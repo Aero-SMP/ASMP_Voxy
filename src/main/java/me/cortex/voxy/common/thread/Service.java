@@ -3,55 +3,79 @@ package me.cortex.voxy.common.thread;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.Pair;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.Semaphore;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
-public class Service {
-    private final PerThreadContextExecutor executor;
-    private final ServiceManager sm;
+public final class Service {
+    private final Supplier<Pair<Runnable, Runnable>> contextFactory;
+    private final Map<Thread, Pair<Runnable, Runnable>> contexts = new HashMap<>();
+    private final ServiceManager manager;
+    private final Semaphore tasks = new Semaphore(0);
+    private final Object state = new Object();
+
     final long weight;
     final String name;
     final BooleanSupplier limiter;
+    long selectionCredit;
 
-    private final Semaphore tasks = new Semaphore(0);
-    private volatile boolean isLive = true;
-    private volatile boolean isStopping = false;
+    private int running;
+    private volatile boolean stopping;
 
-    Service(Supplier<Pair<Runnable, Runnable>> ctxSupplier, ServiceManager sm, long weight, String name, BooleanSupplier limiter) {
-        this.sm = sm;
+    Service(Supplier<Pair<Runnable, Runnable>> contextFactory, ServiceManager manager,
+            long weight, String name, BooleanSupplier limiter) {
+        this.contextFactory = contextFactory;
+        this.manager = manager;
         this.weight = weight;
         this.name = name;
         this.limiter = limiter;
-
-        this.executor = new PerThreadContextExecutor(ctxSupplier, e->sm.handleException(this, e));
     }
 
     public void execute() {
-        if (this.isStopping) {
-            Logger.error("Tried executing on a dead service");
-            return;
+        synchronized (this.state) {
+            if (this.stopping) {
+                Logger.error("Tried executing on a stopped service");
+                return;
+            }
+            this.tasks.release();
+            this.manager.execute();
+            this.state.notifyAll();
         }
-        this.tasks.release();
-        this.sm.execute(this);
     }
 
-    boolean runJob() {
-        if (this.isStopping||!this.isLive) {
-            return false;
+    boolean claimJob() {
+        synchronized (this.state) {
+            if (this.stopping || !this.tasks.tryAcquire()) return false;
+            this.running++;
+            return true;
         }
-        if (!this.tasks.tryAcquire()) {
-            //Failed to get the job, probably due to a race condition
-            return false;
+    }
+
+    void runClaimedJob() {
+        try {
+            try {
+                Pair<Runnable, Runnable> context;
+                synchronized (this.contexts) {
+                    context = this.contexts.computeIfAbsent(Thread.currentThread(),
+                            ignored -> this.contextFactory.get());
+                }
+                context.left().run();
+            } catch (Exception exception) {
+                this.manager.handleException(this, exception);
+            }
+        } finally {
+            this.manager.removeJobs(1);
+            synchronized (this.state) {
+                this.running--;
+                this.state.notifyAll();
+            }
         }
-        if (!this.executor.run()) {//Run the job
-            throw new IllegalStateException("Executor failed to run");
-        }
-        return true;
     }
 
     public boolean isLive() {
-        return this.isLive&&!this.isStopping;
+        return !this.stopping;
     }
 
     public int numJobs() {
@@ -59,42 +83,65 @@ public class Service {
     }
 
     public void blockTillEmpty() {
-        while (this.isLive() && this.numJobs() != 0) {
-            Thread.yield();
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+        synchronized (this.state) {
+            while (this.isLive() && this.numJobs() != 0) {
+                try {
+                    this.state.wait(10);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted waiting for service", exception);
+                }
             }
         }
     }
 
     public int shutdown() {
-        if (this.isStopping) {
-            throw new IllegalStateException("Service not live");
+        synchronized (this.state) {
+            if (this.stopping) throw new IllegalStateException("Service is not live");
+            this.stopping = true;
         }
-        this.isStopping = true;//First mark the service as stopping
-        this.sm.removeService(this);//Remove the service this is so that new jobs are never executed
-        this.executor.shutdown();//Await shutdown of all running jobs
-        int remaining = this.tasks.drainPermits();//Drain the remaining tasks to 0
-        this.isLive = false;//Mark the service as dead
-        this.sm.remJobs(remaining);
+        this.manager.removeService(this);
+        synchronized (this.state) {
+            while (this.running != 0) {
+                try {
+                    this.state.wait();
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted stopping service", exception);
+                }
+            }
+        }
+
+        int remaining = this.tasks.drainPermits();
+        this.manager.removeJobs(remaining);
+        synchronized (this.contexts) {
+            for (Pair<Runnable, Runnable> context : this.contexts.values()) {
+                try {
+                    context.right().run();
+                } catch (Exception exception) {
+                    this.manager.handleException(this, exception);
+                }
+            }
+            this.contexts.clear();
+        }
         return remaining;
     }
 
     public boolean steal() {
-        if (!this.tasks.tryAcquire()) {
-            return false;
+        if (!this.tasks.tryAcquire()) return false;
+        this.manager.removeJobs(1);
+        synchronized (this.state) {
+            this.state.notifyAll();
         }
-        this.sm.remJobs(1);
         return true;
     }
 
     public int drain() {
-        int tasks = this.tasks.drainPermits();
-        if (tasks != 0) {
-            this.sm.remJobs(tasks);
+        int drained = this.tasks.drainPermits();
+        if (drained != 0) this.manager.removeJobs(drained);
+        synchronized (this.state) {
+            this.state.notifyAll();
         }
-        return tasks;
+        return drained;
     }
 }

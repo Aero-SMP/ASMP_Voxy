@@ -36,6 +36,7 @@ import static org.lwjgl.opengl.GL45.glGetNamedFramebufferAttachmentParameteri;
 import static org.lwjgl.opengl.GL45C.glBindTextureUnit;
 
 public abstract class AbstractRenderPipeline extends TrackedObject {
+    public static final int EMPTY_VERTEX_ARRAY = GL30.glGenVertexArrays();
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
     private final HierarchicalOcclusionTraverser traversal;

@@ -554,7 +554,6 @@ public class IrisVoxyRenderPipelineData {
             builder.append(" ").append(val).append(";\n");
             i++;
         }
-        //ssboStore.getBufferIndex()
         IntConsumer bindingFunction = base->{
             for (var binding : bindings) {
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, base+binding.bindingOffset, ssboStore.getBufferIndex(binding.irisIndex));

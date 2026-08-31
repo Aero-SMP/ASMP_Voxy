@@ -3,6 +3,7 @@ use crate::{
     crc::crc32c,
     lod::{Section, compress_encoded, network_body_from_stored},
     registry::RegistrySnapshot,
+    take, take_u16, take_u32, take_u64,
 };
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -336,23 +337,6 @@ fn put_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
-    if input.len() < count {
-        bail!("truncated protocol payload");
-    }
-    let (head, tail) = input.split_at(count);
-    *input = tail;
-    Ok(head)
-}
-fn take_u16(input: &mut &[u8]) -> Result<u16> {
-    Ok(u16::from_le_bytes(take(input, 2)?.try_into().unwrap()))
-}
-fn take_u32(input: &mut &[u8]) -> Result<u32> {
-    Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
-}
-fn take_u64(input: &mut &[u8]) -> Result<u64> {
-    Ok(u64::from_le_bytes(take(input, 8)?.try_into().unwrap()))
-}
 fn take_string(input: &mut &[u8]) -> Result<String> {
     let len = take_u16(input)? as usize;
     if len > MAX_STRING {

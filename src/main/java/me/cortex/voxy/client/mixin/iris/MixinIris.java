@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.mixin.iris;
 
-import me.cortex.voxy.client.iris.ShaderLoadError;
+import me.cortex.voxy.client.iris.IrisShaderPatch.ShaderLoadError;
 import me.cortex.voxy.common.Logger;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.shaderpack.ShaderPack;

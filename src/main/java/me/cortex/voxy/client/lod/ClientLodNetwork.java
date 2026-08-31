@@ -189,10 +189,6 @@ public final class ClientLodNetwork {
         }
     }
 
-    public static boolean isServerConnected() {
-        return serverConnected;
-    }
-
     public static void subscribe(long key) {
         if (DESIRED_SECTIONS.add(key)) {
             DEMAND_PRIORITIES.putIfAbsent(key,

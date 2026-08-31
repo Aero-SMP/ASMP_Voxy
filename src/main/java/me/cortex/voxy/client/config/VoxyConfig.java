@@ -60,10 +60,9 @@ public class VoxyConfig {
                     if (conf != null) {
                         conf.save();
                         return conf;
-                    } else {
-                        Logger.error("Failed to load voxy config, resetting");
                     }
-                } catch (IOException e) {
+                    Logger.error("Failed to load voxy config, resetting");
+                } catch (Exception e) {
                     Logger.error("Could not parse config", e);
                 }
             }

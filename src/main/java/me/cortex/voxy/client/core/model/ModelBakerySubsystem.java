@@ -68,14 +68,17 @@ public class ModelBakerySubsystem {
             return;
         }
         this.seenIdsLock.lock();
-        if (!this.seenIds.add(blockId)) {
+        try {
+            if (!this.seenIds.add(blockId)) return;
+        } finally {
             this.seenIdsLock.unlock();
-            return;
         }
-        this.seenIdsLock.unlock();
         this.enqueueLock.lock();
-        this.factory.addEntry(blockId);
-        this.enqueueLock.unlock();
+        try {
+            this.factory.addEntry(blockId);
+        } finally {
+            this.enqueueLock.unlock();
+        }
         LockSupport.unpark(this.processingThread);
     }
 

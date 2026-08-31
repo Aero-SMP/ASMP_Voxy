@@ -244,7 +244,6 @@ public class WorldEngine {
             throw new IllegalStateException();
         }
 
-        try {this.mapper.close();} catch (Exception e) {Logger.error(e);}
         try {this.storage.flush();} catch (Exception e) {Logger.error(e);}
         //Shutdown in this order to preserve as much data as possible
         try {this.storage.close();} catch (Exception e) {Logger.error(e);}

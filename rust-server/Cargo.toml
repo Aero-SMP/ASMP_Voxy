@@ -19,7 +19,7 @@ toml = "0.9"
 zstd = { version = "0.13", default-features = false, features = ["pkg-config"] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true

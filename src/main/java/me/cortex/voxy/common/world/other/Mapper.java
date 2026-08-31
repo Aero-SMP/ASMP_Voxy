@@ -90,10 +90,6 @@ public class Mapper {
         return (int) ((id>>56)&0xFF);
     }
 
-    public static long withLight(long id, int light) {
-        return (id&(~(0xFFL<<56)))|(Integer.toUnsignedLong(light&0xFF)<<56);
-    }
-
     public static long airWithLight(int light) {
         return Integer.toUnsignedLong(light&0xFF)<<56;
     }
@@ -289,20 +285,17 @@ public class Mapper {
         return (Byte.toUnsignedLong(light)<<56)|(Integer.toUnsignedLong(biomeId) << 47)|(Integer.toUnsignedLong(blockId)<<27);
     }
 
-    //TODO: fixme: synchronize access to this.biomeId2biomeEntry
     public BiomeEntry[] getBiomeEntries() {
         this.biomeLock.lock();
-        var set = new ArrayList<>(this.biomeId2biomeEntry);
-        BiomeEntry[] out = new BiomeEntry[set.size()];
-        int i = 0;
-        for (var entry : set) {
-            if (entry.id != i++) {
-                throw new IllegalStateException();
+        try {
+            BiomeEntry[] entries = this.biomeId2biomeEntry.toArray(new BiomeEntry[0]);
+            for (int i = 0; i < entries.length; i++) {
+                if (entries[i].id != i) throw new IllegalStateException();
             }
-            out[i-1] = entry;
+            return entries;
+        } finally {
+            this.biomeLock.unlock();
         }
-        this.biomeLock.unlock();
-        return out;
     }
 
     public void forceResaveStates() {
@@ -340,11 +333,6 @@ public class Mapper {
 
         this.storage.flush();
     }
-
-    public void close() {
-
-    }
-
 
     public static final class StateEntry {
         public final int id;

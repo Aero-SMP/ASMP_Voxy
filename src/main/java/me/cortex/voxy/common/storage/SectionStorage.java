@@ -27,7 +27,6 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.function.LongConsumer;
 import java.util.zip.CRC32C;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
@@ -105,17 +104,6 @@ public final class SectionStorage implements AutoCloseable {
             }
         } catch (IOException e) {
             throw new UncheckedIOException("Unable to open Voxy storage at " + path, e);
-        }
-    }
-
-    public void iteratePositions(int level, LongConsumer consumer) {
-        this.checkOpen();
-        for (Log log : this.sectionLogs.values()) {
-            for (long key : log.keys()) {
-                if (level == -1 || WorldEngine.getLevel(key) == level) {
-                    consumer.accept(key);
-                }
-            }
         }
     }
 

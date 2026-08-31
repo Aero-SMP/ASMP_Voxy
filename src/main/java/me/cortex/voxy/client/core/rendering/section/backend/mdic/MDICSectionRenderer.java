@@ -4,7 +4,6 @@ package me.cortex.voxy.client.core.rendering.section.backend.mdic;
 import me.cortex.voxy.client.core.AbstractRenderPipeline;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
-import me.cortex.voxy.client.core.gl.GlVertexArray;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
@@ -97,10 +96,6 @@ public final class MDICSectionRenderer {
                 .define("USE_ZERO_ONE_DEPTH")
                 .defineIf("TAA_PATCH", taa != null)
 
-                //.defineIf("USE_NV_JANK", Capabilities.INSTANCE.isNvidia)//TODO: fix use capability to try compile the jank thing to see if it can be and use that
-
-                //.defineIf("USE_NV_BARRY", Capabilities.INSTANCE.nvBarryCoords)
-
                 .addSource(ShaderType.VERTEX, vertex);
 
         //Apply per face tinting
@@ -178,7 +173,7 @@ public final class MDICSectionRenderer {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         this.terrainShader.bind();
-        glBindVertexArray(GlVertexArray.STATIC_VAO);//Needs to be before binding
+        glBindVertexArray(AbstractRenderPipeline.EMPTY_VERTEX_ARRAY);//Needs to be before binding
         this.pipeline.setupAndBindOpaque(viewport);
         this.bindRenderingBuffers(viewport);
 
@@ -214,7 +209,7 @@ public final class MDICSectionRenderer {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         this.translucentTerrainShader.bind();
-        glBindVertexArray(GlVertexArray.STATIC_VAO);//Needs to be before binding
+        glBindVertexArray(AbstractRenderPipeline.EMPTY_VERTEX_ARRAY);//Needs to be before binding
         this.pipeline.setupAndBindTranslucent(viewport);
         this.bindRenderingBuffers(viewport);
 
@@ -255,7 +250,7 @@ public final class MDICSectionRenderer {
             if (Capabilities.INSTANCE.repFragTest) {
                 glEnable(GL_REPRESENTATIVE_FRAGMENT_TEST_NV);
             }
-            glBindVertexArray(GlVertexArray.STATIC_VAO);
+            glBindVertexArray(AbstractRenderPipeline.EMPTY_VERTEX_ARRAY);
             glBindBufferBase(GL_UNIFORM_BUFFER, 0, this.uniform.id);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, this.geometryManager.getMetadataBuffer().id);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, viewport.visibilityBuffer.id);
@@ -322,10 +317,6 @@ public final class MDICSectionRenderer {
         if (this.geometryManager.getSectionCount() == 0) return;
         //Render temporal
         this.renderTerrain(viewport, TEMPORAL_OFFSET*5*4, 4*5, Math.min(this.geometryManager.getSectionCount(), TEMPORAL_DRAW_COUNT));
-    }
-
-    public Viewport createViewport() {
-        return new Viewport(this.geometryManager.getMaxSectionCount());
     }
 
     public void free() {

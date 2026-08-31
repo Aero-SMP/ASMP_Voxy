@@ -36,10 +36,6 @@ public class SectionUpdateRouter {
         this.childUpdateCallback = childUpdateCallback;
     }
 
-    public boolean watch(int lvl, int x, int y, int z, int types) {
-        return this.watch(WorldEngine.getWorldSectionId(lvl, x, y, z), types);
-    }
-
     public boolean watch(long position, int types) {
         int idx = getSliceIndex(position);
         var set = this.slices[idx];
@@ -76,10 +72,6 @@ public class SectionUpdateRouter {
         }
         if (delta != 0) ClientLodNetwork.subscribe(position);
         return delta!=0;
-    }
-
-    public boolean unwatch(int lvl, int x, int y, int z, int types) {
-        return this.unwatch(WorldEngine.getWorldSectionId(lvl, x, y, z), types);
     }
 
     public boolean unwatch(long position, int types) {//Types is types to unwatch

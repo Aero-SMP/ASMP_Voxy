@@ -224,15 +224,6 @@ public final class NodeStore {
         return (int)((this.localNodeData[id2idx(nodeId)+1]>>61)&3)<<30;
     }
 
-    public void setNodeType(int nodeId, int type) {
-        type >>>= 30;
-        int idx = id2idx(nodeId)+1;
-        long data = this.localNodeData[idx];
-        data &= ~(3L<<61);
-        data |= ((long)type)<<61;
-        this.localNodeData[idx] = data;
-    }
-
     public byte getNodeChildExistence(int nodeId) {
         long data = this.localNodeData[id2idx(nodeId)+1];
         return (byte) ((data>>48)&0xFF);

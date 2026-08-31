@@ -1,8 +1,8 @@
 package me.cortex.voxy.client.core.rendering.util;
 
+import me.cortex.voxy.client.core.AbstractRenderPipeline;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
-import me.cortex.voxy.client.core.gl.GlVertexArray;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import org.lwjgl.opengl.GL11;
@@ -75,7 +75,7 @@ public class HiZBuffer {
             }
             this.alloc(Integer.highestOneBit(width), Integer.highestOneBit(height));
         }
-        glBindVertexArray(GlVertexArray.STATIC_VAO);
+        glBindVertexArray(AbstractRenderPipeline.EMPTY_VERTEX_ARRAY);
         int boundFB = GL11.glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
         this.hiz.bind();
         glBindFramebuffer(GL_FRAMEBUFFER, this.fb.id);

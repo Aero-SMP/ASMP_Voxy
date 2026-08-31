@@ -3,8 +3,7 @@ package me.cortex.voxy.common.world;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ArrayBlockingQueue;
 
 //Represents a loaded world section at a specific detail level
 // holds a 32x32x32 region of detail
@@ -12,7 +11,6 @@ public final class WorldSection {
     public static final int SECTION_VOLUME = 32*32*32;
     static final VarHandle ATOMIC_STATE_HANDLE;
     private static final VarHandle NON_EMPTY_CHILD_HANDLE;
-    private static final VarHandle NON_EMPTY_BLOCK_HANDLE;
     private static final VarHandle IN_SAVE_QUEUE_HANDLE;
     private static final VarHandle IS_DIRTY_HANDLE;
 
@@ -20,7 +18,6 @@ public final class WorldSection {
         try {
             ATOMIC_STATE_HANDLE = MethodHandles.lookup().findVarHandle(WorldSection.class, "atomicState", int.class);
             NON_EMPTY_CHILD_HANDLE = MethodHandles.lookup().findVarHandle(WorldSection.class, "nonEmptyChildren", byte.class);
-            NON_EMPTY_BLOCK_HANDLE = MethodHandles.lookup().findVarHandle(WorldSection.class, "nonEmptyBlockCount", int.class);
             IN_SAVE_QUEUE_HANDLE = MethodHandles.lookup().findVarHandle(WorldSection.class, "inSaveQueue", boolean.class);
             IS_DIRTY_HANDLE = MethodHandles.lookup().findVarHandle(WorldSection.class, "isDirty", boolean.class);
         } catch (NoSuchFieldException | IllegalAccessException e) {
@@ -31,9 +28,7 @@ public final class WorldSection {
 
     //TODO: should make it dynamically adjust the size allowance based on memory pressure/WorldSection allocation rate (e.g. is it doing a world import)
     private static final int ARRAY_REUSE_CACHE_SIZE = 400;//500;//32*32*32*8*ARRAY_REUSE_CACHE_SIZE == number of bytes
-    //TODO: maybe just swap this to a ConcurrentLinkedDeque
-    private static final AtomicInteger ARRAY_REUSE_CACHE_COUNT = new AtomicInteger(0);
-    private static final ConcurrentLinkedDeque<long[]> ARRAY_REUSE_CACHE = new ConcurrentLinkedDeque<>();
+    private static final ArrayBlockingQueue<long[]> ARRAY_REUSE_CACHE = new ArrayBlockingQueue<>(ARRAY_REUSE_CACHE_SIZE);
 
 
     public final int lvl;
@@ -70,8 +65,6 @@ public final class WorldSection {
         this.data = ARRAY_REUSE_CACHE.poll();
         if (this.data == null) {
             this.data = new long[32 * 32 * 32];
-        } else {
-            ARRAY_REUSE_CACHE_COUNT.decrementAndGet();
         }
     }
 
@@ -102,11 +95,7 @@ public final class WorldSection {
     }
 
     public int acquire() {
-        return this.acquire(1);
-    }
-
-    public int acquire(int count) {
-        int state = ((int)  ATOMIC_STATE_HANDLE.getAndAdd(this, count<<1)) + (count<<1);
+        int state = ((int) ATOMIC_STATE_HANDLE.getAndAdd(this, 2)) + 2;
         if ((state & 1) == 0) {
             throw new IllegalStateException("Tried to acquire unloaded section: " + WorldEngine.pprintPos(this.key) + " obj: " + System.identityHashCode(this));
         }
@@ -122,7 +111,7 @@ public final class WorldSection {
     }
 
 
-    public static int RELEASE_HINT_POSSIBLE_REUSE = 1;
+    public static final int RELEASE_HINT_POSSIBLE_REUSE = 1;
     //Unload but specify possible reuse hints
     public int release(int hints) {
         return release(true, hints);
@@ -163,30 +152,10 @@ public final class WorldSection {
     }
 
     void _releaseArray() {
-        if (ARRAY_REUSE_CACHE_COUNT.get() < ARRAY_REUSE_CACHE_SIZE) {
-            ARRAY_REUSE_CACHE.add(this.data);
-            ARRAY_REUSE_CACHE_COUNT.incrementAndGet();
-        }
+        ARRAY_REUSE_CACHE.offer(this.data);
         this.data = null;
     }
 
-
-    public static int getIndex(int x, int y, int z) {
-        final int M = (1<<5)-1;
-        return ((y&M)<<10)|((z&M)<<5)|(x&M);
-    }
-
-    public long set(int x, int y, int z, long id) {
-        //TODO: this needs to update the block counts
-        int idx = getIndex(x,y,z);
-        long old = this.data[idx];
-        this.data[idx] = id;
-        return old;
-    }
-
-    public static int getChildIndex(int x, int y, int z) {
-        return (x&1)|((y&1)<<2)|((z&1)<<1);
-    }
 
     public byte getNonEmptyChildren() {
         return (byte) NON_EMPTY_CHILD_HANDLE.get(this);
@@ -195,7 +164,7 @@ public final class WorldSection {
     //Updates this.nonEmptyChildren atomically with respect to the child passed in
     // returns 0 if no change, 1 if it just updated and didnt do a major state change, 2 if it was a major state change (something -> nothing, nothing -> something)
     public int updateEmptyChildState(WorldSection child) {
-        int childIdx = getChildIndex(child.x, child.y, child.z);
+        int childIdx = (child.x & 1) | ((child.y & 1) << 2) | ((child.z & 1) << 1);
         byte msk = (byte) (1<<childIdx);
         byte prev, next;
         do {
@@ -207,21 +176,7 @@ public final class WorldSection {
     }
 
     public int getNonEmptyBlockCount() {
-        return (int) NON_EMPTY_BLOCK_HANDLE.get(this);
-    }
-
-    public int addNonEmptyBlockCount(int delta) {
-        int count = ((int)NON_EMPTY_BLOCK_HANDLE.getAndAdd(this, delta)) + delta;
-        return count;
-    }
-
-    public boolean updateLvl0State() {
-        byte prev, next;
-        do {
-            prev = this.getNonEmptyChildren();
-            next = (byte) (((int)NON_EMPTY_BLOCK_HANDLE.get(this))==0?0:0xFF);
-        } while (!NON_EMPTY_CHILD_HANDLE.compareAndSet(this, prev, next));
-        return prev != next;
+        return this.nonEmptyBlockCount;
     }
 
     public void markDirty() {

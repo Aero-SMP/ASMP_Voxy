@@ -14,6 +14,29 @@ layout(local_size_x = 128) in;
 #import <voxy:lod/section.glsl>
 #import <voxy:lod/gl46/bindings.glsl>
 
+// VOXY_DEBUG_LOD_AUDIT_BEGIN
+#ifdef VOXY_DEBUG_LOD_AUDIT
+#define VOXY_DRAW_FRONTIER_CAPACITY 2048u
+layout(binding = 14, std430) restrict buffer VoxyDrawAuditBuffer {
+    uint voxyDrawCounters[64];
+    uvec2 voxyDrawFrontier[2048];
+};
+
+void voxyDrawHash(uvec2 rawPos) {
+    atomicXor(voxyDrawCounters[24], rawPos.x * 0x9e3779b9u + rawPos.y);
+    atomicXor(voxyDrawCounters[25], rawPos.y * 0x85ebca6bu + rawPos.x);
+    atomicAdd(voxyDrawCounters[26], rawPos.x * 0xc2b2ae35u ^ rawPos.y);
+    atomicAdd(voxyDrawCounters[27], rawPos.y * 0x27d4eb2fu ^ rawPos.x);
+}
+
+#define VOXY_DRAW_ADD(index, value) atomicAdd(voxyDrawCounters[index], value)
+#define VOXY_DRAW_HASH(rawPos) voxyDrawHash(rawPos)
+#else
+#define VOXY_DRAW_ADD(index, value)
+#define VOXY_DRAW_HASH(rawPos)
+#endif
+// VOXY_DEBUG_LOD_AUDIT_END
+
 //https://github.com/KhronosGroup/GLSL/blob/master/extensions/ext/GL_EXT_shader_16bit_storage.txt
 // adds support for uint8_t which can use for compact visibility buffer
 
@@ -37,6 +60,7 @@ void main() {
     if (gl_GlobalInvocationID.x >= sectionCount) {
         return;
     }
+    VOXY_DRAW_ADD(0, 1u);
     uint sectionId = indirectLookup[gl_GlobalInvocationID.x];
     SectionMeta meta = sectionData[sectionId];
     uint detail = extractDetail(meta);
@@ -54,6 +78,16 @@ void main() {
 
 
     if (shouldRender) {
+        VOXY_DRAW_ADD(1, 1u);
+        VOXY_DRAW_ADD(16 + min(detail, 4u), 1u);
+        VOXY_DRAW_HASH(extractRawPos(meta));
+#ifdef VOXY_DEBUG_LOD_AUDIT
+        if (renderTemporally) VOXY_DRAW_ADD(3, 1u);
+        if (voxyDrawCounters[63] != 0u) {
+            uint frontierIndex = VOXY_DRAW_ADD(30, 1u);
+            if (frontierIndex < VOXY_DRAW_FRONTIER_CAPACITY) voxyDrawFrontier[frontierIndex] = extractRawPos(meta);
+        }
+#endif
 
         uint ptr = extractQuadStart(meta);
         ivec3 relative = ipos-(baseSectionPos>>detail);
@@ -75,10 +109,15 @@ void main() {
 
 
         uint cmdCnt = bitCount(msk);
+#ifdef VOXY_DEBUG_LOD_AUDIT
+        if (cmdCnt != 0u) VOXY_DRAW_ADD(4, 1u);
+#endif
+        VOXY_DRAW_ADD(6, cmdCnt);
         uint cmdPtr = atomicAdd(opaqueDrawCount, cmdCnt);
 
         uint tCmdPtr = 0;
         if (renderTemporally) {
+            VOXY_DRAW_ADD(8, cmdCnt);
             tCmdPtr = atomicAdd(temporalOpaqueDrawCount, cmdCnt) + TEMPORAL_OFFSET;
         }
 
@@ -86,6 +125,8 @@ void main() {
         //Translucency
         count = counts.x&0xFFFFu;
         if (count != 0) {
+            VOXY_DRAW_ADD(5, 1u);
+            VOXY_DRAW_ADD(7, 1u);
             uint tp = atomicAdd(translucentDrawCount, 1)+TRANSLUCENT_WRITE_BASE;
             translucentCommandData[tp] = drawId;
             uvec3 absRel = abs(relative);
@@ -166,5 +207,7 @@ void main() {
         }
         ptr += count;
 
+    } else {
+        VOXY_DRAW_ADD(2, 1u);
     }
 }

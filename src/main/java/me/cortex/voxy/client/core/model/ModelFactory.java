@@ -1,10 +1,9 @@
 package me.cortex.voxy.client.core.model;
 
+import it.unimi.dsi.fastutil.bytes.ByteArrayFIFOQueue;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
-import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
-import it.unimi.dsi.fastutil.objects.ObjectSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.model.bakery.SoftwareModelTextureBakery;
@@ -59,6 +58,14 @@ import static org.lwjgl.opengl.GL11.*;
 public class ModelFactory {
     public static final int MODEL_TEXTURE_SIZE = 16;
     public static final int LAYERS = Integer.numberOfTrailingZeros(MODEL_TEXTURE_SIZE);
+    private static final short[] MIP_SCRATCH = new short[MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE];
+    private static final ByteArrayFIFOQueue MIP_QUEUE = new ByteArrayFIFOQueue(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE);
+
+    static {
+        if (MODEL_TEXTURE_SIZE > 16) {
+            throw new IllegalStateException("Texture mipping currently requires a size of 16 or smaller");
+        }
+    }
 
     //TODO: replace the fluid BlockState with a client model id integer of the fluidState, requires looking up
     // the fluid state in the mipper
@@ -115,8 +122,6 @@ public class ModelFactory {
 
     private final List<Biome> biomes = new ArrayList<>();
     private final List<Pair<Integer, BlockState>> modelsRequiringBiomeColours = new ArrayList<>();
-
-    private static final ObjectSet<BlockState> LOGGED_SELF_CULLING_WARNING = new ObjectOpenHashSet<>();
 
     private final Mapper mapper;
     private final ModelStore storage;
@@ -381,12 +386,7 @@ public class ModelFactory {
             throw new IllegalStateException("Block id already added: " + blockId + " for state: " + blockState);
         }
 
-        this.blockStatesInFlightLock.lock();
-        if (!this.blockStatesInFlight.contains(blockId)) {
-            this.blockStatesInFlightLock.unlock();
-            throw new IllegalStateException("processing a texture bake result but the block state was not in flight!!");
-        }
-        this.blockStatesInFlightLock.unlock();
+        this.checkInFlight(blockId, false);
 
         //TODO: add thing for `blockState.hasEmissiveLighting()` and `blockState.getLuminance()`
 
@@ -422,13 +422,7 @@ public class ModelFactory {
             if (possibleDuplicate != -1) {//Duplicate found
                 this.idMappings[blockId] = possibleDuplicate;
                 modelId = possibleDuplicate;
-                //Remove from flight
-                this.blockStatesInFlightLock.lock();
-                if (!this.blockStatesInFlight.remove(blockId)) {
-                    this.blockStatesInFlightLock.unlock();
-                    throw new IllegalStateException();
-                }
-                this.blockStatesInFlightLock.unlock();
+                this.checkInFlight(blockId, true);
                 return null;
             } else {//Not a duplicate so create a new entry
                 modelId = this.modelTexture2id.size();
@@ -665,20 +659,122 @@ public class ModelFactory {
         //TODO callback to inject extra data into the model data
 
 
-        MipGen.putTextures(darkenedTinting, textureData, uploadResult.texture);
+        putTextures(darkenedTinting, textureData, uploadResult.texture);
 
 
         //Set the mapping at the very end
         this.idMappings[blockId] = modelId;
 
-        this.blockStatesInFlightLock.lock();
-        if (!this.blockStatesInFlight.remove(blockId)) {
-            this.blockStatesInFlightLock.unlock();
-            throw new IllegalStateException("processing a texture bake result but the block state was not in flight!!");
-        }
-        this.blockStatesInFlightLock.unlock();
+        this.checkInFlight(blockId, true);
 
         return uploadResult;
+    }
+
+    private static long textureOffset(int baseX, int baseY, int index) {
+        baseX += index & (MODEL_TEXTURE_SIZE - 1);
+        baseY += index / MODEL_TEXTURE_SIZE;
+        return baseX + (long) baseY * MODEL_TEXTURE_SIZE * 3;
+    }
+
+    private static void solidifyTextures(long baseAddress, byte mask) {
+        for (int face = 0; face < 6; face++) {
+            if (((mask >> face) & 1) == 0) continue;
+            int baseX = (face >> 1) * MODEL_TEXTURE_SIZE;
+            int baseY = (face & 1) * MODEL_TEXTURE_SIZE;
+            long colourAddress = baseAddress + (long) (baseX + baseY * MODEL_TEXTURE_SIZE * 3) * 4;
+            Arrays.fill(MIP_SCRATCH, (short) -1);
+            for (int y = 0; y < MODEL_TEXTURE_SIZE; y++) {
+                for (int x = 0; x < MODEL_TEXTURE_SIZE; x++) {
+                    int colour = MemoryUtil.memGetInt(colourAddress + (long) (x + y * MODEL_TEXTURE_SIZE * 3) * 4);
+                    if ((colour & 0xFF000000) != 0) {
+                        int position = x + y * MODEL_TEXTURE_SIZE;
+                        MIP_SCRATCH[position] = (short) position;
+                        MIP_QUEUE.enqueue((byte) position);
+                    }
+                }
+            }
+
+            while (!MIP_QUEUE.isEmpty()) {
+                int position = Byte.toUnsignedInt(MIP_QUEUE.dequeueByte());
+                int x = position & (MODEL_TEXTURE_SIZE - 1);
+                int y = position / MODEL_TEXTURE_SIZE;
+                short newValue = (short) (MIP_SCRATCH[position] + (short) 0x0100);
+                for (int direction = 3; direction >= 0; direction--) {
+                    int delta = 2 * (direction & 1) - 1;
+                    int nextX = x + ((direction & 2) == 2 ? delta : 0);
+                    int nextY = y + ((direction & 2) == 0 ? delta : 0);
+                    if (nextX < 0 || nextX >= MODEL_TEXTURE_SIZE || nextY < 0 || nextY >= MODEL_TEXTURE_SIZE) continue;
+                    int nextPosition = nextX + nextY * MODEL_TEXTURE_SIZE;
+                    if ((newValue & 0xFF00) < (MIP_SCRATCH[nextPosition] & 0xFF00)) {
+                        MIP_SCRATCH[nextPosition] = newValue;
+                        MIP_QUEUE.enqueue((byte) nextPosition);
+                    }
+                }
+            }
+
+            for (int index = 0; index < MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE; index++) {
+                int source = Short.toUnsignedInt(MIP_SCRATCH[index]);
+                if ((source & 0xFF00) != 0) {
+                    int colour = MemoryUtil.memGetInt(baseAddress + textureOffset(baseX, baseY, source & 0xFF) * 4) & 0x00FFFFFF;
+                    MemoryUtil.memPutInt(baseAddress + textureOffset(baseX, baseY, index) * 4, colour);
+                }
+            }
+        }
+    }
+
+    private static void putTextures(boolean darkened, ColourDepthTextureData[] textures, MemoryBuffer target) {
+        long address = target.address;
+        int baseWidth = MODEL_TEXTURE_SIZE * 3;
+        byte solidMask = 0;
+        for (int face = 0; face < 6; face++) {
+            int x = (face >> 1) * MODEL_TEXTURE_SIZE;
+            int y = (face & 1) * MODEL_TEXTURE_SIZE;
+            int index = 0;
+            boolean anyTransparent = false;
+            for (int colour : textures[face].colour()) {
+                int offset = ((y + (index >> LAYERS)) * baseWidth
+                        + ((index & (MODEL_TEXTURE_SIZE - 1)) + x)) * 4;
+                index++;
+                MemoryUtil.memPutInt(address + offset, colour);
+                anyTransparent |= (colour & 0xFF000000) == 0;
+            }
+            solidMask |= (anyTransparent ? 1 : 0) << face;
+        }
+
+        if (!darkened) solidifyTextures(address, solidMask);
+
+        long destinationAddress = address;
+        for (int level = 0; level < LAYERS - 1; level++) {
+            long sourceAddress = destinationAddress;
+            destinationAddress += (MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE * 3 * 2 * 4L) >> (level << 1);
+            int width = (MODEL_TEXTURE_SIZE * 3) >> (level + 1);
+            int sourceWidth = (MODEL_TEXTURE_SIZE * 3) >> level;
+            int height = (MODEL_TEXTURE_SIZE * 2) >> (level + 1);
+            for (int x = 0; x < width; x++) {
+                for (int y = 0; y < height; y++) {
+                    long base = sourceAddress + (long) (x * 2 + y * 2 * sourceWidth) * 4;
+                    int c00 = MemoryUtil.memGetInt(base);
+                    int c01 = MemoryUtil.memGetInt(base + sourceWidth * 4L);
+                    int c10 = MemoryUtil.memGetInt(base + 4);
+                    int c11 = MemoryUtil.memGetInt(base + sourceWidth * 4L + 4);
+                    MemoryUtil.memPutInt(destinationAddress + (x + (long) y * width) * 4,
+                            TextureUtils.mipColours(darkened, c00, c01, c10, c11));
+                }
+            }
+        }
+    }
+
+    private void checkInFlight(int blockId, boolean remove) {
+        this.blockStatesInFlightLock.lock();
+        try {
+            boolean present = remove
+                    ? this.blockStatesInFlight.remove(blockId)
+                    : this.blockStatesInFlight.contains(blockId);
+            if (!present) throw new IllegalStateException(
+                    "processing a texture bake result but the block state was not in flight");
+        } finally {
+            this.blockStatesInFlightLock.unlock();
+        }
     }
 
     private static int getBlockLightEmission(BlockState state) {

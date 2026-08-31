@@ -3,7 +3,8 @@ use crate::{
     crc::crc32c,
     key::{SectionKey, ShardId},
     lod::{Section, compress_encoded, decompress_stored, network_body_from_stored, stored_matches},
-    read_file_bounded,
+    quarantine, read_file_bounded, replace_synced, sync_parent, take_i32, take_u16, take_u32,
+    take_u64,
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -1186,16 +1187,7 @@ impl Shard {
         bytes.extend_from_slice(&self.id.y.to_le_bytes());
         bytes.extend_from_slice(&self.id.z.to_le_bytes());
         bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &path)?;
-        sync_parent(&path)
+        replace_synced(&path, &tmp, &bytes)
     }
 
     fn clear_repair_marker(&self) -> Result<()> {
@@ -1302,16 +1294,7 @@ impl Shard {
         }
         bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
         let tmp = self.index_path.with_extension("vxidx.tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &self.index_path)?;
-        sync_parent(&self.index_path)?;
+        replace_synced(&self.index_path, &tmp, &bytes)?;
         self.transactions_since_checkpoint = 0;
         Ok(())
     }
@@ -1538,13 +1521,6 @@ fn record_padding(payload: usize) -> usize {
     (8 - ((RECORD_HEADER + payload) & 7)) & 7
 }
 
-fn sync_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
 fn read_store_identity(path: &Path) -> Result<Option<(u64, u64)>> {
     let mut bytes = [0u8; 28];
     let mut file = match File::open(path) {
@@ -1574,16 +1550,7 @@ fn write_store_identity(path: &Path, catalog_id: u64, epoch: u64) -> Result<()> 
     let crc = crc32c(&bytes[..24]);
     bytes[24..28].copy_from_slice(&crc.to_le_bytes());
     let tmp = path.with_extension("identity.tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    sync_parent(path)
+    replace_synced(path, &tmp, &bytes)
 }
 
 fn read_shard_manifest(
@@ -1645,16 +1612,7 @@ fn write_shard_manifest(
     }
     bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
     let tmp = path.with_extension("shards.tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    sync_parent(path)
+    replace_synced(path, &tmp, &bytes)
 }
 
 fn new_incarnation() -> u64 {
@@ -1671,46 +1629,6 @@ fn new_revision_base() -> u64 {
         .unwrap_or_default()
         .as_nanos()
         .min(u64::MAX as u128) as u64
-}
-
-fn quarantine(path: &Path) {
-    if !path.exists() {
-        return;
-    }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("shard");
-    let target = path.with_file_name(format!("{name}.corrupt.{stamp}"));
-    if let Err(error) = fs::rename(path, &target) {
-        eprintln!("cannot quarantine {}: {error}", path.display());
-    }
-}
-
-fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
-    if input.len() < count {
-        bail!("truncated checkpoint");
-    }
-    let (head, tail) = input.split_at(count);
-    *input = tail;
-    Ok(head)
-}
-
-fn take_u16(input: &mut &[u8]) -> Result<u16> {
-    Ok(u16::from_le_bytes(take(input, 2)?.try_into().unwrap()))
-}
-fn take_u32(input: &mut &[u8]) -> Result<u32> {
-    Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
-}
-fn take_i32(input: &mut &[u8]) -> Result<i32> {
-    Ok(i32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
-}
-fn take_u64(input: &mut &[u8]) -> Result<u64> {
-    Ok(u64::from_le_bytes(take(input, 8)?.try_into().unwrap()))
 }
 
 fn lock<T>(value: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {

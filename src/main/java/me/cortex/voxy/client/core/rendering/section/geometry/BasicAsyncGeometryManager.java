@@ -80,7 +80,6 @@ public class BasicAsyncGeometryManager {
         //Invalidate the section id
         this.invalidatedIds.add(newId);
 
-        //HierarchicalOcclusionTraverser.HACKY_SECTION_COUNT = this.allocationSet.getCount();
         return newId;
     }
 

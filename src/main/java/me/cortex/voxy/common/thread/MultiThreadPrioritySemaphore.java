@@ -2,137 +2,120 @@ package me.cortex.voxy.common.thread;
 
 import me.cortex.voxy.common.util.TrackedObject;
 
-import java.util.*;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 import java.util.function.IntSupplier;
 
-//Basiclly acts as a priority based mutlti semaphore
-// allows the pooling of multiple threadpools together while prioritizing the work the original was ment for
-public class MultiThreadPrioritySemaphore {
-    public static final class Block extends TrackedObject {
-        private final Semaphore blockSemaphore = new Semaphore(0);//The work pool semaphore
-        private final Semaphore localSemaphore = new Semaphore(0);//The local semaphore
-        private final MultiThreadPrioritySemaphore man;
+/** Lets a local worker wait for its own permit while helping the shared Voxy work pool. */
+public final class MultiThreadPrioritySemaphore {
+    public final class Block extends TrackedObject {
+        private int permits;
+        private boolean freed;
 
-        Block(MultiThreadPrioritySemaphore man) {
-            this.man = man;
-        }
+        private Block() {}
 
         public void release(int permits) {
-            //release local then block to prevent race conditions
-            this.localSemaphore.release(permits);
-            this.blockSemaphore.release(permits);
+            if (permits <= 0) throw new IllegalArgumentException("Permits must be positive");
+            synchronized (MultiThreadPrioritySemaphore.this) {
+                checkLive();
+                this.permits = Math.addExact(this.permits, permits);
+                MultiThreadPrioritySemaphore.this.notifyAll();
+            }
         }
 
         public void acquire() {
             this.acquire(true);
         }
-        public void acquire(boolean runJob) {//Block until a permit for this block is availbe, other jobs maybe executed while we wait
-            //Absolutly no idea if this shitty thing functions correctly... at all, it very much probably doesnt
-            while (true) {
-                if (runJob) {
-                    this.blockSemaphore.acquireUninterruptibly();//Block on all
-                    if (this.localSemaphore.tryAcquire()) {//We prioritize locals first
-                        return;
+
+        /** Waits for a local permit, helping execute shared jobs while one is unavailable. */
+        public void acquire(boolean runJob) {
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    synchronized (MultiThreadPrioritySemaphore.this) {
+                        checkLive();
+                        while (this.permits == 0 && (!runJob || pooledPermits == 0)) {
+                            try {
+                                MultiThreadPrioritySemaphore.this.wait();
+                            } catch (InterruptedException ignored) {
+                                interrupted = true;
+                            }
+                            checkLive();
+                        }
+                        if (this.permits != 0) {
+                            this.permits--;
+                            return;
+                        }
+                        pooledPermits--;
                     }
-                    if (this.man.tryRun(this)) {//Returns true if it captured a local job
-                        break;
+
+                    int status;
+                    try {
+                        status = executor.getAsInt();
+                    } catch (RuntimeException | Error exception) {
+                        pooledRelease(1);
+                        throw exception;
                     }
-                } else {
-                    this.localSemaphore.acquireUninterruptibly();
-                    if (!this.blockSemaphore.tryAcquire()) {
-                        //This is technicanlly/actually a failure state cause blockSemaphore could have more
+                    if (status >= 2) {
+                        synchronized (MultiThreadPrioritySemaphore.this) {
+                            pooledPermits = Math.addExact(pooledPermits, 1);
+                            if (this.permits == 0) {
+                                try {
+                                    MultiThreadPrioritySemaphore.this.wait(10);
+                                } catch (InterruptedException ignored) {
+                                    interrupted = true;
+                                }
+                            }
+                        }
                     }
-                    break;
                 }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
             }
-        }
-
-
-        public void free() {
-            this.man.freeBlock(this);
-            this.free0();
         }
 
         public int availablePermits() {
-            return this.localSemaphore.availablePermits();
+            synchronized (MultiThreadPrioritySemaphore.this) {
+                checkLive();
+                return this.permits;
+            }
         }
 
         public boolean tryAcquire() {
-            if (this.localSemaphore.availablePermits()==0) return false;//Quick exit
-            if (!this.blockSemaphore.tryAcquire()) return false;//There is definatly none
-            if (this.localSemaphore.tryAcquire()) {
-                //we acquired a proper permit
+            synchronized (MultiThreadPrioritySemaphore.this) {
+                checkLive();
+                if (this.permits == 0) return false;
+                this.permits--;
                 return true;
-            } else {
-                //We must release the other permit as we dont do processing here
-                this.blockSemaphore.release(1);
-                return false;
             }
+        }
+
+        public void free() {
+            synchronized (MultiThreadPrioritySemaphore.this) {
+                checkLive();
+                this.freed = true;
+                MultiThreadPrioritySemaphore.this.notifyAll();
+            }
+            this.free0();
+        }
+
+        private void checkLive() {
+            if (this.freed) throw new IllegalStateException("Semaphore block is freed");
         }
     }
 
-    private final Semaphore pooledSemaphore = new Semaphore(0);
     private final IntSupplier executor;
-
-    private volatile Block[] blocks = new Block[0];
+    private int pooledPermits;
 
     public MultiThreadPrioritySemaphore(IntSupplier executor) {
         this.executor = executor;
     }
 
-    public synchronized Block createBlock() {
-        var block = new Block(this);
-        var blocks = Arrays.copyOf(this.blocks, this.blocks.length+1);
-        blocks[blocks.length-1] = block;
-        this.blocks = blocks;
-        return block;
+    public Block createBlock() {
+        return new Block();
     }
 
-    private synchronized void freeBlock(Block block) {
-        var ob = this.blocks;
-        var blocks = new Block[ob.length-1];
-        int j = 0;
-        for (int i = 0; i <= blocks.length; i++) {
-            if (ob[i] != block) {
-                blocks[j++] = ob[i];
-            }
-        }
-        if (j != blocks.length) {
-            throw new IllegalStateException("Could not find the service in the services array");
-        }
-        this.blocks = blocks;
-    }
-
-    public void pooledRelease(int permits) {
-        this.pooledSemaphore.release(permits);
-        for (var block : this.blocks) {
-            block.blockSemaphore.release(permits);
-        }
-    }
-
-    private boolean tryRun(Block block) {
-        if (!this.pooledSemaphore.tryAcquire()) {//No jobs for the unified pool
-            return false;
-        }
-        //Run the pooled job
-        while (true) {
-            int status = this.executor.getAsInt();
-            if (status == 0) return false;//We finished pure and true
-            if (status == 1) return false;// we didnt run a job because there either wasnt any or no services exist
-            if (2 <= status) {//2 and 3 mean failed to find a service that can currently run, but should try again after a delay
-                try {
-                    if (block.localSemaphore.tryAcquire(10, TimeUnit.MILLISECONDS)) {//Await 10 millis for a local job to come in
-                        //We do this confusing thing
-                        block.blockSemaphore.tryAcquire();//Try acquire the block that we just got
-                        this.pooledRelease(1);//We need to release back into the pool
-                        return true;
-                    }
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        }
+    public synchronized void pooledRelease(int permits) {
+        if (permits <= 0) throw new IllegalArgumentException("Permits must be positive");
+        this.pooledPermits = Math.addExact(this.pooledPermits, permits);
+        this.notifyAll();
     }
 }

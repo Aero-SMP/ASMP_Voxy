@@ -236,10 +236,6 @@ public final class VoxyRuntime {
         RenderResourceReuse.clearResources();
     }
 
-    public boolean isRunning() {
-        return this.isRunning;
-    }
-
     public static Path getStoragePath(WorldIdentifier identifier) {
         return getBasePath().normalize().resolve(identifier.getWorldId()).resolve("storage-v3-log");
     }

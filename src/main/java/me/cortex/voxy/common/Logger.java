@@ -4,9 +4,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.StringJoiner;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class Logger {
     public static boolean INSERT_CLASS = true;
@@ -43,55 +42,44 @@ public class Logger {
     }
 
     public static void error(Object... args) {
-        if (SHUTUP) {
-            return;
+        if (!SHUTUP) {
+            String message = format(args);
+            LOGGER.error(message, throwable(args));
+            errorSink.accept(message);
         }
-        Throwable throwable = null;
-        for (var i : args) {
-            if (i instanceof Throwable) {
-                throwable = (Throwable) i;
-            }
-        }
-
-        String error = (INSERT_CLASS?("["+callClsName()+"]: "):"") + Stream.of(args).map(Logger::objToString).collect(Collectors.joining(" "));
-        LOGGER.error(error, throwable);
-        errorSink.accept(error);
     }
 
     public static void warn(Object... args) {
-        if (SHUTUP) {
-            return;
+        if (!SHUTUP) {
+            LOGGER.warn(format(args), throwable(args));
         }
-        Throwable throwable = null;
-        for (var i : args) {
-            if (i instanceof Throwable) {
-                throwable = (Throwable) i;
-            }
-        }
-        LOGGER.warn((INSERT_CLASS?("["+callClsName()+"]: "):"") + Stream.of(args).map(Logger::objToString).collect(Collectors.joining(" ")), throwable);
     }
 
     public static String info(Object... args) {
         if (SHUTUP||SHUTUP_INFO) {
             return "";
         }
-        Throwable throwable = null;
-        for (var i : args) {
-            if (i instanceof Throwable) {
-                throwable = (Throwable) i;
-            }
-        }
-        var val = (INSERT_CLASS?("["+callClsName()+"]: "):"") + Stream.of(args).map(Logger::objToString).collect(Collectors.joining(" "));
-        LOGGER.info(val, throwable);
-        return val;
+        String message = format(args);
+        LOGGER.info(message, throwable(args));
+        return message;
+    }
+
+    private static Throwable throwable(Object[] args) {
+        for (Object arg : args) if (arg instanceof Throwable throwable) return throwable;
+        return null;
+    }
+
+    private static String format(Object[] args) {
+        StringJoiner message = new StringJoiner(" ", INSERT_CLASS ? "["+callClsName()+"]: " : "", "");
+        for (Object arg : args) message.add(objToString(arg));
+        return message.toString();
     }
 
     private static String objToString(Object obj) {
-        if (obj == null) {
-            return "NULL";
-        }
+        if (obj == null) return "NULL";
         if (obj.getClass().isArray()) {
-            return Arrays.deepToString((Object[]) obj);
+            String value = Arrays.deepToString(new Object[]{obj});
+            return value.substring(1, value.length()-1);
         }
         return obj.toString();
     }

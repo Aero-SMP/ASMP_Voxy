@@ -157,7 +157,4 @@ public class BasicSectionGeometryData {
         }
     }
 
-    public long getMaxCapacity() {
-        return this.geometryBuffer.size();
-    }
 }
