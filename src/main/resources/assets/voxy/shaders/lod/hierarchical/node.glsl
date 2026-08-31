@@ -58,10 +58,6 @@ bool childListIsEmpty(in UnpackedNode node) {
     return node.childPtr == EMPTY_QUEUE_ID;
 }
 
-//bool isEmpty(in UnpackedNode node) {
-//    return (node.flags&2u) != 0;
-//}
-
 bool hasRequested(in UnpackedNode node) {
     return (node.flags&1u) != 0u;
 }
@@ -85,11 +81,6 @@ uint getChildPtr(in UnpackedNode node) {
 uvec2 getRawPos(in UnpackedNode node) {
     return node.rawPos;
 }
-
-/*
-uint getTransformIndex(in UnpackedNode node) {
-    return (node.flags >> 5)&31u;
-}*/
 
 //-----------------------------------
 

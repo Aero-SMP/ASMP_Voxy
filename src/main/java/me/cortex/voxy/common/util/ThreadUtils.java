@@ -8,9 +8,6 @@ public class ThreadUtils {
     public static final boolean isWindows = Platform.get() == Platform.WINDOWS;
     public static final boolean isLinux = Platform.get() == Platform.LINUX;
     public static final int WIN32_THREAD_PRIORITY_TIME_CRITICAL = 15;
-    public static final int WIN32_THREAD_PRIORITY_LOWEST = -2;
-    public static final int WIN32_THREAD_MODE_BACKGROUND_BEGIN = 0x00010000;
-    public static final int WIN32_THREAD_MODE_BACKGROUND_END = 0x00020000;
     private static final long SetThreadPriority;
     private static final long SetThreadSelectedCpuSetMasks;
     private static final long schedSetaffinity;
@@ -35,10 +32,6 @@ public class ThreadUtils {
         } else {
             schedSetaffinity = 0;
         }
-    }
-
-    public static boolean SetThreadSelectedCpuSetMasksWin32(long mask) {
-        return SetThreadSelectedCpuSetMasksWin32(new long[]{mask}, new short[]{0});
     }
 
     public static boolean SetThreadSelectedCpuSetMasksWin32(long[] masks, short[] groups) {

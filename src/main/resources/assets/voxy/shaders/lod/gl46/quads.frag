@@ -1,6 +1,4 @@
 #version 460 core
-//Use quad shuffling to compute fragment mip
-//#extension GL_KHR_shader_subgroup_quad: enable
 #ifdef USE_SINGLE_TRI
 #define USE_NV_BARRY
 #endif
@@ -41,10 +39,6 @@ layout(location = 0) out vec4 outColour;
 vec4 uint2vec4RGBA(uint colour) {
     return vec4((uvec4(colour)>>uvec4(24,16,8,0))&uvec4(0xFF))/255.0;
 }
-
-//bool useMipmaps() {
-//    return (interData.x&2u)==0u;
-//}
 
 uint tintingState() {
     return (interData.x>>2)&3u;
@@ -108,7 +102,6 @@ vec4 computeColour(vec2 texturePos, vec4 colour) {
 
 
 void main() {
-    //vec2 uv = vec2(0);
     //Tile is the tile we are in
     vec2 tile;
     #ifdef USE_NV_BARRY
@@ -123,27 +116,18 @@ void main() {
     vec2 uv2 = modf(uv, tile)*(1.0/(vec2(3.0,2.0)*256.0));
     vec4 colour;
     vec2 texPos = uv2 + getBaseUV();
-//This is deprecated, TODO: remove the non mip code path
-    //if (useMipmaps())
-    {
-        vec2 uvSmol = uv*(1.0/(vec2(3.0,2.0)*256.0));
-        vec2 dx = dFdx(uvSmol);//vec2(lDx, dDx);
-        vec2 dy = dFdy(uvSmol);//vec2(lDy, dDy);
-        colour = textureGrad(blockModelAtlas, texPos, dx, dy);
-    }// else {
-    //    colour = textureLod(blockModelAtlas, texPos, 0);
-    //}
+    vec2 uvSmol = uv*(1.0/(vec2(3.0,2.0)*256.0));
+    vec2 dx = dFdx(uvSmol);
+    vec2 dy = dFdy(uvSmol);
+    colour = textureGrad(blockModelAtlas, texPos, dx, dy);
 
     //If we are in shaders and are a helper invocation, just exit, as it enables extra performance gains for small sized
     // fragments, we do this here after derivative computation
-    //Trying it with all shaders
-    //#ifdef PATCHED_SHADER
     #ifndef PATCHED_SHADER_ALLOW_DERIVATIVES
     if (gl_HelperInvocation) {
         return;
     }
     #endif
-    //#endif
 
     if (any(notEqual(clamp(tile, vec2(0), vec2((interData.x>>8)&0xFu, (interData.x>>12)&0xFu)), tile))) {
         discard;
@@ -161,7 +145,6 @@ void main() {
     #ifndef TRANSLUCENT
     colour.a = 1.0f;
     if (useDiscard() && (textureLod(blockModelAtlas, texPos, 0).a <= 0.1f)) {
-    //if (useDiscard() && (colour.a <= 0.1f)) {
     #else
     if (textureLod(blockModelAtlas, texPos, 0).a == 0.0f) {
     #endif
@@ -170,12 +153,6 @@ void main() {
         discard;
         return;
     }
-
-    #ifndef PATCHED_SHADER_ALLOW_DERIVATIVES
-    if (gl_HelperInvocation) {
-        return;
-    }
-    #endif
 
     #ifndef PATCHED_SHADER
     colour = computeColour(texPos, colour);
@@ -203,32 +180,6 @@ void main() {
 
     #endif
 }
-
-
-
-//#ifdef GL_KHR_shader_subgroup_quad
-/*
-uint hash = (uint(tile.x)*(1<<16))^uint(tile.y);
-uint horiz = subgroupQuadSwapHorizontal(hash);
-bool sameTile = horiz==hash;
-uint sv = mix(uint(-1), hash, sameTile);
-uint vert = subgroupQuadSwapVertical(sv);
-sameTile = sameTile&&vert==hash;
-mipBias = sameTile?0:-5.0;
-*/
-/*
-vec2 uvSmol = uv*(1.0/(vec2(3.0,2.0)*256.0));
-float lDx = subgroupQuadSwapHorizontal(uvSmol.x)-uvSmol.x;
-float lDy = subgroupQuadSwapVertical(uvSmol.y)-uvSmol.y;
-float dDx = subgroupQuadSwapDiagonal(lDx);
-float dDy = subgroupQuadSwapDiagonal(lDy);
-vec2 dx = vec2(lDx, dDx);
-vec2 dy = vec2(lDy, dDy);
-colour = textureGrad(blockModelAtlas, texPos, dx, dy);
-*/
-//#else
-//colour = texture(blockModelAtlas, texPos);
-//#endif
 
 //Undefine the depth stuff
 #import <voxy:util/depthutils.glsl>

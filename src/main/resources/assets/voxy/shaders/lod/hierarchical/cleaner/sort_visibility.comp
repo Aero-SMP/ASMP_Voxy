@@ -2,8 +2,6 @@
 //Uses intrinsics and other operations to perform very fast sorting
 // we dont need a propper sort, only a fuzzy sort, as in we only need to top 128 entries, but those can be unsorted
 
-//#define OUTPUT_SIZE 128
-
 layout(local_size_x=WORK_SIZE, local_size_y=1) in;
 #define OPS_PER_THREAD (OUTPUT_SIZE/WORK_SIZE)
 
@@ -107,23 +105,6 @@ bool shouldSortId(uint id) {
     if (hasRequested(node)) {//If a node has a request its not valid to remove
         return false;
     }
-
-    /*THIS IS COMPLETLY WRONG, we need to check if all the children of the parent of the child are leaf nodes
-    // not this node
-
-    //Very sneeky hack, ensure all children are leaf nodes
-    if (hasChildren(node)&&!childListIsEmpty(node)) {
-        uint ptr = getChildPtr(node);
-        uint cnt = getChildCount(node);
-        for (uint i = 0; i < cnt; i++) {
-            UnpackedNode child;
-            unpackNode(child, i+ptr);
-            if (hasChildren(child)) {
-                return;
-            }
-        }
-    }
-    */
 
     return true;
 }

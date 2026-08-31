@@ -47,7 +47,6 @@ public class Mapper {
     private static final int BIOME_TYPE = 2;
 
     private final SectionSerializationStorage storage;
-    public static final long UNKNOWN_MAPPING = -1;
     public static final long AIR = 0;
 
     private final ReentrantLock blockLock = new ReentrantLock();
@@ -125,7 +124,6 @@ public class Mapper {
                 sentries.add(sentry);
                 var oldEntry = this.block2stateEntry.putIfAbsent(sentry.state, sentry);
                 if (oldEntry != null) {
-                    //forceResave[0] |= true;
                     Logger.warn("Multiple mappings for blockstate, using old state, expect things to possibly go really badly. " + oldEntry.id + ":" + sentry.id + ":" + sentry.state );
                 }
             } else if (entryType == BIOME_TYPE) {
@@ -198,7 +196,6 @@ public class Mapper {
         buffer.rewind();
         this.storage.putIdMapping(entry.id | (BLOCK_STATE_TYPE<<30), buffer);
         MemoryUtil.memFree(buffer);
-        //this.storage.flush();
 
         if (this.newStateCallback!=null)this.newStateCallback.accept(entry);
         return entry;
@@ -222,7 +219,6 @@ public class Mapper {
         buffer.rewind();
         this.storage.putIdMapping(entry.id | (BIOME_TYPE<<30), buffer);
         MemoryUtil.memFree(buffer);
-        //this.storage.flush();
 
         if (this.newBiomeCallback!=null)this.newBiomeCallback.accept(entry);
         return entry;

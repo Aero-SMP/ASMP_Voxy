@@ -18,14 +18,6 @@ layout(local_size_x = 128) in;
 // adds support for uint8_t which can use for compact visibility buffer
 
 
-/*
-    uint  count;
-    uint  instanceCount;
-    uint  firstIndex;
-    int  baseVertex;
-    uint  baseInstance;
-    */
-
 layout(binding = TRANSLUCENT_DISTANCE_BUFFER_BINDING, std430) restrict buffer TranslucentCommandCount {
     uint[] translucentCommandData;
 };

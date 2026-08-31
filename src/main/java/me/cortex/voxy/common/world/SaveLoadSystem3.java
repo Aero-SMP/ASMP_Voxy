@@ -60,7 +60,6 @@ public class SaveLoadSystem3 {
         long key = MemoryUtil.memGetLong(ptr); ptr += 8;
 
         if (section.key != key) {
-            //throw new IllegalStateException("Decompressed section not the same as requested. got: " + key + " expected: " + section.key);
             Logger.error("Decompressed section not the same as requested. got: " + key + " expected: " + section.key);
             return false;
         }
