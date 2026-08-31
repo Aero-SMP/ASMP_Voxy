@@ -5,6 +5,7 @@ import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
+import me.cortex.voxy.client.lod.ClientLodNetwork;
 import me.cortex.voxy.client.core.rendering.SectionUpdateRouter;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicAsyncGeometryManager;
@@ -111,6 +112,7 @@ public class NodeManager {
         var request = new NodeRequest(pos);
         request.require(0);
         int id = this.topLevelRequests.put(request);
+        ClientLodNetwork.prioritizeCoverage(pos);
         this.watcher.watch(pos, WorldEngine.DEFAULT_UPDATE_FLAGS);
         this.activeSectionMap.put(pos, id|NODE_TYPE_REQUEST|REQUEST_TYPE_SINGLE);
         this.topLevelNodes.add(pos);
@@ -484,6 +486,7 @@ public class NodeManager {
         if (this.activeSectionMap.put(childPos, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD) != -1) {
             throw new IllegalStateException("Requested child was already active: " + WorldEngine.pprintPos(childPos));
         }
+        ClientLodNetwork.prioritizeVisible(childPos);
         if (!this.watcher.watch(childPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
             throw new IllegalStateException("Requested child was already watched: " + WorldEngine.pprintPos(childPos));
         }
@@ -943,6 +946,12 @@ public class NodeManager {
         byte childExistence = this.nodeData.getNodeChildExistence(nodeId);
 
         if (childExistence == 0) {
+            // A resolved empty node is terminal. This also repairs a node serialized by an
+            // older resolution-ordering race instead of leaving a zero-child request in flight.
+            if (ClientLodNetwork.isSectionResolved(pos)) {
+                this.invalidateNode(nodeId);
+                return;
+            }
             if (!this.topLevelNodes.contains(pos)) {//Top level nodes are special, as they can have a request with child existence of 0 for performance reasons
                 Logger.warn("Not creating a leaf request with existence mask of 0 at pos", WorldEngine.pprintPos(pos));
                 this.invalidateNode(nodeId);
@@ -1064,7 +1073,8 @@ public class NodeManager {
         if (this.nodeUpdates.isEmpty()) {
             return false;
         }
-        this.nodeUpdates.forEach((int i) -> this.nodeData.writeNode(UploadStream.INSTANCE.upload(nodeBuffer, i*16L, 16L), i));
+        this.nodeUpdates.forEach((int i) -> this.writeNodeData(
+                UploadStream.INSTANCE.upload(nodeBuffer, i * 16L, 16L), i));
         this.nodeUpdates.clear();
         return true;
     }
@@ -1076,7 +1086,14 @@ public class NodeManager {
 
     //Used to write a specified node into a specific address (used in async)
     void writeNode(int node, long address) {
-        this.nodeData.writeNode(address, node);
+        this.writeNodeData(address, node);
+    }
+
+    private void writeNodeData(long address, int node) {
+        long position = this.nodeData.nodePosition(node);
+        boolean terminal = this.nodeData.getNodeChildExistence(node) == 0
+                && ClientLodNetwork.isSectionResolved(position);
+        this.nodeData.writeNode(address, node, terminal);
     }
 
     private void invalidateNode(int nodeId) {

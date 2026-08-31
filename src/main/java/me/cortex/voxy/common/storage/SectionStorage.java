@@ -40,7 +40,7 @@ import java.util.zip.Inflater;
 public final class SectionStorage implements AutoCloseable {
     private static final int MAX_RECORD_SIZE = 1 << 20;
     private static final int RECORD_MAGIC = 0x56584C31; // VXL1
-    private static final int INDEX_MAGIC = 0x56584931;  // VXI1
+    private static final int INDEX_MAGIC = 0x56584932;  // VXI2
     private static final int MAPPING_MANIFEST_MAGIC = 0x56584D31; // VXM1
     private static final byte FORMAT_VERSION = 1;
     private static final byte PUT = 1;
@@ -48,7 +48,7 @@ public final class SectionStorage implements AutoCloseable {
     private static final short COMPRESSED = 1;
     private static final int RECORD_HEADER_SIZE = 28;
     private static final int INDEX_HEADER_SIZE = 20;
-    private static final int INDEX_ENTRY_SIZE = 32;
+    private static final int INDEX_ENTRY_SIZE = 40;
     private static final int MAPPING_HIGH_WATER_COUNT = 4;
     private static final int MAPPING_MANIFEST_DATA_SIZE = Integer.BYTES * (2 + MAPPING_HIGH_WATER_COUNT);
     private static final int MAPPING_MANIFEST_SIZE = MAPPING_MANIFEST_DATA_SIZE + Integer.BYTES;
@@ -152,8 +152,15 @@ public final class SectionStorage implements AutoCloseable {
         // registration appends before publishing an ID. Snapshot first, then force the
         // catalog: every ID observed by serialization is therefore covered by this barrier.
         this.flushMappings();
-        this.getSectionLog(section.key).put(section.key, data, true, false);
+        this.getSectionLog(section.key).put(section.key, data, true, false, section.getRemoteRevision());
         this.pruneOpenLogs();
+    }
+
+    /** Reads only the disposable cache index; it never loads or decompresses section cells. */
+    public long getRemoteRevision(long key) {
+        this.checkOpen();
+        Log log = this.sectionLogs.get(shardKey(key));
+        return log == null ? -1 : log.remoteRevision(key);
     }
 
     public void deleteSection(long key) {
@@ -181,12 +188,12 @@ public final class SectionStorage implements AutoCloseable {
         if (!validMappingValue(type, value)) throw new IllegalArgumentException("Invalid mapping ID");
 
         // Two copies let recovery retain the earlier value if the later append is damaged.
-        this.mappings.put(key, data.duplicate(), false, false);
-        this.mappings.put(key, data.duplicate(), false, false);
+        this.mappings.put(key, data.duplicate(), false, false, -1);
+        this.mappings.put(key, data.duplicate(), false, false, -1);
         ByteBuffer marker = ByteBuffer.allocate(4).putInt(value).flip();
         long markerKey = MAPPING_HIGH_WATER | Integer.toUnsignedLong(type);
-        this.mappings.put(markerKey, marker.duplicate(), false, false);
-        this.mappings.put(markerKey, marker.duplicate(), false, false);
+        this.mappings.put(markerKey, marker.duplicate(), false, false, -1);
+        this.mappings.put(markerKey, marker.duplicate(), false, false, -1);
         this.mappingHighWater[type] = Math.max(this.mappingHighWater[type], value);
         this.mappingsDirty = true;
         if (durable) this.flushMappings();
@@ -488,6 +495,16 @@ public final class SectionStorage implements AutoCloseable {
             }
         }
 
+        private long remoteRevision(long key) {
+            this.lock.readLock().lock();
+            try {
+                Entry entry = this.entries.get(key);
+                return entry == null ? -1 : entry.remoteRevision;
+            } finally {
+                this.lock.readLock().unlock();
+            }
+        }
+
         private int readInto(long key, ByteBuffer target) {
             this.lock.readLock().lock();
             try {
@@ -551,7 +568,8 @@ public final class SectionStorage implements AutoCloseable {
             }
         }
 
-        private void put(long key, ByteBuffer source, boolean compress, boolean durable) {
+        private void put(long key, ByteBuffer source, boolean compress, boolean durable,
+                         long remoteRevision) {
             this.lock.writeLock().lock();
             try {
                 this.ensureOpen();
@@ -571,7 +589,7 @@ public final class SectionStorage implements AutoCloseable {
                     }
                 }
 
-                Entry next = this.append(PUT, flags, key, stored, rawLength);
+                Entry next = this.append(PUT, flags, key, stored, rawLength, remoteRevision);
                 Entry previous = this.entries.put(key, next);
                 this.liveBytes += RECORD_HEADER_SIZE + next.storedLength;
                 if (previous != null) this.liveBytes -= RECORD_HEADER_SIZE + previous.storedLength;
@@ -591,7 +609,7 @@ public final class SectionStorage implements AutoCloseable {
                 this.ensureOpen();
                 Entry previous = this.entries.remove(key);
                 if (previous == null) return;
-                this.append(DELETE, (short) 0, key, ByteBuffer.allocate(0), 0);
+                this.append(DELETE, (short) 0, key, ByteBuffer.allocate(0), 0, -1);
                 this.liveBytes -= RECORD_HEADER_SIZE + previous.storedLength;
                 this.checkpointIfNeeded();
                 if (durable) this.openChannel().force(false);
@@ -602,7 +620,8 @@ public final class SectionStorage implements AutoCloseable {
             }
         }
 
-        private Entry append(byte type, short flags, long key, ByteBuffer payload, int rawLength) throws IOException {
+        private Entry append(byte type, short flags, long key, ByteBuffer payload, int rawLength,
+                             long remoteRevision) throws IOException {
             int storedLength = payload.remaining();
             int crc = checksum(type, flags, key, storedLength, rawLength, payload);
             ByteBuffer header = ByteBuffer.allocate(RECORD_HEADER_SIZE);
@@ -617,7 +636,8 @@ public final class SectionStorage implements AutoCloseable {
             this.uncheckpointedBytes += RECORD_HEADER_SIZE + storedLength;
             this.uncheckpointedRecords++;
             this.dirty = true;
-            return new Entry(key, recordOffset + RECORD_HEADER_SIZE, storedLength, rawLength, crc, flags);
+            return new Entry(key, recordOffset + RECORD_HEADER_SIZE, storedLength, rawLength, crc,
+                    flags, remoteRevision);
         }
 
         private void checkpointIfNeeded() throws IOException {
@@ -708,7 +728,8 @@ public final class SectionStorage implements AutoCloseable {
                     writeFully(output, header, newSize);
                     writeFully(output, payload, newSize + RECORD_HEADER_SIZE);
                     compacted.put(entry.key, new Entry(entry.key, newSize + RECORD_HEADER_SIZE,
-                            entry.storedLength, entry.rawLength, entry.crc, entry.flags));
+                            entry.storedLength, entry.rawLength, entry.crc, entry.flags,
+                            entry.remoteRevision));
                     newSize += RECORD_HEADER_SIZE + entry.storedLength;
                 }
                 output.force(false);
@@ -754,12 +775,14 @@ public final class SectionStorage implements AutoCloseable {
                     int rawLength = data.getInt();
                     int crc = data.getInt();
                     short flags = (short) data.getInt();
+                    long remoteRevision = data.getLong();
                     if (offset < RECORD_HEADER_SIZE || storedLength < 0 || rawLength <= 0
                             || storedLength > MAX_RECORD_SIZE || rawLength > MAX_RECORD_SIZE
                             || offset + storedLength > indexedThrough || (flags & ~COMPRESSED) != 0) {
                         throw new IOException("bad index entry");
                     }
-                    this.entries.put(key, new Entry(key, offset, storedLength, rawLength, crc, flags));
+                    this.entries.put(key, new Entry(key, offset, storedLength, rawLength, crc,
+                            flags, remoteRevision));
                     this.liveBytes += RECORD_HEADER_SIZE + storedLength;
                 }
                 return indexedThrough;
@@ -780,7 +803,8 @@ public final class SectionStorage implements AutoCloseable {
             data.putInt(INDEX_MAGIC).putInt(FORMAT_VERSION).putLong(this.logSize).putInt(this.entries.size());
             for (Entry entry : this.entries.values()) {
                 data.putLong(entry.key).putLong(entry.payloadOffset).putInt(entry.storedLength)
-                        .putInt(entry.rawLength).putInt(entry.crc).putInt(entry.flags);
+                        .putInt(entry.rawLength).putInt(entry.crc).putInt(entry.flags)
+                        .putLong(entry.remoteRevision);
             }
             CRC32C checksum = new CRC32C();
             ByteBuffer checked = data.duplicate();
@@ -874,7 +898,17 @@ public final class SectionStorage implements AutoCloseable {
                 if (checksum(type, flags, key, storedLength, rawLength, payload) == crc) {
                     Entry previous;
                     if (type == PUT) {
-                        Entry entry = new Entry(key, position + RECORD_HEADER_SIZE, storedLength, rawLength, crc, flags);
+                        long remoteRevision = this.compactable
+                                ? recoverRemoteRevision(payload, flags, rawLength) : -1;
+                        if (this.compactable && remoteRevision == Long.MIN_VALUE) {
+                            Logger.warn("Ignoring Voxy section whose revision metadata cannot be recovered",
+                                    this.path, position);
+                            this.entries.remove(key);
+                            position = end;
+                            continue;
+                        }
+                        Entry entry = new Entry(key, position + RECORD_HEADER_SIZE, storedLength,
+                                rawLength, crc, flags, remoteRevision);
                         previous = this.entries.put(key, entry);
                         this.liveBytes += RECORD_HEADER_SIZE + storedLength;
                     } else {
@@ -945,13 +979,42 @@ public final class SectionStorage implements AutoCloseable {
         }
     }
 
-    private record Entry(long key, long payloadOffset, int storedLength, int rawLength, int crc, short flags) {}
+    private record Entry(long key, long payloadOffset, int storedLength, int rawLength, int crc,
+                         short flags, long remoteRevision) {}
 
     private static final class CodecScratch {
         private final byte[] bytes = new byte[MAX_RECORD_SIZE + 256];
         private final ByteBuffer buffer = ByteBuffer.wrap(this.bytes);
         private final Deflater deflater = new Deflater(Deflater.BEST_SPEED, true);
         private final Inflater inflater = new Inflater(true);
+        private final byte[] sectionHeader = new byte[24];
+    }
+
+    /** Returns Long.MIN_VALUE when the first 24 canonical bytes cannot be recovered safely. */
+    private static long recoverRemoteRevision(ByteBuffer stored, short flags, int rawLength) {
+        if (rawLength < 24) return Long.MIN_VALUE;
+        CodecScratch scratch = CODEC.get();
+        byte[] header = scratch.sectionHeader;
+        if ((flags & COMPRESSED) == 0) {
+            if (stored.remaining() < header.length) return Long.MIN_VALUE;
+            ByteBuffer copy = stored.duplicate();
+            copy.get(header);
+        } else {
+            Inflater inflater = scratch.inflater;
+            inflater.reset();
+            inflater.setInput(stored.duplicate());
+            int count = 0;
+            try {
+                while (count < header.length) {
+                    int read = inflater.inflate(header, count, header.length - count);
+                    if (read == 0) return Long.MIN_VALUE;
+                    count += read;
+                }
+            } catch (DataFormatException exception) {
+                return Long.MIN_VALUE;
+            }
+        }
+        return ByteBuffer.wrap(header).order(ByteOrder.nativeOrder()).getLong(16);
     }
 
     private static ByteBuffer compress(ByteBuffer input) {

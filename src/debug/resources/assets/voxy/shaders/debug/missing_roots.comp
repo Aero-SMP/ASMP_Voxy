@@ -1,0 +1,122 @@
+#version 460 core
+
+#define USE_ZERO_ONE_DEPTH
+#define LOCAL_SIZE 32
+layout(local_size_x = LOCAL_SIZE) in;
+
+#import <voxy:lod/frustum.glsl>
+#import <voxy:lod/pos_util.glsl>
+#import <voxy:util/depthutils.glsl>
+
+layout(binding = 13, std140) uniform VoxyAuditSceneUniform {
+    mat4 MVP;
+    ivec3 camSecPos;
+    uint packedHizSize;
+    vec3 camSubSecPos;
+    float minSSS;
+    Frustum frustum;
+    uint renderQueueMaxSize;
+    uint frameId;
+    uint requestQueueSize;
+    float renderDistance;
+};
+
+layout(binding = 0) uniform sampler2D hizDepthSampler;
+layout(location = 0) uniform uint missingRootCount;
+
+layout(binding = 13, std430) readonly restrict buffer VoxyMissingRootBuffer {
+    uvec2 missingRoots[];
+};
+
+layout(binding = 15, std430) restrict buffer VoxyLodAuditBuffer {
+    uint voxyAuditCounters[64];
+    uvec4 voxyAuditAnomalies[128];
+    uvec2 voxyAuditFrontier[2048];
+};
+
+#ifdef TAA
+vec2 getTAA();
+#endif
+
+vec3 closestPoint(ivec3 pos, uint lod) {
+    vec3 nodePos = vec3(((pos << lod) - camSecPos) << 5) - camSubSecPos;
+    float scale = float(1u << (lod + 5u));
+    return mix(mix(vec3(0), nodePos, greaterThan(nodePos, vec3(0))),
+            nodePos + scale, lessThan(nodePos + scale, vec3(0)));
+}
+
+bool withinRenderDistance(ivec3 pos, uint lod) {
+    if (renderDistance < 0.0f) return true;
+    vec3 close = closestPoint(pos, lod);
+    return close.x * close.x + close.z * close.z <= renderDistance;
+}
+
+bool relevantByHiz(ivec3 pos, uint lod) {
+    vec3 basePos = vec3(((pos << lod) - camSecPos) << 5) - camSubSecPos;
+    float scale = float(32u << lod);
+    if (outsideFrustum(frustum, basePos, scale)) return false;
+
+    vec4 p000 = MVP * vec4(basePos, 1);
+    mat3x4 axis = mat3x4(MVP) * scale;
+    vec4 p100 = axis[0] + p000;
+    vec4 p001 = axis[2] + p000;
+    vec4 p101 = axis[2] + p100;
+    vec4 p010 = axis[1] + p000;
+    vec4 p110 = axis[1] + p100;
+    vec4 p011 = axis[1] + p001;
+    vec4 p111 = axis[1] + p101;
+
+    vec3 n000 = NDC2SCREEN(p000.xyz / p000.w);
+    vec3 n100 = NDC2SCREEN(p100.xyz / p100.w);
+    vec3 n001 = NDC2SCREEN(p001.xyz / p001.w);
+    vec3 n101 = NDC2SCREEN(p101.xyz / p101.w);
+    vec3 n010 = NDC2SCREEN(p010.xyz / p010.w);
+    vec3 n110 = NDC2SCREEN(p110.xyz / p110.w);
+    vec3 n011 = NDC2SCREEN(p011.xyz / p011.w);
+    vec3 n111 = NDC2SCREEN(p111.xyz / p111.w);
+    vec3 minBB = min(min(min(n000, n100), min(n001, n101)), min(min(n010, n110), min(n011, n111)));
+    vec3 maxBB = max(max(max(n000, n100), max(n001, n101)), max(max(n010, n110), max(n011, n111)));
+#ifdef TAA
+    vec2 taaValue = getTAA() * 0.5f;
+    minBB.xy += taaValue;
+    maxBB.xy += taaValue;
+#endif
+    minBB = clamp(minBB, vec3(0), vec3(1));
+    maxBB = clamp(maxBB, vec3(0), vec3(1));
+    if (any(lessThan(abs(maxBB.xy - minBB.xy - vec2(1.0f)), vec2(0.000001f)))) return true;
+
+    ivec2 size = ivec2(packedHizSize >> 16, packedHizSize & 0xffffu);
+    vec2 pixelSize = (maxBB.xy - minBB.xy) * size;
+    int mip = int(clamp(floor(log2(max(max(pixelSize.x, pixelSize.y), 1.0f))) - 1.0f,
+            0.0f, float(textureQueryLevels(hizDepthSampler) - 1)));
+    size = max(ivec2(1), size >> mip);
+    ivec2 maxPixel = min(ivec2(ceil(maxBB.xy * size)), size - 1);
+    ivec2 minPixel = ivec2(floor(minBB.xy * size));
+    float sampleDepth = (NEAR * 3.0f) - 1.0f;
+    for (int x = minPixel.x; x <= maxPixel.x; x++) {
+        for (int y = minPixel.y; y <= maxPixel.y; y++) {
+            sampleDepth = REDUCTION(texelFetch(hizDepthSampler, ivec2(x, y), mip).r, sampleDepth);
+        }
+    }
+#ifdef USE_REVERSE_Z
+    float depth = maxBB.z;
+#else
+    float depth = minBB.z;
+#endif
+    return !DEPTH_SCALAR_COMPARE_EQUAL(sampleDepth, depth);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= missingRootCount) return;
+    uvec2 raw = missingRoots[index];
+    uint lod = getLoDLevel(raw);
+    ivec3 pos = getLoDPosition(raw);
+    if (!withinRenderDistance(pos, lod) || !relevantByHiz(pos, lod)) return;
+
+    atomicAdd(voxyAuditCounters[28], 1u);
+    uint anomaly = atomicAdd(voxyAuditCounters[31], 1u);
+    if (anomaly < 128u) {
+        voxyAuditAnomalies[anomaly] = uvec4(raw, 3u | (lod << 16), floatBitsToUint(0.0f));
+    }
+}

@@ -1,4 +1,9 @@
-use crate::{MAX_LOD, PROTOCOL_VERSION, crc::crc32c, lod::Section, registry::RegistrySnapshot};
+use crate::{
+    MAX_LOD, PROTOCOL_VERSION,
+    crc::crc32c,
+    lod::{Section, compress_encoded, network_body_from_stored},
+    registry::RegistrySnapshot,
+};
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -22,7 +27,10 @@ pub const S_MAPPING_DELTA: u16 = 0x8002;
 pub const S_SECTION: u16 = 0x8003;
 pub const S_INVALIDATE: u16 = 0x8004;
 pub const S_PONG: u16 = 0x8005;
+pub const S_RESOLUTION: u16 = 0x8006;
 pub const S_ERROR: u16 = 0x80ff;
+
+pub const RESOLUTION_NO_UPDATE: u8 = 1;
 
 pub const CAP_BLOCK_PROPERTIES: u32 = 1;
 
@@ -248,9 +256,10 @@ pub fn mapping_deltas(
 }
 
 pub fn section(section: &Section, revision: u64) -> Result<Frame> {
+    let stored = compress_encoded(&section.encode()?)?;
     Ok(Frame {
         kind: S_SECTION,
-        payload: section.network_body(revision)?,
+        payload: network_body_from_stored(&stored, section.key.packed(), revision)?,
     })
 }
 
@@ -264,6 +273,23 @@ pub fn invalidate(key: u64, revision: u64, reason: u8) -> Frame {
         kind: S_INVALIDATE,
         payload,
     }
+}
+
+pub fn resolution(keys: &[u64]) -> Result<Frame> {
+    if keys.is_empty() || keys.len() > MAX_SUBSCRIPTION_ENTRIES {
+        bail!("section resolution batch size is outside 1..={MAX_SUBSCRIPTION_ENTRIES}");
+    }
+    let mut payload = Vec::with_capacity(4 + keys.len() * 8);
+    payload.push(RESOLUTION_NO_UPDATE);
+    payload.push(0);
+    payload.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+    for &key in keys {
+        payload.extend_from_slice(&key.to_le_bytes());
+    }
+    Ok(Frame {
+        kind: S_RESOLUTION,
+        payload,
+    })
 }
 
 pub fn pong(nonce: u64) -> Frame {
@@ -408,6 +434,23 @@ mod tests {
     fn server_payload_sizes_match_the_java_decoder() {
         assert_eq!(hello(1, 0, 2, 3).payload.len(), 24);
         assert_eq!(invalidate(5, 6, 1).payload.len(), 24);
+        let resolved = resolution(&[7, 8]).unwrap();
+        assert_eq!(resolved.kind, S_RESOLUTION);
+        assert_eq!(
+            resolved.payload,
+            [
+                &[RESOLUTION_NO_UPDATE, 0, 2, 0][..],
+                &7u64.to_le_bytes(),
+                &8u64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert!(resolution(&[]).is_err());
+        let maximum = (0..MAX_SUBSCRIPTION_ENTRIES as u64).collect::<Vec<_>>();
+        assert_eq!(
+            resolution(&maximum).unwrap().payload.len(),
+            4 + maximum.len() * 8
+        );
 
         let key = SectionKey::new(0, 0, 0, 0).unwrap();
         let stored_section = Section::from_cells(
@@ -423,8 +466,13 @@ mod tests {
         )
         .unwrap();
         let frame = section(&stored_section, 8).unwrap();
-        // Fixed prefix (24), one 12-byte palette value, and no words for a single value.
-        assert_eq!(frame.payload.len(), 36);
+        assert_eq!(&frame.payload[..8], &key.packed().to_le_bytes());
+        assert_eq!(&frame.payload[8..16], &8u64.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(frame.payload[16..20].try_into().unwrap()),
+            24
+        );
+        assert_eq!(&frame.payload[20..24], &[1, 0, 0, 0]);
 
         let snapshot = RegistrySnapshot {
             catalog_id: 1,

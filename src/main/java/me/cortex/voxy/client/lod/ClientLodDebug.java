@@ -24,6 +24,7 @@ final class ClientLodDebug {
     static void sectionInstalled(long startedNanos) {}
     static void sectionApplied() {}
     static void invalidationApplied() {}
+    static void resolutionApplied(int count) {}
     static void droppedUnsubscribed() {}
     static void droppedRevision() {}
     static void subscriptionBatch(int additions, int removals) {}

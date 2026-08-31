@@ -1,3 +1,4 @@
+use crate::crc::crc32c;
 use crate::key::SectionKey;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -5,6 +6,9 @@ use std::collections::HashMap;
 pub const SECTION_EDGE: usize = 32;
 pub const SECTION_VOLUME: usize = SECTION_EDGE * SECTION_EDGE * SECTION_EDGE;
 const DATA_SCHEMA: u8 = 1;
+const STORED_HEADER: usize = 8;
+const ZSTD_LEVEL: i32 = 1;
+const MAX_ENCODED_SECTION: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Cell {
@@ -181,34 +185,63 @@ impl Section {
             cells,
         })
     }
-
-    pub fn network_body(&self, revision: u64) -> Result<Vec<u8>> {
-        let packed = self.packed()?;
-        let mut out = Vec::with_capacity(24 + packed.palette.len() * 12 + packed.words.len() * 8);
-        out.extend_from_slice(&self.key.packed().to_le_bytes());
-        out.extend_from_slice(&revision.to_le_bytes());
-        out.push(packed.non_empty_children);
-        out.push(packed.bits_per_index);
-        out.extend_from_slice(&(packed.palette.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(packed.words.len() as u32).to_le_bytes());
-        encode_palette_and_words(&mut out, &packed.palette, &packed.words);
-        Ok(out)
-    }
 }
 
-/// Builds an S_SECTION payload directly from the validated storage encoding. This avoids
-/// materializing and re-palette-packing 32,768 cells for every client stream.
-pub fn network_body_from_encoded(encoded: &[u8], key: u64, revision: u64) -> Result<Vec<u8>> {
+/// Compresses canonical section bytes once for both durable storage and network transfer.
+pub fn compress_encoded(encoded: &[u8]) -> Result<Vec<u8>> {
     validate_encoded(encoded)?;
-    let mut out = Vec::with_capacity(24 + encoded.len() - 12);
+    if encoded.len() > MAX_ENCODED_SECTION {
+        bail!("encoded section exceeds {MAX_ENCODED_SECTION} bytes");
+    }
+    let compressed = zstd::bulk::compress(encoded, ZSTD_LEVEL)?;
+    let mut out = Vec::with_capacity(STORED_HEADER + compressed.len());
+    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32c(encoded).to_le_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+pub fn decompress_stored(stored: &[u8]) -> Result<Vec<u8>> {
+    let (length, expected_crc, compressed) = stored_parts(stored)?;
+    let encoded = zstd::bulk::decompress(compressed, length)?;
+    if encoded.len() != length || crc32c(&encoded) != expected_crc {
+        bail!("stored section canonical checksum mismatch");
+    }
+    validate_encoded(&encoded)?;
+    Ok(encoded)
+}
+
+pub fn stored_matches(stored: &[u8], encoded: &[u8], encoded_crc: u32) -> Result<bool> {
+    let (length, expected_crc, _) = stored_parts(stored)?;
+    if length != encoded.len() || expected_crc != encoded_crc {
+        return Ok(false);
+    }
+    Ok(decompress_stored(stored)? == encoded)
+}
+
+/// Builds an S_SECTION payload without decompressing or recompressing the stored Zstd frame.
+pub fn network_body_from_stored(stored: &[u8], key: u64, revision: u64) -> Result<Vec<u8>> {
+    let (length, _, compressed) = stored_parts(stored)?;
+    let mut out = Vec::with_capacity(24 + compressed.len());
     out.extend_from_slice(&key.to_le_bytes());
     out.extend_from_slice(&revision.to_le_bytes());
-    out.push(encoded[1]);
-    out.push(encoded[2]);
-    out.extend_from_slice(&encoded[4..6]);
-    out.extend_from_slice(&encoded[8..12]);
-    out.extend_from_slice(&encoded[12..]);
+    out.extend_from_slice(&(length as u32).to_le_bytes());
+    out.push(1); // Zstd
+    out.extend_from_slice(&[0; 3]);
+    out.extend_from_slice(compressed);
     Ok(out)
+}
+
+fn stored_parts(stored: &[u8]) -> Result<(usize, u32, &[u8])> {
+    if stored.len() <= STORED_HEADER {
+        bail!("truncated compressed section");
+    }
+    let length = u32::from_le_bytes(stored[..4].try_into().unwrap()) as usize;
+    let checksum = u32::from_le_bytes(stored[4..8].try_into().unwrap());
+    if !(12..=MAX_ENCODED_SECTION).contains(&length) {
+        bail!("invalid canonical section length");
+    }
+    Ok((length, checksum, &stored[STORED_HEADER..]))
 }
 
 fn validate_encoded(input: &[u8]) -> Result<()> {

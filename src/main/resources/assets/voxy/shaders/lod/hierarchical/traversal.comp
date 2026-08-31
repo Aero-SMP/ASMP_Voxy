@@ -106,7 +106,7 @@ void traverse(in UnpackedNode node) {
         //It is visible, TODO: maybe do a more detailed hiz test? (or make it so that )
 
         //Only decend if not a root node
-        if (node.lodLevel!=0 && shouldDecend()) {
+        if (node.lodLevel!=0 && !isTerminal(node) && shouldDecend()) {
             if (hasChildren(node)) {
                 enqueueChildren(node);
             } else {
@@ -115,15 +115,9 @@ void traverse(in UnpackedNode node) {
                 // Basicly guarenteed to have a mesh, if it doesnt it is very very bad and incorect since its a violation of the graph properties
                 // that all leaf nodes must contain a mesh
 
-                bool shouldRenderSelf = renderDistance<0.0f;
-                if (!shouldRenderSelf) {
-                    vec3 far = furthestPointToCamera(node);
-                    shouldRenderSelf = (far.x*far.x+far.z*far.z+(16*16*16))<=renderDistance;//the +16*16 is to add some buffer room
-                }
-
-                if (shouldRenderSelf) {
-                    enqueueSelfForRender(node);
-                }
+                // Keep the coarse node visible until the requested children are available.
+                // The node already passed render-distance, frustum and HiZ rejection above.
+                enqueueSelfForRender(node);
             }
         } else {
             if (hasMesh(node)) {

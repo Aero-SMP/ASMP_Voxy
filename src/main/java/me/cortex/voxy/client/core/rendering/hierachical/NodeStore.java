@@ -261,7 +261,7 @@ public final class NodeStore {
     }
 
     //Writes out a nodes data to the ptr in the compacted/reduced format
-    public void writeNode(long ptr, int nodeId) {
+    public void writeNode(long ptr, int nodeId, boolean terminal) {
         if (!this.nodeExists(nodeId)) {
             MemoryUtil.memPutLong(ptr, -1);
             MemoryUtil.memPutLong(ptr + 8, -1);
@@ -276,6 +276,7 @@ public final class NodeStore {
 
         short flags = 0;
         flags |= (short) (this.isNodeRequestInFlight(nodeId)?1:0);//1 bit
+        flags |= (short) (terminal ? 1 << 1 : 0);//authoritatively has no children
         flags |= (short) ((this.getChildPtrCount(nodeId)-1)<<2);//3 bit
 
         boolean isEligibleForCleaning = false;

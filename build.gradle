@@ -65,6 +65,22 @@ sourceSets {
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
         runtimeClasspath += output + sourceSets.main.runtimeClasspath
     }
+    debugTest {
+        java.srcDirs = ['src/debugTest/java']
+        resources.srcDirs = []
+        compileClasspath += sourceSets.main.output + sourceSets.debug.output + sourceSets.test.output
+        runtimeClasspath += output + compileClasspath
+    }
+}
+
+configurations {
+    clientEmbedded {
+        canBeConsumed = false
+        canBeResolved = true
+        transitive = false
+    }
+    debugTestImplementation.extendsFrom testImplementation
+    debugTestRuntimeOnly.extendsFrom testRuntimeOnly
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -109,6 +125,8 @@ dependencies {
     compileOnly "maven.modrinth:iris:${providers.gradleProperty('iris_version').get()}"
     runtimeOnly 'io.github.douira:glsl-transformer:2.0.1'
     runtimeOnly 'org.anarres:jcpp:1.4.14'
+    implementation 'io.airlift:aircompressor:0.27'
+    clientEmbedded 'io.airlift:aircompressor:0.27'
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testImplementation 'it.unimi.dsi:fastutil:8.5.12'
@@ -117,8 +135,299 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+def addEmbeddedClientClasses = { Jar task ->
+    task.from({ configurations.clientEmbedded.collect { zipTree(it) } }) {
+        include 'io/airlift/compress/zstd/**', 'io/airlift/compress/Decompressor.class',
+                'io/airlift/compress/MalformedInputException.class',
+                'io/airlift/compress/IncompatibleJvmException.class'
+        exclude 'module-info.class', 'META-INF/MANIFEST.MF', 'META-INF/*.SF',
+                'META-INF/*.RSA', 'META-INF/*.DSA'
+    }
+    task.duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named('jar', Jar) { task ->
+    addEmbeddedClientClasses(task)
+}
+
 tasks.named('test') {
+    dependsOn tasks.named('debugTestClasses')
+    testClassesDirs += sourceSets.debugTest.output.classesDirs
+    classpath += sourceSets.debugTest.output + sourceSets.debug.output
     useJUnitPlatform()
+}
+
+def generatedDebugResources = layout.buildDirectory.dir('generated/voxyDebugResources')
+
+tasks.register('generateDebugResources') {
+    description = 'Generate debug-only metadata and instrumented LOD audit shaders'
+    dependsOn tasks.named('processResources')
+    inputs.files(
+            'src/main/resources/assets/voxy/shaders/lod/hierarchical/traversal.comp',
+            'src/main/resources/assets/voxy/shaders/lod/gl46/cmdgen.comp',
+            'src/main/resources/META-INF/neoforge.mods.toml')
+    outputs.dir generatedDebugResources
+
+    doLast {
+        File outputRoot = generatedDebugResources.get().asFile
+        project.delete(outputRoot)
+
+        File processedMetadata = sourceSets.main.output.resourcesDir.toPath()
+                .resolve('META-INF/neoforge.mods.toml').toFile()
+        File debugMetadata = outputRoot.toPath().resolve('META-INF/neoforge.mods.toml').toFile()
+        debugMetadata.parentFile.mkdirs()
+        debugMetadata.text = processedMetadata.getText('UTF-8') +
+                '\n[[mixins]]\nconfig="debug.voxy.mixins.json"\n'
+
+        File traversalSource = file('src/main/resources/assets/voxy/shaders/lod/hierarchical/traversal.comp')
+        String traversal = traversalSource.getText('UTF-8')
+        String traversalDeclaration = '''layout(binding = RENDER_TRACKER_BINDING, std430) restrict writeonly buffer renderTrackerArray {
+    uint[] lastRenderFrame;
+};'''
+        String traversalAuditDeclaration = traversalDeclaration + '''
+
+// VOXY_DEBUG_LOD_AUDIT_BEGIN
+#define VOXY_AUDIT_COUNTER_COUNT 64u
+#define VOXY_AUDIT_ANOMALY_CAPACITY 128u
+#define VOXY_AUDIT_FRONTIER_CAPACITY 2048u
+layout(binding = 15, std430) restrict buffer VoxyLodAuditBuffer {
+    uint voxyAuditCounters[64];
+    uvec4 voxyAuditAnomalies[128];
+    uvec2 voxyAuditFrontier[2048];
+};
+
+void voxyAuditHash(uvec2 rawPos) {
+    atomicXor(voxyAuditCounters[21], rawPos.x * 0x9e3779b9u + rawPos.y);
+    atomicXor(voxyAuditCounters[22], rawPos.y * 0x85ebca6bu + rawPos.x);
+    atomicAdd(voxyAuditCounters[23], rawPos.x * 0xc2b2ae35u ^ rawPos.y);
+    atomicAdd(voxyAuditCounters[24], rawPos.y * 0x27d4eb2fu ^ rawPos.x);
+}
+
+void voxyAuditAnomaly(in UnpackedNode node, uint reason, float ratio) {
+    uint index = atomicAdd(voxyAuditCounters[31], 1u);
+    if (index < VOXY_AUDIT_ANOMALY_CAPACITY) {
+        voxyAuditAnomalies[index] = uvec4(node.rawPos, reason | (node.lodLevel << 16), floatBitsToUint(ratio));
+    }
+}
+
+void voxyAuditSelected(in UnpackedNode node) {
+    atomicAdd(voxyAuditCounters[16 + min(node.lodLevel, 4u)], 1u);
+    voxyAuditHash(node.rawPos);
+    if (voxyAuditCounters[63] != 0u) {
+        uint index = atomicAdd(voxyAuditCounters[30], 1u);
+        if (index < VOXY_AUDIT_FRONTIER_CAPACITY) voxyAuditFrontier[index] = node.rawPos;
+    }
+}
+// VOXY_DEBUG_LOD_AUDIT_END'''
+        if (!traversal.contains(traversalDeclaration)) {
+            throw new GradleException('Traversal shader audit declaration anchor changed')
+        }
+        traversal = traversal.replace(traversalDeclaration, traversalAuditDeclaration)
+        traversal = traversal.replace('''void addRequest(inout UnpackedNode node) {
+    if (!hasRequested(node)) {
+        if (requestQueueIndex.x < requestQueueSize) {//Soft limit''', '''void addRequest(inout UnpackedNode node) {
+    if (hasRequested(node)) {
+        atomicAdd(voxyAuditCounters[8], 1u);
+    } else {
+        if (requestQueueIndex.x < requestQueueSize) {//Soft limit
+            atomicAdd(voxyAuditCounters[9], 1u);''')
+        traversal = traversal.replace('''            }
+        }
+    }
+}
+
+void enqueueChildren''', '''            }
+        } else {
+            atomicAdd(voxyAuditCounters[10], 1u);
+        }
+    }
+}
+
+void enqueueChildren''')
+        traversal = traversal.replace('''                markRequested(node);
+            }
+        } else {''', '''                markRequested(node);
+            } else {
+                atomicAdd(voxyAuditCounters[25], 1u);
+            }
+        } else {''')
+        traversal = traversal.replace('''    uint children = getChildCount(node);
+    pushNodesInit(children);''', '''    uint children = getChildCount(node);
+    pushNodesInit(children);
+    if (nodePushIndex + children > 200000u) {
+        atomicAdd(voxyAuditCounters[15], 1u);
+    }''')
+        traversal = traversal.replace('''void enqueueSelfForRender(in UnpackedNode node) {
+    if (renderQueueIndex < renderQueueMaxSize) {''', '''void enqueueSelfForRender(in UnpackedNode node) {
+    voxyAuditSelected(node);
+    if (renderQueueIndex < renderQueueMaxSize) {''')
+        traversal = traversal.replace('''            }
+        }
+    }
+}
+
+
+vec3 closestPointToCamera''', '''            }
+        }
+    } else {
+        atomicAdd(voxyAuditCounters[14], 1u);
+    }
+}
+
+
+vec3 closestPointToCamera''')
+        traversal = traversal.replace('''void traverse(in UnpackedNode node) {
+    //Compute screenspace
+    setupScreenspace(node);
+
+    if (!(outsideFrustum() || isCulledByHiz())) {''', '''void traverse(in UnpackedNode node) {
+    //Compute screenspace
+    setupScreenspace(node);
+
+    if (outsideFrustum()) {
+        atomicAdd(voxyAuditCounters[2], 1u);
+        return;
+    }
+    if (isCulledByHiz()) {
+        atomicAdd(voxyAuditCounters[3], 1u);
+        return;
+    }
+    atomicAdd(voxyAuditCounters[4], 1u);
+    {''')
+        traversal = traversal.replace('''        if (node.lodLevel!=0 && !isTerminal(node) && shouldDecend()) {
+            if (hasChildren(node)) {
+                enqueueChildren(node);
+            } else {
+                addRequest(node);''', '''        if (node.lodLevel!=0 && !isTerminal(node) && shouldDecend()) {
+            atomicAdd(voxyAuditCounters[5], 1u);
+            if (hasChildren(node)) {
+                atomicAdd(voxyAuditCounters[6], 1u);
+                enqueueChildren(node);
+            } else {
+                atomicAdd(voxyAuditCounters[7], 1u);
+                voxyAuditAnomaly(node, 1u, _screenSize / max(minSSS, 0.0000001f));
+                addRequest(node);''')
+        traversal = traversal.replace('''                // Keep the coarse node visible until the requested children are available.
+                // The node already passed render-distance, frustum and HiZ rejection above.
+                enqueueSelfForRender(node);''', '''                // Keep the coarse node visible until the requested children are available.
+                // The node already passed render-distance, frustum and HiZ rejection above.
+                atomicAdd(voxyAuditCounters[12], 1u);
+                enqueueSelfForRender(node);''')
+        traversal = traversal.replace('''                renderQueue[renderIndex] = getMesh(node);
+
+            }
+        }
+    } else {''', '''                renderQueue[renderIndex] = getMesh(node);
+
+            } else {
+                atomicAdd(voxyAuditCounters[14], 1u);
+            }
+        }
+    } else {''')
+        traversal = traversal.replace('''            } else {
+                //!! not ideal, we want to render this mesh but dont have it.''', '''            } else {
+                atomicAdd(voxyAuditCounters[11], 1u);
+                voxyAuditAnomaly(node, 2u, _screenSize / max(minSSS, 0.0000001f));
+                //!! not ideal, we want to render this mesh but dont have it.''')
+        traversal = traversal.replace('''        UnpackedNode node;
+        unpackNode(node, nodeId);
+
+        //Check if were inside the render distastance before traversince
+        if (isWithinRenderDistance(node)) {
+            traverse(node);
+        }''', '''        UnpackedNode node;
+        unpackNode(node, nodeId);
+        atomicAdd(voxyAuditCounters[0], 1u);
+
+        //Check if were inside the render distastance before traversince
+        if (isWithinRenderDistance(node)) {
+            traverse(node);
+        } else {
+            atomicAdd(voxyAuditCounters[1], 1u);
+        }''')
+        if (!traversal.contains('VOXY_DEBUG_LOD_AUDIT_BEGIN') || !traversal.contains('voxyAuditAnomaly(node, 2u')) {
+            throw new GradleException('Traversal shader audit transformation was incomplete')
+        }
+        File traversalOutput = outputRoot.toPath()
+                .resolve('assets/voxy/shaders/lod/hierarchical/traversal.comp').toFile()
+        traversalOutput.parentFile.mkdirs()
+        traversalOutput.setText(traversal, 'UTF-8')
+
+        File cmdSource = file('src/main/resources/assets/voxy/shaders/lod/gl46/cmdgen.comp')
+        String cmdgen = cmdSource.getText('UTF-8')
+        String cmdAnchor = '#import <voxy:lod/gl46/bindings.glsl>'
+        String cmdAudit = cmdAnchor + '''
+
+// VOXY_DEBUG_LOD_AUDIT_BEGIN
+#define VOXY_DRAW_FRONTIER_CAPACITY 2048u
+layout(binding = 14, std430) restrict buffer VoxyDrawAuditBuffer {
+    uint voxyDrawCounters[64];
+    uvec2 voxyDrawFrontier[2048];
+};
+
+void voxyDrawHash(uvec2 rawPos) {
+    atomicXor(voxyDrawCounters[24], rawPos.x * 0x9e3779b9u + rawPos.y);
+    atomicXor(voxyDrawCounters[25], rawPos.y * 0x85ebca6bu + rawPos.x);
+    atomicAdd(voxyDrawCounters[26], rawPos.x * 0xc2b2ae35u ^ rawPos.y);
+    atomicAdd(voxyDrawCounters[27], rawPos.y * 0x27d4eb2fu ^ rawPos.x);
+}
+// VOXY_DEBUG_LOD_AUDIT_END'''
+        if (!cmdgen.contains(cmdAnchor)) throw new GradleException('Command shader audit anchor changed')
+        cmdgen = cmdgen.replace(cmdAnchor, cmdAudit)
+        cmdgen = cmdgen.replace('''    uint sectionId = indirectLookup[gl_GlobalInvocationID.x];
+    SectionMeta meta = sectionData[sectionId];''', '''    atomicAdd(voxyDrawCounters[0], 1u);
+    uint sectionId = indirectLookup[gl_GlobalInvocationID.x];
+    SectionMeta meta = sectionData[sectionId];''')
+        cmdgen = cmdgen.replace('''    if (shouldRender) {
+
+        uint ptr''', '''    if (shouldRender) {
+        atomicAdd(voxyDrawCounters[1], 1u);
+        atomicAdd(voxyDrawCounters[16 + min(detail, 4u)], 1u);
+        voxyDrawHash(extractRawPos(meta));
+        if (renderTemporally) atomicAdd(voxyDrawCounters[3], 1u);
+        if (voxyDrawCounters[63] != 0u) {
+            uint frontierIndex = atomicAdd(voxyDrawCounters[30], 1u);
+            if (frontierIndex < VOXY_DRAW_FRONTIER_CAPACITY) voxyDrawFrontier[frontierIndex] = extractRawPos(meta);
+        }
+
+        uint ptr''')
+        cmdgen = cmdgen.replace('''        uint cmdCnt = bitCount(msk);
+        uint cmdPtr = atomicAdd(opaqueDrawCount, cmdCnt);''', '''        uint cmdCnt = bitCount(msk);
+        if (cmdCnt != 0u) atomicAdd(voxyDrawCounters[4], 1u);
+        atomicAdd(voxyDrawCounters[6], cmdCnt);
+        uint cmdPtr = atomicAdd(opaqueDrawCount, cmdCnt);''')
+        cmdgen = cmdgen.replace('''        if (renderTemporally) {
+            tCmdPtr = atomicAdd(temporalOpaqueDrawCount, cmdCnt) + TEMPORAL_OFFSET;
+        }''', '''        if (renderTemporally) {
+            atomicAdd(voxyDrawCounters[8], cmdCnt);
+            tCmdPtr = atomicAdd(temporalOpaqueDrawCount, cmdCnt) + TEMPORAL_OFFSET;
+        }''')
+        cmdgen = cmdgen.replace('''        if (count != 0) {
+            uint tp = atomicAdd(translucentDrawCount, 1)+TRANSLUCENT_WRITE_BASE;''', '''        if (count != 0) {
+            atomicAdd(voxyDrawCounters[5], 1u);
+            atomicAdd(voxyDrawCounters[7], 1u);
+            uint tp = atomicAdd(translucentDrawCount, 1)+TRANSLUCENT_WRITE_BASE;''')
+        cmdgen = cmdgen.replace('''        ptr += count;
+
+    }
+}''', '''        ptr += count;
+
+    } else {
+        atomicAdd(voxyDrawCounters[2], 1u);
+    }
+}''')
+        if (!cmdgen.contains('VOXY_DEBUG_LOD_AUDIT_BEGIN') || !cmdgen.contains('voxyDrawCounters[2]')) {
+            throw new GradleException('Command shader audit transformation was incomplete')
+        }
+        File cmdOutput = outputRoot.toPath().resolve('assets/voxy/shaders/lod/gl46/cmdgen.comp').toFile()
+        cmdOutput.parentFile.mkdirs()
+        cmdOutput.setText(cmdgen, 'UTF-8')
+    }
+}
+
+sourceSets.debug.resources.srcDir generatedDebugResources
+tasks.named('processDebugResources') {
+    dependsOn tasks.named('generateDebugResources')
 }
 
 tasks.register('debugJar', Jar) {
@@ -127,9 +436,79 @@ tasks.register('debugJar', Jar) {
     dependsOn tasks.named('debugClasses')
     from(sourceSets.main.output) {
         exclude 'me/cortex/voxy/client/lod/ClientLodDebug.class'
+        exclude 'META-INF/neoforge.mods.toml'
+        exclude 'assets/voxy/shaders/lod/hierarchical/traversal.comp'
+        exclude 'assets/voxy/shaders/lod/gl46/cmdgen.comp'
     }
     from sourceSets.debug.output
     from layout.projectDirectory.dir('debug-marker')
+    addEmbeddedClientClasses(delegate)
+}
+
+tasks.register('verifyDebugIsolation') {
+    description = 'Verify that debug-only audit code and resources do not enter the normal JAR'
+    group = 'verification'
+    dependsOn tasks.named('jar'), tasks.named('debugJar')
+    doLast {
+        File normalJar = tasks.named('jar').get().archiveFile.get().asFile
+        File diagnosticJar = tasks.named('debugJar').get().archiveFile.get().asFile
+        Set<String> normalEntries = zipTree(normalJar).matching {
+            include '**/*LodAudit*', '**/DetailDecision*', '**/DetailStateMachine*',
+                    '**/Mixin*Debug*', 'debug.voxy.mixins.json',
+                    'assets/voxy/shaders/debug/**'
+        }.files.collect { it.name } as Set
+        if (!normalEntries.isEmpty()) {
+            throw new GradleException("Debug audit entries leaked into normal JAR: ${normalEntries}")
+        }
+        def debugTree = zipTree(diagnosticJar)
+        ['debug.voxy.mixins.json',
+         'assets/voxy/shaders/debug/missing_roots.comp',
+         'assets/voxy/shaders/lod/hierarchical/traversal.comp',
+         'assets/voxy/shaders/lod/gl46/cmdgen.comp'].each { entry ->
+            if (debugTree.matching { include entry }.isEmpty()) {
+                throw new GradleException("Debug JAR is missing ${entry}")
+            }
+        }
+        File mixinConfigFile = debugTree.matching { include 'debug.voxy.mixins.json' }.singleFile
+        Map<String, Object> mixinConfig = new groovy.json.JsonSlurper()
+                .parse(mixinConfigFile) as Map<String, Object>
+        String debugMixinPackage = 'me.cortex.voxy.debug.mixin'
+        if (mixinConfig.package != debugMixinPackage) {
+            throw new GradleException("Debug Mixins must use the isolated ${debugMixinPackage} package; " +
+                    "a broader package makes Mixin reject ordinary Voxy classes at runtime")
+        }
+        List<String> configuredMixins = []
+        ['mixins', 'client', 'server'].each { side ->
+            configuredMixins.addAll((mixinConfig[side] ?: []) as Collection<String>)
+        }
+        configuredMixins.each { mixin ->
+            String entry = debugMixinPackage.replace('.', '/') + '/' + mixin + '.class'
+            if (debugTree.matching { include entry }.isEmpty()) {
+                throw new GradleException("Debug Mixin config references missing class ${entry}")
+            }
+        }
+        if (!fileTree('src/main/java').matching {
+            include debugMixinPackage.replace('.', '/') + '/**'
+        }.isEmpty()) {
+            throw new GradleException("Production sources must not use the reserved debug Mixin package")
+        }
+        ['assets/voxy/shaders/lod/hierarchical/traversal.comp',
+         'assets/voxy/shaders/lod/gl46/cmdgen.comp'].each { entry ->
+            byte[] packaged = zipTree(normalJar).matching { include entry }.singleFile.bytes
+            byte[] source = file("src/main/resources/${entry}").bytes
+            if (!java.util.Arrays.equals(packaged, source)) {
+                throw new GradleException("Normal JAR shader changed while packaging ${entry}")
+            }
+            String diagnostic = zipTree(diagnosticJar).matching { include entry }.singleFile.getText('UTF-8')
+            if (!diagnostic.contains('VOXY_DEBUG_LOD_AUDIT_BEGIN')) {
+                throw new GradleException("Debug JAR shader is not instrumented: ${entry}")
+            }
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyDebugIsolation')
 }
 
 tasks.named('assemble') {

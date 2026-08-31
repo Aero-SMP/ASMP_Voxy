@@ -2,14 +2,15 @@ use crate::{
     FORMAT_VERSION,
     crc::crc32c,
     key::{SectionKey, ShardId},
-    lod::{Section, network_body_from_encoded},
+    lod::{Section, compress_encoded, decompress_stored, network_body_from_stored, stored_matches},
     read_file_bounded,
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -31,6 +32,7 @@ const KIND_INVALIDATE: u8 = 1;
 const KIND_PUT: u8 = 2;
 const KIND_COMMIT: u8 = 3;
 const MAX_RECOVERY_ENTRIES: usize = 1_500_000;
+const PAYLOAD_CACHE_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EntryMeta {
@@ -77,6 +79,10 @@ pub struct StoredSection {
 pub enum NetworkItem {
     Section(Vec<u8>),
     Invalidate(Invalidation),
+    Resolved(Vec<u64>),
+    /// Keys with no durable record. The server decides whether absence is authoritative or only
+    /// temporary while scanner reconciliation is rebuilding a missing cache.
+    Missing(Vec<(u64, u64)>),
 }
 
 #[derive(Debug)]
@@ -90,6 +96,43 @@ pub struct Store {
     columns: RwLock<HashMap<(i32, i32), Vec<i32>>>,
     manifest_lock: Mutex<()>,
     manifest_dirty: AtomicBool,
+    payload_cache: Mutex<PayloadCache>,
+}
+
+#[derive(Debug, Default)]
+struct PayloadCache {
+    entries: HashMap<(u64, u64), Arc<[u8]>>,
+    order: VecDeque<(u64, u64)>,
+    bytes: usize,
+}
+
+impl PayloadCache {
+    fn get(&self, key: u64, revision: u64) -> Option<Arc<[u8]>> {
+        self.entries.get(&(key, revision)).cloned()
+    }
+
+    fn insert(&mut self, key: u64, revision: u64, payload: Arc<[u8]>) {
+        if payload.len() > PAYLOAD_CACHE_LIMIT || self.entries.contains_key(&(key, revision)) {
+            return;
+        }
+        while self.bytes + payload.len() > PAYLOAD_CACHE_LIMIT {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(value) = self.entries.remove(&old) {
+                self.bytes -= value.len();
+            }
+        }
+        self.bytes += payload.len();
+        self.order.push_back((key, revision));
+        self.entries.insert((key, revision), payload);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
 }
 
 #[derive(Debug)]
@@ -228,6 +271,7 @@ impl Store {
             columns: RwLock::new(columns),
             manifest_lock: Mutex::new(()),
             manifest_dirty: AtomicBool::new(false),
+            payload_cache: Mutex::new(PayloadCache::default()),
         })
     }
 
@@ -456,10 +500,28 @@ impl Store {
         let Some(shard) = read_lock(&self.shards)?.get(&key.shard()).cloned() else {
             return Ok(None);
         };
-        let mut shard = lock(&shard)?;
-        let result = shard.read(key);
-        self.observe_destructive_reset(&mut shard)?;
-        result
+        let (meta, file, incarnation) = {
+            let shard = lock(&shard)?;
+            let Some(meta) = shard.index.get(&key.packed()).copied() else {
+                return Ok(None);
+            };
+            (meta, shard.file.try_clone()?, shard.incarnation)
+        };
+        let result = read_payload_from(&file, meta)
+            .and_then(|stored| decompress_stored(&stored))
+            .and_then(|payload| Section::decode(key, &payload));
+        match result {
+            Ok(section) => Ok(Some(StoredSection { section, meta })),
+            Err(error) => {
+                eprintln!("damaged section {} while reading: {error:#}", key.packed());
+                let mut shard = lock(&shard)?;
+                if shard.incarnation == incarnation {
+                    shard.reset_corrupt()?;
+                    self.observe_destructive_reset(&mut shard)?;
+                }
+                Ok(None)
+            }
+        }
     }
 
     pub fn revision(&self, key: SectionKey) -> Result<Option<u64>> {
@@ -470,16 +532,17 @@ impl Store {
         Ok(result)
     }
 
-    /// Resolves only the keys selected by the client's renderer. A matching known revision is
-    /// omitted, making reconnects use the durable client cache without downloading it again.
+    /// Resolves only the keys selected by the client's renderer. Every requested key produces
+    /// either section data, an invalidation, a cache-current acknowledgement, or an absent
+    /// acknowledgement.
     pub fn requested_items(&self, requests: &[(u64, u64)]) -> Result<Vec<NetworkItem>> {
-        let mut groups = BTreeMap::<ShardId, Vec<(u64, u64)>>::new();
-        for &(packed, revision) in requests {
+        let mut groups = BTreeMap::<ShardId, Vec<(usize, u64, u64)>>::new();
+        for (priority, &(packed, revision)) in requests.iter().enumerate() {
             let key = SectionKey::unpack(packed)?;
             groups
                 .entry(key.shard())
                 .or_default()
-                .push((packed, revision));
+                .push((priority, packed, revision));
         }
         let handles = {
             let shards = read_lock(&self.shards)?;
@@ -488,49 +551,78 @@ impl Store {
                 .filter_map(|id| shards.get(id).map(|shard| (*id, shard.clone())))
                 .collect::<HashMap<_, _>>()
         };
-        let mut out = Vec::with_capacity(requests.len());
+        let mut ordered = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        let mut resolved = Vec::new();
+        let mut missing = Vec::new();
+        let mut recovery = Vec::new();
         'groups: for (id, requests) in groups {
             let Some(shard) = handles.get(&id) else {
+                missing.extend(requests.into_iter().map(|request| (request.1, request.2)));
                 continue;
             };
-            let mut shard = lock(shard)?;
-            let mut sections = Vec::new();
-            for (packed, known_revision) in requests {
-                let Some(revision) = shard.revisions.get(&packed).copied() else {
-                    continue;
-                };
-                if revision == known_revision {
-                    continue;
+            let (file, incarnation, mut sections) = {
+                let shard = lock(shard)?;
+                let mut sections = Vec::new();
+                for (priority, packed, known_revision) in requests {
+                    let Some(revision) = shard.revisions.get(&packed).copied() else {
+                        missing.push((packed, known_revision));
+                        continue;
+                    };
+                    if revision == known_revision {
+                        resolved.push(packed);
+                        continue;
+                    }
+                    let Some(current) = shard.index.get(&packed).copied() else {
+                        ordered[priority] = Some(NetworkItem::Invalidate(Invalidation {
+                            key: packed,
+                            revision,
+                            reason: 2,
+                        }));
+                        continue;
+                    };
+                    sections.push((priority, current));
                 }
-                let Some(current) = shard.index.get(&packed).copied() else {
-                    out.push(NetworkItem::Invalidate(Invalidation {
-                        key: packed,
-                        revision,
-                        reason: 2,
-                    }));
-                    continue;
+                (shard.file.try_clone()?, shard.incarnation, sections)
+            };
+            // Positional reads remain disk-sequential inside the shard, but responses are put
+            // back into the client's priority order before they enter the network queue.
+            sections.sort_unstable_by_key(|entry| entry.1.offset);
+            for (priority, current) in sections {
+                let cached = lock(&self.payload_cache)?.get(current.key, current.revision);
+                let result = match cached {
+                    Some(payload) => Ok(payload.as_ref().to_vec()),
+                    None => read_payload_from(&file, current).and_then(|stored| {
+                        network_body_from_stored(&stored, current.key, current.revision)
+                    }),
                 };
-                sections.push(current);
-            }
-            sections.sort_unstable_by_key(|entry| entry.offset);
-            for current in sections {
-                match shard.read_payload(current).and_then(|encoded| {
-                    network_body_from_encoded(&encoded, current.key, current.revision)
-                }) {
-                    Ok(payload) => out.push(NetworkItem::Section(payload)),
+                match result {
+                    Ok(payload) => {
+                        let cached = Arc::<[u8]>::from(payload.clone());
+                        lock(&self.payload_cache)?.insert(current.key, current.revision, cached);
+                        ordered[priority] = Some(NetworkItem::Section(payload));
+                    }
                     Err(error) => {
                         eprintln!("cannot stream section {}: {error:#}", current.key);
-                        let recovery = shard.reset_corrupt();
-                        self.observe_destructive_reset(&mut shard)?;
-                        for invalidation in recovery? {
-                            out.push(NetworkItem::Invalidate(invalidation));
+                        let mut shard = lock(shard)?;
+                        if shard.incarnation == incarnation {
+                            let invalidations = shard.reset_corrupt()?;
+                            self.observe_destructive_reset(&mut shard)?;
+                            recovery.extend(invalidations.into_iter().map(NetworkItem::Invalidate));
                         }
                         continue 'groups;
                     }
                 };
             }
-            self.observe_destructive_reset(&mut shard)?;
         }
+        let mut out = Vec::with_capacity(requests.len() + 1 + recovery.len());
+        if !resolved.is_empty() {
+            out.push(NetworkItem::Resolved(resolved));
+        }
+        if !missing.is_empty() {
+            out.push(NetworkItem::Missing(missing));
+        }
+        out.extend(ordered.into_iter().flatten());
+        out.extend(recovery);
         Ok(out)
     }
 
@@ -680,6 +772,7 @@ impl Store {
         // repair marker makes startup roll it again, while keeping the old in-memory identity
         // here could leave unknown cached keys visible until the disk error clears.
         self.epoch.store(epoch, Ordering::Release);
+        lock(&self.payload_cache)?.clear();
         write_store_identity(&self.identity_path, self.catalog_id, epoch)?;
         shard.destructive_reset = false;
         Ok(())
@@ -802,16 +895,16 @@ impl Shard {
                 out.rejected += 1;
                 continue;
             }
-            let identical = self.index.get(key).copied().is_some_and(|current| {
-                current.length == payload.len() as u32 && current.payload_crc == *payload_crc
-            });
-            if identical {
-                match self.read_payload(self.index[key]) {
-                    Ok(current) if current == *payload => {
+            if let Some(current) = self.index.get(key).copied() {
+                match self
+                    .read_payload(current)
+                    .and_then(|stored| stored_matches(&stored, payload, *payload_crc))
+                {
+                    Ok(true) => {
                         out.unchanged += 1;
                         continue;
                     }
-                    Ok(_) => {}
+                    Ok(false) => {}
                     Err(error) => {
                         eprintln!(
                             "damaged section {key} in {} while comparing replacement: {error:#}",
@@ -832,14 +925,16 @@ impl Shard {
         }
         let generation = self.next_generation()?;
         let mut pending = Vec::with_capacity(changed.len());
-        for (key, _, payload, payload_crc) in changed {
-            let offset = self.append_record(KIND_PUT, generation, *key, payload)?;
+        for (key, _, payload, _) in changed {
+            let stored = compress_encoded(payload)?;
+            let stored_crc = crc32c(&stored);
+            let offset = self.append_record(KIND_PUT, generation, *key, &stored)?;
             pending.push(EntryMeta {
                 key: *key,
                 revision: generation,
                 offset,
-                length: payload.len() as u32,
-                payload_crc: *payload_crc,
+                length: stored.len() as u32,
+                payload_crc: stored_crc,
             });
         }
         self.append_record(KIND_COMMIT, generation, 0, &[])?;
@@ -857,45 +952,8 @@ impl Shard {
         Ok(out)
     }
 
-    fn read(&mut self, key: SectionKey) -> Result<Option<StoredSection>> {
-        let packed = key.packed();
-        let Some(meta) = self.index.get(&packed).copied() else {
-            return Ok(None);
-        };
-        match self.read_payload(meta) {
-            Ok(payload) => match Section::decode(key, &payload) {
-                Ok(section) => Ok(Some(StoredSection { section, meta })),
-                Err(error) => {
-                    eprintln!(
-                        "invalid section {} in {}: {error:#}",
-                        packed,
-                        self.path.display()
-                    );
-                    self.reset_corrupt()?;
-                    Ok(None)
-                }
-            },
-            Err(error) => {
-                eprintln!(
-                    "damaged section {} in {}: {error:#}",
-                    packed,
-                    self.path.display()
-                );
-                self.reset_corrupt()?;
-                Ok(None)
-            }
-        }
-    }
-
-    fn read_payload(&mut self, meta: EntryMeta) -> Result<Vec<u8>> {
-        self.file
-            .seek(SeekFrom::Start(meta.offset + RECORD_HEADER as u64))?;
-        let mut payload = vec![0; meta.length as usize];
-        self.file.read_exact(&mut payload)?;
-        if crc32c(&payload) != meta.payload_crc {
-            bail!("payload checksum mismatch");
-        }
-        Ok(payload)
+    fn read_payload(&self, meta: EntryMeta) -> Result<Vec<u8>> {
+        read_payload_from(&self.file, meta)
     }
 
     fn append_record(
@@ -1379,6 +1437,15 @@ struct RecordHeader {
     payload_crc: u32,
     generation: u64,
     key: u64,
+}
+
+fn read_payload_from(file: &File, meta: EntryMeta) -> Result<Vec<u8>> {
+    let mut payload = vec![0; meta.length as usize];
+    file.read_exact_at(&mut payload, meta.offset + RECORD_HEADER as u64)?;
+    if crc32c(&payload) != meta.payload_crc {
+        bail!("payload checksum mismatch");
+    }
+    Ok(payload)
 }
 
 fn write_file_header(
@@ -1883,12 +1950,34 @@ mod tests {
             .requested_items(&[(fine.packed(), u64::MAX), (coarse.packed(), u64::MAX)])
             .unwrap();
         assert_eq!(items.len(), 2);
-        assert!(
+        let reversed = store
+            .requested_items(&[(coarse.packed(), u64::MAX), (fine.packed(), u64::MAX)])
+            .unwrap();
+        let streamed = reversed
+            .iter()
+            .map(|item| match item {
+                NetworkItem::Section(payload) => {
+                    u64::from_le_bytes(payload[..8].try_into().unwrap())
+                }
+                _ => panic!("unexpected non-section response"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(streamed, vec![coarse.packed(), fine.packed()]);
+        assert!(matches!(
             store
                 .requested_items(&[(fine.packed(), fine_revision)])
                 .unwrap()
-                .is_empty()
-        );
+                .as_slice(),
+            [NetworkItem::Resolved(keys)] if keys == &[fine.packed()]
+        ));
+        let missing = SectionKey::new(0, 1, 0, 0).unwrap();
+        assert!(matches!(
+            store
+                .requested_items(&[(missing.packed(), u64::MAX)])
+                .unwrap()
+                .as_slice(),
+            [NetworkItem::Missing(keys)] if keys == &[(missing.packed(), u64::MAX)]
+        ));
         assert_eq!(store.live_horizontal_columns().unwrap(), vec![(0, 0)]);
 
         store.invalidate_many(&[fine, coarse], 1).unwrap();

@@ -8,7 +8,7 @@ import net.minecraft.resources.ResourceLocation;
 /** Request or response for the Voxy transport selected by the authenticated Minecraft server. */
 public record TransportPayload(int protocolVersion, byte mode, String host, int port)
         implements CustomPacketPayload {
-    public static final int PROTOCOL_VERSION = 4;
+    public static final int PROTOCOL_VERSION = 6;
     public static final byte REQUEST = 0;
     public static final byte MINECRAFT = 1;
     public static final byte DIRECT = 2;

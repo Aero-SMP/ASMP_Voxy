@@ -152,6 +152,8 @@ public class WorldEngine {
         if (getLevel(key) > MAX_LOD_LAYER || (key & 0xf) != 0) throw new IllegalArgumentException("Invalid remote section key");
         WorldSection section = this.acquire(key);
         try {
+            int flags;
+            int neighborMask;
             synchronized (section) {
                 section.advanceStorageRevision();
                 section.setRemoteRevision(revision);
@@ -168,14 +170,68 @@ public class WorldEngine {
                 // reapply the same server tombstone forever.
                 this.storage.saveSection(section);
                 section.setNotDirty();
-                if (!blocksChanged && !childrenChanged) return;
-
-                int flags = (blocksChanged ? UPDATE_TYPE_BLOCK_BIT : 0)
+                flags = (blocksChanged ? UPDATE_TYPE_BLOCK_BIT : 0)
                         | (childrenChanged ? UPDATE_TYPE_CHILD_EXISTENCE_BIT : 0);
-                this.markDirty(section, flags | UPDATE_TYPE_DONT_SAVE, blocksChanged ? 0x3f : 0);
+                neighborMask = blocksChanged ? 0x3f : 0;
+            }
+            // Remove a contradictory parent bit first, so an in-flight child request cannot
+            // briefly publish an empty child and replace the parent's coarse fallback.
+            this.clearParentChild(section);
+            if (flags != 0) {
+                synchronized (section) {
+                    this.markDirty(section, flags | UPDATE_TYPE_DONT_SAVE, neighborMask);
+                }
             }
         } finally {
             section.release();
+        }
+    }
+
+    /**
+     * Re-publishes cached metadata when a subscription has no newer payload. A sparse server
+     * store missing a key is not proof that terrain was deleted, so only a revisioned
+     * invalidation may erase last-known-good client data.
+     */
+    public void refreshResolvedRemoteSection(long key) {
+        this.refreshResolvedRemoteSection(key, false);
+    }
+
+    /** Returns false when a response claimed an indexed cached revision whose payload is gone. */
+    public boolean refreshResolvedRemoteSection(long key, boolean requireCached) {
+        if (getLevel(key) > MAX_LOD_LAYER || (key & 0xf) != 0) {
+            throw new IllegalArgumentException("Invalid remote section key");
+        }
+        WorldSection section = requireCached ? this.acquireIfExists(key) : this.acquire(key);
+        if (section == null) return false;
+        try {
+            synchronized (section) {
+                this.markDirty(section, UPDATE_TYPE_CHILD_EXISTENCE_BIT | UPDATE_TYPE_DONT_SAVE, 0);
+            }
+        } finally {
+            section.release();
+        }
+        return true;
+    }
+
+    /**
+     * Removes a server-confirmed absent child from the parent's transient hierarchy. Keeping
+     * this change out of storage preserves the last durable server revision, while the parent
+     * mesh remains available as a hole-free coarse fallback until Rust publishes a repair.
+     */
+    private void clearParentChild(WorldSection child) {
+        if (child.lvl >= MAX_LOD_LAYER) return;
+        long parentKey = getWorldSectionId(child.lvl + 1, Math.floorDiv(child.x, 2),
+                Math.floorDiv(child.y, 2), Math.floorDiv(child.z, 2));
+        WorldSection parent = this.acquireIfExists(parentKey);
+        if (parent == null) return;
+        try {
+            synchronized (parent) {
+                if (parent.updateEmptyChildState(child) == 0) return;
+                parent.advanceStorageRevision();
+                this.markDirty(parent, UPDATE_TYPE_CHILD_EXISTENCE_BIT | UPDATE_TYPE_DONT_SAVE, 0);
+            }
+        } finally {
+            parent.release();
         }
     }
 

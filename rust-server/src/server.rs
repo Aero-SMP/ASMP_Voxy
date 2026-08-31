@@ -6,6 +6,7 @@ use crate::{
         C_BLOCK_PROPERTIES, C_CREDIT, C_HELLO, C_PING, C_SUBSCRIBE, Frame, HEADER_LEN, S_SECTION,
         SubscriptionBatch, WRITE_TIMEOUT, error, hello, invalidate, mapping_deltas,
         parse_block_properties, parse_credit, parse_hello, parse_nonce, parse_subscriptions, pong,
+        resolution,
     },
     registry::Registry,
     scanner::{DimensionRuntime, Update, UpdateEvent},
@@ -13,7 +14,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -30,7 +31,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CREDIT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SUBSCRIPTIONS: usize = 2_200_000;
-const LOOKUP_BATCH: usize = 32;
+// One blocking lookup job now matches the protocol's maximum resolution frame. Most warm-cache
+// requests resolve without a payload, so smaller jobs only multiply scheduling and frame costs.
+const LOOKUP_BATCH: usize = 256;
 const LOOKUP_LOW_WATER: usize = 2 * 1024 * 1024;
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 trait AsyncSocket: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -67,7 +70,7 @@ enum Command {
 }
 
 struct Pending {
-    key: u64,
+    key: Option<u64>,
     frame: Frame,
 }
 
@@ -237,6 +240,7 @@ async fn writer_loop(
     let mut dimension = None::<String>;
     let mut subscriptions = HashSet::<u64>::new();
     let mut lookups = VecDeque::<(u64, u64)>::new();
+    let mut deferred_missing = HashMap::<u64, u64>::new();
     let mut pending = VecDeque::<Pending>::new();
     let mut pending_bytes = 0usize;
     let mut credit_stalled = None::<Instant>;
@@ -246,9 +250,18 @@ async fn writer_loop(
     loop {
         ensure_instance(&state, server_instance)?;
 
+        if !deferred_missing.is_empty()
+            && dimension
+                .as_ref()
+                .and_then(|name| state.dimensions.get(name))
+                .is_some_and(|runtime| !runtime.is_reconciling())
+        {
+            lookups.extend(deferred_missing.drain());
+        }
+
         let mut wrote = false;
         while let Some(item) = pending.front() {
-            if !subscriptions.contains(&item.key) {
+            if item.key.is_some_and(|key| !subscriptions.contains(&key)) {
                 pending_bytes -= item.frame.payload.len() + HEADER_LEN;
                 pending.pop_front();
                 continue;
@@ -302,7 +315,32 @@ async fn writer_loop(
                     tokio::task::spawn_blocking(move || store.requested_items(&batch)).await??;
                 ensure_instance(&state, server_instance)?;
                 send_mappings(&state, &mut writer, &mut sent_blocks, &mut sent_biomes).await?;
-                enqueue_items(&mut pending, &mut pending_bytes, items)?;
+                let rebuilding = runtime.is_reconciling();
+                let mut ready = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        NetworkItem::Missing(requests) if rebuilding => {
+                            deferred_missing.extend(
+                                requests
+                                    .into_iter()
+                                    .filter(|request| subscriptions.contains(&request.0)),
+                            );
+                        }
+                        NetworkItem::Missing(requests) => ready.push(NetworkItem::Resolved(
+                            requests.into_iter().map(|request| request.0).collect(),
+                        )),
+                        NetworkItem::Section(payload) => {
+                            deferred_missing.remove(&payload_key(&payload));
+                            ready.push(NetworkItem::Section(payload));
+                        }
+                        NetworkItem::Invalidate(value) => {
+                            deferred_missing.remove(&value.key);
+                            ready.push(NetworkItem::Invalidate(value));
+                        }
+                        item => ready.push(item),
+                    }
+                }
+                enqueue_items(&mut pending, &mut pending_bytes, ready)?;
                 continue;
             }
         }
@@ -329,12 +367,14 @@ async fn writer_loop(
                         dimension = Some(batch.dimension.clone());
                         subscriptions.clear();
                         lookups.clear();
+                        deferred_missing.clear();
                         pending.clear();
                         pending_bytes = 0;
                     }
                     for key in batch.removals {
                         SectionKey::unpack(key)?;
                         subscriptions.remove(&key);
+                        deferred_missing.remove(&key);
                     }
                     for (key, known_revision) in batch.additions {
                         SectionKey::unpack(key)?;
@@ -354,12 +394,18 @@ async fn writer_loop(
                     let key = update_key(&update);
                     if dimension.as_deref() == Some(&update.dimension) && subscriptions.contains(&key) {
                         match update.change {
-                            Update::Invalidate(value) => enqueue_items(
-                                &mut pending,
-                                &mut pending_bytes,
-                                vec![NetworkItem::Invalidate(value)],
-                            )?,
-                            Update::Section(_) => lookups.push_back((key, u64::MAX)),
+                            Update::Invalidate(value) => {
+                                deferred_missing.remove(&key);
+                                enqueue_items(
+                                    &mut pending,
+                                    &mut pending_bytes,
+                                    vec![NetworkItem::Invalidate(value)],
+                                )?;
+                            }
+                            Update::Section(_) => {
+                                deferred_missing.remove(&key);
+                                lookups.push_back((key, u64::MAX));
+                            }
                         }
                     }
                 }
@@ -437,16 +483,18 @@ fn enqueue_items(
     for item in items {
         let (key, frame) = match item {
             NetworkItem::Section(payload) => (
-                payload_key(&payload),
+                Some(payload_key(&payload)),
                 Frame {
                     kind: S_SECTION,
                     payload,
                 },
             ),
             NetworkItem::Invalidate(value) => (
-                value.key,
+                Some(value.key),
                 invalidate(value.key, value.revision, value.reason),
             ),
+            NetworkItem::Resolved(keys) => (None, resolution(&keys)?),
+            NetworkItem::Missing(_) => bail!("unresolved store miss reached the network queue"),
         };
         *bytes = bytes
             .checked_add(frame.payload.len() + HEADER_LEN)

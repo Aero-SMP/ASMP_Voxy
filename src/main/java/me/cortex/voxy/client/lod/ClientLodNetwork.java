@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.lod;
 
-import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import io.airlift.compress.zstd.ZstdDecompressor;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.runtime.VoxyRuntime;
@@ -39,6 +39,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -65,7 +66,9 @@ public final class ClientLodNetwork {
     private static final short S_SECTION = (short) 0x8003;
     private static final short S_INVALIDATE = (short) 0x8004;
     private static final short S_PONG = (short) 0x8005;
+    private static final short S_RESOLUTION = (short) 0x8006;
     private static final short S_ERROR = (short) 0x80ff;
+    private static final byte RESOLUTION_NO_UPDATE = 1;
 
     private static final int CAP_BLOCK_PROPERTIES = 1;
     private static final int MAX_INBOUND_FRAMES = 512;
@@ -74,6 +77,7 @@ public final class ClientLodNetwork {
     private static final int MAX_BLOCK_ID = 1 << 20;
     private static final int MAX_BIOME_ID = 1 << 9;
     private static final int MAX_CANONICAL_LENGTH = 4096;
+    private static final int MAX_SECTION_ENCODING = 512 * 1024;
     private static final int MAX_MAPPINGS_PER_FRAME = 256;
     private static final int SUBSCRIPTION_BATCH = 256;
     private static final int PREPARED_SECTION_KIB =
@@ -84,14 +88,21 @@ public final class ClientLodNetwork {
     private static final ArrayBlockingQueue<QueuedInbound> INBOUND = new ArrayBlockingQueue<>(MAX_INBOUND_FRAMES);
     private static final Semaphore INBOUND_MEMORY = new Semaphore(MAX_INBOUND_KIB);
     private static final Set<Long> DESIRED_SECTIONS = ConcurrentHashMap.newKeySet();
+    private static final Set<Long> RESOLVED_SECTIONS = ConcurrentHashMap.newKeySet();
+    private static final Set<Long> PENDING_SECTIONS = ConcurrentHashMap.newKeySet();
     private static final ConcurrentLinkedQueue<Long> SUBSCRIPTION_CHANGES = new ConcurrentLinkedQueue<>();
+    private static final ConcurrentHashMap<Long, DemandPriority> DEMAND_PRIORITIES = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Long, Long> REQUESTED_REVISIONS = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedQueue<Long> RETRY_SECTIONS = new ConcurrentLinkedQueue<>();
+    private static final AtomicLong DEMAND_SEQUENCE = new AtomicLong();
     private static final AtomicLong SESSION = new AtomicLong();
     private static final AtomicLong CONNECTION_SEQUENCE = new AtomicLong();
     private static final Object LIFECYCLE_LOCK = new Object();
 
     private static final ArrayBlockingQueue<long[]> SECTION_BUFFERS = new ArrayBlockingQueue<>(16);
+    private static final ThreadLocal<ZstdScratch> ZSTD = ThreadLocal.withInitial(ZstdScratch::new);
     /** Latest revisions observed in this client process; durable revisions live on WorldSection. */
-    private static final Long2LongOpenHashMap SECTION_REVISIONS = new Long2LongOpenHashMap();
+    private static final ConcurrentHashMap<Long, Long> SECTION_REVISIONS = new ConcurrentHashMap<>();
     private static int[] blockTranslations = new int[256];
     private static int[] biomeTranslations = new int[64];
     private static String[] blockNames = new String[256];
@@ -107,6 +118,8 @@ public final class ClientLodNetwork {
     private static int helloBlockEpoch;
     private static int helloBiomeEpoch;
     private static volatile WorldEngine activeWorld;
+    private static volatile double cameraX;
+    private static volatile double cameraZ;
 
     static {
         Arrays.fill(blockTranslations, -1);
@@ -152,6 +165,8 @@ public final class ClientLodNetwork {
             if (networkThread != null) disconnect();
             return;
         }
+        cameraX = minecraft.gameRenderer.getMainCamera().getPosition().x;
+        cameraZ = minecraft.gameRenderer.getMainCamera().getPosition().z;
 
         String dimension = level.dimension().location().toString();
         if (networkThread == null || !networkThread.isAlive()) {
@@ -179,21 +194,61 @@ public final class ClientLodNetwork {
     }
 
     public static void subscribe(long key) {
-        if (DESIRED_SECTIONS.add(key)) SUBSCRIPTION_CHANGES.add(key);
+        if (DESIRED_SECTIONS.add(key)) {
+            DEMAND_PRIORITIES.putIfAbsent(key,
+                    demandPriority(key, 2, DEMAND_SEQUENCE.getAndIncrement()));
+            RESOLVED_SECTIONS.remove(key);
+            SUBSCRIPTION_CHANGES.add(key);
+        }
+    }
+
+    /** A missing coarse root blocks all coverage below it. */
+    public static void prioritizeCoverage(long key) {
+        prioritize(key, 0);
+    }
+
+    /** A GPU traversal requested this child because its current fallback is visibly too coarse. */
+    public static void prioritizeVisible(long key) {
+        prioritize(key, 1);
+    }
+
+    private static void prioritize(long key, int priorityClass) {
+        DEMAND_PRIORITIES.compute(key, (ignored, current) -> {
+            long age = current == null ? DEMAND_SEQUENCE.getAndIncrement() : current.age;
+            DemandPriority next = demandPriority(key, priorityClass, age);
+            if (current != null && current.priorityClass <= priorityClass) return current;
+            if (DESIRED_SECTIONS.contains(key)) SUBSCRIPTION_CHANGES.add(key);
+            return next;
+        });
     }
 
     public static void unsubscribe(long key) {
+        RESOLVED_SECTIONS.remove(key);
+        PENDING_SECTIONS.remove(key);
+        REQUESTED_REVISIONS.remove(key);
+        DEMAND_PRIORITIES.remove(key);
         if (DESIRED_SECTIONS.remove(key)) SUBSCRIPTION_CHANGES.add(key);
     }
 
     public static void resetDemand() {
         DESIRED_SECTIONS.clear();
+        RESOLVED_SECTIONS.clear();
+        PENDING_SECTIONS.clear();
         SUBSCRIPTION_CHANGES.clear();
+        DEMAND_PRIORITIES.clear();
+        REQUESTED_REVISIONS.clear();
+        RETRY_SECTIONS.clear();
+    }
+
+    /** True once the authoritative server has answered the current subscription. */
+    public static boolean isSectionResolved(long key) {
+        return RESOLVED_SECTIONS.contains(key);
     }
 
     static int debugInboundFrames() { return INBOUND.size(); }
     static int debugInboundKiB() { return MAX_INBOUND_KIB - INBOUND_MEMORY.availablePermits(); }
     static int debugDesiredSections() { return DESIRED_SECTIONS.size(); }
+    static int debugPendingSections() { return PENDING_SECTIONS.size(); }
 
     private static void start(String dimension) {
         synchronized (LIFECYCLE_LOCK) {
@@ -285,6 +340,9 @@ public final class ClientLodNetwork {
                 } else if (message instanceof Invalidation invalidation) {
                     applyInvalidation(world, invalidation);
                     updates++;
+                } else if (message instanceof ResolutionBatch resolution) {
+                    applyResolution(world, resolution);
+                    updates += resolution.keys.length;
                 }
             } catch (RuntimeException exception) {
                 Logger.error("Failed to apply Rust LOD message", exception);
@@ -395,6 +453,8 @@ public final class ClientLodNetwork {
     }
 
     private static void applySection(WorldEngine world, PreparedSection update) {
+        PENDING_SECTIONS.remove(update.key);
+        REQUESTED_REVISIONS.remove(update.key);
         if (!validWorldKey(update.key) || !DESIRED_SECTIONS.contains(update.key)) {
             ClientLodDebug.droppedUnsubscribed();
             return;
@@ -406,6 +466,7 @@ public final class ClientLodNetwork {
 
         long started = ClientLodDebug.timer();
         try {
+            RESOLVED_SECTIONS.add(update.key);
             world.replaceRemoteSection(update.key, update.revision, update.data,
                     update.nonEmptyChildren, update.nonEmptyBlockCount);
             SECTION_REVISIONS.put(update.key, update.revision);
@@ -414,6 +475,8 @@ public final class ClientLodNetwork {
     }
 
     private static void applyInvalidation(WorldEngine world, Invalidation invalidation) {
+        PENDING_SECTIONS.remove(invalidation.key);
+        REQUESTED_REVISIONS.remove(invalidation.key);
         if (!validWorldKey(invalidation.key) || !DESIRED_SECTIONS.contains(invalidation.key)) {
             ClientLodDebug.droppedUnsubscribed();
             return;
@@ -422,14 +485,49 @@ public final class ClientLodNetwork {
             ClientLodDebug.droppedRevision();
             return;
         }
+        RESOLVED_SECTIONS.add(invalidation.key);
         world.invalidateRemoteSection(invalidation.key, invalidation.revision);
         SECTION_REVISIONS.put(invalidation.key, invalidation.revision);
         ClientLodDebug.invalidationApplied();
     }
 
+    private static void applyResolution(WorldEngine world, ResolutionBatch resolution) {
+        int applied = 0;
+        for (long key : resolution.keys) {
+            PENDING_SECTIONS.remove(key);
+            long requestedRevision = REQUESTED_REVISIONS.getOrDefault(key, -1L);
+            REQUESTED_REVISIONS.remove(key);
+            if (!validWorldKey(key) || !DESIRED_SECTIONS.contains(key)) {
+                ClientLodDebug.droppedUnsubscribed();
+                continue;
+            }
+            if (!publishResolution(world, key, requestedRevision != -1)) {
+                // The metadata index was current but the demanded payload failed its checksum.
+                // Re-resolve only this subscription with an unknown revision.
+                SECTION_REVISIONS.remove(key);
+                RETRY_SECTIONS.add(key);
+                continue;
+            }
+            applied++;
+        }
+        ClientLodDebug.resolutionApplied(applied);
+    }
+
+    /** Publishes authority before the renderer callback can serialize the node's terminal bit. */
+    static boolean publishResolution(WorldEngine world, long key, boolean requireCached) {
+        RESOLVED_SECTIONS.add(key);
+        boolean published = false;
+        try {
+            published = world.refreshResolvedRemoteSection(key, requireCached);
+            return published;
+        } finally {
+            if (!published) RESOLVED_SECTIONS.remove(key);
+        }
+    }
+
     private static boolean isOlderRevision(long key, long revision) {
-        return SECTION_REVISIONS.containsKey(key)
-                && Long.compareUnsigned(revision, SECTION_REVISIONS.get(key)) < 0;
+        Long current = SECTION_REVISIONS.get(key);
+        return current != null && Long.compareUnsigned(revision, current) < 0;
     }
 
     private static int translated(int[] translations, int serverId) {
@@ -441,19 +539,27 @@ public final class ClientLodNetwork {
     }
 
     private static long knownRevision(long key) {
+        Long observed = SECTION_REVISIONS.get(key);
+        if (observed != null) return observed;
         WorldEngine world = activeWorld;
         if (world == null || !world.isLive()) return -1;
         try {
-            WorldSection section = world.acquireIfExists(key);
-            if (section == null) return -1;
-            try {
-                return section.getRemoteRevision();
-            } finally {
-                section.release();
-            }
+            return world.storage.getRemoteRevision(key);
         } catch (RuntimeException exception) {
             return -1;
         }
+    }
+
+    private static DemandPriority demandPriority(long key, int priorityClass, long age) {
+        int level = WorldEngine.getLevel(key);
+        double width = 32L << level;
+        double centerX = (WorldEngine.getX(key) + 0.5) * width;
+        double centerZ = (WorldEngine.getZ(key) + 0.5) * width;
+        double dx = centerX - cameraX;
+        double dz = centerZ - cameraZ;
+        double distanceSquared = dx * dx + dz * dz;
+        double projected = width * width / Math.max(1.0, distanceSquared);
+        return new DemandPriority(priorityClass, projected, distanceSquared, age);
     }
 
     private static void rejectConnection(String reason) {
@@ -558,6 +664,10 @@ public final class ClientLodNetwork {
         helloBiomeEpoch = 0;
         activeWorld = null;
         SECTION_REVISIONS.clear();
+        RESOLVED_SECTIONS.clear();
+        PENDING_SECTIONS.clear();
+        REQUESTED_REVISIONS.clear();
+        RETRY_SECTIONS.clear();
         QueuedInbound queued;
         while ((queued = INBOUND.poll()) != null) releaseInbound(queued);
         resetMappings();
@@ -671,6 +781,7 @@ public final class ClientLodNetwork {
                         memoryReserved = true;
                     }
                     int creditBytes = frame.type == S_SECTION || frame.type == S_INVALIDATE
+                            || frame.type == S_RESOLUTION
                             ? frame.payload.length + 16 : 0;
                     INBOUND.put(new QueuedInbound(decoded, memoryKib, creditBytes));
                     transferred = true;
@@ -688,7 +799,8 @@ public final class ClientLodNetwork {
 
         private void writeLoop() {
             HashSet<Long> sent = new HashSet<>();
-            ArrayDeque<Long> initial = new ArrayDeque<>();
+            PriorityQueue<QueuedDemand> queued = new PriorityQueue<>();
+            ArrayDeque<Long> queuedRemovals = new ArrayDeque<>();
             String sentDimension = null;
             long lastPing = System.nanoTime();
             try {
@@ -701,26 +813,60 @@ public final class ClientLodNetwork {
                     String dimension = activeDimension;
                     if (serverConnected && dimension != null && !dimension.equals(sentDimension)) {
                         sent.clear();
-                        initial.clear();
-                        List<Long> ordered = new ArrayList<>(DESIRED_SECTIONS);
-                        ordered.sort((left, right) -> Integer.compare(
-                                WorldEngine.getLevel(right), WorldEngine.getLevel(left)));
-                        initial.addAll(ordered);
+                        queued.clear();
+                        queuedRemovals.clear();
+                        for (long key : DESIRED_SECTIONS) {
+                            DemandPriority priority = DEMAND_PRIORITIES.get(key);
+                            if (priority != null) queued.add(new QueuedDemand(key, priority));
+                        }
                         sentDimension = dimension;
                     }
 
                     if (serverConnected && sentDimension != null) {
+                        Long changed;
+                        while ((changed = SUBSCRIPTION_CHANGES.poll()) != null) {
+                            DemandPriority priority = DEMAND_PRIORITIES.get(changed);
+                            if (DESIRED_SECTIONS.contains(changed) && !sent.contains(changed)
+                                    && priority != null) {
+                                queued.add(new QueuedDemand(changed, priority));
+                            } else if (!DESIRED_SECTIONS.contains(changed) && sent.contains(changed)) {
+                                queuedRemovals.add(changed);
+                            }
+                        }
                         List<Subscription> additions = new ArrayList<>(SUBSCRIPTION_BATCH);
                         List<Long> removals = new ArrayList<>(SUBSCRIPTION_BATCH);
-                        while (additions.size() + removals.size() < SUBSCRIPTION_BATCH) {
-                            Long key = SUBSCRIPTION_CHANGES.poll();
-                            if (key == null) key = initial.pollFirst();
+                        while (additions.size() + removals.size() <= SUBSCRIPTION_BATCH - 2) {
+                            Long key = RETRY_SECTIONS.poll();
                             if (key == null) break;
-                            if (DESIRED_SECTIONS.contains(key)) {
-                                if (sent.add(key)) additions.add(new Subscription(key, knownRevision(key)));
-                            } else if (sent.remove(key)) {
+                            if (!DESIRED_SECTIONS.contains(key)) continue;
+                            if (!sent.contains(key)) {
+                                DemandPriority priority = DEMAND_PRIORITIES.get(key);
+                                if (priority != null) queued.add(new QueuedDemand(key, priority));
+                                continue;
+                            }
+                            removals.add(key);
+                            additions.add(new Subscription(key, -1));
+                            REQUESTED_REVISIONS.put(key, -1L);
+                            PENDING_SECTIONS.add(key);
+                        }
+                        while (!queuedRemovals.isEmpty() && removals.size() < SUBSCRIPTION_BATCH) {
+                            long key = queuedRemovals.removeFirst();
+                            if (sent.remove(key)) {
+                                PENDING_SECTIONS.remove(key);
                                 removals.add(key);
                             }
+                        }
+                        while (additions.size() + removals.size() < SUBSCRIPTION_BATCH
+                                && !queued.isEmpty()) {
+                            QueuedDemand candidate = queued.remove();
+                            DemandPriority current = DEMAND_PRIORITIES.get(candidate.key);
+                            if (!candidate.priority.equals(current)
+                                    || !DESIRED_SECTIONS.contains(candidate.key)
+                                    || !sent.add(candidate.key)) continue;
+                            PENDING_SECTIONS.add(candidate.key);
+                            long revision = knownRevision(candidate.key);
+                            REQUESTED_REVISIONS.put(candidate.key, revision);
+                            additions.add(new Subscription(candidate.key, revision));
                         }
                         if (!additions.isEmpty() || !removals.isEmpty()) {
                             writeFrame(C_SUBSCRIBE, encodeSubscriptions(sentDimension, additions, removals));
@@ -826,6 +972,7 @@ public final class ClientLodNetwork {
                 if (reason < 1 || reason > 3) throw new ProtocolException("Unknown invalidation reason");
                 result = new Invalidation(session, key, revision, (byte) reason);
             }
+            case S_RESOLUTION -> result = decodeResolution(session, input);
             case S_PONG -> {
                 requireRemaining(input, 8);
                 input.getLong();
@@ -841,6 +988,26 @@ public final class ClientLodNetwork {
         }
         if (input.hasRemaining()) throw new ProtocolException("Trailing bytes in frame");
         return result;
+    }
+
+    static ResolutionBatch decodeResolution(long session, ByteBuffer input) throws ProtocolException {
+        requireRemaining(input, 4);
+        byte status = input.get();
+        requireZero(input.get());
+        int count = Short.toUnsignedInt(input.getShort());
+        // Status 2 was emitted by the first protocol-5 server and also means no payload. It
+        // must never regain its old, destructive client interpretation.
+        if ((status != RESOLUTION_NO_UPDATE && status != 2) || count == 0 || count > SUBSCRIPTION_BATCH
+                || input.remaining() != count * Long.BYTES) {
+            throw new ProtocolException("Invalid subscription resolution");
+        }
+        long[] keys = new long[count];
+        for (int i = 0; i < count; i++) {
+            long key = input.getLong();
+            if (!validWorldKey(key)) throw new ProtocolException("Invalid resolved section key");
+            keys[i] = key;
+        }
+        return new ResolutionBatch(session, keys);
     }
 
     private static MappingDelta decodeMappings(long session, ByteBuffer input) throws ProtocolException {
@@ -883,27 +1050,57 @@ public final class ClientLodNetwork {
         requireRemaining(input, 24);
         long key = input.getLong();
         long revision = input.getLong();
-        byte nonEmptyChildren = input.get();
-        int bits = Byte.toUnsignedInt(input.get());
-        int paletteLength = Short.toUnsignedInt(input.getShort());
-        long rawWordCount = Integer.toUnsignedLong(input.getInt());
+        long rawLength = Integer.toUnsignedLong(input.getInt());
+        int codec = Byte.toUnsignedInt(input.get());
+        byte reserved0 = input.get();
+        byte reserved1 = input.get();
+        byte reserved2 = input.get();
+        if (!validWorldKey(key) || rawLength < 12 || rawLength > MAX_SECTION_ENCODING
+                || codec != 1 || input.remaining() == 0) {
+            throw new ProtocolException("Invalid compressed section metadata");
+        }
+        requireZero(reserved0, reserved1, reserved2);
 
-        if (!validWorldKey(key) || paletteLength < 1 || paletteLength > WorldSection.SECTION_VOLUME) {
+        ZstdScratch scratch = ZSTD.get();
+        int compressedLength = input.remaining();
+        int written;
+        try {
+            written = scratch.decompressor.decompress(input.array(),
+                    input.arrayOffset() + input.position(), compressedLength,
+                    scratch.bytes, 0, (int) rawLength);
+        } catch (RuntimeException exception) {
+            throw new ProtocolException("Invalid Zstd section payload", exception);
+        }
+        input.position(input.limit());
+        if (written != rawLength) throw new ProtocolException("Wrong decompressed section length");
+
+        ByteBuffer encoded = ByteBuffer.wrap(scratch.bytes, 0, written).order(ByteOrder.LITTLE_ENDIAN);
+        requireRemaining(encoded, 12);
+        int schema = Byte.toUnsignedInt(encoded.get());
+        byte nonEmptyChildren = encoded.get();
+        int bits = Byte.toUnsignedInt(encoded.get());
+        byte encodingReserved = encoded.get();
+        int paletteLength = Short.toUnsignedInt(encoded.getShort());
+        short paletteReserved = encoded.getShort();
+        long rawWordCount = Integer.toUnsignedLong(encoded.getInt());
+
+        if (schema != 1 || encodingReserved != 0 || paletteReserved != 0
+                || paletteLength < 1 || paletteLength > WorldSection.SECTION_VOLUME) {
             throw new ProtocolException("Invalid section metadata");
         }
         int expectedBits = paletteLength == 1 ? 0 : 32 - Integer.numberOfLeadingZeros(paletteLength - 1);
         long expectedWords = ((long) WorldSection.SECTION_VOLUME * expectedBits + 63) >>> 6;
         if (bits != expectedBits || rawWordCount != expectedWords) throw new ProtocolException("Invalid packed palette dimensions");
         long expectedRemaining = (long) paletteLength * 12 + rawWordCount * 8;
-        if (expectedRemaining != input.remaining()) throw new ProtocolException("Invalid section payload length");
+        if (expectedRemaining != encoded.remaining()) throw new ProtocolException("Invalid section payload length");
         if (data.length != WorldSection.SECTION_VOLUME) throw new IllegalArgumentException("Invalid section output buffer");
 
         long[] palette = new long[paletteLength];
         for (int i = 0; i < palette.length; i++) {
-            long block = Integer.toUnsignedLong(input.getInt());
-            long biome = Integer.toUnsignedLong(input.getInt());
-            byte light = input.get();
-            requireZero(input.get(), input.get(), input.get());
+            long block = Integer.toUnsignedLong(encoded.getInt());
+            long biome = Integer.toUnsignedLong(encoded.getInt());
+            byte light = encoded.get();
+            requireZero(encoded.get(), encoded.get(), encoded.get());
             if (block >= MAX_BLOCK_ID || biome >= MAX_BIOME_ID) throw new ProtocolException("Palette mapping ID out of range");
             int localBlock = translated(blockMap, (int) block);
             int localBiome = translated(biomeMap, (int) biome);
@@ -921,15 +1118,15 @@ public final class ClientLodNetwork {
             Arrays.fill(data, value);
             if (countNonAir && !Mapper.isAir(value)) nonEmptyBlockCount = WorldSection.SECTION_VOLUME;
         } else {
-            int wordsOffset = input.position();
+            int wordsOffset = encoded.position();
             long mask = (1L << bits) - 1;
             for (int i = 0; i < data.length; i++) {
                 long bit = (long) i * bits;
                 int word = (int) (bit >>> 6);
                 int shift = (int) (bit & 63);
-                long index = input.getLong(wordsOffset + word * Long.BYTES) >>> shift;
+                long index = encoded.getLong(wordsOffset + word * Long.BYTES) >>> shift;
                 if (shift + bits > 64) {
-                    index |= input.getLong(wordsOffset + (word + 1) * Long.BYTES) << (64 - shift);
+                    index |= encoded.getLong(wordsOffset + (word + 1) * Long.BYTES) << (64 - shift);
                 }
                 int paletteIndex = (int) (index & mask);
                 if (paletteIndex >= palette.length) {
@@ -940,7 +1137,7 @@ public final class ClientLodNetwork {
                 if (countNonAir && !Mapper.isAir(value)) nonEmptyBlockCount++;
             }
         }
-        input.position(input.limit());
+        encoded.position(encoded.limit());
         return new PreparedSection(session, key, revision, nonEmptyChildren, nonEmptyBlockCount, data);
     }
 
@@ -999,7 +1196,8 @@ public final class ClientLodNetwork {
         return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
     }
 
-    private sealed interface Inbound permits ServerHello, MappingDelta, PreparedSection, Invalidation, ServerError {
+    private sealed interface Inbound permits ServerHello, MappingDelta, PreparedSection, Invalidation,
+            ResolutionBatch, ServerError {
         long session();
     }
 
@@ -1011,15 +1209,37 @@ public final class ClientLodNetwork {
                            int nonEmptyBlockCount, long[] data) implements Inbound {}
     private record Invalidation(long session, long key, long revision,
                                 byte reason) implements Inbound {}
+    record ResolutionBatch(long session, long[] keys) implements Inbound {}
     private record ServerError(long session, int code, String text) implements Inbound {}
     private record RemoteBlock(int id, byte opacity, String canonical) {}
     private record RemoteBiome(int id, String name) {}
     private record BlockProperty(int id, byte opacity) {}
     private record Subscription(long key, long knownRevision) {}
+    private record DemandPriority(int priorityClass, double projectedSize,
+                                  double distanceSquared, long age) {}
+    private record QueuedDemand(long key, DemandPriority priority)
+            implements Comparable<QueuedDemand> {
+        @Override
+        public int compareTo(QueuedDemand other) {
+            int value = Integer.compare(this.priority.priorityClass, other.priority.priorityClass);
+            if (value == 0) value = Double.compare(other.priority.projectedSize,
+                    this.priority.projectedSize);
+            if (value == 0) value = Double.compare(this.priority.distanceSquared,
+                    other.priority.distanceSquared);
+            if (value == 0) value = Long.compare(this.priority.age, other.priority.age);
+            return value == 0 ? Long.compareUnsigned(this.key, other.key) : value;
+        }
+    }
+
+    private static final class ZstdScratch {
+        final ZstdDecompressor decompressor = new ZstdDecompressor();
+        final byte[] bytes = new byte[MAX_SECTION_ENCODING];
+    }
     private record Frame(short type, byte[] payload) {}
     private record QueuedInbound(Inbound message, int memoryKib, int creditBytes) {}
 
     static final class ProtocolException extends Exception {
         private ProtocolException(String message) { super(message); }
+        private ProtocolException(String message, Throwable cause) { super(message, cause); }
     }
 }

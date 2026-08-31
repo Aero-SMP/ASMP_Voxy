@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.lod;
 
+import io.airlift.compress.zstd.ZstdCompressor;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.other.Mapper;
@@ -128,6 +129,36 @@ final class ClientLodSectionDecoderTest {
                 blocks, biomes));
     }
 
+    @Test
+    void decodesNoUpdateResolutionBatch() throws Exception {
+        long first = WorldEngine.getWorldSectionId(2, 7, -2, 11);
+        long second = WorldEngine.getWorldSectionId(0, -1, 3, 4);
+        var current = ClientLodNetwork.decodeResolution(17, resolution((byte) 1, (byte) 0, first, second));
+        var legacy = ClientLodNetwork.decodeResolution(18, resolution((byte) 2, (byte) 0, second));
+
+        assertEquals(17, current.session());
+        assertArrayEquals(new long[] {first, second}, current.keys());
+        assertEquals(18, legacy.session());
+        assertArrayEquals(new long[] {second}, legacy.keys());
+    }
+
+    @Test
+    void rejectsMalformedResolutionBatches() {
+        long key = WorldEngine.getWorldSectionId(1, 0, 0, 0);
+        assertThrows(ClientLodNetwork.ProtocolException.class,
+                () -> ClientLodNetwork.decodeResolution(1, resolution((byte) 3, (byte) 0, key)));
+        assertThrows(ClientLodNetwork.ProtocolException.class,
+                () -> ClientLodNetwork.decodeResolution(1, resolution((byte) 1, (byte) 1, key)));
+        assertThrows(ClientLodNetwork.ProtocolException.class,
+                () -> ClientLodNetwork.decodeResolution(1,
+                        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+                                .put((byte) 1).put((byte) 0).putShort((short) 0).flip()));
+        ByteBuffer trailing = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+                .put((byte) 1).put((byte) 0).putShort((short) 1).putLong(key).put((byte) 0).flip();
+        assertThrows(ClientLodNetwork.ProtocolException.class,
+                () -> ClientLodNetwork.decodeResolution(1, trailing));
+    }
+
     private static ClientLodNetwork.PreparedSection decode(ByteBuffer payload, int[] blocks,
                                                             int[] biomes) throws Exception {
         return ClientLodNetwork.decodeSection(1, payload, blocks, biomes,
@@ -139,6 +170,14 @@ final class ClientLodSectionDecoderTest {
         Arrays.fill(result, -1);
         for (int i = 0; i < pairs.length; i += 2) result[pairs[i]] = pairs[i + 1];
         return result;
+    }
+
+    private static ByteBuffer resolution(byte status, byte reserved, long... keys) {
+        ByteBuffer output = ByteBuffer.allocate(4 + keys.length * Long.BYTES)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        output.put(status).put(reserved).putShort((short) keys.length);
+        for (long key : keys) output.putLong(key);
+        return output.flip();
     }
 
     private static ByteBuffer payload(int level, Entry[] palette, int[] indexes, byte reserved) {
@@ -159,16 +198,24 @@ final class ClientLodSectionDecoderTest {
             }
         }
 
-        ByteBuffer output = ByteBuffer.allocate(24 + palette.length * 12 + words.length * 8)
+        ByteBuffer canonical = ByteBuffer.allocate(12 + palette.length * 12 + words.length * 8)
                 .order(ByteOrder.LITTLE_ENDIAN);
-        output.putLong(WorldEngine.getWorldSectionId(level, 7, -2, 11))
-                .putLong(REVISION).put(CHILDREN).put((byte) bits)
-                .putShort((short) palette.length).putInt(words.length);
+        canonical.put((byte) 1).put(CHILDREN).put((byte) bits).put((byte) 0)
+                .putShort((short) palette.length).putShort((short) 0).putInt(words.length);
         for (Entry entry : palette) {
-            output.putInt(entry.block()).putInt(entry.biome()).put(entry.light())
+            canonical.putInt(entry.block()).putInt(entry.biome()).put(entry.light())
                     .put(reserved).put((byte) 0).put((byte) 0);
         }
-        for (long word : words) output.putLong(word);
+        for (long word : words) canonical.putLong(word);
+
+        byte[] raw = canonical.array();
+        ZstdCompressor compressor = new ZstdCompressor();
+        byte[] compressed = new byte[compressor.maxCompressedLength(raw.length)];
+        int compressedLength = compressor.compress(raw, 0, raw.length, compressed, 0, compressed.length);
+        ByteBuffer output = ByteBuffer.allocate(24 + compressedLength).order(ByteOrder.LITTLE_ENDIAN);
+        output.putLong(WorldEngine.getWorldSectionId(level, 7, -2, 11)).putLong(REVISION)
+                .putInt(raw.length).put((byte) 1).put((byte) 0).put((byte) 0).put((byte) 0)
+                .put(compressed, 0, compressedLength);
         return output.flip();
     }
 

@@ -9,8 +9,8 @@ pub mod scanner;
 pub mod server;
 pub mod store;
 
-pub const FORMAT_VERSION: u16 = 2;
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_LOD: u8 = 4;
 
 pub(crate) fn read_file_bounded(

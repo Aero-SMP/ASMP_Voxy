@@ -2,7 +2,7 @@
 
 This crate is the standalone server-side half of Voxy. It reads Minecraft 1.21.1 Anvil saves,
 builds Voxy's 32x32x32 sections at LOD levels 0 through 4, stores them in a corruption-contained
-regional log, and streams them to the Java client over protocol v4. A small Java bridge installed
+regional log, and streams them to the Java client over protocol v6. A small Java bridge installed
 on the Minecraft server advertises the selected transport after normal Minecraft login. In
 Minecraft mode it also relays bytes to Rust; all generation, storage, and streaming logic remains
 in this Rust process.
@@ -19,6 +19,9 @@ checkpoint, registry, scan state, or complete missing shard causes a bounded inv
 regeneration; it does not require deleting the whole cache by hand.
 
 ## Build and run
+
+The release binary links the host's `libzstd.so.1`; this deployment targets the configured
+Linux x86-64 server and requires the system Zstd library at build and runtime.
 
 ```sh
 cargo build --release --locked
@@ -48,7 +51,7 @@ Use firewalling, a private network, VPN, or authenticated proxy when that is una
 automatically relay frames over their existing authenticated Minecraft connection. Rust remains
 a separate child process and opens no public Voxy port.
 
-In both modes, the client first sends a transport request containing protocol version 4 over the
+In both modes, the client first sends a transport request containing protocol version 6 over the
 authenticated Minecraft connection. The bridge responds with Minecraft mode or the direct host
 and port. It never pushes an early advertisement. A missing, malformed, or incompatible response
 leaves Voxy streaming disabled; the client performs no DNS lookup or port fallback.
@@ -96,6 +99,10 @@ zoom changes the renderer's screen-space choice and therefore requests finer sec
 Each addition includes the durable revision in the client cache, and a matching server revision
 returns no payload. Live changes are sent only for currently subscribed keys.
 
+Lookup jobs consume the protocol's full 256-key batch. The client orders those keys by missing
+coarse coverage, visible refinement, projected size, camera distance, and request age. Rust may
+read a shard in file-offset order, then restores that priority before transmission.
+
 Section traffic consumes a byte-credit window. The client returns those bytes only after its
 main thread consumes the frame, propagating backpressure through either TCP or the Minecraft
 relay. Frame writes and buffer flushes retain a 30-second deadline, so a non-reading client
@@ -113,6 +120,10 @@ Each spatial shard is an append-only `.vxlog` with:
 - an atomic `.vxidx` checkpoint bound to the exact log incarnation;
 - a durable repair marker for any destructively recovered shard;
 - a per-dimension expected-shard manifest and store epoch.
+
+Canonical section bytes are compared exactly before publication, compressed once with Zstd
+level 1, and stored in that form. Network section frames reuse the identical compressed bytes;
+the server does not decompress and recompress data per client.
 
 Indexes are disposable. A missing or stale checkpoint is rebuilt by scanning the log. A torn tail
 is truncated and marks only that shard for repair. Non-tail corruption quarantines and replaces
@@ -182,10 +193,11 @@ Strings are `u16 byte_length` followed by UTF-8, at most 4096 bytes.
 - `0x8002 S_MAPPING_DELTA`: `block_count u32`; each block is `id u32, opacity u8,
   reserved u8, canonical string`; then `biome_count u32`; each biome is `id u32, name string`.
   A frame has at most 256 combined entries and is sent before any section that references it.
-- `0x8003 S_SECTION`: `key u64`, `revision u64`,
-  `non_empty_children u8`, `bits_per_index u8`,
-  `palette_len u16`, `word_count u32`, followed by palette entries and packed words. A palette
-  entry is `block_id u32, biome_id u32, light u8, reserved[3]=0`. Words are `u64`; 32,768 palette
+- `0x8003 S_SECTION`: `key u64`, `revision u64`, `canonical_length u32`, `codec u8=1`,
+  `reserved[3]=0`, followed by one Zstd frame. The decompressed canonical data contains
+  `schema u8=1`, `non_empty_children u8`, `bits_per_index u8`, `reserved u8=0`,
+  `palette_len u16`, `reserved u16=0`, `word_count u32`, then palette entries and packed words.
+  A palette entry is `block_id u32, biome_id u32, light u8, reserved[3]=0`. Words are `u64`; 32,768 palette
   indexes form one continuous least-significant-bit-first bitstream and may straddle words.
 - `0x8004 S_INVALIDATE` (24 bytes): `key u64`, `revision u64`,
   `reason u8`, `reserved[7]=0`.

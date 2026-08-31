@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.debug.LodAudit;
 import me.cortex.voxy.network.DebugPayload;
 import net.minecraft.client.Minecraft;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
@@ -31,6 +32,7 @@ final class ClientLodDebug {
     private static final AtomicLong MAX_INSTALL_NANOS = new AtomicLong();
     private static final AtomicLong SECTIONS_APPLIED = new AtomicLong();
     private static final AtomicLong INVALIDATIONS = new AtomicLong();
+    private static final AtomicLong RESOLUTIONS = new AtomicLong();
     private static final AtomicLong DROPPED_UNSUBSCRIBED = new AtomicLong();
     private static final AtomicLong DROPPED_REVISION = new AtomicLong();
     private static final AtomicLong SUBSCRIBED = new AtomicLong();
@@ -49,6 +51,10 @@ final class ClientLodDebug {
     private static volatile long lastStallReportNanos;
 
     private ClientLodDebug() {}
+
+    static {
+        LodAudit.setRemoteSink(ClientLodDebug::event);
+    }
 
     static void register(PayloadRegistrar registrar) {
         registrar.playBidirectional(DebugPayload.TYPE, DebugPayload.CODEC,
@@ -72,7 +78,7 @@ final class ClientLodDebug {
         if (listener == null || !listener.hasChannel(DebugPayload.TYPE)) return;
         if (!announced) {
             announced = true;
-            send("debug-client-start protocol=4");
+            send("debug-client-start protocol=5");
         }
 
         int ping = -1;
@@ -105,14 +111,17 @@ final class ClientLodDebug {
                 + " installMaxMs=" + nanosToMillis(MAX_INSTALL_NANOS.getAndSet(0))
                 + " sectionsApplied=" + SECTIONS_APPLIED.getAndSet(0)
                 + " invalidations=" + INVALIDATIONS.getAndSet(0)
+                + " resolutions=" + RESOLUTIONS.getAndSet(0)
                 + " droppedUnsubscribed=" + DROPPED_UNSUBSCRIBED.getAndSet(0)
                 + " droppedRevision=" + DROPPED_REVISION.getAndSet(0)
                 + " subscribed=" + SUBSCRIBED.getAndSet(0)
                 + " unsubscribed=" + UNSUBSCRIBED.getAndSet(0)
                 + " creditKiB=" + CREDIT_KIB.getAndSet(0)
                 + " desiredSections=" + ClientLodNetwork.debugDesiredSections()
+                + " pendingSections=" + ClientLodNetwork.debugPendingSections()
                 + " inboundFrames=" + ClientLodNetwork.debugInboundFrames()
-                + " inboundKiB=" + ClientLodNetwork.debugInboundKiB());
+                + " inboundKiB=" + ClientLodNetwork.debugInboundKiB()
+                + " " + LodAudit.summary());
         ticks = 0;
         maxTickGap = 0;
     }
@@ -126,15 +135,18 @@ final class ClientLodDebug {
     }
 
     static void networkStart(long session, String dimension) {
+        LodAudit.networkStart(session, dimension);
         event("network-start session=" + session + " dimension=" + dimension);
     }
 
     static void networkFailure(Throwable failure) {
+        LodAudit.networkFailure(failure);
         event("network-failure type=" + failure.getClass().getSimpleName()
                 + " message=" + failure.getMessage());
     }
 
     static void serverHello(long id, boolean restart, boolean resetSections, int blockEpoch, int biomeEpoch) {
+        LodAudit.serverHello(id);
         event("server-hello id=" + Long.toUnsignedString(id)
                 + " restart=" + restart + " resetSections=" + resetSections
                 + " blockEpoch=" + blockEpoch + " biomeEpoch=" + biomeEpoch);
@@ -245,6 +257,7 @@ final class ClientLodDebug {
     }
 
     static void rustFrame(short type, int bytes) {
+        LodAudit.rustFrame(type);
         RUST_FRAMES.incrementAndGet();
         RUST_BYTES.addAndGet(bytes + 16L);
         if (type == (short) 0x8003) SECTION_FRAMES.incrementAndGet();
@@ -272,6 +285,10 @@ final class ClientLodDebug {
         INVALIDATIONS.incrementAndGet();
     }
 
+    static void resolutionApplied(int count) {
+        RESOLUTIONS.addAndGet(count);
+    }
+
     static void droppedUnsubscribed() {
         DROPPED_UNSUBSCRIBED.incrementAndGet();
     }
@@ -290,6 +307,7 @@ final class ClientLodDebug {
     }
 
     static void reset() {
+        LodAudit.reset();
         announced = false;
         lastTick = 0;
         lastSample = 0;

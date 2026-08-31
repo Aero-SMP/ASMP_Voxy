@@ -164,6 +164,13 @@ impl DimensionRuntime {
         self.first_scan.store(false, Ordering::Release);
     }
 
+    /// True while the durable store is known to be incomplete or inconsistent with its Anvil
+    /// source. Missing records are not authoritative during this interval: clients must keep
+    /// their subscriptions open until a replacement is published or reconciliation completes.
+    pub fn is_reconciling(&self) -> bool {
+        self.reconcile_required.load(Ordering::Acquire)
+    }
+
     pub fn scan_once(
         &self,
         registry: &Arc<RwLock<Registry>>,
