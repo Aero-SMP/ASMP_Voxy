@@ -1,18 +1,9 @@
 {
-  "voxy.config.title": "Voxy",
-
   "voxy.config.general": "General",
   "voxy.config.rendering": "Rendering",
 
   "voxy.config.general.enabled": "Enable Voxy",
   "voxy.config.general.enabled.tooltip": "Fully enables or disables voxy",
-
-  "voxy.config.general.serviceThreads": "Service threads",
-  "voxy.config.general.serviceThreads.tooltip": "Number of threads the ServiceThreadPool can use",
-
-  "voxy.config.general.useSodiumBuilder": "Use sodium threads",
-  "voxy.config.general.useSodiumBuilder.tooltip": "Uses sodium builder threads as part of voxys thread pool, can reduce stuttering and lag when moving quickly at high render distance",
-
 
   "voxy.config.general.rendering": "Voxy Rendering",
   "voxy.config.general.rendering.tooltip": "Enables or disables voxy rendering",
@@ -23,15 +14,14 @@
   "voxy.config.general.renderDistance": "Render distance",
   "voxy.config.general.renderDistance.tooltip": "Render distance of voxy in chunks",
 
+  "voxy.config.general.virtualSurfaceMemory": "Virtual Surface memory",
+  "voxy.config.general.virtualSurfaceMemory.tooltip": "One hard memory budget shared by streamed objects, decoded microtiles, meshing, geometry, fallbacks, and network buffers",
+
   "voxy.config.general.environmental_fog": "Enable environmental fog",
   "voxy.config.general.environmental_fog.tooltip": "Enables or disables voxy rendering environmental fog",
 
   "voxy.config.general.ssao_mode": "SSAO Mode",
   "voxy.config.general.ssao_mode.tooltip": "The mode used for screenspace ambient occlusion (Auto attempts to pick the best option while reducing performance impact)",
-  "voxy.config.general.ssao_mode.auto": "Auto",
-  "voxy.config.general.ssao_mode.basic": "Basic",
-  "voxy.config.general.ssao_mode.better": "Better",
-  "voxy.config.general.ssao_mode.best": "Best",
 
   "voxy.config.general.adaptCloudDistance": "Adaptive cloud distance",
   "voxy.config.general.adaptCloudDistance.tooltip": "Enables or disables adaptive cloud distance",

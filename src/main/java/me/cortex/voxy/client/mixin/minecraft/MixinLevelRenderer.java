@@ -4,11 +4,9 @@ import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
-import me.cortex.voxy.client.core.util.IrisUtil;
-import me.cortex.voxy.client.runtime.VoxyRuntime;
-import me.cortex.voxy.client.world.WorldIdentifier;
+import me.cortex.voxy.client.lod.ClientLodClient;
+import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.world.WorldEngine;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.LevelRenderer;
 import org.jetbrains.annotations.Nullable;
@@ -52,8 +50,13 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
     @Override
     public void voxy$shutdownRenderer() {
         if (this.renderer != null) {
-            this.renderer.shutdown();
+            // Stop object decoding, hybrid meshing, activation candidates and their GPU fences
+            // while every renderer/model resource they own is still valid.  Shutting the
+            // renderer first can free ModelFactory and GL objects underneath an in-flight             // candidate.
+            ClientLodClient.rendererLifecycleChanged();
+            VoxyRenderSystem closing = this.renderer;
             this.renderer = null;
+            closing.shutdown();
         }
     }
 
@@ -72,26 +75,21 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
             Logger.error("Not creating renderer due to null world");
             return;
         }
-        VoxyRuntime runtime = VoxyClient.getRuntime();
-        if (runtime == null) {
+        CatalogMapper mapper = VoxyClient.getMapper();
+        if (mapper == null) {
             Logger.error("Not creating renderer due to null runtime");
             return;
         }
-        WorldIdentifier identifier = WorldIdentifier.of(this.level);
-        WorldEngine world = identifier == null ? null : runtime.getOrCreate(identifier);
-        if (world == null) {
-            Logger.error("Null world selected");
-            return;
-        }
         try {
-            this.renderer = new VoxyRenderSystem(world, runtime.getServiceManager());
+            VoxyRenderSystem created = new VoxyRenderSystem(mapper);
+            this.renderer = created;
+            ClientLodClient.rendererLifecycleChanged();
         } catch (RuntimeException e) {
-            if (IrisUtil.irisShaderPackEnabled()) {
-                IrisUtil.disableIrisShaders();
-            } else {
-                throw e;
-            }
+            // Renderer setup runs inside Minecraft's login packet.  Propagating a shader or
+            // driver failure leaves the connection with a level but no player, causing a
+            // misleading vanilla NPE on the following tick.  Iris-specific setup failures are
+            // handled inside VoxyRenderSystem; a core failure disables Voxy for this reload.
+            Logger.error("Failed to create Voxy renderer; continuing without Voxy rendering", e);
         }
-        runtime.updateDedicatedThreads();
     }
 }

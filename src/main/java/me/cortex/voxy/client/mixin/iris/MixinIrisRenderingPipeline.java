@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.mixin.iris;
 
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
-import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.iris.IrisUtil;
 import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
 import me.cortex.voxy.client.iris.IGetVoxyPatchData;
 import me.cortex.voxy.client.iris.IrisShaderPatch;

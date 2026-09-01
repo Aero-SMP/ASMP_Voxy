@@ -9,8 +9,6 @@ import java.util.function.Consumer;
 
 public class Logger {
     public static boolean INSERT_CLASS = true;
-    public static boolean SHUTUP = false;
-    public static boolean SHUTUP_INFO = false;
     private static final org.slf4j.Logger LOGGER = LoggerFactory.getLogger("Voxy");
     private static volatile Consumer<String> errorSink = ignored -> {};
 
@@ -21,7 +19,7 @@ public class Logger {
     private static String callClsName() {
         String className = "";
         if (INSERT_CLASS) {
-            var stackEntry = new Throwable().getStackTrace()[2];
+            var stackEntry = new Throwable().getStackTrace()[3];
             className = stackEntry.getClassName();
             var builder = new StringBuilder();
             var parts = className.split("\\.");
@@ -42,26 +40,18 @@ public class Logger {
     }
 
     public static void error(Object... args) {
-        if (!SHUTUP) {
-            String message = format(args);
-            LOGGER.error(message, throwable(args));
-            errorSink.accept(message);
-        }
+        String message = format(args);
+        LOGGER.error(message, throwable(args));
+        errorSink.accept(message);
     }
 
     public static void warn(Object... args) {
-        if (!SHUTUP) {
-            LOGGER.warn(format(args), throwable(args));
-        }
+        LOGGER.warn(format(args), throwable(args));
     }
 
-    public static String info(Object... args) {
-        if (SHUTUP||SHUTUP_INFO) {
-            return "";
-        }
+    public static void info(Object... args) {
         String message = format(args);
         LOGGER.info(message, throwable(args));
-        return message;
     }
 
     private static Throwable throwable(Object[] args) {
@@ -69,7 +59,7 @@ public class Logger {
         return null;
     }
 
-    private static String format(Object[] args) {
+    static String format(Object... args) {
         StringJoiner message = new StringJoiner(" ", INSERT_CLASS ? "["+callClsName()+"]: " : "", "");
         for (Object arg : args) message.add(objToString(arg));
         return message.toString();

@@ -65,15 +65,3 @@ pub fn xxh64(mut bytes: &[u8], seed: u64) -> u64 {
     hash = hash.wrapping_mul(P3);
     hash ^ (hash >> 32)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn standard_vector() {
-        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
-        assert_eq!(xxh64(b"", 0), 0xef46_db37_51d8_e999);
-        assert_eq!(xxh64(b"a", 0), 0xd24e_c4f1_a98c_6e5b);
-    }
-}

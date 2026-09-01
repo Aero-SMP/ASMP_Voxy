@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.model;
 
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.world.other.Mapper;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -13,12 +12,12 @@ public class ModelBakerySubsystem {
 
     private final ModelStore storage = new ModelStore();
     public final ModelFactory factory;
-    private final Mapper mapper;
+    private final CatalogMapper mapper;
 
     private final Thread processingThread;
     private volatile boolean isRunning = true;
     private volatile Throwable processingThreadException;
-    public ModelBakerySubsystem(Mapper mapper) {
+    public ModelBakerySubsystem(CatalogMapper mapper) {
         this.mapper = mapper;
         this.factory = new ModelFactory(mapper, this.storage);
         this.processingThread = new Thread(()->{//TODO replace this with something good/integrate it into the async processor so that we just have less threads overall
@@ -37,7 +36,7 @@ public class ModelBakerySubsystem {
         this.processingThread.start();
     }
 
-    public void tick(long totalBudget) {
+    public void tick() {
         if (this.processingThreadException != null) {
             Logger.error(this.processingThreadException.getStackTrace().toString(), this.processingThreadException);
             throw new RuntimeException(this.processingThreadException);
@@ -82,7 +81,7 @@ public class ModelBakerySubsystem {
         LockSupport.unpark(this.processingThread);
     }
 
-    public void addBiome(Mapper.BiomeEntry biomeEntry) {
+    public void addBiome(CatalogMapper.BiomeEntry biomeEntry) {
         this.factory.addBiome(biomeEntry);
         LockSupport.unpark(this.processingThread);
     }

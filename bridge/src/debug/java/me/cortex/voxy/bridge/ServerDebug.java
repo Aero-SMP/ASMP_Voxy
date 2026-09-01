@@ -24,42 +24,42 @@ import java.util.concurrent.atomic.AtomicLong;
 final class ServerDebug {
     private static final Logger LOGGER = LoggerFactory.getLogger("Voxy Minecraft Bridge");
     private static final Path LOG = Path.of("logs", "voxy-debug.log").toAbsolutePath();
+    private static final String VERSION = ServerDebug.class.getPackage().getImplementationVersion();
     private static final ConcurrentHashMap<UUID, Stats> SESSIONS = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<UUID, ClientHeartbeat> CLIENTS = new ConcurrentHashMap<>();
-    private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(action -> {
-        Thread thread = new Thread(action, "Voxy debug log writer");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(
+            Thread.ofPlatform().daemon().name("Voxy debug log writer").factory());
     private static final ScheduledExecutorService WATCHER =
-            Executors.newSingleThreadScheduledExecutor(action -> {
-                Thread thread = new Thread(action, "Voxy debug client watchdog");
-                thread.setDaemon(true);
-                return thread;
-            });
+            Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofPlatform().daemon().name("Voxy debug client watchdog").factory());
     private static volatile boolean serverRunning;
 
     static {
+        startLog();
         WATCHER.scheduleAtFixedRate(ServerDebug::checkClients, 1, 1, TimeUnit.SECONDS);
     }
 
     private ServerDebug() {}
 
     static void register(PayloadRegistrar registrar) {
-        registrar.playBidirectional(DebugPayload.TYPE, DebugPayload.CODEC,
+        registrar.playToServer(DebugPayload.TYPE, DebugPayload.CODEC,
                 (payload, context) -> receive((ServerPlayer) context.player(), payload));
     }
 
     static void serverStart(byte transport) {
+        SESSIONS.clear();
         CLIENTS.clear();
         serverRunning = true;
+        startLog();
         append("server-start transport="
                 + (transport == TransportPayload.MINECRAFT ? "minecraft" : "direct"));
     }
 
     static void serverStop() {
         serverRunning = false;
+        SESSIONS.clear();
         CLIENTS.clear();
+        append("server-stop");
     }
 
     static void playerLogout(ServerPlayer player) {
@@ -120,10 +120,6 @@ final class ServerDebug {
                 + " mcBytesBeforeUnwritable=" + channel.bytesBeforeUnwritable()
                 + (stats == null ? " bridge=closed" : stats.describe())
                 + " client={" + payload.message().replace('\n', ' ').replace('\r', ' ') + '}');
-        if (player.connection.isAcceptingMessages()
-                && player.connection.hasChannel(DebugPayload.TYPE)) {
-            player.connection.send(new DebugPayload(payload.sequence(), payload.sentNanos(), ""));
-        }
     }
 
     private static void checkClients() {
@@ -153,6 +149,19 @@ final class ServerDebug {
                         StandardOpenOption.CREATE, StandardOpenOption.APPEND);
             } catch (IOException exception) {
                 LOGGER.error("Could not write Voxy debug log", exception);
+            }
+        });
+    }
+
+    /** Starts each server run with an unambiguous build identifier from gradle.properties. */
+    private static void startLog() {
+        WRITER.execute(() -> {
+            try {
+                Files.createDirectories(LOG.getParent());
+                Files.writeString(LOG, "Voxy version " + VERSION + System.lineSeparator(),
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (IOException exception) {
+                LOGGER.error("Could not initialize Voxy debug log", exception);
             }
         });
     }

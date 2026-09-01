@@ -5,7 +5,6 @@ import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.util.ThreadUtils;
 import me.cortex.voxy.common.util.TrackedObject;
 
 import java.util.ArrayList;
@@ -59,7 +58,7 @@ public class RenderResourceReuse {
             }
 
             glGetError();//Clear any errors
-            if (!(Capabilities.INSTANCE.isNvidia&& ThreadUtils.isWindows&&Capabilities.INSTANCE.sparseBuffer)) {//This hack makes it so it doesnt crash on renderdoc
+            if (!(Capabilities.INSTANCE.isNvidia && Capabilities.INSTANCE.isWindows && Capabilities.INSTANCE.sparseBuffer)) {//This hack makes it so it doesnt crash on renderdoc
                 buffer = new GlBuffer(capacity, false);//Only do this if we are not on nvidia
                 //TODO: FIXME: TEST, see if the issue is that we are trying to zero the entire buffer, try only zeroing increments
                 // or dont zero it at all
@@ -101,7 +100,7 @@ public class RenderResourceReuse {
         if (Capabilities.INSTANCE.isIntel) {
             geometryCapacity = Math.max(geometryCapacity, 1L<<30);//intel moment, force min 1gb
         }
-        if (Capabilities.INSTANCE.isNvidia && ThreadUtils.isLinux) {
+        if (Capabilities.INSTANCE.isNvidia && Capabilities.INSTANCE.isLinux) {
             geometryCapacity = Math.min(geometryCapacity, 2000L*1024L*1024L);//nvidia linux moment, force max 2gb heap
         }
 

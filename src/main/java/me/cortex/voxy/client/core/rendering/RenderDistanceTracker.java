@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.core.rendering;
 
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
-import me.cortex.voxy.common.world.WorldEngine;
 
 import java.util.function.LongConsumer;
 
@@ -62,13 +61,13 @@ public class RenderDistanceTracker {
 
     private void add(int x, int z) {
         for (int y = this.minSec; y <= this.maxSec; y++) {
-            this.addTopLevelNode.accept(WorldEngine.getWorldSectionId(4, x, y, z));
+            this.addTopLevelNode.accept(SectionKey.pack(4, x, y, z));
         }
     }
 
     private void rem(int x, int z) {
         for (int y = this.minSec; y <= this.maxSec; y++) {
-            this.removeTopLevelNode.accept(WorldEngine.getWorldSectionId(4, x, y, z));
+            this.removeTopLevelNode.accept(SectionKey.pack(4, x, y, z));
         }
     }
 

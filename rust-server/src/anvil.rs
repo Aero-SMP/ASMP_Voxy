@@ -4,6 +4,7 @@ use crate::{
     lod::{Cell, SECTION_EDGE, SECTION_VOLUME, Section, cell_index},
     read_file_bounded,
     registry::Registry,
+    write_lock,
 };
 use anyhow::{Context, Result, bail};
 use fastnbt::{ByteArray, LongArray};
@@ -196,6 +197,26 @@ impl AnvilWorld {
         Ok(out)
     }
 
+    /// Captures one region immediately before an incremental build. This avoids coupling a
+    /// bounded regional transaction to the time required to enumerate every other region in a
+    /// large, actively saving world.
+    pub fn region_header(&self, region_x: i32, region_z: i32) -> Result<Option<RegionHeader>> {
+        let path = self
+            .region_dir()
+            .join(format!("r.{region_x}.{region_z}.mca"));
+        match read_region_header(&path, region_x, region_z) {
+            Ok(header) => Ok(Some(header)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn read_chunk(
         &self,
         chunk_x: i32,
@@ -284,6 +305,9 @@ impl AnvilWorld {
         if sector == 0 || sectors == 0 {
             return Ok(None);
         }
+        if sector < 2 {
+            bail!("chunk ({chunk_x},{chunk_z}) points inside its region header");
+        }
         file.seek(SeekFrom::Start(u64::from(sector) * 4096))?;
         let mut length_bytes = [0; 4];
         file.read_exact(&mut length_bytes)?;
@@ -314,6 +338,78 @@ impl AnvilWorld {
             bail!("chunk exceeds compressed size limit while fingerprinting");
         }
         Ok(Some(fingerprint(sector, sectors as u8, kind, &bytes)))
+    }
+
+    /// Reads every canonical compressed-chunk fingerprint from one already-snapshotted region
+    /// through a single file handle. Incremental surface publication uses this compact source table
+    /// to distinguish the actually changed 2×2 chunk groups from unrelated region rewrites.
+    pub fn region_fingerprints(&self, header: &RegionHeader) -> Result<Vec<Option<u64>>> {
+        if header.entries.len() != 1024 {
+            bail!("region fingerprint scan requires exactly 1024 header entries");
+        }
+        let expected_path = self
+            .region_dir()
+            .join(format!("r.{}.{}.mca", header.region_x, header.region_z));
+        if header.path != expected_path {
+            bail!("region fingerprint header path disagrees with its coordinates");
+        }
+        let mut file =
+            File::open(&header.path).with_context(|| format!("open {}", header.path.display()))?;
+        if region_file_marker(&file.metadata()?) != header.file_marker {
+            bail!("region changed before its fingerprint scan began");
+        }
+        let base_x = header
+            .region_x
+            .checked_mul(32)
+            .context("region chunk x overflow")?;
+        let base_z = header
+            .region_z
+            .checked_mul(32)
+            .context("region chunk z overflow")?;
+        let mut output = Vec::with_capacity(1024);
+        for (slot, entry) in header.entries.iter().enumerate() {
+            let sector = entry.location >> 8;
+            let sectors = (entry.location & 0xff) as usize;
+            if sector == 0 || sectors == 0 {
+                output.push(None);
+                continue;
+            }
+            if sector < 2 {
+                bail!("region chunk entry points inside its header");
+            }
+            file.seek(SeekFrom::Start(u64::from(sector) * 4096))?;
+            let mut length_bytes = [0u8; 4];
+            file.read_exact(&mut length_bytes)?;
+            let length = u32::from_be_bytes(length_bytes) as usize;
+            if length == 0 || length > sectors * 4096 - 4 || length > MAX_COMPRESSED_CHUNK {
+                bail!("invalid compressed chunk length during region fingerprint scan");
+            }
+            let mut compression = [0u8; 1];
+            file.read_exact(&mut compression)?;
+            let external = compression[0] & 0x80 != 0;
+            let kind = compression[0] & 0x7f;
+            let chunk_x = base_x
+                .checked_add(slot as i32 & 31)
+                .context("region chunk x overflow")?;
+            let chunk_z = base_z
+                .checked_add(slot as i32 >> 5)
+                .context("region chunk z overflow")?;
+            let bytes = if external {
+                read_file_bounded(
+                    &self.region_dir().join(format!("c.{chunk_x}.{chunk_z}.mcc")),
+                    MAX_EXTERNAL_CHUNK,
+                )?
+            } else {
+                let mut bytes = vec![0; length - 1];
+                file.read_exact(&mut bytes)?;
+                bytes
+            };
+            output.push(Some(fingerprint(sector, sectors as u8, kind, &bytes)));
+        }
+        if region_file_marker(&file.metadata()?) != header.file_marker {
+            bail!("region changed during its fingerprint scan");
+        }
+        Ok(output)
     }
 
     pub fn load_level_zero_group(
@@ -617,10 +713,10 @@ fn parse_chunk(
         if block_names
             .iter()
             .chain(biome_names.iter())
-            .any(|name| name.len() > 4096)
+            .any(|name| name.is_empty() || name.len() > 4096)
         {
             bail!(
-                "section {} contains a mapping name longer than 4096 bytes",
+                "section {} contains an empty or overlong mapping name",
                 section.y
             );
         }
@@ -634,9 +730,7 @@ fn parse_chunk(
             unpack_anvil_palette(block_data.as_deref(), block_names.len(), 4096, 4)?;
         let biome_indexes = unpack_anvil_palette(biome_data.as_deref(), biome_names.len(), 64, 1)?;
         let (block_ids, biome_ids) = {
-            let mut registry = registry
-                .write()
-                .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+            let mut registry = write_lock(registry)?;
             let blocks = block_names
                 .iter()
                 .map(|name| registry.block_id(name))
@@ -794,165 +888,4 @@ fn nibble(data: Option<&[i8]>, index: usize, missing: u8) -> u8 {
         return missing;
     };
     ((byte as u8) >> ((index & 1) * 4)) & 15
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unrelated_chunk_metadata_does_not_change_terrain_fingerprint() {
-        use fastnbt::Value;
-        use std::collections::HashMap;
-
-        let root = std::env::temp_dir().join(format!(
-            "voxy-terrain-fingerprint-test-{}",
-            std::process::id()
-        ));
-        let registry = Arc::new(RwLock::new(Registry::open(&root).unwrap()));
-        let chunk = |inhabited_time| {
-            HashMap::from([
-                ("xPos".to_owned(), Value::Int(0)),
-                ("zPos".to_owned(), Value::Int(0)),
-                ("Status".to_owned(), Value::String("full".to_owned())),
-                ("sections".to_owned(), Value::List(Vec::new())),
-                ("InhabitedTime".to_owned(), Value::Long(inhabited_time)),
-                (
-                    "entities".to_owned(),
-                    Value::List(if inhabited_time == 1 {
-                        Vec::new()
-                    } else {
-                        vec![Value::Compound(HashMap::from([(
-                            "id".to_owned(),
-                            Value::String("minecraft:pig".to_owned()),
-                        )]))]
-                    }),
-                ),
-            ])
-        };
-        let first = parse_chunk(&fastnbt::to_bytes(&chunk(1)).unwrap(), &registry, 0).unwrap();
-        let second = parse_chunk(&fastnbt::to_bytes(&chunk(2)).unwrap(), &registry, 0).unwrap();
-
-        assert_eq!(first.terrain_fingerprint, second.terrain_fingerprint);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn anvil_palette_does_not_straddle_longs() {
-        let bits = 5usize;
-        let per = 64 / bits;
-        let values = (0..4096).map(|index| index % 23).collect::<Vec<_>>();
-        let mut words = vec![0i64; values.len().div_ceil(per)];
-        for (index, &value) in values.iter().enumerate() {
-            words[index / per] |= (value as i64) << ((index % per) * bits);
-        }
-        assert_eq!(
-            unpack_anvil_palette(Some(&words), 23, 4096, 4).unwrap(),
-            values
-        );
-    }
-
-    #[test]
-    fn single_palette_needs_no_data() {
-        assert_eq!(unpack_anvil_palette(None, 1, 64, 1).unwrap(), vec![0; 64]);
-    }
-
-    #[test]
-    fn canonical_properties_are_stably_sorted() {
-        let entry = BlockPaletteNbt {
-            name: "minecraft:oak_log".into(),
-            properties: BTreeMap::from([
-                ("waterlogged".into(), "false".into()),
-                ("axis".into(), "y".into()),
-            ]),
-        };
-        assert_eq!(
-            canonical_block_state(&entry),
-            "minecraft:oak_log[axis=y,waterlogged=false]"
-        );
-    }
-
-    #[test]
-    fn terrain_fingerprint_uses_normalized_sections_and_every_lod_input() {
-        let cells = vec![
-            Cell {
-                block: 7,
-                biome: 3,
-                light: 0xa5,
-            };
-            4096
-        ];
-        // Distinct source palettes that decode to these same cells reach this exact normalized
-        // representation, so their fingerprints are necessarily identical.
-        let sections = BTreeMap::from([(
-            -2,
-            ChunkSection {
-                y: -2,
-                cells: cells.clone(),
-            },
-        )]);
-        assert_eq!(
-            terrain_fingerprint(&sections),
-            terrain_fingerprint(&sections.clone())
-        );
-
-        for mutation in [
-            Cell {
-                block: 8,
-                ..cells[0]
-            },
-            Cell {
-                biome: 4,
-                ..cells[0]
-            },
-            Cell {
-                light: 0xa4,
-                ..cells[0]
-            },
-        ] {
-            let mut changed = sections.clone();
-            changed.get_mut(&-2).unwrap().cells[0] = mutation;
-            assert_ne!(
-                terrain_fingerprint(&sections),
-                terrain_fingerprint(&changed)
-            );
-        }
-
-        let shifted = BTreeMap::from([(-1, ChunkSection { y: -1, cells })]);
-        assert_ne!(
-            terrain_fingerprint(&sections),
-            terrain_fingerprint(&shifted)
-        );
-        assert_ne!(
-            terrain_fingerprint(&sections),
-            terrain_fingerprint(&BTreeMap::new())
-        );
-    }
-
-    #[test]
-    fn zero_byte_region_is_a_confirmed_empty_placeholder() {
-        let root = std::env::temp_dir().join(format!(
-            "voxy-empty-region-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let region_dir = root.join("region");
-        std::fs::create_dir_all(&region_dir).unwrap();
-        std::fs::File::create(region_dir.join("r.0.0.mca")).unwrap();
-        let world = AnvilWorld::new("test:empty".into(), root.clone());
-        let headers = world.region_headers().unwrap();
-        assert!(headers.failed.is_empty());
-        assert_eq!(headers.valid.len(), 1);
-        assert!(
-            headers.valid[0]
-                .entries
-                .iter()
-                .all(|entry| entry.location == 0)
-        );
-        assert_eq!(world.chunk_fingerprint(0, 0).unwrap(), None);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

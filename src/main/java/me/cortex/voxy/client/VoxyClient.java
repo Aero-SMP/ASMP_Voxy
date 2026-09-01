@@ -1,10 +1,11 @@
 package me.cortex.voxy.client;
 
-import me.cortex.voxy.client.lod.ClientLodNetwork;
+import me.cortex.voxy.client.lod.ClientLodClient;
+import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.core.gl.Capabilities;
+import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.runtime.VoxyRuntime;
 import me.cortex.voxy.common.Logger;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
@@ -24,13 +25,13 @@ import java.nio.file.Path;
 public class VoxyClient {
     public static final String MOD_VERSION = getModVersion("voxy");
     private static FileLock EXCLUSIVE_LOCK;
-    private static VoxyRuntime runtime;
+    private static CatalogMapper mapper;
     private static boolean available;
     public static boolean inSession;
 
     public VoxyClient(IEventBus modBus) {
         Logger.setErrorSink(VoxyClient::showErrorInHud);
-        ClientLodNetwork.init(modBus);
+        ClientLodClient.init(modBus);
     }
 
     private static void showErrorInHud(String message) {
@@ -89,14 +90,14 @@ public class VoxyClient {
     public static void sessionStart() {
         if (inSession) throw new IllegalStateException("Cannot start new session while in a session");
         try {
-            ClientLodNetwork.resetDemand();
+            ClientLodClient.resetDemand();
             inSession = true;
-            if (getRuntime() != null) throw new IllegalStateException();
+            if (getMapper() != null) throw new IllegalStateException();
             if (isAvailable() && VoxyConfig.CONFIG.enabled) {
                 createRuntime();
             }
         } catch (RuntimeException exception) {
-            ClientLodNetwork.disconnect();
+            ClientLodClient.disconnect();
             try {
                 shutdownRuntime();
             } catch (RuntimeException cleanupException) {
@@ -110,29 +111,32 @@ public class VoxyClient {
 
     public static void sessionEnd() {
         if (!inSession) throw new IllegalStateException("Cannot end a session while not in a session");
-        ClientLodNetwork.disconnect();
+        ClientLodClient.disconnect();
         try { shutdownRuntime(); }
         finally {
-            ClientLodNetwork.resetDemand();
+            ClientLodClient.resetDemand();
             inSession = false;
         }
     }
 
-    public static VoxyRuntime getRuntime() {
-        return runtime;
+    public static CatalogMapper getMapper() {
+        return mapper;
     }
 
     public static void createRuntime() {
         if (!available) return;
-        if (runtime != null) throw new IllegalStateException("Cannot create multiple runtimes");
-        runtime = new VoxyRuntime();
+        if (mapper != null) throw new IllegalStateException("Cannot create multiple runtimes");
+        Logger.info("Initializing Voxy client runtime");
+        mapper = new CatalogMapper();
     }
 
     public static void shutdownRuntime() {
-        if (runtime != null) {
-            VoxyRuntime closing = runtime;
-            runtime = null;
-            closing.shutdown();
+        if (mapper != null) {
+            CatalogMapper closing = mapper;
+            mapper = null;
+            Logger.info("Shutting down Voxy client runtime");
+            closing.setBiomeCallback(null);
+            RenderResourceReuse.clearResources();
         }
     }
 

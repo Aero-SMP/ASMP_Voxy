@@ -1,13 +1,12 @@
 modLoader="javafml"
 loaderVersion="[1,)"
 license="All-Rights-Reserved"
-#issueTrackerURL="https://github.com/..."
 
 [[mods]]
 modId="${mod_id}"
 version="${version}"
 displayName="${mod_name}"
-description='''Far distance rendering mod utilising LoDs. Build ${commit} at ${buildtime}'''
+description='''Streams and renders distant terrain surfaces. Build ${commit}'''
 displayTest="IGNORE_ALL_VERSION"
 logoFile="assets/voxy/icon.png"
 authors="Cortex"
@@ -18,7 +17,7 @@ config="client.voxy.mixins.json"
 [[dependencies.${mod_id}]]
 modId="neoforge"
 type="required"
-versionRange="[21.1.228,)"
+versionRange="[$neoforge,)"
 ordering="NONE"
 side="CLIENT"
 [[dependencies.${mod_id}]]

@@ -12,6 +12,8 @@ bin/
 .project
 *.launch
 .settings/
+__pycache__/
+*.pyc
 
 .vscode/
 *.xml

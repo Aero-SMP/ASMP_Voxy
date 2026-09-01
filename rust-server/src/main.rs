@@ -1,18 +1,21 @@
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::broadcast;
 use voxy_rust_server::{
     anvil::{AnvilWorld, discover_dimensions},
     config::Config,
+    read_lock,
     registry::Registry,
-    scanner::{DimensionRuntime, poll_dimension, safe_dimension_name},
+    safe_dimension_name,
     server::{self, ServerState},
-    store::Store,
+    surface::{
+        gc::{GcMoment, GcPolicy},
+        memory::ServerMemoryBudget,
+        service::Service,
+    },
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -31,81 +34,79 @@ async fn main() -> Result<()> {
             .build_global()
             .context("configure Rayon worker pool")?;
     }
-    let registry = Arc::new(RwLock::new(Registry::open(config.data.join("catalog"))?));
-    let catalog_id = registry
-        .read()
-        .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?
-        .catalog_id();
-    let dimensions = discover_dimensions(&config.world, &config.dimension)?;
-    let mut runtimes = BTreeMap::new();
-    let mut dimension_paths = HashSet::new();
-    for dimension in dimensions {
-        let safe_name = safe_dimension_name(&dimension.id);
-        if !dimension_paths.insert(safe_name.clone()) {
-            bail!("two dimension identifiers resolve to the same storage path: {safe_name}");
+    let registry = Arc::new(RwLock::new(Registry::open(
+        config.data.join("surface").join("catalog"),
+    )?));
+    let memory = ServerMemoryBudget::from_mib(config.managed_memory_mib)?;
+    let catalog_id = read_lock(&registry)?.catalog_id();
+    let discovered = discover_dimensions(&config.world, &config.dimension)?;
+    let mut dimensions = BTreeMap::new();
+    let mut paths = HashSet::new();
+    for dimension in discovered {
+        let safe = safe_dimension_name(&dimension.id);
+        if !paths.insert(safe.clone()) {
+            bail!("two dimension identifiers resolve to the same storage path: {safe}");
         }
-        let dimension_data = config.data.join("worlds").join(safe_name);
-        let store = Arc::new(Store::open(&dimension_data, catalog_id)?);
-        let runtime = Arc::new(DimensionRuntime::new(
-            AnvilWorld::new(dimension.id.clone(), dimension.root),
-            store,
-            &config.data,
-        ));
-        runtimes.insert(dimension.id, runtime);
+        dimensions.insert(
+            dimension.id.clone(),
+            Arc::new(AnvilWorld::new(dimension.id, dimension.root)),
+        );
     }
-    let (updates, _) = broadcast::channel(65_536);
+    let service = Arc::new(Service::open_with_budget_and_policies(
+        &config.data,
+        &dimensions,
+        registry.clone(),
+        config.poll_interval,
+        memory.clone(),
+        &config.visibility_policies,
+    )?);
     if config.once {
-        for runtime in runtimes.values() {
-            let report = runtime
-                .scan_once(&registry, &updates)
-                .with_context(|| format!("initial scan of {}", runtime.anvil.dimension))?;
-            eprintln!(
-                "{}: initial scan generated {} sections ({} failures)",
-                runtime.anvil.dimension, report.generated_sections, report.failures
-            );
-            runtime.store.checkpoint_all()?;
-        }
-        eprintln!("index-only scan complete");
+        service.refresh_all()?;
+        eprintln!("surface build complete");
         return Ok(());
     }
-
-    // Dirty journals and unowned store records are tombstoned before the socket is exposed.
-    // The expensive Anvil scan starts below in background workers, so healthy cached regions
-    // remain immediately available while missing regions self-heal on the fly.
-    for runtime in runtimes.values() {
-        runtime
-            .recover_before_serve()
-            .with_context(|| format!("metadata recovery of {}", runtime.anvil.dimension))?;
-        runtime.begin_serving();
-    }
-
-    let state = Arc::new(ServerState {
-        registry: registry.clone(),
-        dimensions: runtimes.clone(),
-        updates: updates.clone(),
-        trust_client_opacity: config.trust_client_opacity,
+    service.start()?;
+    let state = Arc::new(ServerState::new(
+        &dimensions,
         catalog_id,
-    });
-    for runtime in runtimes.values() {
-        tokio::spawn(poll_dimension(
-            runtime.clone(),
-            registry.clone(),
-            updates.clone(),
-            config.poll_interval,
-        ));
-    }
-    let maintenance = runtimes.clone();
+        service.clone(),
+        memory,
+        config.max_connections,
+    ));
+
+    let maintenance = service.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(600)).await;
-            for runtime in maintenance.values() {
-                if let Err(error) = runtime
-                    .store
-                    .checkpoint_all()
-                    .and_then(|_| runtime.store.compact_if_needed().map(|_| ()))
-                {
-                    eprintln!("{} maintenance failed: {error:#}", runtime.anvil.dimension);
+            let service = maintenance.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock is before the Unix epoch")?
+                    .as_secs();
+                for dimension in service.dimensions() {
+                    match service.collect_garbage(
+                        dimension,
+                        GcMoment { unix_seconds: now },
+                        GcPolicy::default(),
+                    ) {
+                        Ok(Some(report)) if report.switched || report.reclaimed_objects != 0 => {
+                            eprintln!(
+                                "{dimension}: surface GC retained {} and reclaimed {} objects",
+                                report.retained_objects, report.reclaimed_objects
+                            );
+                        }
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(error) => eprintln!("{dimension}: surface GC failed safely: {error:#}"),
+                    }
                 }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("surface maintenance failed safely: {error:#}"),
+                Err(error) => eprintln!("surface maintenance worker failed: {error}"),
             }
         }
     });
@@ -113,9 +114,6 @@ async fn main() -> Result<()> {
     tokio::select! {
         result = server::serve(state, config.transport) => result?,
         result = shutdown_signal() => result?,
-    }
-    for runtime in runtimes.values() {
-        runtime.store.checkpoint_all()?;
     }
     Ok(())
 }

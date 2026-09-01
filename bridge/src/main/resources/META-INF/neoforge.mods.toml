@@ -12,13 +12,13 @@ displayTest="IGNORE_ALL_VERSION"
 [[dependencies.voxy_minecraft_bridge]]
 modId="neoforge"
 type="required"
-versionRange="[21.1.228,)"
+versionRange="[$neoforge,)"
 ordering="NONE"
 side="SERVER"
 
 [[dependencies.voxy_minecraft_bridge]]
 modId="minecraft"
 type="required"
-versionRange="[1.21.1]"
+versionRange="[$minecraft]"
 ordering="NONE"
 side="SERVER"

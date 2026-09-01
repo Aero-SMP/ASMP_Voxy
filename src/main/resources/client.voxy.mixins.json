@@ -22,15 +22,10 @@
     "minecraft.MixinLevelRenderer",
     "minecraft.MixinMinecraft",
     "minecraft.MixinRenderSystem",
-    "minecraft.MixinWorld",
-    
     "nvidium.MixinRenderPipeline",
-    "sodium.AccessorSodiumWorldRenderer",
-    "sodium.MixinChunkJobQueue",
     "sodium.MixinCloudRenderer",
     "sodium.MixinDefaultChunkRenderer",
-    "sodium.MixinRenderSectionManager",
-    "sodium.MixinSodiumWorldRenderer"
+    "sodium.MixinRenderSectionManager"
   ],
   "injectors": {
     "defaultRequire": 1

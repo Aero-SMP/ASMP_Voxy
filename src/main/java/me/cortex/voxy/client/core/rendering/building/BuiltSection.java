@@ -7,13 +7,14 @@ import java.util.Arrays;
 //TODO: also have an AABB size stored
 public final class BuiltSection {
     public final long position;
+    public final long sourceRevision;
     public final byte childExistence;
     public final int aabb;
     public final MemoryBuffer geometryBuffer;
     public final int[] offsets;
 
     private BuiltSection(long position, byte children) {
-        this(position, children, -1, null, null);
+        this(position, -1, children, -1, null, null);
     }
 
     public static BuiltSection empty(long position) {
@@ -23,8 +24,18 @@ public final class BuiltSection {
         return new BuiltSection(position, children);
     }
 
+    public static BuiltSection emptyWithChildren(long position, long sourceRevision, byte children) {
+        return new BuiltSection(position, sourceRevision, children, -1, null, null);
+    }
+
     public BuiltSection(long position, byte childExistence, int aabb, MemoryBuffer geometryBuffer, int[] offsets) {
+        this(position, -1, childExistence, aabb, geometryBuffer, offsets);
+    }
+
+    public BuiltSection(long position, long sourceRevision, byte childExistence, int aabb,
+                        MemoryBuffer geometryBuffer, int[] offsets) {
         this.position = position;
+        this.sourceRevision = sourceRevision;
         this.childExistence = childExistence;
         this.aabb = aabb;
         this.geometryBuffer = geometryBuffer;
@@ -32,7 +43,9 @@ public final class BuiltSection {
     }
 
     public BuiltSection clone() {
-        return new BuiltSection(this.position, this.childExistence, this.aabb, this.geometryBuffer!=null?this.geometryBuffer.copy():null, this.offsets!=null?Arrays.copyOf(this.offsets, this.offsets.length):null);
+        return new BuiltSection(this.position, this.sourceRevision, this.childExistence,
+                this.aabb, this.geometryBuffer != null ? this.geometryBuffer.copy() : null,
+                this.offsets != null ? Arrays.copyOf(this.offsets, this.offsets.length) : null);
     }
 
     public void free() {

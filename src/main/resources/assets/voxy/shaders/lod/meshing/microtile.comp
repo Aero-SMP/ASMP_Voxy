@@ -1,0 +1,116 @@
+#version 460 core
+
+layout(local_size_x = 128) in;
+
+#define SECTION_EDGE 32u
+#define SECTION_CELLS (SECTION_EDGE * SECTION_EDGE * SECTION_EDGE)
+#define HALO_FACE_CELLS (SECTION_EDGE * SECTION_EDGE)
+#define CELL_WORDS 3u
+#define MAX_QUADS_PER_FACE SECTION_CELLS
+
+layout(binding = 0, std430) readonly restrict buffer MeshingCells {
+    uint cellWords[];
+};
+
+layout(binding = 1, std430) restrict buffer MeshingOutput {
+    uint faceCounts[6];
+    uint overflowFlags;
+    uint _reserved;
+    uvec2 quads[];
+};
+
+uint cellWord(uint cell, uint offset) {
+    return cellWords[cell * CELL_WORDS + offset];
+}
+
+bool occupied(uint cell) {
+    return (cellWord(cell, 1u) & (1u << 23u)) != 0u;
+}
+
+bool known(uint cell) {
+    return (cellWord(cell, 1u) & (1u << 25u)) != 0u;
+}
+
+uint faceCellIndex(uint cell, uint face) {
+    uint x = cell & 31u;
+    uint z = (cell >> 5u) & 31u;
+    uint y = cell >> 10u;
+    if (face < 2u) return x | (z << 5u);
+    if (face < 4u) return x | (y << 5u);
+    return z | (y << 5u);
+}
+
+int neighborIndex(uint cell, uint face) {
+    uint x = cell & 31u;
+    uint z = (cell >> 5u) & 31u;
+    uint y = cell >> 10u;
+    if (face == 0u && y != 0u) return int(cell - 1024u);
+    if (face == 1u && y != 31u) return int(cell + 1024u);
+    if (face == 2u && z != 0u) return int(cell - 32u);
+    if (face == 3u && z != 31u) return int(cell + 32u);
+    if (face == 4u && x != 0u) return int(cell - 1u);
+    if (face == 5u && x != 31u) return int(cell + 1u);
+    return int(SECTION_CELLS + face * HALO_FACE_CELLS + faceCellIndex(cell, face));
+}
+
+uint encodePosition(uint cell, uint face) {
+    uint x = cell & 31u;
+    uint z = (cell >> 5u) & 31u;
+    uint y = cell >> 10u;
+    return face | (x << 21u) | (y << 16u) | (z << 11u);
+}
+
+void appendQuad(uint cell, uint face, uint modelId, uint material, uint light) {
+    uint slot = atomicAdd(faceCounts[face], 1u);
+    if (slot >= MAX_QUADS_PER_FACE) {
+        atomicOr(overflowFlags, 1u << face);
+        return;
+    }
+    uint biome = (material & 0x1ffu)
+            * ((material >> 21u) & 1u);
+    uint low = encodePosition(cell, face) | (modelId << 26u);
+    uint high = (modelId >> 6u) | (biome << 14u) | (light << 23u);
+    quads[face * MAX_QUADS_PER_FACE + slot] = uvec2(low, high);
+}
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= SECTION_CELLS || !occupied(cell)) return;
+    uint material = cellWord(cell, 1u);
+    if ((material & (1u << 24u)) == 0u) return;
+    uint modelId = cellWord(cell, 0u);
+    uint faces = cellWord(cell, 2u);
+    uint existingFaces = faces & 0x3fu;
+    uint canBeOccludedFaces = (faces >> 8u) & 0x3fu;
+    uint selfLitFaces = (faces >> 24u) & 0x3fu;
+    uint ownLight = (material >> 9u) & 0xffu;
+    uint emission = (material >> 17u) & 0xfu;
+
+    for (uint face = 0u; face < 6u; face++) {
+        uint bit = 1u << face;
+        if ((existingFaces & bit) == 0u) continue;
+        int neighbor = neighborIndex(cell, face);
+        uint neighborLight = ownLight;
+        bool hidden = false;
+        if (neighbor >= 0) {
+            uint neighborCell = uint(neighbor);
+            uint neighborMaterial = cellWord(neighborCell, 1u);
+            if (known(neighborCell)) {
+                neighborLight = (neighborMaterial >> 9u) & 0xffu;
+            }
+            if (known(neighborCell) && occupied(neighborCell)) {
+                uint neighborModel = cellWord(neighborCell, 0u);
+                uint neighborOccludes = (cellWord(neighborCell, 2u) >> 16u) & 0x3fu;
+                bool sameCulled = ((material >> 22u) & 1u) != 0u
+                        && neighborModel == modelId;
+                bool faceOccluded = (canBeOccludedFaces & bit) != 0u
+                        && (neighborOccludes & (1u << (face ^ 1u))) != 0u;
+                hidden = sameCulled || faceOccluded;
+            }
+        }
+        if (hidden) continue;
+        uint light = (selfLitFaces & bit) != 0u ? ownLight : neighborLight;
+        light = (light & 0x0fu) | (max(light >> 4u, emission) << 4u);
+        appendQuad(cell, face, modelId, material, light);
+    }
+}

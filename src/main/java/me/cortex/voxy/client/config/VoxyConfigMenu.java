@@ -3,8 +3,7 @@ package me.cortex.voxy.client.config;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.SSAO;
-import me.cortex.voxy.client.core.util.IrisUtil;
-import me.cortex.voxy.common.util.cpu.CpuLayout;
+import me.cortex.voxy.client.iris.IrisUtil;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPointForge;
 import net.caffeinemc.mods.sodium.api.config.ConfigState;
@@ -28,10 +27,10 @@ import java.util.function.Supplier;
 public class VoxyConfigMenu implements ConfigEntryPoint {
     private static final VoxyConfig CFG = VoxyConfig.CONFIG;
     private static final ResourceLocation ENABLED = id("enabled");
-    private static final ResourceLocation UPDATE_THREADS = id("update_threads");
     private static final ResourceLocation IRIS_RELOAD = id("iris_reload");
     private static final ResourceLocation RENDERING = id("rendering");
     private static final ResourceLocation RENDER_DISTANCE = id("render_distance");
+    private static final ResourceLocation MEMORY_BUDGET = id("virtual_surface_memory");
     private static final ResourceLocation RENDER_RELOAD = OptionFlag.REQUIRES_RENDERER_RELOAD.getId();
 
     @Override
@@ -49,21 +48,9 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                     }
                 }, ENABLED, RENDER_RELOAD, IRIS_RELOAD);
 
-        var threadCount = option(builder.createIntegerOption(id("thread_count")),
-                "voxy.config.general.serviceThreads", () -> CFG.serviceThreads,
-                value -> CFG.serviceThreads = value, UPDATE_THREADS)
-                .setRange(new Range(1, CpuLayout.getCoreCount(), 1))
-                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
-
-        var sodiumThreads = option(builder.createBooleanOption(id("use_sodium_threads")),
-                "voxy.config.general.useSodiumBuilder", () -> !CFG.dontUseSodiumBuilderThreads,
-                value -> CFG.dontUseSodiumBuilderThreads = !value, UPDATE_THREADS, RENDER_RELOAD)
-                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
-
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.general"))
-                .addOptionGroup(group(builder, enabled))
-                .addOptionGroup(group(builder, threadCount, sodiumThreads)));
+                .addOptionGroup(group(builder, enabled)));
 
         var rendering = option(builder.createBooleanOption(RENDERING),
                 "voxy.config.general.rendering", () -> CFG.enableRendering,
@@ -83,6 +70,15 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 value -> CFG.sectionRenderDistance = (float) value / 16, RENDER_DISTANCE)
                 .setRange(new Range(10, 64 * 16, 1))
                 .setValueFormatter(value -> Component.literal(Integer.toString(value * 2)))
+                .setImpact(OptionImpact.MEDIUM)
+                .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
+
+        var memoryBudget = option(builder.createIntegerOption(MEMORY_BUDGET),
+                "voxy.config.general.virtualSurfaceMemory", () -> CFG.virtualSurfaceMemoryMiB,
+                value -> CFG.virtualSurfaceMemoryMiB = value, RENDER_RELOAD)
+                .setRange(new Range(VoxyConfig.MIN_VIRTUAL_SURFACE_MEMORY_MIB,
+                        VoxyConfig.MAX_VIRTUAL_SURFACE_MEMORY_MIB, 64))
+                .setValueFormatter(value -> Component.literal(value + " MiB"))
                 .setImpact(OptionImpact.MEDIUM)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
@@ -136,7 +132,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
-                .addOptionGroup(group(builder, subdivisionSize, renderDistance))
+                .addOptionGroup(group(builder, subdivisionSize, renderDistance, memoryBudget))
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
                 .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));
@@ -147,12 +143,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
     private static void registerApplyHooks(ModOptionsBuilder options) {
         options.registerFlagHook((identifiers, state) -> {
             for (var identifier : identifiers) {
-                if (identifier.equals(UPDATE_THREADS)) {
-                    if (!identifiers.contains(ENABLED)) {
-                        var runtime = VoxyClient.getRuntime();
-                        if (runtime != null) runtime.updateDedicatedThreads();
-                    }
-                } else if (identifier.equals(IRIS_RELOAD)) {
+                if (identifier.equals(IRIS_RELOAD)) {
                     IrisUtil.reload();
                 } else if (identifier.equals(ENABLED)) {
                     if (!CFG.enabled) {
@@ -178,7 +169,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                     }
                 }
             }
-        }, UPDATE_THREADS, IRIS_RELOAD, ENABLED, RENDERING, RENDER_DISTANCE);
+        }, IRIS_RELOAD, ENABLED, RENDERING, RENDER_DISTANCE);
     }
 
     private static <T, B extends StatefulOptionBuilder<T>> B option(B builder, String translation,

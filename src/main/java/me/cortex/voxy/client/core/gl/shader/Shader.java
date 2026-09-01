@@ -2,7 +2,6 @@ package me.cortex.voxy.client.core.gl.shader;
 
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.util.ThreadUtils;
 import me.cortex.voxy.common.util.TrackedObject;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.system.MemoryStack;
@@ -135,7 +134,9 @@ public class Shader extends TrackedObject {
         private int compileToProgram() {
             int program = GL20C.glCreateProgram();
             int[] shaders = new int[this.sources.size()];
-            {
+            boolean[] attached = new boolean[shaders.length];
+            boolean complete = false;
+            try {
                 String defs = this.defines.entrySet().stream().map(a->"#define " + a.getKey() + " " + a.getValue() + "\n").collect(Collectors.joining());
                 int i = 0;
                 for (var entry : this.sources.entrySet()) {
@@ -152,24 +153,29 @@ public class Shader extends TrackedObject {
 
                     shaders[i++] = createShader(entry.getKey(), src);
                 }
-            }
 
-            for (int i : shaders) {
-                GL20C.glAttachShader(program, i);
+                for (int shaderIndex = 0; shaderIndex < shaders.length; shaderIndex++) {
+                    GL20C.glAttachShader(program, shaders[shaderIndex]);
+                    attached[shaderIndex] = true;
+                }
+                GL20C.glLinkProgram(program);
+                printProgramLinkLog(program);
+                verifyProgramLinked(program);
+                complete = true;
+                return program;
+            } finally {
+                for (int i = 0; i < shaders.length; i++) {
+                    if (shaders[i] == 0) continue;
+                    if (attached[i]) GL20C.glDetachShader(program, shaders[i]);
+                    GL20C.glDeleteShader(shaders[i]);
+                }
+                if (!complete) GL20C.glDeleteProgram(program);
             }
-            GL20C.glLinkProgram(program);
-            for (int i : shaders) {
-                GL20C.glDetachShader(program, i);
-                GL20C.glDeleteShader(i);
-            }
-            printProgramLinkLog(program);
-            verifyProgramLinked(program);
-            return program;
         }
 
         public T compile() {
             this.defineIf("IS_INTEL", Capabilities.INSTANCE.isIntel);
-            this.defineIf("IS_WINDOWS", ThreadUtils.isWindows);
+            this.defineIf("IS_WINDOWS", Capabilities.INSTANCE.isWindows);
             return this.constructor.apply(this, this.compileToProgram());
         }
 

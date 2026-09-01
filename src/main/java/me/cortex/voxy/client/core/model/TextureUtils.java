@@ -167,8 +167,6 @@ public class TextureUtils {
     private static float u2fdepth(int depth) {
         float depthF = (float) ((double) depth / ((1 << 24) - 1));
         //https://registry.khronos.org/OpenGL-Refpages/gl4/html/glDepthRange.xhtml
-        // due to this and the unsigned bullshit, believe the depth value needs to get multiplied by 2
-
         return depthF;
     }
 

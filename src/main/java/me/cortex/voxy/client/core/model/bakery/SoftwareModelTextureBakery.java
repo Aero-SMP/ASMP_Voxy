@@ -114,8 +114,7 @@ public class SoftwareModelTextureBakery {
             }
             @Override
             public int getBlockTint(BlockPos pos, ColorResolver colorResolver) {
-                //This is such a stupid and bad hack, we can inject tinting state here since this is called
-                // before the quad is added
+                // This callback runs before the quad is added, so it carries tinting state.
                 //TODO: need to make a quad once tinting thing
                 translucentVC.setDefaultMeta(translucentVC.getDefaultMeta()|4);//Tinting
                 opaqueVC.setDefaultMeta(opaqueVC.getDefaultMeta()|4);//Tinting
@@ -229,8 +228,7 @@ public class SoftwareModelTextureBakery {
             isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
             anyTranslucent |= !this.translucentVC.isEmpty();
             anyDiscard |= this.opaqueVC.anyDiscard;
-            if (!(this.opaqueVC.isEmpty() && this.translucentVC.isEmpty())) {// only render if there... is shit to
-                                                                             // render
+            if (!(this.opaqueVC.isEmpty() && this.translucentVC.isEmpty())) {
                 for (int i = 0; i < VIEWS.length; i++) {
                     this.rasterizer.setFaceCull(i == 1 || i == 2 || i == 4);
                     this.rasterizer.clear();

@@ -5,10 +5,10 @@ import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.rendering.Viewport;
-import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
-import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
-import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
-import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
+import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
+import me.cortex.voxy.client.core.rendering.hierarchical.NodeCleaner;
+import me.cortex.voxy.client.core.rendering.FullscreenBlit;
 import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
 

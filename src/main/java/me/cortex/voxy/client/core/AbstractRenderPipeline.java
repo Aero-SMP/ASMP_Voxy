@@ -2,11 +2,11 @@ package me.cortex.voxy.client.core;
 
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
-import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
-import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
-import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
-import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
-import me.cortex.voxy.client.core.rendering.section.backend.mdic.MDICSectionRenderer;
+import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
+import me.cortex.voxy.client.core.rendering.hierarchical.NodeCleaner;
+import me.cortex.voxy.client.core.rendering.FullscreenBlit;
+import me.cortex.voxy.client.core.rendering.section.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.common.util.TrackedObject;
@@ -89,6 +89,12 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         rs.buildDrawCalls(viewport);
         rs.renderTemporal(viewport);
 
+        // The conservative pass above guarantees a complete current-view cut.  Newly drawn
+        // temporal occluders are now present in this frame's Voxy depth target, so rebuild HZB
+        // and refine both the render cut and manifested object frontier authoritatively.
+        this.innerRefinementWork(viewport, this.fb.getDepthTex().id);
+        rs.buildDrawCalls(viewport);
+
         this.postOpaquePreTranslucent(viewport, sourceFrameBuffer);
 
         rs.renderTranslucent(viewport);
@@ -160,11 +166,18 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
         this.nodeManager.tick(this.traversal.getNodeBuffer(), this.nodeCleaner);
 
-        this.nodeCleaner.tick(this.traversal.getNodeBuffer());//Probably do this here??
+        this.nodeCleaner.tick();
 
         glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);
 
         this.traversal.doTraversal(viewport);
+    }
+
+    protected void innerRefinementWork(Viewport viewport, int currentFrameDepthTexture) {
+        viewport.refinedHiZBuffer.buildMipChain(currentFrameDepthTexture,
+                viewport.width, viewport.height);
+        glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);
+        this.traversal.doSecondPass(viewport);
     }
 
     @Override

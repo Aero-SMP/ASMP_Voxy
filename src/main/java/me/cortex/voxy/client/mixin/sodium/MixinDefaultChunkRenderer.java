@@ -2,7 +2,7 @@ package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
-import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.iris.IrisUtil;
 import net.caffeinemc.mods.sodium.client.gl.device.CommandList;
 import net.caffeinemc.mods.sodium.client.gl.device.RenderDevice;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;

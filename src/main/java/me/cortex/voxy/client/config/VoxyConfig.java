@@ -6,7 +6,6 @@ import com.google.gson.GsonBuilder;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.util.cpu.CpuLayout;
 
 import java.io.FileReader;
 import java.io.IOException;
@@ -16,6 +15,8 @@ import java.nio.file.Path;
 import java.util.Locale;
 
 public class VoxyConfig {
+    public static final int MIN_VIRTUAL_SURFACE_MEMORY_MIB = 256;
+    public static final int MAX_VIRTUAL_SURFACE_MEMORY_MIB = 4096;
     private static final Gson GSON = new GsonBuilder()
             .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .setPrettyPrinting()
@@ -27,14 +28,14 @@ public class VoxyConfig {
     public boolean enabled = true;
     public boolean enableRendering = true;
     public float sectionRenderDistance = 16;
-    public int serviceThreads = (int) Math.max(CpuLayout.getCoreCount()/1.5, 1);
     public float subDivisionSize = 64;
     public int skyFogDistance = 96;
     public float fogIntensity = 1.0f;
     public float fogDensity = 0.0f;
     public boolean adaptCloudDistance = true;
     public int cloudDistance = 0;
-    public boolean dontUseSodiumBuilderThreads = false;
+    /** One aggregate cap for all resident and in-flight Virtual Surface client data. */
+    public int virtualSurfaceMemoryMiB = 768;
 
     public String ssaoMode;
 
@@ -66,7 +67,7 @@ public class VoxyConfig {
                     Logger.error("Could not parse config", e);
                 }
             }
-            Logger.info("Config doesnt exist, creating new");
+            Logger.info("Config does not exist; creating it");
             var config = new VoxyConfig();
             config.save();
             return config;
@@ -80,7 +81,7 @@ public class VoxyConfig {
 
     public void save() {
         if (!VoxyClient.isAvailable()) {
-            Logger.info("Not saving config since voxy is unavalible");
+            Logger.info("Not saving config because Voxy is unavailable");
             return;
         }
 
@@ -97,5 +98,11 @@ public class VoxyConfig {
 
     public boolean isRenderingEnabled() {
         return VoxyClient.isAvailable() && this.enabled && this.enableRendering;
+    }
+
+    public long virtualSurfaceMemoryBytes() {
+        int bounded = Math.max(MIN_VIRTUAL_SURFACE_MEMORY_MIB,
+                Math.min(MAX_VIRTUAL_SURFACE_MEMORY_MIB, this.virtualSurfaceMemoryMiB));
+        return (long) bounded << 20;
     }
 }

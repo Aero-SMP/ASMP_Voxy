@@ -1,8 +1,8 @@
 package me.cortex.voxy.client.core.rendering;
 
 import me.cortex.voxy.client.core.gl.GlBuffer;
-import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
-import me.cortex.voxy.client.core.rendering.section.backend.mdic.MDICSectionRenderer;
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
+import me.cortex.voxy.client.core.rendering.section.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import net.minecraft.util.Mth;
@@ -12,6 +12,8 @@ import java.lang.reflect.Field;
 
 public final class Viewport {
     public final HiZBuffer hiZBuffer;
+    /** Current-frame occluder hierarchy used by the authoritative refinement pass. */
+    public final HiZBuffer refinedHiZBuffer;
     public final DepthFramebuffer depthBoundingBuffer = new DepthFramebuffer();
     public final GlBuffer drawCountCallBuffer = new GlBuffer(1024).zero();
     public final GlBuffer drawCallBuffer = new GlBuffer(5 * 4 * (MDICSectionRenderer.OPAQUE_DRAW_COUNT
@@ -56,11 +58,13 @@ public final class Viewport {
         this.frustumPlanes = planes;
 
         this.hiZBuffer = new HiZBuffer();
+        this.refinedHiZBuffer = new HiZBuffer();
         this.visibilityBuffer = new GlBuffer(maxSectionCount * 4L);
     }
 
     public final void delete() {
         this.hiZBuffer.free();
+        this.refinedHiZBuffer.free();
         this.depthBoundingBuffer.free();
         this.visibilityBuffer.free();
         this.indirectLookupBuffer.free();

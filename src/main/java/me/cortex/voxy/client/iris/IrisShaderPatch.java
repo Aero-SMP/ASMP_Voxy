@@ -342,7 +342,7 @@ public class IrisShaderPatch {
                 voxyPatchData = builder.toString();
             }
 
-            //Stupid chunk fade in patch (should probably just breaks
+            // Remove the chunk-fade marker before parsing the patch data.
             voxyPatchData = voxyPatchData.replaceAll("void _cfi_ignoreMarker\\(\\) \\{\\}", "");
 
             patchData = GSON.fromJson(voxyPatchData, PatchGson.class);

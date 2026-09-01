@@ -3,15 +3,41 @@ pub mod config;
 pub mod crc;
 pub mod key;
 pub mod lod;
-pub mod protocol;
 pub mod registry;
-pub mod scanner;
 pub mod server;
-pub mod store;
+pub mod surface;
 
-pub const FORMAT_VERSION: u16 = 3;
-pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_LOD: u8 = 4;
+
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> anyhow::Result<std::sync::MutexGuard<'_, T>> {
+    mutex.lock().map_err(|_| anyhow::anyhow!("mutex poisoned"))
+}
+
+pub fn read_lock<T>(
+    lock: &std::sync::RwLock<T>,
+) -> anyhow::Result<std::sync::RwLockReadGuard<'_, T>> {
+    lock.read()
+        .map_err(|_| anyhow::anyhow!("read lock poisoned"))
+}
+
+pub(crate) fn write_lock<T>(
+    lock: &std::sync::RwLock<T>,
+) -> anyhow::Result<std::sync::RwLockWriteGuard<'_, T>> {
+    lock.write()
+        .map_err(|_| anyhow::anyhow!("write lock poisoned"))
+}
+
+pub fn safe_dimension_name(name: &str) -> String {
+    let mut value = String::with_capacity(name.len() + 17);
+    for byte in name.bytes() {
+        // Escaping '_' prevents literal text from colliding with an encoded byte.
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' => value.push(byte as char),
+            _ => value.push_str(&format!("_{byte:02x}")),
+        }
+    }
+    value
+}
 
 pub(crate) fn take<'a>(input: &mut &'a [u8], count: usize) -> anyhow::Result<&'a [u8]> {
     if input.len() < count {
@@ -24,6 +50,10 @@ pub(crate) fn take<'a>(input: &mut &'a [u8], count: usize) -> anyhow::Result<&'a
 
 pub(crate) fn take_u16(input: &mut &[u8]) -> anyhow::Result<u16> {
     Ok(u16::from_le_bytes(take(input, 2)?.try_into().unwrap()))
+}
+
+pub(crate) fn take_u8(input: &mut &[u8]) -> anyhow::Result<u8> {
+    Ok(take(input, 1)?[0])
 }
 
 pub(crate) fn take_u32(input: &mut &[u8]) -> anyhow::Result<u32> {

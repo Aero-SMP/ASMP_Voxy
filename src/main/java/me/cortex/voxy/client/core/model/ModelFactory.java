@@ -10,8 +10,6 @@ import me.cortex.voxy.client.core.model.bakery.SoftwareModelTextureBakery;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
-import me.cortex.voxy.common.util.Pair;
-import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColor;
 import net.minecraft.client.renderer.RenderType;
@@ -37,6 +35,8 @@ import org.lwjgl.system.MemoryUtil;
 import java.lang.invoke.VarHandle;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static me.cortex.voxy.client.core.model.ModelStore.MODEL_SIZE;
@@ -74,6 +74,8 @@ public class ModelFactory {
             this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour);
         }
     }
+
+    private record BiomeModel(int modelId, BlockState state) {}
 
     private final Biome DEFAULT_BIOME = Minecraft.getInstance().level.registryAccess().lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS).value();
 
@@ -114,6 +116,7 @@ public class ModelFactory {
     //Provides a map from id -> model id as multiple ids might have the same internal model id
     private final int[] idMappings;
     private final Object2IntOpenHashMap<ModelEntry> modelTexture2id = new Object2IntOpenHashMap<>();
+    private final ModelEntry[] modelEntriesById = new ModelEntry[1 << 16];
 
     //Contains the set of all block ids that are currently inflight/being baked
     // this is required due to "async" nature of gpu feedback
@@ -121,20 +124,23 @@ public class ModelFactory {
     private final ReentrantLock blockStatesInFlightLock = new ReentrantLock();
 
     private final List<Biome> biomes = new ArrayList<>();
-    private final List<Pair<Integer, BlockState>> modelsRequiringBiomeColours = new ArrayList<>();
+    private final List<BiomeModel> modelsRequiringBiomeColours = new ArrayList<>();
 
-    private final Mapper mapper;
+    private final CatalogMapper mapper;
     private final ModelStore storage;
 
     private final ConcurrentLinkedDeque<BlockBake> bakeQueue = new ConcurrentLinkedDeque<>();
 
     private final ConcurrentLinkedDeque<ResultUploader> uploadResults = new ConcurrentLinkedDeque<>();
+    /** Models whose CPU metadata exists but whose renderer upload has not completed yet. */
+    private final Set<Integer> modelIdsPendingUpload = ConcurrentHashMap.newKeySet();
+    private final AtomicLong modelMappingPublication = new AtomicLong();
 
     private Object2IntMap<BlockState> customBlockStateIdMapping;
 
     //TODO: NOTE!!! is it worth even uploading as a 16x16 texture, since automatic lod selection... doing 8x8 textures might be perfectly ok!!!
     // this _quarters_ the memory requirements for the texture atlas!!! WHICH IS HUGE saving
-    public ModelFactory(Mapper mapper, ModelStore storage) {
+    public ModelFactory(CatalogMapper mapper, ModelStore storage) {
         this.mapper = mapper;
         this.storage = storage;
         this.bakery2 = new SoftwareModelTextureBakery();
@@ -292,8 +298,8 @@ public class ModelFactory {
         return !this.bakeQueue.isEmpty();
     }
 
-    private final ConcurrentLinkedDeque<Mapper.BiomeEntry> biomeQueue = new ConcurrentLinkedDeque<>();
-    public void addBiome(Mapper.BiomeEntry biome) {
+    private final ConcurrentLinkedDeque<CatalogMapper.BiomeEntry> biomeQueue = new ConcurrentLinkedDeque<>();
+    public void addBiome(CatalogMapper.BiomeEntry biome) {
         this.biomeQueue.add(biome);
     }
 
@@ -325,7 +331,10 @@ public class ModelFactory {
         glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         do {
+            int pendingModelId = upload instanceof ModelBakeResultUpload model
+                    ? model.modelId : -1;
             upload.upload(this.storage);
+            if (pendingModelId >= 0) this.modelIdsPendingUpload.remove(pendingModelId);
             upload.free();
             upload = this.uploadResults.poll();
         } while (upload != null);
@@ -421,6 +430,7 @@ public class ModelFactory {
             int possibleDuplicate = this.modelTexture2id.getInt(entry);
             if (possibleDuplicate != -1) {//Duplicate found
                 this.idMappings[blockId] = possibleDuplicate;
+                this.modelMappingPublication.incrementAndGet();
                 modelId = possibleDuplicate;
                 this.checkInFlight(blockId, true);
                 return null;
@@ -429,6 +439,7 @@ public class ModelFactory {
                 //NOTE: we set the mapping at the very end so that race conditions with this and getMetadata dont occur
                 //this.idMappings[blockId] = modelId;
                 this.modelTexture2id.put(entry, modelId);
+                this.modelEntriesById[modelId] = entry;
             }
         }
 
@@ -474,7 +485,7 @@ public class ModelFactory {
         boolean cullsSame = false;
 
         {
-            //TODO: Could also move this into the RenderDataFactory and do it on the actual blockstates instead of a guestimation
+            // Conservative alpha selection is finalized by the model-compatibility classifier.
             boolean allTrue = true;
             boolean allFalse = true;
             //Guestimation test for if the block culls itself
@@ -632,7 +643,7 @@ public class ModelFactory {
             //Populate the list of biomes for the model state
             int biomeIndex = this.modelsRequiringBiomeColours.size() * this.biomes.size();
             MemoryUtil.memPutInt(uploadPtr, biomeIndex);
-            this.modelsRequiringBiomeColours.add(new Pair<>(modelId, blockState));
+            this.modelsRequiringBiomeColours.add(new BiomeModel(modelId, blockState));
             if (!this.biomes.isEmpty()) {
                 uploadResult.biomeUploadIndex = biomeIndex;
                 long clrUploadPtr = (uploadResult.biomeUpload = new MemoryBuffer(4L * this.biomes.size())).address;
@@ -663,7 +674,11 @@ public class ModelFactory {
 
 
         //Set the mapping at the very end
+        if (!this.modelIdsPendingUpload.add(modelId)) {
+            throw new IllegalStateException("Model already awaits renderer upload: " + modelId);
+        }
         this.idMappings[blockId] = modelId;
+        this.modelMappingPublication.incrementAndGet();
 
         this.checkInFlight(blockId, true);
 
@@ -868,19 +883,19 @@ public class ModelFactory {
         int i = 0;
         long modelUpPtr = result.modelBiomeIndexPairs.address;
         for (var entry : this.modelsRequiringBiomeColours) {
-            var colourProvider = getColourProvider(entry.right().getBlock());
+            var colourProvider = getColourProvider(entry.state().getBlock());
             if (colourProvider == null) {
                 throw new IllegalStateException();
             }
             //Populate the list of biomes for the model state
             int biomeIndex = (i++) * this.biomes.size();
-            MemoryUtil.memPutLong(modelUpPtr, Integer.toUnsignedLong(entry.left())|(Integer.toUnsignedLong(biomeIndex)<<32));modelUpPtr+=8;
+            MemoryUtil.memPutLong(modelUpPtr, Integer.toUnsignedLong(entry.modelId())|(Integer.toUnsignedLong(biomeIndex)<<32));modelUpPtr+=8;
             long clrUploadPtr = result.biomeColourBuffer.address + biomeIndex * 4L;
             for (var biomeE : this.biomes) {
                 if (biomeE == null) {
                     continue;//If null, ignore
                 }
-                MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(colourProvider, entry.right(), biomeE)|0xFF000000); clrUploadPtr += 4;
+                MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(colourProvider, entry.state(), biomeE)|0xFF000000); clrUploadPtr += 4;
             }
         }
 
@@ -1022,14 +1037,10 @@ public class ModelFactory {
         return res;
     }
 
-    public int[] _unsafeRawAccess() {
-        return this.idMappings;
-    }
-
     public int getModelId(int blockId) {
         int map = this.idMappings[blockId];
         if (map == -1) {
-            throw new IdNotYetComputedException(blockId, true);
+            throw new IllegalStateException("Model ID has not been computed for block " + blockId);
         }
         return map;
     }
@@ -1038,16 +1049,53 @@ public class ModelFactory {
         return this.idMappings[blockId] != -1;
     }
 
+    /** True only after both model baking and its renderer-buffer upload have completed. */
+    public boolean isModelReadyForBlockId(int blockId) {
+        this.modelMappingPublication.get();
+        int modelId = this.idMappings[blockId];
+        return modelId != -1 && !this.modelIdsPendingUpload.contains(modelId);
+    }
+
     public int getFluidClientStateId(int clientBlockStateId) {
         int map = this.fluidStateLUT[clientBlockStateId];
         if (map == -1) {
-            throw new IdNotYetComputedException(clientBlockStateId, false);
+            throw new IllegalStateException(
+                    "Fluid model ID has not been computed for state " + clientBlockStateId);
         }
         return map;
     }
 
     public final long getModelMetadataFromClientId(int clientId) {
         return this.metadataCache[clientId];
+    }
+
+    /** Stable baked texture/template contribution used by the compiled-geometry identity. */
+    public long getModelResourceFingerprint(int clientId) {
+        if (clientId < 0 || clientId >= this.modelEntriesById.length) {
+            throw new IllegalArgumentException("model id is outside the renderer format");
+        }
+        ModelEntry entry = this.modelEntriesById[clientId];
+        if (entry == null) return 0;
+        long hash = 0x9e3779b97f4a7c15L;
+        hash = mixFingerprint(hash, entry.down());
+        hash = mixFingerprint(hash, entry.up());
+        hash = mixFingerprint(hash, entry.north());
+        hash = mixFingerprint(hash, entry.south());
+        hash = mixFingerprint(hash, entry.west());
+        hash = mixFingerprint(hash, entry.east());
+        hash ^= Integer.toUnsignedLong(entry.fluidBlockStateId()) * 0xd6e8feb86659fd93L;
+        hash = Long.rotateLeft(hash, 23)
+                ^ Integer.toUnsignedLong(entry.tintingColour()) * 0xa0761d6478bd642fL;
+        hash ^= hash >>> 29;
+        hash *= 0x94d049bb133111ebL;
+        return hash ^ hash >>> 31;
+    }
+
+    private static long mixFingerprint(long hash, ColourDepthTextureData texture) {
+        long value = Integer.toUnsignedLong(texture.hash())
+                | (long) texture.width() << 32 | (long) texture.height() << 48;
+        hash ^= value * 0x9e3779b185ebca87L;
+        return Long.rotateLeft(hash, 27) * 0xc2b2ae3d27d4eb4fL;
     }
 
 

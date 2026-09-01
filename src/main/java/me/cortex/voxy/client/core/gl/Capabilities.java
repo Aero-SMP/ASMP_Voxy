@@ -6,6 +6,7 @@ import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.system.Platform;
 
 import java.util.Locale;
 
@@ -28,14 +29,10 @@ public class Capabilities {
     public static final Capabilities INSTANCE = new Capabilities();
 
     public final boolean repFragTest;
-    public final boolean meshShaders;
-    public final boolean INT64_t;
     public final long ssboMaxSize;
     public final int ssboBindingAlignment;
-    public final boolean isMesa;
     public final boolean canQueryGpuMemory;
     public final long totalDedicatedMemory;//Bytes, dedicated memory
-    public final long totalDynamicMemory;//Bytes, total allocation memory - dedicated memory
     public final boolean compute;
     public final boolean indirectParameters;
     public final boolean isIntel;
@@ -43,7 +40,8 @@ public class Capabilities {
     public final boolean sparseBuffer;
     public final boolean isNvidia;
     public final boolean isAmd;
-    public final boolean nvBarryCoords;
+    public final boolean isWindows;
+    public final boolean isLinux;
     public final boolean hasBrokenDepthSampler;
 
     public Capabilities() {
@@ -52,18 +50,7 @@ public class Capabilities {
         this.compute = cap.glDispatchComputeIndirect != 0;
         this.indirectParameters = cap.glMultiDrawElementsIndirectCountARB != 0;
         this.repFragTest = cap.GL_NV_representative_fragment_test;
-        this.meshShaders = cap.GL_NV_mesh_shader;
         this.canQueryGpuMemory = cap.GL_NVX_gpu_memory_info;
-        //this.INT64_t = cap.GL_ARB_gpu_shader_int64 || cap.GL_AMD_gpu_shader_int64;
-        //The only reliable way to test for int64 support is to try compile a shader
-        this.INT64_t = testShaderCompilesOk(ShaderType.COMPUTE, """
-                #version 430
-                #extension GL_ARB_gpu_shader_int64 : require
-                layout(local_size_x=32) in;
-                void main() {
-                    uint64_t a = 1234;
-                }
-                """);
         if (cap.GL_KHR_shader_subgroup) {
             this.subgroup = testShaderCompilesOk(ShaderType.COMPUTE, """
                 #version 430
@@ -81,21 +68,18 @@ public class Capabilities {
         this.ssboMaxSize = glGetInteger64(GL_MAX_SHADER_STORAGE_BLOCK_SIZE);
         this.ssboBindingAlignment = glGetInteger(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT);
 
-        this.isMesa = glGetString(GL_VERSION).toLowerCase(Locale.ROOT).contains("mesa");
         var vendor = glGetString(GL_VENDOR).toLowerCase(Locale.ROOT);
         this.isIntel = vendor.contains("intel");
         this.isNvidia = vendor.contains("nvidia");
         this.isAmd = vendor.contains("amd")||vendor.contains("radeon");
+        this.isWindows = Platform.get() == Platform.WINDOWS;
+        this.isLinux = Platform.get() == Platform.LINUX;
 
         if (this.canQueryGpuMemory) {
             this.totalDedicatedMemory = glGetInteger64(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX)*1024;//Since its in Kb
-            this.totalDynamicMemory = (glGetInteger64(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX)*1024) - this.totalDedicatedMemory;//Since its in Kb
         } else {
             this.totalDedicatedMemory = -1;
-            this.totalDynamicMemory = -1;
         }
-
-        this.nvBarryCoords = cap.GL_NV_fragment_shader_barycentric;
 
         if (this.compute&&this.isAmd) {
             this.hasBrokenDepthSampler = testDepthSampler();

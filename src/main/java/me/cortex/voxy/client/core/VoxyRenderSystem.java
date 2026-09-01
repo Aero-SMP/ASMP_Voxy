@@ -6,22 +6,37 @@ import com.mojang.blaze3d.systems.RenderSystem;
 
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
+import me.cortex.voxy.client.core.model.CatalogModelCompatibility;
 import me.cortex.voxy.client.core.rendering.ChunkBoundRenderer;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.Viewport;
-import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
-import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
-import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
-import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
-import me.cortex.voxy.client.core.rendering.section.backend.mdic.MDICSectionRenderer;
-import me.cortex.voxy.client.core.rendering.section.geometry.BasicSectionGeometryData;
+import me.cortex.voxy.client.core.rendering.building.BuiltSection;
+import me.cortex.voxy.client.core.rendering.building.CpuMicrotileMesher;
+import me.cortex.voxy.client.core.rendering.building.GeometryMerger;
+import me.cortex.voxy.client.core.rendering.building.GpuMicrotileMesher;
+import me.cortex.voxy.client.core.rendering.building.HybridMeshingDispatcher;
+import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
+import me.cortex.voxy.client.core.rendering.hierarchical.NodeCleaner;
+import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
+import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
+import me.cortex.voxy.client.core.rendering.selection.SelectionTelemetry;
+import me.cortex.voxy.client.core.rendering.section.MDICSectionRenderer;
+import me.cortex.voxy.client.core.rendering.section.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.iris.IrisUtil;
+import me.cortex.voxy.client.lod.MicrotileActivationManager;
+import me.cortex.voxy.client.lod.CatalogCodec;
+import me.cortex.voxy.client.lod.CompiledGeometryCache;
+import me.cortex.voxy.client.lod.ContentPipeline;
+import me.cortex.voxy.client.lod.MemoryBudget;
+import me.cortex.voxy.client.lod.ManifestCodec.SpatialNode;
+import me.cortex.voxy.client.lod.RootDemandPlan;
+import me.cortex.voxy.client.lod.ClientLodClient;
 import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.thread.ServiceManager;
-import me.cortex.voxy.common.world.WorldEngine;
+import me.cortex.voxy.client.core.model.CatalogMapper;
 import net.irisshaders.iris.Iris;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
@@ -29,7 +44,12 @@ import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
 
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.lwjgl.opengl.GL11.GL_VIEWPORT;
 import static org.lwjgl.opengl.GL11.glEnable;
@@ -45,23 +65,286 @@ import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
 
 public class VoxyRenderSystem {
-    private final WorldEngine worldIn;
+    private static final int VIRTUAL_SURFACE_CACHE_ENTRIES = 4096;
+
+    private final CatalogMapper mapper;
+    private ModelBakerySubsystem modelService;
+    private BasicSectionGeometryData geometryData;
+    private AsyncNodeManager nodeManager;
+    private final AtomicLong virtualSurfaceRevision = new AtomicLong(1);
+
+    /** The renderer-local translation table populated exclusively from the catalog. */
+    public CatalogMapper getMapper() {
+        return this.mapper;
+    }
+
+    /** Publishes one immutable manifest/residency snapshot to the render-thread GPU cut. */
+    public void publishSelectionManifest(SelectionManifest manifest) {
+        this.traversal.publishSelectionManifest(manifest);
+    }
+
+    public void clearSelectionManifest(long generation, long snapshotId) {
+        this.traversal.clearSelectionManifest(generation, snapshotId);
+    }
+
+    public void updateSelectionTelemetry(SelectionTelemetry telemetry) {
+        this.traversal.updateSelectionTelemetry(telemetry);
+    }
+
+    public SelectionBatch pollSelectionBatch() {
+        return this.traversal.pollSelectionBatch();
+    }
+
+    /** Direct publication bridge for final microtile geometry. */
+    public MicrotileActivationManager.RendererBridge virtualSurfaceRendererBridge() {
+        return new MicrotileActivationManager.RendererBridge() {
+            @Override
+            public MicrotileActivationManager.Publication publishAtomically(
+                    SpatialNode node, BuiltSection geometry,
+                    Optional<MicrotileActivationManager.Publication> previous) {
+                return publishVirtualSurface(node, geometry, previous);
+            }
+
+            @Override
+            public MicrotileActivationManager.Publication removeAtomically(
+                    SpatialNode node, MicrotileActivationManager.Publication previous) {
+                return removeVirtualSurface(node, previous);
+            }
+        };
+    }
+
+    /** Creates the connection-lifetime activation owner; callers must retain it across roots. */
+    public MicrotileActivationManager createVirtualSurfaceActivationManager(
+            MemoryBudget memory) {
+        Objects.requireNonNull(memory, "memory");
+        if (!RenderSystem.isOnRenderThread()) {
+            throw new IllegalStateException(
+                    "Virtual Surface GPU resources must be created on the render thread");
+        }
+        this.traversal.bindVirtualSurfaceMemory(memory);
+        CompiledGeometryCache cache = new CompiledGeometryCache(memory,
+                VIRTUAL_SURFACE_CACHE_ENTRIES);
+        try {
+            HybridMeshingDispatcher dispatcher = new HybridMeshingDispatcher(
+                    new GpuMicrotileMesher(this.modelService.factory,
+                            Minecraft.getInstance()::execute, memory),
+                    new CpuMicrotileMesher(this.modelService.factory),
+                    new GeometryMerger(), cache);
+            return new MicrotileActivationManager(memory, dispatcher,
+                    virtualSurfaceRendererBridge());
+        } catch (RuntimeException | Error failure) {
+            cache.close();
+            this.traversal.unbindVirtualSurfaceMemory(memory);
+            throw failure;
+        }
+    }
+
+    public void releaseVirtualSurfaceMemory(MemoryBudget memory) {
+        this.traversal.unbindVirtualSurfaceMemory(Objects.requireNonNull(memory, "memory"));
+    }
+
+    /** Captures catalog authority and the current renderer/model resource identity. */
+    public CatalogModelCompatibility createVirtualSurfaceModelCompatibility(
+            CatalogCodec.Catalog catalog,
+            ContentPipeline.CatalogMappings mappings) {
+        Objects.requireNonNull(catalog, "catalog");
+        Objects.requireNonNull(mappings, "mappings");
+        if (catalog.catalogId() != mappings.catalogId()) {
+            throw new IllegalArgumentException("catalog mappings belong to another catalog");
+        }
+        int[] blocks = mappings.blocks();
+        if (!virtualSurfaceModelsReady(blocks)) {
+            throw new IllegalStateException(
+                    "Virtual Surface model compatibility is still waiting for catalog bakes");
+        }
+        return CatalogModelCompatibility.create(catalog, blocks, mappings.biomes(),
+                this.modelService.factory);
+    }
+
+    /** Requests every local model named by a catalog without classifying an unfinished bake. */
+    public void requestVirtualSurfaceModelBakes(int[] localBlockIds) {
+        Objects.requireNonNull(localBlockIds, "localBlockIds");
+        for (int block : localBlockIds) {
+            if (block > 0 && !this.modelService.factory.hasModelForBlockId(block)) {
+                this.modelService.requestBlockBake(block);
+            }
+        }
+    }
+
+    /** Main-thread readiness barrier for the immutable resource/model compatibility identity. */
+    public boolean virtualSurfaceModelsReady(int[] localBlockIds) {
+        Objects.requireNonNull(localBlockIds, "localBlockIds");
+        for (int block : localBlockIds) {
+            if (block > 0 && !this.modelService.factory.isModelReadyForBlockId(block)) return false;
+        }
+        return true;
+    }
+
+    private MicrotileActivationManager.Publication publishVirtualSurface(
+            SpatialNode node, BuiltSection geometry,
+            Optional<MicrotileActivationManager.Publication> previous) {
+        long position = RootDemandPlan.sectionKey(node);
+        if (geometry.position != position) {
+            throw new IllegalArgumentException("microtile geometry is bound to the wrong node");
+        }
+        VirtualSurfacePublication previousPublication = previous
+                .map(value -> requireVirtualSurfacePublication(position, value))
+                .orElse(null);
+        return queueVirtualSurface(position, geometry, previousPublication, false);
+    }
+
+    private MicrotileActivationManager.Publication removeVirtualSurface(
+            SpatialNode node, MicrotileActivationManager.Publication previous) {
+        Objects.requireNonNull(node, "node");
+        long position = RootDemandPlan.sectionKey(node);
+        VirtualSurfacePublication publication = requireVirtualSurfacePublication(
+                position, previous);
+        BuiltSection empty = BuiltSection.emptyWithChildren(position,
+                publication.children);
+        return queueVirtualSurface(position, empty, publication, true);
+    }
+
+    private VirtualSurfacePublication queueVirtualSurface(
+            long position, BuiltSection geometry, VirtualSurfacePublication previous,
+            boolean removal) {
+        long revision = this.virtualSurfaceRevision.getAndIncrement();
+        if (revision <= 0) throw new IllegalStateException("virtual-surface revision exhausted");
+        BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
+                geometry.aabb, geometry.geometryBuffer, geometry.offsets);
+        VirtualSurfacePublication publication = new VirtualSurfacePublication(
+                this.nodeManager, position, revision, geometry.childExistence, removal);
+        long previousRevision = previous == null ? -1 : previous.revision;
+        this.nodeManager.publishVirtualSurface(queued, previousRevision, () ->
+                this.nodeManager.finalizeStagedRoot(revision, () -> {
+                    publication.activated.set(true);
+                    if (previous != null) previous.markSafeToRelease();
+                    if (removal) publication.markSafeToRelease();
+                    publication.finishCloseIfRequested();
+                }, publication::failAndRollback), publication::failAndRollback);
+        return publication;
+    }
+
+    private VirtualSurfacePublication requireVirtualSurfacePublication(
+            long position, MicrotileActivationManager.Publication value) {
+        if (!(Objects.requireNonNull(value, "previous")
+                instanceof VirtualSurfacePublication publication)
+                || publication.position != position) {
+            throw new IllegalArgumentException(
+                    "replacement publication belongs to another renderer");
+        }
+        if (!publication.activationFencePassed() || publication.retired.get()) {
+            throw new IllegalStateException("publication is not an active renderer surface");
+        }
+        return publication;
+    }
+
+    private final class VirtualSurfacePublication
+            implements MicrotileActivationManager.Publication {
+        private final AsyncNodeManager renderer;
+        private final long position;
+        private final long revision;
+        private final byte children;
+        private final boolean removal;
+        private final AtomicBoolean activated = new AtomicBoolean();
+        private final AtomicBoolean retired = new AtomicBoolean();
+        private final AtomicBoolean closeRequested = new AtomicBoolean();
+        private final AtomicBoolean removalQueued = new AtomicBoolean();
+        private final AtomicBoolean failureRecoveryQueued = new AtomicBoolean();
+        private final ArrayDeque<Runnable> safeReleases = new ArrayDeque<>();
+        private volatile Throwable failure;
+
+        private VirtualSurfacePublication(AsyncNodeManager renderer, long position,
+                                          long revision, byte children, boolean removal) {
+            this.renderer = renderer;
+            this.position = position;
+            this.revision = revision;
+            this.children = children;
+            this.removal = removal;
+        }
+
+        @Override
+        public boolean activationFencePassed() {
+            return this.activated.get() && this.failure == null;
+        }
+
+        @Override
+        public Optional<Throwable> activationFailure() {
+            return Optional.ofNullable(this.failure);
+        }
+
+        @Override
+        public boolean retirementFencePassed() {
+            return this.retired.get();
+        }
+
+        @Override
+        public void releaseWhenSafe(Runnable release) {
+            Objects.requireNonNull(release, "release");
+            synchronized (this.safeReleases) {
+                if (!this.retired.get() && this.failure == null) {
+                    this.safeReleases.addLast(release);
+                    return;
+                }
+            }
+            release.run();
+        }
+
+        @Override
+        public void close() {
+            this.closeRequested.set(true);
+            finishCloseIfRequested();
+        }
+
+        private void finishCloseIfRequested() {
+            if (!this.closeRequested.get() || this.failure != null || !this.activated.get()
+                    || this.retired.get() || this.removal
+                    || !this.removalQueued.compareAndSet(false, true)) return;
+            BuiltSection empty = BuiltSection.emptyWithChildren(this.position, this.children);
+            queueVirtualSurface(this.position, empty, this, true);
+        }
+
+        /**
+         * A failed upload/fence must restore the retained old pointer before the failure becomes
+         * externally actionable. NodeManager rollback is idempotent for failures that happened
+         * before staging, so every asynchronous failure can use the same path.
+         */
+        private void failAndRollback(Throwable primary) {
+            Objects.requireNonNull(primary, "primary");
+            if (!this.failureRecoveryQueued.compareAndSet(false, true)) return;
+            this.renderer.rollbackStagedRoot(this.revision,
+                    () -> this.recordFailure(primary, null),
+                    rollback -> this.recordFailure(primary, rollback));
+        }
+
+        private void recordFailure(Throwable primary, Throwable rollback) {
+            if (rollback != null && rollback != primary) primary.addSuppressed(rollback);
+            this.failure = primary;
+            markSafeToRelease();
+            this.finishCloseIfRequested();
+        }
+
+        private void markSafeToRelease() {
+            ArrayDeque<Runnable> releases;
+            synchronized (this.safeReleases) {
+                this.retired.set(true);
+                if (this.safeReleases.isEmpty()) return;
+                releases = new ArrayDeque<>(this.safeReleases);
+                this.safeReleases.clear();
+            }
+            for (Runnable release : releases) release.run();
+        }
+    }
+
+    private NodeCleaner nodeCleaner;
+    private HierarchicalOcclusionTraverser traversal;
 
 
-    private final ModelBakerySubsystem modelService;
-    private final RenderGenerationService renderGen;
-    private final BasicSectionGeometryData geometryData;
-    private final AsyncNodeManager nodeManager;
-    private final NodeCleaner nodeCleaner;
-    private final HierarchicalOcclusionTraverser traversal;
+    private RenderDistanceTracker renderDistanceTracker;
+    public ChunkBoundRenderer chunkBoundRenderer;
 
+    private Viewport viewport;
 
-    private final RenderDistanceTracker renderDistanceTracker;
-    public final ChunkBoundRenderer chunkBoundRenderer;
-
-    private final Viewport viewport;
-
-    private final AbstractRenderPipeline pipeline;
+    private AbstractRenderPipeline pipeline;
 
     // Fog parameters captured before modification by MixinFogRenderer, for Voxy's own fog pass
     private float capturedFogStart;
@@ -78,10 +361,8 @@ public class VoxyRenderSystem {
     public float getCapturedFogEnd()   { return this.capturedFogEnd; }
     public float[] getCapturedFogColor() { return this.capturedFogColor; }
 
-    public VoxyRenderSystem(WorldEngine world, ServiceManager sm) {
-        //Keep the world loaded, NOTE: this is done FIRST, to keep and ensure that even if the rest of loading takes more
-        // than timeout, we keep the world acquired
-        world.acquireRef();
+    public VoxyRenderSystem(CatalogMapper mapper) {
+        this.mapper = Objects.requireNonNull(mapper, "mapper");
         Logger.info("Creating Voxy render system");
 
         if (Minecraft.getInstance().options.renderDistance().get()<3) {
@@ -100,22 +381,17 @@ public class VoxyRenderSystem {
             //wait for opengl to be finished, this should hopefully ensure all memory allocations are free
             glFinish();
 
-            this.worldIn = world;
-
             {
-                this.modelService = new ModelBakerySubsystem(world.getMapper());
-                this.renderGen = new RenderGenerationService(world, this.modelService, sm);
+                this.modelService = new ModelBakerySubsystem(this.mapper);
 
                 this.geometryData = new BasicSectionGeometryData(1<<20, RenderResourceReuse.getOrCreateGeometryBuffer());
 
-                this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen);
+                this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData);
                 this.nodeCleaner = new NodeCleaner(this.nodeManager);
-                this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner, this.renderGen);
+                this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner);
 
-                world.setDirtyCallback(this.nodeManager::worldEvent);
-
-                Arrays.stream(world.getMapper().getBiomeEntries()).forEach(this.modelService::addBiome);
-                world.getMapper().setBiomeCallback(this.modelService::addBiome);
+                Arrays.stream(this.mapper.getBiomeEntries()).forEach(this.modelService::addBiome);
+                this.mapper.setBiomeCallback(this.modelService::addBiome);
 
                 this.nodeManager.start();
             }
@@ -154,8 +430,14 @@ public class VoxyRenderSystem {
                 this.renderDistanceTracker = new RenderDistanceTracker(40,
                         minSec,
                         maxSec,
-                        this.nodeManager::addTopLevel,
-                        this.nodeManager::removeTopLevel);
+                        position -> {
+                            this.nodeManager.addTopLevel(position);
+                            ClientLodClient.metadataRootEntered(position);
+                        },
+                        position -> {
+                            ClientLodClient.metadataRootLeft(position);
+                            this.nodeManager.removeTopLevel(position);
+                        });
 
                 this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
             }
@@ -163,19 +445,18 @@ public class VoxyRenderSystem {
             this.chunkBoundRenderer = new ChunkBoundRenderer(this.pipeline);
 
             Logger.info("Voxy render system created with " + this.geometryData.getGeometryCapacityBytes() + " geometry capacity, using pipeline '" + this.pipeline.getClass().getSimpleName() + "' with renderer '" + sectionRenderer.getClass().getSimpleName() + "'");
-        } catch (RuntimeException e) {
-            world.releaseRef();//If something goes wrong, we must release the world first
-            throw e;
-        }
-
-        for (int i = 0; i < oldBufferBindings.length; i++) {
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, oldBufferBindings[i]);
-        }
-
-        for (int i = 0; i < 12; i++) {
-            GlStateManager._activeTexture(GlConst.GL_TEXTURE0+i);
-            GlStateManager._bindTexture(0);
-            glBindSampler(i, 0);
+        } catch (RuntimeException | Error failure) {
+            this.releaseComponents(failure);
+            throw failure;
+        } finally {
+            for (int i = 0; i < oldBufferBindings.length; i++) {
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, oldBufferBindings[i]);
+            }
+            for (int i = 0; i < 12; i++) {
+                GlStateManager._activeTexture(GlConst.GL_TEXTURE0+i);
+                GlStateManager._bindTexture(0);
+                glBindSampler(i, 0);
+            }
         }
     }
 
@@ -266,7 +547,7 @@ public class VoxyRenderSystem {
 
             this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);
             //Done here as is allows less gl state resetup
-            this.modelService.tick(900_000);
+            this.modelService.tick();
         }
 
         glBindFramebuffer(GlConst.GL_FRAMEBUFFER, oldFB);
@@ -333,38 +614,52 @@ public class VoxyRenderSystem {
         Logger.info("Flushing download stream");
         DownloadStream.INSTANCE.flushWaitClear();
         Logger.info("Shutting down rendering");
-        try {
-            //Cleanup callbacks
-            this.worldIn.setDirtyCallback(null);
-            this.worldIn.getMapper().setBiomeCallback(null);
-            this.worldIn.getMapper().setStateCallback(null);
-
-            this.nodeManager.stop();
-
-            this.modelService.shutdown();
-            this.renderGen.shutdown();
-            this.traversal.free();
-            this.nodeCleaner.free();
-            this.geometryData.free();
-            if (((BasicSectionGeometryData)this.geometryData).isExternalGeometryBuffer) {
-                RenderResourceReuse.giveBackGeometryBuffer(((BasicSectionGeometryData)this.geometryData).getGeometryBuffer());
-            }
-
-            this.chunkBoundRenderer.free();
-
-            this.viewport.delete();
-        } catch (Exception e) {Logger.error("Error shutting down renderer components", e);}
-        Logger.info("Shutting down render pipeline");
-        try {this.pipeline.free();} catch (Exception e){Logger.error("Error releasing render pipeline", e);}
-
-
+        this.releaseComponents(null);
 
         Logger.info("Flushing download stream");
         DownloadStream.INSTANCE.flushWaitClear();
-
-        //Release hold on the world
-        this.worldIn.releaseRef();
         Logger.info("Render shutdown completed");
+    }
+
+    /** Releases both fully initialized and constructor-partial renderer state exactly once. */
+    private void releaseComponents(Throwable constructionFailure) {
+        release("biome callback", () -> this.mapper.setBiomeCallback(null), constructionFailure);
+        AsyncNodeManager nodes = this.nodeManager;
+        this.nodeManager = null;
+        if (nodes != null) release("node manager", nodes::stop, constructionFailure);
+        ModelBakerySubsystem models = this.modelService;
+        this.modelService = null;
+        if (models != null) release("model bakery", models::shutdown, constructionFailure);
+        HierarchicalOcclusionTraverser traverser = this.traversal;
+        this.traversal = null;
+        if (traverser != null) release("hierarchy traversal", traverser::free, constructionFailure);
+        NodeCleaner cleaner = this.nodeCleaner;
+        this.nodeCleaner = null;
+        if (cleaner != null) release("node cleaner", cleaner::free, constructionFailure);
+        BasicSectionGeometryData geometry = this.geometryData;
+        this.geometryData = null;
+        if (geometry != null) release("geometry data", () -> {
+            geometry.free();
+            RenderResourceReuse.giveBackGeometryBuffer(geometry.getGeometryBuffer());
+        }, constructionFailure);
+        ChunkBoundRenderer bounds = this.chunkBoundRenderer;
+        this.chunkBoundRenderer = null;
+        if (bounds != null) release("chunk bounds", bounds::free, constructionFailure);
+        Viewport oldViewport = this.viewport;
+        this.viewport = null;
+        if (oldViewport != null) release("viewport", oldViewport::delete, constructionFailure);
+        AbstractRenderPipeline oldPipeline = this.pipeline;
+        this.pipeline = null;
+        if (oldPipeline != null) release("render pipeline", oldPipeline::free, constructionFailure);
+    }
+
+    private static void release(String component, Runnable action, Throwable constructionFailure) {
+        try {
+            action.run();
+        } catch (RuntimeException | Error cleanupFailure) {
+            if (constructionFailure != null) constructionFailure.addSuppressed(cleanupFailure);
+            else Logger.error("Error releasing " + component, cleanupFailure);
+        }
     }
 
 }

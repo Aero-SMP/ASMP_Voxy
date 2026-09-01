@@ -9,7 +9,11 @@ public class GlFence extends TrackedObject {
     private boolean signaled;
 
     public GlFence() {
-        this.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        long value = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (value == 0) {
+            throw new IllegalStateException("OpenGL failed to create a GPU fence");
+        }
+        this.fence = value;
     }
 
     public boolean signaled() {

@@ -29,24 +29,12 @@ public abstract class ModelQueries {
         return ((metadata>>(8*6))&8) != 0;
     }
 
-    public static long _containsFluid(long metadata) {
-        return ((metadata>>(8*6+3))&1L);
-    }
-
     public static boolean isFluid(long metadata) {
         return ((metadata>>(8*6))&16) != 0;
     }
 
-    public static long _isFluid(long metadata) {
-        return ((metadata>>(8*6+4))&1L);
-    }
-
     public static boolean isBiomeColoured(long metadata) {
         return ((metadata>>(8*6))&1L) != 0;
-    }
-
-    public static long _notIsBiomeColoured(long metadata) {
-        return (((~metadata)>>(8*6))&1L);
     }
 
     //NOTE: this might need to be moved to per face
@@ -56,10 +44,6 @@ public abstract class ModelQueries {
 
     public static boolean isFullyOpaque(long metadata) {
         return ((metadata>>(8*6))&64) != 0;
-    }
-
-    public static long _isFullyOpaque(long metadata) {
-        return ((metadata>>(8*6+6))&1L);
     }
 
     public static long lightEmission(long meta) {

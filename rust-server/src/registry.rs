@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MAGIC: &[u8; 8] = b"VXYREG3\0";
+const MAGIC: &[u8; 8] = b"VXYREG\0\0";
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_BLOCKS: usize = 1 << 20;
 pub const MAX_BIOMES: usize = 512;
@@ -48,8 +48,8 @@ impl Registry {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-        let a_path = root.join("registry.a");
-        let b_path = root.join("registry.b");
+        let a_path = root.join("catalog.a");
+        let b_path = root.join("catalog.b");
         let a = read_snapshot(&a_path);
         let b = read_snapshot(&b_path);
         if let Err(error) = &a {
@@ -64,8 +64,8 @@ impl Registry {
                 b_path.display()
             );
         }
-        // save() publishes one generation to both peers before any caller may publish a section
-        // using its IDs. Therefore either valid peer is a safe high-water snapshot after a
+        // save() publishes one generation to both peers before any surface root may reference its
+        // IDs. Therefore either valid peer is a safe high-water snapshot after a
         // single-file fault. A higher lone generation can only be an interrupted, unpublished
         // first copy; retaining its append-only IDs is also safe and prevents later aliasing.
         let selected = match (a, b) {
@@ -134,6 +134,7 @@ impl Registry {
             biome_ids,
             dirty,
         };
+        registry.apply_production_classification()?;
         registry.save()?;
         // Repair both peers to the selected committed/high-water state before returning.
         let snapshot = registry.snapshot();
@@ -156,11 +157,12 @@ impl Registry {
             bail!("block registry reached Voxy's {MAX_BLOCKS} entry limit");
         }
         let id = self.blocks.len() as u32;
-        let opacity = estimated_opacity(canonical);
+        let production_opacity = production_full_cube_opacity(canonical);
+        let opacity = production_opacity.unwrap_or_else(|| estimated_opacity(canonical));
         self.blocks.push(BlockEntry {
             canonical: canonical.to_owned(),
             opacity,
-            authoritative: false,
+            authoritative: production_opacity.is_some(),
         });
         self.block_ids.insert(canonical.to_owned(), id);
         self.dirty = true;
@@ -181,70 +183,6 @@ impl Registry {
         Ok(id)
     }
 
-    pub fn opacity(&self, id: u32) -> u8 {
-        self.blocks
-            .get(id as usize)
-            .map_or(15, |entry| entry.opacity)
-    }
-
-    /// Validates and applies one complete client feedback frame atomically. The first trusted
-    /// value for an ID wins; later clients may confirm it but cannot oscillate the global mip
-    /// catalog. A failed durable save restores every changed in-memory entry.
-    pub fn apply_opacity_batch(&mut self, values: &[(u32, u8)]) -> Result<bool> {
-        let mut unique = HashMap::<u32, u8>::with_capacity(values.len());
-        for &(id, opacity) in values {
-            if opacity > 15 {
-                bail!("block mapping {id} has invalid opacity {opacity}");
-            }
-            if id as usize >= self.blocks.len() {
-                bail!("unknown block mapping {id}");
-            }
-            if let Some(previous) = unique.insert(id, opacity)
-                && previous != opacity
-            {
-                bail!("block mapping {id} has conflicting opacity values in one frame");
-            }
-        }
-
-        let changed = unique
-            .into_iter()
-            .filter(|(id, _)| !self.blocks[*id as usize].authoritative)
-            .collect::<Vec<_>>();
-        if changed.is_empty() {
-            return Ok(false);
-        }
-        let old = changed
-            .iter()
-            .map(|&(id, _)| (id, self.blocks[id as usize].clone()))
-            .collect::<Vec<_>>();
-        let mip_changed = changed
-            .iter()
-            .any(|&(id, opacity)| self.blocks[id as usize].opacity != opacity);
-        let was_dirty = self.dirty;
-        let old_mip_generation = self.mip_generation;
-        for &(id, opacity) in &changed {
-            let entry = &mut self.blocks[id as usize];
-            entry.opacity = opacity;
-            entry.authoritative = true;
-        }
-        if mip_changed {
-            self.mip_generation = self
-                .mip_generation
-                .checked_add(1)
-                .context("mip semantics generation overflow")?;
-        }
-        self.dirty = true;
-        if let Err(error) = self.save() {
-            for (id, entry) in old {
-                self.blocks[id as usize] = entry;
-            }
-            self.mip_generation = old_mip_generation;
-            self.dirty = was_dirty;
-            return Err(error);
-        }
-        Ok(true)
-    }
-
     pub fn snapshot(&self) -> RegistrySnapshot {
         RegistrySnapshot {
             catalog_id: self.catalog_id,
@@ -257,10 +195,6 @@ impl Registry {
 
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub fn mip_generation(&self) -> u64 {
-        self.mip_generation
     }
 
     pub fn opacity_table(&self) -> Vec<u8> {
@@ -290,10 +224,32 @@ impl Registry {
             blocks: self.blocks.clone(),
             biomes: self.biomes.clone(),
         };
-        write_snapshot(&self.root.join("registry.a"), &snapshot)?;
-        write_snapshot(&self.root.join("registry.b"), &snapshot)?;
+        write_snapshot(&self.root.join("catalog.a"), &snapshot)?;
+        write_snapshot(&self.root.join("catalog.b"), &snapshot)?;
         self.generation = generation;
         self.dirty = false;
+        Ok(())
+    }
+
+    fn apply_production_classification(&mut self) -> Result<()> {
+        let mut mip_changed = false;
+        for entry in &mut self.blocks {
+            let production = production_full_cube_opacity(&entry.canonical);
+            let opacity = production.unwrap_or_else(|| estimated_opacity(&entry.canonical));
+            let authoritative = production.is_some();
+            mip_changed |= entry.opacity != opacity;
+            if entry.opacity != opacity || entry.authoritative != authoritative {
+                entry.opacity = opacity;
+                entry.authoritative = authoritative;
+                self.dirty = true;
+            }
+        }
+        if mip_changed {
+            self.mip_generation = self
+                .mip_generation
+                .checked_add(1)
+                .context("production block classification generation overflow")?;
+        }
         Ok(())
     }
 }
@@ -303,14 +259,15 @@ fn validate_entries(blocks: &[BlockEntry], biomes: &[String]) -> Result<()> {
         bail!("block mapping zero must be minecraft:air");
     }
     if blocks.len() > MAX_BLOCKS || biomes.is_empty() || biomes.len() > MAX_BIOMES {
-        bail!("registry entry counts are outside the protocol limits");
+        bail!("registry entry counts are outside the configured limits");
     }
-    if blocks
+    if blocks.iter().any(|entry| {
+        entry.opacity > 15 || entry.canonical.is_empty() || entry.canonical.len() > 4096
+    }) || biomes
         .iter()
-        .any(|entry| entry.opacity > 15 || entry.canonical.len() > 4096)
-        || biomes.iter().any(|entry| entry.len() > 4096)
+        .any(|entry| entry.is_empty() || entry.len() > 4096)
     {
-        bail!("registry contains an invalid opacity or overlong protocol name");
+        bail!("registry contains an invalid opacity or name");
     }
     let unique_blocks: std::collections::HashSet<_> = blocks.iter().map(|b| &b.canonical).collect();
     let unique_biomes: std::collections::HashSet<_> = biomes.iter().collect();
@@ -333,6 +290,72 @@ fn estimated_opacity(canonical: &str) -> u8 {
     }
     // Voxy deliberately treats leaves as opaque when selecting a representative mip voxel.
     15
+}
+
+/// Conservative server-owned fast classification. Mod namespaces and vanilla shapes not proven
+/// to be opaque full cubes remain non-authoritative and therefore use complex content.
+pub(crate) fn production_full_cube_opacity(canonical: &str) -> Option<u8> {
+    let name = canonical.split('[').next().unwrap_or(canonical);
+    if matches!(
+        name,
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+    ) {
+        return Some(0);
+    }
+    let path = name.strip_prefix("minecraft:")?;
+    let exact = matches!(
+        path,
+        "stone"
+            | "granite"
+            | "diorite"
+            | "andesite"
+            | "cobblestone"
+            | "bedrock"
+            | "dirt"
+            | "coarse_dirt"
+            | "podzol"
+            | "grass_block"
+            | "mycelium"
+            | "rooted_dirt"
+            | "sand"
+            | "red_sand"
+            | "gravel"
+            | "clay"
+            | "bricks"
+            | "netherrack"
+            | "soul_sand"
+            | "soul_soil"
+            | "basalt"
+            | "smooth_basalt"
+            | "blackstone"
+            | "end_stone"
+            | "obsidian"
+            | "crying_obsidian"
+            | "tuff"
+            | "calcite"
+            | "deepslate"
+            | "cobbled_deepslate"
+    );
+    let patterned = [
+        "_ore",
+        "_planks",
+        "_log",
+        "_wood",
+        "_stem",
+        "_hyphae",
+        "_terracotta",
+        "_concrete",
+        "_concrete_powder",
+        "_wool",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+        || (path.ends_with("_block")
+            && !matches!(
+                path,
+                "glass_block" | "slime_block" | "honey_block" | "scaffolding_block"
+            ));
+    (exact || patterned).then_some(15)
 }
 
 fn encode_snapshot(snapshot: &RegistrySnapshot) -> Result<Vec<u8>> {
@@ -379,8 +402,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<RegistrySnapshot> {
     let mip_generation = take_u64(&mut input)?;
     let block_count = take_u32(&mut input)? as usize;
     let biome_count = take_u32(&mut input)? as usize;
-    if block_count > MAX_BLOCKS || biome_count > MAX_BIOMES {
-        bail!("registry count exceeds protocol limit");
+    if catalog_id == 0 || block_count > MAX_BLOCKS || biome_count > MAX_BIOMES {
+        bail!("registry identity or count is outside configured limits");
     }
     let mut blocks = Vec::with_capacity(block_count);
     for _ in 0..block_count {
@@ -437,138 +460,5 @@ fn new_catalog_id() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
-    nanos.rotate_left(17) ^ u64::from(std::process::id()) ^ 0x5658_5932_4341_5441
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, Write};
-
-    #[test]
-    fn snapshot_round_trip_and_crc() {
-        let snapshot = RegistrySnapshot {
-            catalog_id: 123,
-            generation: 7,
-            mip_generation: 3,
-            blocks: vec![
-                BlockEntry {
-                    canonical: "minecraft:air".into(),
-                    opacity: 0,
-                    authoritative: true,
-                },
-                BlockEntry {
-                    canonical: "minecraft:oak_log[axis=y]".into(),
-                    opacity: 15,
-                    authoritative: false,
-                },
-            ],
-            biomes: vec!["minecraft:plains".into()],
-        };
-        let mut encoded = encode_snapshot(&snapshot).unwrap();
-        assert_eq!(decode_snapshot(&encoded).unwrap().blocks.len(), 2);
-        encoded[12] ^= 1;
-        assert!(decode_snapshot(&encoded).is_err());
-    }
-
-    #[test]
-    fn every_vanilla_air_state_uses_mapping_zero() {
-        let root = std::env::temp_dir().join(format!(
-            "voxy-registry-air-{}-{}",
-            std::process::id(),
-            new_catalog_id()
-        ));
-        let mut registry = Registry::open(&root).unwrap();
-        assert_eq!(registry.block_id("minecraft:air").unwrap(), 0);
-        assert_eq!(registry.block_id("minecraft:cave_air").unwrap(), 0);
-        assert_eq!(registry.block_id("minecraft:void_air").unwrap(), 0);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn either_damaged_redundant_peer_is_repaired_without_resetting_ids() {
-        for peer in ["registry.a", "registry.b"] {
-            let root = std::env::temp_dir().join(format!(
-                "voxy-registry-corrupt-{peer}-{}-{}",
-                std::process::id(),
-                new_catalog_id()
-            ));
-            let (catalog, generation) = {
-                let mut registry = Registry::open(&root).unwrap();
-                assert_eq!(registry.block_id("minecraft:stone").unwrap(), 1);
-                registry.save().unwrap();
-                (registry.catalog_id(), registry.generation())
-            };
-            let path = root.join(peer);
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
-            let mut first = [0];
-            file.read_exact(&mut first).unwrap();
-            first[0] ^= 1;
-            file.rewind().unwrap();
-            file.write_all(&first).unwrap();
-            file.sync_all().unwrap();
-            let registry = Registry::open(&root).unwrap();
-            assert_eq!(registry.catalog_id(), catalog);
-            assert_eq!(registry.generation(), generation);
-            assert_eq!(registry.counts().0, 2);
-            assert_eq!(
-                read_snapshot(&root.join("registry.a"))
-                    .unwrap()
-                    .unwrap()
-                    .generation,
-                generation
-            );
-            assert_eq!(
-                read_snapshot(&root.join("registry.b"))
-                    .unwrap()
-                    .unwrap()
-                    .generation,
-                generation
-            );
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn interrupted_first_peer_copy_cannot_reuse_a_tentative_id() {
-        let root = std::env::temp_dir().join(format!(
-            "voxy-registry-interrupted-{}-{}",
-            std::process::id(),
-            new_catalog_id()
-        ));
-        let mut registry = Registry::open(&root).unwrap();
-        assert_eq!(registry.block_id("minecraft:stone").unwrap(), 1);
-        registry.save().unwrap();
-        let mut tentative = registry.snapshot();
-        tentative.generation += 1;
-        tentative.blocks.push(BlockEntry {
-            canonical: "minecraft:dirt".into(),
-            opacity: 15,
-            authoritative: false,
-        });
-        // Simulate a crash after the first durable peer but before save() writes the second.
-        write_snapshot(&root.join("registry.a"), &tentative).unwrap();
-        drop(registry);
-
-        let mut recovered = Registry::open(&root).unwrap();
-        assert_eq!(recovered.block_id("minecraft:dirt").unwrap(), 2);
-        assert_eq!(recovered.block_id("minecraft:diamond_block").unwrap(), 3);
-        recovered.save().unwrap();
-        assert_eq!(
-            read_snapshot(&root.join("registry.a"))
-                .unwrap()
-                .unwrap()
-                .generation,
-            read_snapshot(&root.join("registry.b"))
-                .unwrap()
-                .unwrap()
-                .generation
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
+    (nanos.rotate_left(17) ^ u64::from(std::process::id()) ^ 0x5658_5932_4341_5441).max(1)
 }

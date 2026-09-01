@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.mixin.iris;
 
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
-import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.iris.IrisUtil;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
@@ -37,7 +37,7 @@ public class MixinLevelRenderer {
         if (IrisUtil.irisShaderPackEnabled()) {
             var renderer = ((IGetVoxyRenderSystem) this).voxy$getRenderSystem();
             if (renderer != null) {
-                //Fixthe fucking viewport dims, fuck iris
+                // Iris may leave a viewport that does not match the main render target.
                 glViewport(0,0,Minecraft.getInstance().getMainRenderTarget().width, Minecraft.getInstance().getMainRenderTarget().height);
 
                 var pos = camera.getPosition();

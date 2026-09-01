@@ -1,0 +1,452 @@
+#version 460 core
+
+layout(local_size_x = 128) in;
+
+#import <voxy:lod/frustum.glsl>
+#import <voxy:lod/pos_util.glsl>
+#import <voxy:util/depthutils.glsl>
+
+#define NODE_WORDS 56u
+#define NO_NODE 0xffffffffu
+#define CLASS_WORDS 11u
+#define EXTERIOR_BASE 16u
+#define INTERIOR_BASE 27u
+#define COMPLEX_BASE 38u
+#define OUTPUT_ENTRY_WORDS 12u
+
+layout(binding = 0, std140) uniform SelectionScene {
+    mat4 MVP;
+    ivec3 camSecPos;
+    uint packedHizSize;
+    vec3 camSubSecPos;
+    float sseThresholdPixels;
+    Frustum frustum;
+    vec3 predictionDelta;
+    float angularPadding;
+    uint nodeCount;
+    uint frameId;
+    uint passKind;
+    uint cameraDomainLo;
+    uint cameraDomainHi;
+    uint outputCapacity;
+    uint _reserved0;
+    uint _reserved1;
+    float projectionScale;
+    float predictionHorizon;
+    float hizDepthBias;
+    float _reserved2;
+};
+
+layout(binding = 0) uniform sampler2D hizDepthSampler;
+
+layout(binding = 1, std430) readonly restrict buffer SelectionNodes {
+    uint nodeWords[];
+};
+
+layout(binding = 2, std430) restrict buffer SelectionOutput {
+    uint currentFrontierCount;
+    uint predictedFrontierCount;
+    uint overflowFlags;
+    uint _outputReserved[13];
+    uint outputWords[];
+};
+
+uint word(uint node, uint offset) {
+    return nodeWords[node * NODE_WORDS + offset];
+}
+
+uvec2 rawPosition(uint node) {
+    return uvec2(word(node, 0u), word(node, 1u));
+}
+
+uint parentOf(uint node) {
+    return word(node, 2u);
+}
+
+uint nodeFlags(uint node) {
+    return word(node, 3u);
+}
+
+uint childMask(uint node) {
+    return nodeFlags(node) & 0xffu;
+}
+
+bool descriptorReady(uint node) {
+    return (nodeFlags(node) & (1u << 9u)) != 0u;
+}
+
+uint childAt(uint node, uint child) {
+    return word(node, 4u + child);
+}
+
+uint contentBase(uint contentClass) {
+    return contentClass == 0u ? EXTERIOR_BASE
+            : (contentClass == 1u ? INTERIOR_BASE : COMPLEX_BASE);
+}
+
+uvec2 availableMask(uint node, uint contentClass) {
+    uint base = contentBase(contentClass);
+    return uvec2(word(node, base), word(node, base + 1u));
+}
+
+uvec2 residentMask(uint node, uint contentClass) {
+    uint base = contentBase(contentClass);
+    return uvec2(word(node, base + 2u), word(node, base + 3u));
+}
+
+uvec2 renderableMask(uint node, uint contentClass) {
+    uint base = contentBase(contentClass);
+    return uvec2(word(node, base + 4u), word(node, base + 5u));
+}
+
+uvec2 inFlightMask(uint node, uint contentClass) {
+    uint base = contentBase(contentClass);
+    return uvec2(word(node, base + 6u), word(node, base + 7u));
+}
+
+uint contentMeta(uint node, uint contentClass) {
+    return word(node, contentBase(contentClass) + 8u);
+}
+
+bool maskEmpty(uvec2 value) {
+    return (value.x | value.y) == 0u;
+}
+
+bool maskContains(uvec2 superset, uvec2 subset) {
+    return ((subset.x & ~superset.x) | (subset.y & ~superset.y)) == 0u;
+}
+
+bool classEligible(uint node, uint contentClass) {
+    // availableMask is the exact per-microtile visibility intersection captured for this
+    // camera-domain snapshot. Domain zero was expanded to all manifested microtiles on CPU.
+    return !maskEmpty(availableMask(node, contentClass));
+}
+
+uint selectedClasses(uint node) {
+    uint selected = 0u;
+    for (uint contentClass = 0u; contentClass < 3u; contentClass++) {
+        if (classEligible(node, contentClass)) selected |= 1u << contentClass;
+    }
+    return selected;
+}
+
+bool classFullyRenderable(uint node, uint contentClass) {
+    if (!classEligible(node, contentClass)) return true;
+    uvec2 available = availableMask(node, contentClass);
+    return maskContains(renderableMask(node, contentClass), available);
+}
+
+bool nodeFullyRenderable(uint node) {
+    return descriptorReady(node)
+            && classFullyRenderable(node, 0u)
+            && classFullyRenderable(node, 1u)
+            && classFullyRenderable(node, 2u);
+}
+
+void nodeBounds(uint node, bool predicted, out vec3 minimum, out vec3 maximum) {
+    uvec2 raw = rawPosition(node);
+    uint lod = getLoDLevel(raw);
+    ivec3 position = getLoDPosition(raw);
+    float scale = float(32u << lod);
+    vec3 origin = vec3(((position << int(lod)) - camSecPos) << 5) - camSubSecPos;
+    if (predicted) origin -= predictionDelta;
+
+    if ((nodeFlags(node) & (1u << 8u)) == 0u) {
+        minimum = origin;
+        maximum = origin + vec3(scale);
+        return;
+    }
+
+    uint xy = word(node, 12u);
+    uint zx = word(node, 13u);
+    uint yz = word(node, 14u);
+    vec3 quantizedMin = vec3(xy & 0xffffu, zx & 0xffffu, yz & 0xffffu);
+    vec3 quantizedMax = vec3(xy >> 16u, zx >> 16u, yz >> 16u);
+    // Expand by one quantization step on each side so decoded bounds remain conservative.
+    vec3 unit = vec3(scale / 65535.0f);
+    minimum = origin + quantizedMin * unit - unit;
+    maximum = origin + quantizedMax * unit + unit;
+}
+
+bool outsideCurrentFrustum(vec3 minimum, vec3 maximum) {
+    vec3 center = (minimum + maximum) * 0.5f;
+    vec3 extent = (maximum - minimum) * 0.5f;
+    for (int planeIndex = 0; planeIndex < 5; planeIndex++) {
+        vec4 plane = frustum.planes[planeIndex];
+        float radius = dot(abs(plane.xyz), extent);
+        if (dot(plane.xyz, center) + plane.w + radius < 0.0f) return true;
+    }
+    return false;
+}
+
+bool outsideSweptBounds(vec3 currentMin, vec3 currentMax,
+                        vec3 futureMin, vec3 futureMax) {
+    vec3 currentCenter = (currentMin + currentMax) * 0.5f;
+    vec3 futureCenter = (futureMin + futureMax) * 0.5f;
+    vec3 extent = max(currentMax - currentMin, futureMax - futureMin) * 0.5f;
+    float turnRelaxation = max(length(currentCenter), length(futureCenter))
+            * sin(min(angularPadding, 1.0471976f));
+    for (int planeIndex = 0; planeIndex < 5; planeIndex++) {
+        vec4 plane = frustum.planes[planeIndex];
+        float radius = dot(abs(plane.xyz), extent) + turnRelaxation;
+        float currentDistance = dot(plane.xyz, currentCenter) + plane.w;
+        float futureDistance = dot(plane.xyz, futureCenter) + plane.w;
+        if (max(currentDistance, futureDistance) + radius < 0.0f) return true;
+    }
+    return false;
+}
+
+bool boundsCulledByHiz(vec3 minimum, vec3 maximum) {
+    vec3 corners[8] = vec3[](
+            vec3(minimum.x, minimum.y, minimum.z),
+            vec3(maximum.x, minimum.y, minimum.z),
+            vec3(minimum.x, maximum.y, minimum.z),
+            vec3(maximum.x, maximum.y, minimum.z),
+            vec3(minimum.x, minimum.y, maximum.z),
+            vec3(maximum.x, minimum.y, maximum.z),
+            vec3(minimum.x, maximum.y, maximum.z),
+            vec3(maximum.x, maximum.y, maximum.z));
+    vec3 screenMin = vec3(1.0f);
+    vec3 screenMax = vec3(0.0f);
+    for (int corner = 0; corner < 8; corner++) {
+        vec4 clip = MVP * vec4(corners[corner], 1.0f);
+        if (clip.w <= 0.00001f) return false;
+        vec3 screen = NDC2SCREEN(clip.xyz / clip.w);
+        screenMin = min(screenMin, screen);
+        screenMax = max(screenMax, screen);
+    }
+    if (screenMax.x <= 0.0f || screenMax.y <= 0.0f
+            || screenMin.x >= 1.0f || screenMin.y >= 1.0f) return false;
+    screenMin = clamp(screenMin, vec3(0.0f), vec3(1.0f));
+    screenMax = clamp(screenMax, vec3(0.0f), vec3(1.0f));
+    if (any(lessThanEqual(screenMax.xy - screenMin.xy, vec2(0.0f)))) return false;
+
+    ivec2 baseSize = ivec2(packedHizSize >> 16u, packedHizSize & 0xffffu);
+    vec2 pixelExtent = (screenMax.xy - screenMin.xy) * vec2(baseSize);
+    int mip = int(clamp(floor(log2(max(max(pixelExtent.x, pixelExtent.y), 1.0f))) - 1.0f,
+            0.0f, float(textureQueryLevels(hizDepthSampler) - 1)));
+    ivec2 mipSize = max(ivec2(1), baseSize >> mip);
+    ivec2 first = clamp(ivec2(floor(screenMin.xy * vec2(mipSize))),
+            ivec2(0), mipSize - 1);
+    ivec2 last = clamp(ivec2(ceil(screenMax.xy * vec2(mipSize))),
+            ivec2(0), mipSize - 1);
+    float depth = NEAR;
+    for (int y = first.y; y <= last.y; y++) {
+        for (int x = first.x; x <= last.x; x++) {
+            depth = REDUCTION(depth, texelFetch(hizDepthSampler, ivec2(x, y), mip).r);
+        }
+    }
+#ifdef USE_REVERSE_Z
+    return depth >= screenMax.z + hizDepthBias;
+#else
+    return depth <= screenMin.z - hizDepthBias;
+#endif
+}
+
+bool intersectsView(uint node, bool predicted) {
+    if (predicted) {
+        vec3 currentMin;
+        vec3 currentMax;
+        vec3 futureMin;
+        vec3 futureMax;
+        nodeBounds(node, false, currentMin, currentMax);
+        nodeBounds(node, true, futureMin, futureMax);
+        return !outsideSweptBounds(currentMin, currentMax, futureMin, futureMax);
+    }
+    vec3 minimum;
+    vec3 maximum;
+    nodeBounds(node, false, minimum, maximum);
+    return !outsideCurrentFrustum(minimum, maximum)
+            // The first pass cannot reject missing final coverage using the older cut.  The
+            // second pass uses this frame's completed occluders and is authoritative.
+            && ((passKind == 0u && !nodeFullyRenderable(node))
+            || !boundsCulledByHiz(minimum, maximum));
+}
+
+uvec3 inverseMorton2(uint index) {
+    uint high = index >> 3u;
+    uint low = index & 7u;
+    return uvec3(
+            ((high & 1u) << 1u) | (low & 1u),
+            (((high >> 1u) & 1u) << 1u) | ((low >> 1u) & 1u),
+            (((high >> 2u) & 1u) << 1u) | ((low >> 2u) & 1u));
+}
+
+void microtileBounds(uint node, uint microtile, bool predicted,
+                     out vec3 minimum, out vec3 maximum) {
+    uvec2 raw = rawPosition(node);
+    uint lod = getLoDLevel(raw);
+    ivec3 position = getLoDPosition(raw);
+    float nodeScale = float(32u << lod);
+    float tileScale = nodeScale * 0.25f;
+    vec3 origin = vec3(((position << int(lod)) - camSecPos) << 5) - camSubSecPos;
+    if (predicted) origin -= predictionDelta;
+    uvec3 tile = inverseMorton2(microtile);
+    minimum = origin + vec3(tile) * tileScale;
+    maximum = minimum + vec3(tileScale);
+
+    vec3 tightMin;
+    vec3 tightMax;
+    nodeBounds(node, predicted, tightMin, tightMax);
+    minimum = max(minimum, tightMin);
+    maximum = min(maximum, tightMax);
+}
+
+bool microtileFullyRenderable(uint node, uint contentClass, uint microtile) {
+    uvec2 renderable = renderableMask(node, contentClass);
+    uint maskWord = microtile >> 5u;
+    uint bit = 1u << (microtile & 31u);
+    return (renderable[maskWord] & bit) != 0u;
+}
+
+uvec2 selectedMicrotiles(uint node, uint contentClass, bool predicted) {
+    if (!classEligible(node, contentClass)) return uvec2(0u);
+    uvec2 available = availableMask(node, contentClass);
+    uvec2 selected = uvec2(0u);
+    for (uint microtile = 0u; microtile < 64u; microtile++) {
+        uint maskWord = microtile >> 5u;
+        uint bit = 1u << (microtile & 31u);
+        if ((available[maskWord] & bit) == 0u) continue;
+        vec3 minimum;
+        vec3 maximum;
+        microtileBounds(node, microtile, predicted, minimum, maximum);
+        if (any(lessThanEqual(maximum, minimum))) continue;
+        bool visible;
+        if (predicted) {
+            vec3 currentMin;
+            vec3 currentMax;
+            microtileBounds(node, microtile, false, currentMin, currentMax);
+            visible = !outsideSweptBounds(currentMin, currentMax, minimum, maximum);
+        } else {
+            visible = !outsideCurrentFrustum(minimum, maximum)
+                    && ((passKind == 0u
+                    && !microtileFullyRenderable(node, contentClass, microtile))
+                    || !boundsCulledByHiz(minimum, maximum));
+        }
+        if (visible) selected[maskWord] |= bit;
+    }
+    return selected;
+}
+
+void selectedContentMasks(uint node, bool predicted, out uvec2 masks[3]) {
+    masks[0] = selectedMicrotiles(node, 0u, predicted);
+    masks[1] = selectedMicrotiles(node, 1u, predicted);
+    masks[2] = selectedMicrotiles(node, 2u, predicted);
+}
+
+uint classesForMasks(uvec2 masks[3]) {
+    uint classes = 0u;
+    for (uint contentClass = 0u; contentClass < 3u; contentClass++) {
+        if (!maskEmpty(masks[contentClass])) classes |= 1u << contentClass;
+    }
+    return classes;
+}
+
+float screenSpaceError(uint node, bool predicted) {
+    vec3 minimum;
+    vec3 maximum;
+    nodeBounds(node, predicted, minimum, maximum);
+    vec3 center = (minimum + maximum) * 0.5f;
+    vec3 extent = (maximum - minimum) * 0.5f;
+    float closestDistance = max(length(center) - length(extent), 0.25f);
+    float errorBlocks = float(word(node, 15u)) / 65536.0f;
+    return errorBlocks * projectionScale / closestDistance;
+}
+
+bool shouldDescend(uint node, bool predicted) {
+    if (childMask(node) == 0u) return false;
+    // Structural metadata is complete before bounded descriptor pages. Until this node's page
+    // arrives, select its hierarchy level from SSE alone and return the node key to the CPU.
+    if (!descriptorReady(node)) {
+        return screenSpaceError(node, predicted) > sseThresholdPixels;
+    }
+    // A structural node whose final classes are all hidden/absent must be crossed to find any
+    // eligible descendants, independently of its own error value.
+    if (selectedClasses(node) == 0u) return true;
+    return screenSpaceError(node, predicted) > sseThresholdPixels;
+}
+
+bool selectedInCut(uint node, bool predicted) {
+    if (!intersectsView(node, predicted)) return false;
+    uint cursor = parentOf(node);
+    for (uint depth = 0u; cursor != NO_NODE && depth < 32u; depth++) {
+        if (!intersectsView(cursor, predicted) || !shouldDescend(cursor, predicted)) return false;
+        cursor = parentOf(cursor);
+    }
+    return !shouldDescend(node, predicted);
+}
+
+float selectionScore(uint node, bool predicted) {
+    float error = max(screenSpaceError(node, predicted), 0.001f);
+    uint missingLo = word(node, 49u);
+    uint missingHi = word(node, 50u);
+    float missingMiB = float(missingHi) * 4096.0f
+            + float(missingLo) / 1048576.0f;
+    uint geometryLo = word(node, 51u);
+    uint geometryHi = word(node, 52u);
+    float geometryMiB = float(geometryHi) * 4096.0f
+            + float(geometryLo) / 1048576.0f;
+    float completionSeconds = float(word(node, 53u)) / 1000000.0f;
+    float cost = 1.0f + missingMiB + geometryMiB * 0.25f + completionSeconds * 8.0f;
+    float score = error / cost;
+    return predicted ? score * 0.125f : score + 1048576.0f;
+}
+
+void appendEntry(uint queue, uint node, uvec2 masks[3], float score) {
+    uint index;
+    uint overflowBit;
+    if (queue == 0u) {
+        index = atomicAdd(currentFrontierCount, 1u);
+        overflowBit = 1u;
+    } else {
+        index = atomicAdd(predictedFrontierCount, 1u);
+        overflowBit = 2u;
+    }
+    if (index >= outputCapacity) {
+        atomicOr(overflowFlags, overflowBit);
+        return;
+    }
+    uint base = (queue * outputCapacity + index) * OUTPUT_ENTRY_WORDS;
+    outputWords[base] = node;
+    outputWords[base + 1u] = classesForMasks(masks);
+    outputWords[base + 2u] = floatBitsToUint(max(score, 0.0f));
+    outputWords[base + 3u] = passKind;
+    outputWords[base + 4u] = masks[0].x;
+    outputWords[base + 5u] = masks[0].y;
+    outputWords[base + 6u] = masks[1].x;
+    outputWords[base + 7u] = masks[1].y;
+    outputWords[base + 8u] = masks[2].x;
+    outputWords[base + 9u] = masks[2].y;
+    outputWords[base + 10u] = 0u;
+    outputWords[base + 11u] = 0u;
+}
+
+void main() {
+    uint node = gl_GlobalInvocationID.x;
+    if (node >= nodeCount) return;
+
+    uvec2 currentMasks[3];
+    currentMasks[0] = uvec2(0u);
+    currentMasks[1] = uvec2(0u);
+    currentMasks[2] = uvec2(0u);
+    bool current = selectedInCut(node, false);
+    if (current) selectedContentMasks(node, false, currentMasks);
+    if (current && (!descriptorReady(node) || classesForMasks(currentMasks) != 0u)) {
+        float score = selectionScore(node, false);
+        appendEntry(0u, node, currentMasks, score);
+    }
+
+    bool predicted = selectedInCut(node, true);
+    uvec2 predictedMasks[3];
+    predictedMasks[0] = uvec2(0u);
+    predictedMasks[1] = uvec2(0u);
+    predictedMasks[2] = uvec2(0u);
+    if (predicted) selectedContentMasks(node, true, predictedMasks);
+    for (uint contentClass = 0u; contentClass < 3u; contentClass++) {
+        predictedMasks[contentClass] &= ~currentMasks[contentClass];
+    }
+    if (classesForMasks(predictedMasks) != 0u) {
+        float score = selectionScore(node, true);
+        appendEntry(1u, node, predictedMasks, score);
+    }
+}
