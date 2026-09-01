@@ -15,7 +15,8 @@ import java.nio.file.Path;
 import java.util.Locale;
 
 public class VoxyConfig {
-    public static final int MIN_VIRTUAL_SURFACE_MEMORY_MIB = 256;
+    /** Smallest budget that can retain fixed metadata and still make visible-terrain progress. */
+    public static final int MIN_VIRTUAL_SURFACE_MEMORY_MIB = 768;
     public static final int MAX_VIRTUAL_SURFACE_MEMORY_MIB = 4096;
     private static final Gson GSON = new GsonBuilder()
             .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
@@ -85,6 +86,7 @@ public class VoxyConfig {
             return;
         }
 
+        this.virtualSurfaceMemoryMiB = boundedVirtualSurfaceMemoryMiB();
         try {
             Files.writeString(getConfigPath(), GSON.toJson(this));
         } catch (IOException e) {
@@ -101,8 +103,11 @@ public class VoxyConfig {
     }
 
     public long virtualSurfaceMemoryBytes() {
-        int bounded = Math.max(MIN_VIRTUAL_SURFACE_MEMORY_MIB,
+        return (long) boundedVirtualSurfaceMemoryMiB() << 20;
+    }
+
+    private int boundedVirtualSurfaceMemoryMiB() {
+        return Math.max(MIN_VIRTUAL_SURFACE_MEMORY_MIB,
                 Math.min(MAX_VIRTUAL_SURFACE_MEMORY_MIB, this.virtualSurfaceMemoryMiB));
-        return (long) bounded << 20;
     }
 }
