@@ -288,6 +288,7 @@ public final class RootDemandPlan {
     private final Map<Hash256, LinkedHashSet<Long>> bindingsByObject = new HashMap<>();
     private final Map<Long, Optional<Binding>> resolutions = new LinkedHashMap<>();
     private boolean metadataCapacityBlocked;
+    private boolean contentCapacityBlocked;
     private volatile long manifestRevision;
     /** Changes only when the selector's immutable node/object namespace changes. */
     private volatile long selectionTopologyRevision;
@@ -390,7 +391,7 @@ public final class RootDemandPlan {
                 this.expectedObjects.size(), this.processedObjects.size(),
                 this.coverageQueue.size(), this.currentViewQueue.size(),
                 this.predictedQueue.size(), this.objectInFlight.size(),
-                this.metadataCapacityBlocked, complete, coverage,
+                this.metadataCapacityBlocked || this.contentCapacityBlocked, complete, coverage,
                 availableWindowRoots, pendingWindowRoots, absentWindowRoots,
                 sampleAbsentWindowRoot,
                 minX, maxX, minY, maxY, minZ, maxZ);
@@ -982,52 +983,63 @@ public final class RootDemandPlan {
      */
     private void resolveAvailableDemands() {
         boolean discoveryComplete = discoveryComplete();
-        for (int demandIndex = 0; demandIndex < this.demanded.size(); demandIndex++) {
-            long key = this.demanded.valueAt(demandIndex);
-            if (this.resolutions.containsKey(key)) continue;
-            if (!discoveryComplete && !resolutionAvailable(key)) continue;
-            requireNodeCapacity((long) this.resolutions.size() + 1, "resolved demand");
-            Optional<Binding> binding = resolve(key);
-            LinkedHashMap<Hash256, ExpectedObject> additions = new LinkedHashMap<>();
-            binding.ifPresent(value -> {
-                for (ContentLayer layer : value.layers()) {
-                    ExpectedObject expected = new ExpectedObject(
-                            MicrotileCodec.objectKind(layer.contentClass()));
-                    for (ContentObject object : layer.objects()) {
-                        validateManifestReference(object.hash(), expected, additions);
-                    }
-                    for (Hash256 dependency : layer.dependencies()) {
-                        validateManifestReference(dependency, expected, additions);
-                    }
-                    ExpectedObject complex = new ExpectedObject(
-                            ObjectKind.COMPLEX_MICROTILE);
-                    for (NeighborDependency dependency : layer.neighborDependencies()) {
-                        validateManifestReference(dependency.hash(), complex, additions);
-                    }
-                }
-            });
-            requireObjectCapacity((long) this.expectedObjects.size() + additions.size(),
-                    "resolved content object table");
-            this.resolutions.put(key, binding);
-            binding.ifPresent(value -> {
-                for (ContentLayer layer : value.layers()) {
-                    ObjectKind kind = MicrotileCodec.objectKind(layer.contentClass());
-                    for (ContentObject object : layer.objects()) {
-                        bindExpectedObject(key, object.hash(), kind);
-                    }
-                    for (Hash256 dependency : layer.dependencies()) {
-                        bindExpectedObject(key, dependency, kind);
-                    }
-                    for (NeighborDependency dependency : layer.neighborDependencies()) {
-                        bindExpectedObject(key, dependency.hash(),
+        this.contentCapacityBlocked = false;
+        // Resolve coarse coverage before fine detail so a full handle table degrades detail
+        // instead of withholding the hierarchy required for a first draw.
+        for (int lod = ManifestCodec.MAX_LOD; lod >= 0; lod--) {
+            for (int demandIndex = 0; demandIndex < this.demanded.size(); demandIndex++) {
+                long key = this.demanded.valueAt(demandIndex);
+                if (spatial(key).lod() != lod) continue;
+                if (this.resolutions.containsKey(key)) continue;
+                if (!discoveryComplete && !resolutionAvailable(key)) continue;
+                requireNodeCapacity((long) this.resolutions.size() + 1, "resolved demand");
+                Optional<Binding> binding = resolve(key);
+                LinkedHashMap<Hash256, ExpectedObject> additions = new LinkedHashMap<>();
+                binding.ifPresent(value -> {
+                    for (ContentLayer layer : value.layers()) {
+                        ExpectedObject expected = new ExpectedObject(
+                                MicrotileCodec.objectKind(layer.contentClass()));
+                        for (ContentObject object : layer.objects()) {
+                            validateManifestReference(object.hash(), expected, additions);
+                        }
+                        for (Hash256 dependency : layer.dependencies()) {
+                            validateManifestReference(dependency, expected, additions);
+                        }
+                        ExpectedObject complex = new ExpectedObject(
                                 ObjectKind.COMPLEX_MICROTILE);
+                        for (NeighborDependency dependency : layer.neighborDependencies()) {
+                            validateManifestReference(dependency.hash(), complex, additions);
+                        }
                     }
+                });
+                // A renderer cut may legitimately reference more distinct immutable objects than
+                // fit in one bounded GPU handle namespace. Keep the unresolved tail as
+                // backpressure; a later, smaller cut will free bindings and retry it here.
+                if (!hasObjectCapacity((long) this.expectedObjects.size() + additions.size())) {
+                    this.contentCapacityBlocked = true;
+                    continue;
                 }
-            });
-            // Descriptor visibility changes the immutable renderer manifest even when every
-            // referenced object was already registered by another selected node.
-            this.manifestRevision++;
-            this.selectionTopologyRevision++;
+                this.resolutions.put(key, binding);
+                binding.ifPresent(value -> {
+                    for (ContentLayer layer : value.layers()) {
+                        ObjectKind kind = MicrotileCodec.objectKind(layer.contentClass());
+                        for (ContentObject object : layer.objects()) {
+                            bindExpectedObject(key, object.hash(), kind);
+                        }
+                        for (Hash256 dependency : layer.dependencies()) {
+                            bindExpectedObject(key, dependency, kind);
+                        }
+                        for (NeighborDependency dependency : layer.neighborDependencies()) {
+                            bindExpectedObject(key, dependency.hash(),
+                                    ObjectKind.COMPLEX_MICROTILE);
+                        }
+                    }
+                });
+                // Descriptor visibility changes the immutable renderer manifest even when every
+                // referenced object was already registered by another selected node.
+                this.manifestRevision++;
+                this.selectionTopologyRevision++;
+            }
         }
     }
 
