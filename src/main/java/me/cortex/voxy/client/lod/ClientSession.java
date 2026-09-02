@@ -1627,6 +1627,11 @@ final class ClientSession {
             if (!this.awaitingFence.remove(fence.node, fence.root)) return;
             if (fence.failure != null) {
                 this.resources.activations.discardFailedPublication(fence.node);
+                if (fence.failure
+                        instanceof MicrotileActivationManager.PublicationCancelledException) {
+                    this.manifestDirty = true;
+                    return;
+                }
                 throw new IllegalStateException("renderer activation fence failed", fence.failure);
             }
             if (this.retiring.remove(fence.node)) {

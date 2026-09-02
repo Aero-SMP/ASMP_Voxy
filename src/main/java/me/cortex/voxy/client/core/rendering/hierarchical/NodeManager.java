@@ -195,10 +195,7 @@ public class NodeManager {
         long sourceRevision = sectionResult.sourceRevision;
         long geometryBytes = sectionResult.geometryBuffer == null ? 0
                 : sectionResult.geometryBuffer.size;
-        if (this.activeSectionMap.get(pos) == -1) {
-            sectionResult.free();
-            return null;
-        }
+        if (this.activeSectionMap.get(pos) == -1) return null;
         StagedGeometryKey key = new StagedGeometryKey(sourceRevision, pos);
         if (this.committedGeometry.containsKey(key)) {
             sectionResult.free();
@@ -216,6 +213,36 @@ public class NodeManager {
         this.stagedGeometry.put(key, new StagedGeometry(geometryId,
                 sectionResult.childExistence, geometryBytes));
         return new RendererFence(pos, sourceRevision, geometryBytes);
+    }
+
+    /**
+     * Creates every immediately possible request owner on the path to {@code position}.
+     * Deeper owners remain pending until their nearest requested ancestor publishes geometry.
+     */
+    boolean ensureHierarchyOwner(long position) {
+        assertPosValid(position);
+        if (this.activeSectionMap.get(position) != -1) return true;
+        long top = ancestorAtLevel(position, MAX_LOD_LAYER);
+        if (!this.topLevelNodes.contains(top)) return false;
+        for (int level = MAX_LOD_LAYER; level > SectionKey.level(position); level--) {
+            long ancestor = ancestorAtLevel(position, level);
+            if (this.activeSectionMap.get(ancestor) == -1) return false;
+            this.processRequest(ancestor);
+        }
+        return this.activeSectionMap.get(position) != -1;
+    }
+
+    boolean hasTopLevelAncestor(long position) {
+        assertPosValid(position);
+        while (SectionKey.level(position) < MAX_LOD_LAYER) position = makeParentPos(position);
+        return this.topLevelNodes.contains(position);
+    }
+
+    private static long ancestorAtLevel(long position, int level) {
+        int shift = level - SectionKey.level(position);
+        if (shift < 0) throw new IllegalArgumentException("ancestor level is below its node");
+        return SectionKey.pack(level, SectionKey.x(position) >> shift,
+                SectionKey.y(position) >> shift, SectionKey.z(position) >> shift);
     }
 
     /**

@@ -23,6 +23,14 @@ import java.util.function.Consumer;
  */
 public final class MicrotileActivationManager implements AutoCloseable {
     private static final long SLOT_BYTES = 384;
+
+    /** A renderer publication became irrelevant before it acquired a hierarchy owner. */
+    public static final class PublicationCancelledException extends RuntimeException {
+        public PublicationCancelledException(String message) {
+            super(message, null, false, false);
+        }
+    }
+
     public interface Publication extends AutoCloseable {
         /** True after the complete replacement is uploaded and renderer-visible. */
         boolean activationFencePassed();

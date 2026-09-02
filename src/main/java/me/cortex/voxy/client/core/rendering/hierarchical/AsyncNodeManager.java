@@ -12,6 +12,7 @@ import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.section.BasicAsyncGeometryManager;
 import me.cortex.voxy.client.core.rendering.section.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
+import me.cortex.voxy.client.lod.MicrotileActivationManager.PublicationCancelledException;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.AllocationArena;
 import me.cortex.voxy.common.util.MemoryBuffer;
@@ -70,6 +71,8 @@ public class AsyncNodeManager {
     private final ArrayList<RendererTransaction> completedRendererTransactions = new ArrayList<>();
     private final ArrayList<VirtualSurfacePublication> completedVirtualSurfacePublications =
             new ArrayList<>();
+    private final ArrayDeque<VirtualSurfacePublication> deferredVirtualSurfacePublications =
+            new ArrayDeque<>();
     /**
      * Render-thread-owned completion queue. A result becoming visible to OpenGL is not the same
      * thing as its commands merely having been submitted: publication and retirement callbacks
@@ -191,6 +194,7 @@ public class AsyncNodeManager {
 
 
         int workDone = 0;
+        boolean hierarchyAdvanced = false;
 
         {
             LongOpenHashSet add = null;
@@ -225,42 +229,14 @@ public class AsyncNodeManager {
             }
 
             workDone += work;
-        }
-
-        // Upload and attach one complete node while the
-        // old geometry remains retained by NodeManager until a later finalize transaction.
-        while ((this.geometryCapacity - this.geometryManager.getGeometryUsedBytes())
-                > 50_000_000L) {
-            VirtualSurfacePublication publication = this.virtualSurfaceQueue.poll();
-            if (publication == null) break;
-            workDone++;
-            BuiltSection geometry = publication.geometry();
-            try {
-                if (publication.previousRevision() >= 0) {
-                    this.manager.finalizeStagedRoot(publication.previousRevision());
-                }
-                NodeManager.RendererFence staged = this.manager.stageGeometryResult(geometry);
-                if (staged == null) {
-                    throw new IllegalStateException(
-                            "Virtual Surface geometry has no active hierarchy owner");
-                }
-                this.manager.commitStagedRoot(geometry.sourceRevision,
-                        Set.of(geometry.position));
-                this.completedVirtualSurfacePublications.add(publication);
-            } catch (Throwable failure) {
-                try {
-                    this.manager.rollbackStagedRoot(geometry.sourceRevision);
-                } catch (Throwable rollbackFailure) {
-                    failure.addSuppressed(rollbackFailure);
-                }
-                publication.failure().accept(failure);
-            }
+            hierarchyAdvanced = work != 0;
         }
 
         while (true) {
             RendererTransaction transaction = this.rendererTransactionQueue.poll();
             if (transaction == null) break;
             workDone++;
+            hierarchyAdvanced = true;
             try {
                 switch (transaction.operation) {
                     case COMMIT -> this.manager.commitStagedRoot(
@@ -293,6 +269,19 @@ public class AsyncNodeManager {
                 this.manager.processRequest(pos);
             }
             job.free();
+            hierarchyAdvanced = true;
+        }
+
+        // Resolve topology work first. A directly selected descendant may arrive before its
+        // request owner, so retain its complete geometry and retry only after hierarchy progress.
+        if (hierarchyAdvanced) this.retryDeferredVirtualSurfacePublications();
+        while (hasGeometryCapacity()) {
+            VirtualSurfacePublication publication = this.virtualSurfaceQueue.poll();
+            if (publication == null) break;
+            workDone++;
+            if (!this.processVirtualSurfacePublication(publication)) {
+                this.deferredVirtualSurfacePublications.addLast(publication);
+            }
         }
 
 
@@ -442,6 +431,54 @@ public class AsyncNodeManager {
             throw new IllegalArgumentException("Should always have null");
         }
 
+    }
+
+    private boolean hasGeometryCapacity() {
+        return this.geometryCapacity - this.geometryManager.getGeometryUsedBytes()
+                > 50_000_000L;
+    }
+
+    private void retryDeferredVirtualSurfacePublications() {
+        int remaining = this.deferredVirtualSurfacePublications.size();
+        while (remaining-- > 0 && hasGeometryCapacity()) {
+            VirtualSurfacePublication publication =
+                    this.deferredVirtualSurfacePublications.removeFirst();
+            if (!this.processVirtualSurfacePublication(publication)) {
+                this.deferredVirtualSurfacePublications.addLast(publication);
+            }
+        }
+    }
+
+    /** Uploads one complete node, or retains it until its manifested parent path exists. */
+    private boolean processVirtualSurfacePublication(VirtualSurfacePublication publication) {
+        BuiltSection geometry = publication.geometry();
+        boolean transferred = false;
+        try {
+            if (publication.previousRevision() >= 0) {
+                this.manager.finalizeStagedRoot(publication.previousRevision());
+            }
+            NodeManager.RendererFence staged = this.manager.stageGeometryResult(geometry);
+            if (staged == null && this.manager.ensureHierarchyOwner(geometry.position)) {
+                staged = this.manager.stageGeometryResult(geometry);
+            }
+            if (staged == null) {
+                if (this.manager.hasTopLevelAncestor(geometry.position)) return false;
+                throw new PublicationCancelledException(
+                        "Virtual Surface hierarchy root is no longer active");
+            }
+            transferred = true;
+            this.manager.commitStagedRoot(geometry.sourceRevision, Set.of(geometry.position));
+            this.completedVirtualSurfacePublications.add(publication);
+        } catch (Throwable failure) {
+            if (!transferred) geometry.free();
+            try {
+                this.manager.rollbackStagedRoot(geometry.sourceRevision);
+            } catch (Throwable rollbackFailure) {
+                failure.addSuppressed(rollbackFailure);
+            }
+            publication.failure().accept(failure);
+        }
+        return true;
     }
 
     private IntConsumer tlnAddCallback; private IntConsumer tlnRemoveCallback;
@@ -785,6 +822,12 @@ public class AsyncNodeManager {
         while (true) {
             VirtualSurfacePublication publication = this.virtualSurfaceQueue.poll();
             if (publication == null) break;
+            publication.geometry().free();
+            publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
+        }
+        while (!this.deferredVirtualSurfacePublications.isEmpty()) {
+            VirtualSurfacePublication publication =
+                    this.deferredVirtualSurfacePublications.removeFirst();
             publication.geometry().free();
             publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
         }
