@@ -164,8 +164,9 @@ final class SelectionCutPlanner {
     /**
      * Requests hierarchy coverage from coarse to fine. A descendant may be decoded and meshed
      * before its ancestors, but it cannot be published until those ancestors own the renderer
-     * path. Selecting the first incomplete ancestor keeps that path progressing without
-     * withdrawing the finer current-view demand.
+     * path. Refining a published parent is an atomic replacement: every manifested child in the
+     * sibling group must own geometry before the hierarchy can expose any one child. Request the
+     * first incomplete group as a unit so a frustum edge cannot strand visible children forever.
      */
     private static void appendCoveragePrerequisites(SelectionManifest manifest,
                                                     SelectionBatch batch,
@@ -181,6 +182,12 @@ final class SelectionCutPlanner {
             for (int lod = 4; lod >= selectedLod; lod--) {
                 int ancestorIndex = ancestorAtLod(manifest, selectedIndex, lod);
                 if (ancestorIndex < 0) continue;
+                if (lod < 4) {
+                    int parentIndex = ancestorAtLod(manifest, selectedIndex, lod + 1);
+                    if (parentIndex >= 0 && appendIncompleteSiblingGroup(manifest, batch,
+                            parentIndex, batch.inputScore(input))) break;
+                    continue;
+                }
                 Node ancestor = manifest.nodeAt(ancestorIndex);
                 if (!ancestor.descriptorReady()) {
                     batch.append(Segment.REQUESTS, ancestorIndex, Priority.COVERAGE,
@@ -204,6 +211,48 @@ final class SelectionCutPlanner {
                 }
             }
         }
+    }
+
+    /** Returns true when this atomic child replacement still needs descriptor or terrain work. */
+    private static boolean appendIncompleteSiblingGroup(SelectionManifest manifest,
+                                                        SelectionBatch batch,
+                                                        int parentIndex, float score) {
+        Node parent = manifest.nodeAt(parentIndex);
+        boolean incomplete = false;
+        int[] children = parent.childHandlesInternal();
+        for (int child = 0; child < children.length; child++) {
+            if ((parent.manifestedChildMask() & 1 << child) == 0) continue;
+            int childIndex = manifest.indexForHandle(children[child]);
+            if (childIndex < 0) {
+                batch.markStructureIncomplete();
+                incomplete = true;
+                continue;
+            }
+            Node node = manifest.nodeAt(childIndex);
+            if (!node.descriptorReady()) {
+                batch.append(Segment.REQUESTS, childIndex, Priority.COVERAGE,
+                        score, 0, 0, 0);
+                incomplete = true;
+                continue;
+            }
+            // Renderer hierarchy ownership is global, not camera-domain local. A sibling hidden
+            // from the current domain still needs its complete geometry before the atomic child
+            // allocation can replace the parent; otherwise visible siblings remain pending.
+            long exterior = manifest.coverageAvailableMask(
+                    childIndex, ContentClass.EXTERIOR);
+            long interior = manifest.coverageAvailableMask(
+                    childIndex, ContentClass.INTERIOR);
+            long complex = manifest.coverageAvailableMask(
+                    childIndex, ContentClass.COMPLEX);
+            if ((exterior | interior | complex) == 0) continue;
+            if (!fullyCoverageRenderable(manifest, childIndex,
+                    exterior, interior, complex)) {
+                batch.append(Segment.REQUESTS, childIndex, Priority.COVERAGE,
+                        score, exterior, interior, complex);
+                incomplete = true;
+            }
+        }
+        return incomplete;
     }
 
     private static void copyMasks(SelectionBatch batch, int input, long[] target, int row) {
@@ -246,6 +295,17 @@ final class SelectionCutPlanner {
                 && (interior & ~manifest.renderableMask(
                 nodeIndex, ContentClass.INTERIOR)) == 0
                 && (complex & ~manifest.renderableMask(
+                nodeIndex, ContentClass.COMPLEX)) == 0;
+    }
+
+    private static boolean fullyCoverageRenderable(SelectionManifest manifest, int nodeIndex,
+                                                   long exterior, long interior, long complex) {
+        return (exterior | interior | complex) != 0
+                && (exterior & ~manifest.coverageRenderableMask(
+                nodeIndex, ContentClass.EXTERIOR)) == 0
+                && (interior & ~manifest.coverageRenderableMask(
+                nodeIndex, ContentClass.INTERIOR)) == 0
+                && (complex & ~manifest.coverageRenderableMask(
                 nodeIndex, ContentClass.COMPLEX)) == 0;
     }
 

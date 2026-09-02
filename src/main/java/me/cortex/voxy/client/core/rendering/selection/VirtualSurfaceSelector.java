@@ -431,7 +431,7 @@ public final class VirtualSurfaceSelector {
             ticket.predictedCount = (int) Math.min(predictedUnsigned, ticket.outputCapacity);
             ticket.overflow = MemoryUtil.memGetInt(pointer + 8);
             int inputCapacity = Math.addExact(ticket.currentCount, ticket.predictedCount);
-            int plannedCapacity = Math.addExact(Math.multiplyExact(ticket.currentCount, 4),
+            int plannedCapacity = Math.addExact(Math.multiplyExact(ticket.currentCount, 11),
                     ticket.predictedCount);
             ticket.batch = this.selectionPool.acquire(ticket.manifest, inputCapacity,
                     plannedCapacity);

@@ -22,7 +22,7 @@ public final class SelectionManifest implements AutoCloseable {
     public static final int MAX_OBJECT_HANDLES = 262_144;
     public static final int MAX_DEPENDENCIES_PER_CONTENT = 0xffff;
     private static final int CONTENT_CLASSES = 3;
-    private static final int MASKS_PER_CONTENT = 4;
+    private static final int MASKS_PER_CONTENT = 6;
 
     public enum ContentClass { EXTERIOR, INTERIOR, COMPLEX }
 
@@ -380,11 +380,15 @@ public final class SelectionManifest implements AutoCloseable {
     }
 
     public void setContentState(int nodeIndex, ContentClass contentClass,
-                                long available, long resident, long renderable, long inFlight) {
+                                long available, long resident, long renderable, long inFlight,
+                                long coverageAvailable, long coverageRenderable) {
         ensureWritable();
         ContentLayout layout = contentLayout(nodeIndex, contentClass);
-        if ((available & ~layout.declaredMask) != 0 || (resident & ~available) != 0
-                || (renderable & ~resident) != 0 || (inFlight & ~available) != 0) {
+        if ((coverageAvailable & ~layout.declaredMask) != 0
+                || (available & ~coverageAvailable) != 0
+                || (resident & ~available) != 0 || (renderable & ~resident) != 0
+                || (inFlight & ~available) != 0
+                || (coverageRenderable & ~coverageAvailable) != 0) {
             throw new IllegalArgumentException("invalid dynamic content masks");
         }
         int offset = contentOffset(nodeIndex, contentClass);
@@ -392,6 +396,8 @@ public final class SelectionManifest implements AutoCloseable {
         this.storage.masks[offset + 1] = resident;
         this.storage.masks[offset + 2] = renderable;
         this.storage.masks[offset + 3] = inFlight;
+        this.storage.masks[offset + 4] = coverageAvailable;
+        this.storage.masks[offset + 5] = coverageRenderable;
     }
 
     public void setDependencyState(int nodeIndex, ContentClass contentClass, int index,
@@ -455,6 +461,16 @@ public final class SelectionManifest implements AutoCloseable {
 
     public long inFlightMask(int nodeIndex, ContentClass contentClass) {
         return this.storage.masks[contentOffset(nodeIndex, contentClass) + 3];
+    }
+
+    /** Compatibility-filtered content before the current camera visibility domain is applied. */
+    public long coverageAvailableMask(int nodeIndex, ContentClass contentClass) {
+        return this.storage.masks[contentOffset(nodeIndex, contentClass) + 4];
+    }
+
+    /** Renderer-visible content independent of the current camera visibility domain. */
+    public long coverageRenderableMask(int nodeIndex, ContentClass contentClass) {
+        return this.storage.masks[contentOffset(nodeIndex, contentClass) + 5];
     }
 
     public boolean dependencyResident(int nodeIndex, ContentClass contentClass, int index) {

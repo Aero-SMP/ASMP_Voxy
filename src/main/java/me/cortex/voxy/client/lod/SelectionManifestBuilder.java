@@ -80,10 +80,11 @@ public final class SelectionManifestBuilder {
                     ContentLayer source = this.sources[nodeIndex * 3 + content];
                     var contentClass = selectionClass(content);
                     if (source == null) {
-                        manifest.setContentState(nodeIndex, contentClass, 0, 0, 0, 0);
+                        manifest.setContentState(nodeIndex, contentClass, 0, 0, 0, 0,
+                                0, 0);
                         continue;
                     }
-                    long available = switch (content) {
+                    long coverageAvailable = switch (content) {
                         case 0 -> modelState == null
                                 ? exteriorRaw : modelState.exteriorAvailableMask();
                         case 1 -> modelState == null
@@ -92,20 +93,23 @@ public final class SelectionManifestBuilder {
                                 ? complexRaw & ~ordinaryRaw : modelState.complexAvailableMask();
                         default -> throw new AssertionError();
                     };
-                    available &= eligibleMask(source, cameraVisibilityDomain);
-                    long resident = 0;
+                    long available = coverageAvailable
+                            & eligibleMask(source, cameraVisibilityDomain);
+                    long coverageResident = 0;
                     long inFlight = 0;
                     for (ContentObject object : source.objects()) {
                         long bit = 1L << object.microtileIndex();
-                        if ((available & bit) == 0) continue;
-                        if (residency.hasPreparedMicrotile(object.hash())) resident |= bit;
-                        if (plan.selectionObjectInFlight(object.hash())) inFlight |= bit;
+                        if ((coverageAvailable & bit) == 0) continue;
+                        if (residency.hasPreparedMicrotile(object.hash())) coverageResident |= bit;
+                        if ((available & bit) != 0
+                                && plan.selectionObjectInFlight(object.hash())) inFlight |= bit;
                     }
+                    long resident = coverageResident & available;
                     long renderable = this.renderableScratch[content] & resident & available;
-                    resident &= available;
-                    inFlight &= available;
+                    long coverageRenderable = this.renderableScratch[content]
+                            & coverageResident & coverageAvailable;
                     manifest.setContentState(nodeIndex, contentClass, available, resident,
-                            renderable, inFlight);
+                            renderable, inFlight, coverageAvailable, coverageRenderable);
                     for (int index = 0; index < source.dependencies().size(); index++) {
                         Hash256 hash = source.dependencies().get(index);
                         manifest.setDependencyState(nodeIndex, contentClass, index,
