@@ -856,12 +856,20 @@ impl Service {
             send.finish()?;
             return Ok(());
         }
-        let response = prepare_response(
-            &surface,
-            authorization.record,
-            &authorization.dictionaries,
-            &request.hashes,
-        );
+        let response_surface = surface.clone();
+        let response_record = authorization.record;
+        let response_dictionaries = authorization.dictionaries.clone();
+        let response_hashes = request.hashes.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            prepare_response(
+                &response_surface,
+                response_record,
+                &response_dictionaries,
+                &response_hashes,
+            )
+        })
+        .await
+        .context("object-response preparation worker failed")?;
         // Every response now owns immutable file handles, so the root only needs to remain
         // explicitly pinned through source acquisition rather than through network backpressure.
         drop(request_pin);

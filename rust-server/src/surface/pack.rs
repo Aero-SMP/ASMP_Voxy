@@ -38,6 +38,9 @@ const ZSTD_LEVEL: i32 = 1;
 const PREFIXES: usize = 256;
 const MAX_INDEX_DELTA_ENTRIES: usize = 32 * 1024;
 const HOT_INDEX_ENTRIES: usize = 4 * 1024;
+const INDEX_FILTER_BITS_PER_ENTRY: usize = 8;
+const MAX_INDEX_FILTER_BYTES: usize = 16 * 1024 * 1024;
+const INDEX_FILTER_PROBES: u64 = 3;
 const INDEX_REBUILD_BUFFER_ENTRIES: usize = 16 * 1024;
 /// Delta indexes are immutable and cheap to publish. Periodic consolidation bounds lookup depth
 /// without putting a world-sized rewrite on every terrain update's critical path.
@@ -246,6 +249,7 @@ struct MappedIndex {
     entries_offset: usize,
     entry_count: usize,
     prefixes: [(u32, u32); PREFIXES],
+    filter: IndexMembershipFilter,
 }
 
 impl MappedIndex {
@@ -256,6 +260,9 @@ impl MappedIndex {
     }
 
     fn location(&self, hash: ObjectHash) -> Option<ObjectLocation> {
+        if !self.filter.might_contain(hash) {
+            return None;
+        }
         let (start, end) = self.prefixes[hash.as_bytes()[0] as usize];
         let mut start = start as usize;
         let mut end = end as usize;
@@ -270,6 +277,53 @@ impl MappedIndex {
         }
         None
     }
+}
+
+/// Compact negative lookup filter for one immutable index segment. Object hashes are already
+/// uniformly distributed, so double hashing three independent bit positions gives small delta
+/// segments a low false-positive rate while the fixed cap keeps adversarial stores bounded.
+/// False positives only fall through to the authoritative binary search; false negatives are
+/// impossible because the filter is constructed during the mandatory index validation pass.
+#[derive(Debug)]
+struct IndexMembershipFilter {
+    words: Box<[u64]>,
+}
+
+impl IndexMembershipFilter {
+    fn new(entries: usize) -> Self {
+        let requested_bits = entries
+            .saturating_mul(INDEX_FILTER_BITS_PER_ENTRY)
+            .clamp(64, MAX_INDEX_FILTER_BYTES * 8);
+        let words = requested_bits.div_ceil(64).next_power_of_two();
+        Self {
+            words: vec![0; words].into_boxed_slice(),
+        }
+    }
+
+    fn insert(&mut self, hash: ObjectHash) {
+        let [first, step] = filter_hashes(hash);
+        let mask = self.words.len() as u64 * 64 - 1;
+        for probe in 0..INDEX_FILTER_PROBES {
+            let bit = first.wrapping_add(probe.wrapping_mul(step)) & mask;
+            self.words[bit as usize >> 6] |= 1 << (bit & 63);
+        }
+    }
+
+    fn might_contain(&self, hash: ObjectHash) -> bool {
+        let [first, step] = filter_hashes(hash);
+        let mask = self.words.len() as u64 * 64 - 1;
+        (0..INDEX_FILTER_PROBES).all(|probe| {
+            let bit = first.wrapping_add(probe.wrapping_mul(step)) & mask;
+            self.words[bit as usize >> 6] & (1 << (bit & 63)) != 0
+        })
+    }
+}
+
+fn filter_hashes(hash: ObjectHash) -> [u64; 2] {
+    let bytes = hash.as_bytes();
+    let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let step = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) | 1;
+    [first, step]
 }
 
 #[derive(Debug)]
@@ -1667,6 +1721,7 @@ fn read_mapped_index(path: &Path) -> Result<Option<(BTreeMap<u64, u64>, Arc<Mapp
         }
     }
     let mut previous = None;
+    let mut filter = IndexMembershipFilter::new(entry_count);
     for index in 0..entry_count {
         let offset = entries_offset + index * INDEX_ENTRY;
         let (hash, location) = decode_index_entry(&bytes[offset..offset + INDEX_ENTRY])?;
@@ -1674,6 +1729,7 @@ fn read_mapped_index(path: &Path) -> Result<Option<(BTreeMap<u64, u64>, Arc<Mapp
             bail!("surface object index is unsorted or contains an invalid location");
         }
         previous = Some(hash);
+        filter.insert(hash);
     }
     let mut prefixes = [(0u32, 0u32); PREFIXES];
     let mut index = 0usize;
@@ -1696,6 +1752,7 @@ fn read_mapped_index(path: &Path) -> Result<Option<(BTreeMap<u64, u64>, Arc<Mapp
             entries_offset,
             entry_count,
             prefixes,
+            filter,
         }),
     )))
 }
@@ -1752,4 +1809,57 @@ fn parse_pack_name(path: &Path) -> Option<u64> {
     (encoded.len() == 16)
         .then(|| u64::from_str_radix(encoded, 16).ok())
         .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CanonicalObject, INDEX_FILTER_BITS_PER_ENTRY, IndexMembershipFilter,
+        MAX_INDEX_FILTER_BYTES, ObjectHash, ObjectKind,
+    };
+
+    fn hash(index: u64) -> ObjectHash {
+        CanonicalObject::new(ObjectKind::Catalog, index.to_le_bytes().to_vec())
+            .unwrap()
+            .hash()
+    }
+
+    #[test]
+    fn mapped_index_filter_never_rejects_inserted_hashes() {
+        let hashes = (1..=16_384).map(hash).collect::<Vec<_>>();
+        let mut filter = IndexMembershipFilter::new(hashes.len());
+        for &hash in &hashes {
+            filter.insert(hash);
+        }
+        assert!(hashes.into_iter().all(|hash| filter.might_contain(hash)));
+    }
+
+    #[test]
+    fn mapped_index_filter_rejects_most_absent_hashes() {
+        let entries = 16_384u64;
+        let mut filter = IndexMembershipFilter::new(entries as usize);
+        for index in 0..entries {
+            filter.insert(hash(index));
+        }
+        let false_positives = (entries..entries * 2)
+            .filter(|&index| filter.might_contain(hash(index)))
+            .count();
+        assert!(false_positives < entries as usize / 10);
+    }
+
+    #[test]
+    fn mapped_index_filter_storage_is_bounded() {
+        let small = IndexMembershipFilter::new(1);
+        assert_eq!(small.words.len(), 1);
+
+        let ordinary_entries = 32_768;
+        let ordinary = IndexMembershipFilter::new(ordinary_entries);
+        assert!(ordinary.words.len() * 64 >= ordinary_entries * INDEX_FILTER_BITS_PER_ENTRY);
+
+        let oversized = IndexMembershipFilter::new(usize::MAX);
+        assert_eq!(
+            oversized.words.len() * size_of::<u64>(),
+            MAX_INDEX_FILTER_BYTES
+        );
+    }
 }

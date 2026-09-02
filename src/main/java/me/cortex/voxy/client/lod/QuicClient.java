@@ -51,6 +51,8 @@ interface QuicClient extends AutoCloseable {
          * invokes {@code release}, propagating decoder/cache backpressure to QUIC flow control.
          */
         void object(EncodedObject object, Runnable release);
+        /** Records validated response progress without queueing work on the connection owner. */
+        void progress();
         void complete();
         void failed(Throwable failure);
     }

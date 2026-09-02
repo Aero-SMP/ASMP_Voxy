@@ -346,7 +346,7 @@ final class KwikQuicClient implements QuicClient {
             boolean owned = false;
             try {
                 CRC32C checksum = new CRC32C();
-                readBody(input, body.buffer, transfer, checksum);
+                readBody(input, body.buffer, transfer, checksum, handle);
                 body.buffer.flip();
                 if ((int) checksum.getValue() != expectedChecksum) {
                     throw new IOException("compressed Voxy object checksum mismatch");
@@ -455,7 +455,7 @@ final class KwikQuicClient implements QuicClient {
     }
 
     private static void readBody(InputStream input, ByteBuffer output, byte[] transfer,
-                                 CRC32C checksum) throws IOException {
+                                 CRC32C checksum, RequestHandle handle) throws IOException {
         while (output.hasRemaining()) {
             int length = Math.min(output.remaining(), transfer.length);
             int read = input.read(transfer, 0, length);
@@ -463,6 +463,7 @@ final class KwikQuicClient implements QuicClient {
             if (read == 0) continue;
             checksum.update(transfer, 0, read);
             output.put(transfer, 0, read);
+            handle.progress();
         }
     }
 
@@ -591,6 +592,10 @@ final class KwikQuicClient implements QuicClient {
 
         private boolean cancelled() {
             return this.cancelled.get();
+        }
+
+        private void progress() {
+            if (!this.cancelled.get() && !this.finished.get()) this.receiver.progress();
         }
 
         private void object(EncodedObject object) throws IOException {

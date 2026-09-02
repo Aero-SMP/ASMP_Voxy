@@ -81,6 +81,8 @@ final class ClientSession {
             TimeUnit.MILLISECONDS.toNanos(100);
     private static final long CAMERA_DOMAIN_QUERY_TIMEOUT_NANOS =
             TimeUnit.SECONDS.toNanos(2);
+    private static final long OBJECT_STREAM_PROGRESS_TIMEOUT_NANOS =
+            TimeUnit.SECONDS.toNanos(15);
     private static final long THROUGHPUT_WINDOW_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
     private static final int MAX_RETAINED_OUTSIDE_VIEW = 256;
     private static final int MAX_RETIREMENTS_PER_PASS = 16;
@@ -740,6 +742,7 @@ final class ClientSession {
 
                 reconcileMetadata();
                 updateCameraDomainQuery();
+                expireStalledStreams();
                 cancelObsoleteStreams();
                 releaseDelayedRetries(false);
                 pumpRequests();
@@ -1524,6 +1527,19 @@ final class ClientSession {
                     }
                 }
                 if (!required) cancelRequest(request, true);
+            }
+        }
+
+        private void expireStalledStreams() {
+            long now = System.nanoTime();
+            for (ActiveRequest request : List.copyOf(this.activeRequests)) {
+                long deadline = request.progressDeadlineNanos();
+                if (deadline == Long.MAX_VALUE || deadline - now > 0) continue;
+                Logger.warn("Voxy QUIC " + request.lane
+                        + " object stream made no progress for "
+                        + TimeUnit.NANOSECONDS.toSeconds(OBJECT_STREAM_PROGRESS_TIMEOUT_NANOS)
+                        + " seconds; resetting and retrying current demand");
+                cancelRequest(request, true);
             }
         }
 
@@ -2335,6 +2351,7 @@ final class ClientSession {
             private boolean cancelled;
             private boolean latencyRecorded;
             private boolean ownerQueued;
+            private long lastProgressNanos = this.startedNanos;
             private NetworkHandoff networkHandoff;
             private final ArrayDeque<DecodedObjectEvent> cachedDecodeHandoffs =
                     new ArrayDeque<>();
@@ -2361,6 +2378,7 @@ final class ClientSession {
                     throw new IllegalStateException("invalid QUIC network request transition");
                 }
                 this.networkRequestCount = count;
+                this.lastProgressNanos = System.nanoTime();
             }
 
             private synchronized int networkRequestCount() {
@@ -2410,6 +2428,13 @@ final class ClientSession {
                     release.run();
                 } else {
                     signalOwner();
+                }
+            }
+
+            @Override
+            public synchronized void progress() {
+                if (!this.cancelled && !this.networkFinished) {
+                    this.lastProgressNanos = System.nanoTime();
                 }
             }
 
@@ -2554,6 +2579,14 @@ final class ClientSession {
                 return this.networkFinished;
             }
 
+            private synchronized long progressDeadlineNanos() {
+                if (this.cancelled || this.networkRequestCount == 0 || this.networkFinished) {
+                    return Long.MAX_VALUE;
+                }
+                return saturatingAdd(this.lastProgressNanos,
+                        OBJECT_STREAM_PROGRESS_TIMEOUT_NANOS);
+            }
+
             private synchronized void processingCompleted() {
                 if (this.processing <= 0) throw new IllegalStateException(
                         "object decode completion has no owned input");
@@ -2657,6 +2690,9 @@ final class ClientSession {
             }
             for (DelayedRetry retry : this.delayedObjectRetries.values()) {
                 deadline = Math.min(deadline, retry.readyNanos);
+            }
+            for (ActiveRequest request : this.activeRequests) {
+                deadline = Math.min(deadline, request.progressDeadlineNanos());
             }
             return deadline;
         }
