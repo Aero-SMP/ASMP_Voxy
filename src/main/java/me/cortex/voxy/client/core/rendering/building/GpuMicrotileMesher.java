@@ -28,6 +28,8 @@ import static org.lwjgl.opengl.GL30C.glBindBufferBase;
 /** Bounded render-thread compute mesher for locally proven opaque and template microtiles. */
 public final class GpuMicrotileMesher
         implements HybridMeshingDispatcher.Backend {
+    /** Matches the bounded compiler pool; every job owns independent staging buffers. */
+    public static final int MAX_CONCURRENT_JOBS = 8;
     private static final int CELL_WORDS = 3;
     private static final int FACE_COUNT = 6;
     private static final int MAX_QUADS_PER_FACE = MicrotileGeometry.SECTION_CELLS;
@@ -41,9 +43,7 @@ public final class GpuMicrotileMesher
     private final Thread ownerThread = Thread.currentThread();
     private final Executor ownerExecutor;
     private final Shader shader;
-    private final GlBuffer input;
-    private final GlBuffer output;
-    private CompletableFuture<BuiltSection> pending;
+    private final Lane[] lanes;
     private boolean closeRequested;
     private boolean closed;
 
@@ -51,23 +51,23 @@ public final class GpuMicrotileMesher
         this.models = Objects.requireNonNull(models, "models");
         this.ownerExecutor = Objects.requireNonNull(ownerExecutor, "ownerExecutor");
         Shader createdShader = null;
-        GlBuffer createdInput = null;
-        GlBuffer createdOutput = null;
+        Lane[] createdLanes = new Lane[MAX_CONCURRENT_JOBS];
         try {
             createdShader = Shader.make()
                     .add(ShaderType.COMPUTE, "voxy:lod/meshing/microtile.comp")
                     .compile();
-            createdInput = new GlBuffer(INPUT_BYTES).zero();
-            createdOutput = new GlBuffer(OUTPUT_BYTES).zero();
+            for (int index = 0; index < createdLanes.length; index++) {
+                createdLanes[index] = Lane.create();
+            }
         } catch (RuntimeException | Error failure) {
-            if (createdOutput != null) createdOutput.free();
-            if (createdInput != null) createdInput.free();
+            for (Lane lane : createdLanes) {
+                if (lane != null) lane.close();
+            }
             if (createdShader != null) createdShader.free();
             throw failure;
         }
         this.shader = createdShader;
-        this.input = createdInput;
-        this.output = createdOutput;
+        this.lanes = createdLanes;
     }
 
     @Override
@@ -82,7 +82,8 @@ public final class GpuMicrotileMesher
             try {
                 submitOnOwner(request, result);
             } catch (Throwable failure) {
-                if (this.pending == result) this.pending = null;
+                Lane lane = find(result);
+                if (lane != null) lane.pending = null;
                 result.completeExceptionally(failure);
                 finishDeferredClose();
             }
@@ -108,10 +109,9 @@ public final class GpuMicrotileMesher
                                CompletableFuture<BuiltSection> result) {
         this.ensureOwner();
         if (result.isDone()) return;
-        if (this.pending != null) {
-            throw new IllegalStateException("GPU microtile mesher already has in-flight work");
-        }
-        this.pending = result;
+        Lane lane = availableLane();
+        if (lane == null) throw new IllegalStateException("GPU meshing lanes exhausted");
+        lane.pending = result;
         if (request.sectionPosition() != RootDemandPlan.sectionKey(request.activation().node())) {
             throw new IllegalArgumentException("GPU meshing request is bound to another node");
         }
@@ -122,7 +122,7 @@ public final class GpuMicrotileMesher
         }
 
         MicrotileGeometry.Grid grid = MicrotileGeometry.assemble(request.activation());
-        long pointer = UploadStream.INSTANCE.upload(this.input, 0, INPUT_BYTES);
+        long pointer = UploadStream.INSTANCE.upload(lane.input, 0, INPUT_BYTES);
         byte[] paths = grid.paths();
         for (int index = 0; index < MicrotileGeometry.INPUT_CELLS; index++) {
             long cell = grid.inputCell(index);
@@ -160,16 +160,16 @@ public final class GpuMicrotileMesher
         }
         UploadStream.INSTANCE.commit();
 
-        this.output.zeroRange(0, OUTPUT_HEADER_BYTES);
+        lane.output.zeroRange(0, OUTPUT_HEADER_BYTES);
         this.shader.bind();
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, this.input.id);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, this.output.id);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, lane.input.id);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, lane.output.id);
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
         glDispatchCompute((MicrotileGeometry.SECTION_CELLS + 127) / 128, 1, 1);
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
         // The copy and its fence are queued on the render thread, but parsing happens only after
         // the fence signals on a later frame. No glGet* call stalls Minecraft's render loop.
-        DownloadStream.INSTANCE.download(this.output, 0, OUTPUT_BYTES, (download, size) -> {
+        DownloadStream.INSTANCE.download(lane.output, 0, OUTPUT_BYTES, (download, size) -> {
             try {
                 if (this.closed) throw new IllegalStateException("GPU mesher closed in flight");
                 BuiltSection geometry = readResult(request, grid, download, size);
@@ -177,7 +177,7 @@ public final class GpuMicrotileMesher
             } catch (Throwable failure) {
                 result.completeExceptionally(failure);
             } finally {
-                if (this.pending == result) this.pending = null;
+                if (lane.pending == result) lane.pending = null;
                 finishDeferredClose();
             }
         });
@@ -263,7 +263,7 @@ public final class GpuMicrotileMesher
             throw new IllegalStateException("GPU microtile meshing requires its render thread");
         }
         if (this.closed || this.closeRequested) return;
-        if (this.pending != null) {
+        if (hasPending()) {
             this.closeRequested = true;
             return;
         }
@@ -272,15 +272,35 @@ public final class GpuMicrotileMesher
 
     private void finishDeferredClose() {
         this.ensureOwnerThreadOnly();
-        if (this.closeRequested && this.pending == null && !this.closed) freeOnOwner();
+        if (this.closeRequested && !hasPending() && !this.closed) freeOnOwner();
     }
 
     private void freeOnOwner() {
         this.closed = true;
         this.closeRequested = false;
         this.shader.free();
-        this.input.free();
-        this.output.free();
+        for (Lane lane : this.lanes) lane.close();
+    }
+
+    private Lane availableLane() {
+        for (Lane lane : this.lanes) {
+            if (lane.pending == null) return lane;
+        }
+        return null;
+    }
+
+    private Lane find(CompletableFuture<BuiltSection> result) {
+        for (Lane lane : this.lanes) {
+            if (lane.pending == result) return lane;
+        }
+        return null;
+    }
+
+    private boolean hasPending() {
+        for (Lane lane : this.lanes) {
+            if (lane.pending != null) return true;
+        }
+        return false;
     }
 
     private void ensureOwner() {
@@ -319,5 +339,36 @@ public final class GpuMicrotileMesher
         CAN_BE_OCCLUDED,
         OCCLUDES,
         SELF_LIGHT
+    }
+
+    private static final class Lane implements AutoCloseable {
+        private final GlBuffer input;
+        private final GlBuffer output;
+        private CompletableFuture<BuiltSection> pending;
+
+        private Lane(GlBuffer input, GlBuffer output) {
+            this.input = input;
+            this.output = output;
+        }
+
+        private static Lane create() {
+            GlBuffer input = null;
+            GlBuffer output = null;
+            try {
+                input = new GlBuffer(INPUT_BYTES).zero();
+                output = new GlBuffer(OUTPUT_BYTES).zero();
+                return new Lane(input, output);
+            } catch (RuntimeException | Error failure) {
+                if (output != null) output.free();
+                if (input != null) input.free();
+                throw failure;
+            }
+        }
+
+        @Override
+        public void close() {
+            this.input.free();
+            this.output.free();
+        }
     }
 }

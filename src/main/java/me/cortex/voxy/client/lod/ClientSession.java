@@ -3,6 +3,7 @@ package me.cortex.voxy.client.lod;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.model.CatalogModelCompatibility;
+import me.cortex.voxy.client.core.rendering.building.GpuMicrotileMesher;
 import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
 import me.cortex.voxy.client.core.rendering.selection.PredictionTiming;
@@ -66,7 +67,7 @@ import java.util.concurrent.atomic.AtomicReference;
 final class ClientSession {
     private static final int MAX_MAIN_TASKS = 512;
     private static final int MAX_MAIN_PER_TICK = 96;
-    private static final int MAX_MESHING_JOBS = 1;
+    private static final int MAX_MESHING_JOBS = GpuMicrotileMesher.MAX_CONCURRENT_JOBS;
     private static final int MAX_BLOCK_ID = 1 << 20;
     private static final int MAX_BIOME_ID = 1 << 9;
     private static final long ESTIMATED_CONTENT_REQUEST_BYTES = 8L << 10;
@@ -540,7 +541,7 @@ final class ClientSession {
         private final ExecutorService cacheReadWorker;
         private final ExecutorService cacheWriteWorker;
         private final AtomicReference<Thread> decoderThread = new AtomicReference<>();
-        private final AtomicReference<Thread> mesherThread = new AtomicReference<>();
+        private final Set<Thread> mesherThreads = ConcurrentHashMap.newKeySet();
         private final ObjectDecoder decoder;
         private final ArrayBlockingQueue<StateEvent> state = new ArrayBlockingQueue<>(1024);
         /**
@@ -652,10 +653,10 @@ final class ClientSession {
                     this.decoderThread.set(thread);
                     return thread;
                 });
-                openedMesherWorker = Executors.newSingleThreadExecutor(task -> {
+                openedMesherWorker = Executors.newFixedThreadPool(MAX_MESHING_JOBS, task -> {
                     Thread thread = new Thread(task, "Voxy hybrid mesher");
                     thread.setDaemon(true);
-                    this.mesherThread.set(thread);
+                    this.mesherThreads.add(thread);
                     return thread;
                 });
                 openedCacheReader = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
@@ -2730,7 +2731,8 @@ final class ClientSession {
             }
 
             Thread current = Thread.currentThread();
-            boolean worker = current == this.decoderThread.get() || current == this.mesherThread.get();
+            boolean worker = current == this.decoderThread.get()
+                    || this.mesherThreads.contains(current);
             long shutdownDeadline = System.nanoTime() + SHUTDOWN_TIMEOUT_NANOS;
             if (!worker) {
                 awaitTermination(this.decoderWorker, shutdownDeadline, "object decoder");
