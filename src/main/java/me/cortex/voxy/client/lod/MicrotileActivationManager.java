@@ -119,8 +119,9 @@ public final class MicrotileActivationManager implements AutoCloseable {
     }
 
     /**
-     * Retains only candidates that still cover the latest accepted renderer cut. A compiler
-     * keeps ownership until it returns, at which point an obsolete result is discarded.
+     * Retains only candidates that cover the latest cut and do not belong to a superseded root.
+     * A compiler keeps ownership until it returns, at which point an obsolete result is
+     * discarded. A candidate newer than the caller's authority is left untouched.
      */
     public synchronized void retainCandidates(
             RootToken authority, Function<SpatialNode, ContentPipeline.SelectionCut> requiredCut) {
@@ -132,8 +133,11 @@ public final class MicrotileActivationManager implements AutoCloseable {
             Map.Entry<SpatialNode, Slot> entry = iterator.next();
             Slot slot = entry.getValue();
             Candidate candidate = slot.candidate;
-            if (candidate == null || !candidate.content.root().equals(authority)) continue;
-            ContentPipeline.SelectionCut required = requiredCut.apply(entry.getKey());
+            if (candidate == null) continue;
+            int freshness = compareAuthority(authority, candidate.content.root());
+            if (freshness < 0) continue;
+            ContentPipeline.SelectionCut required = freshness == 0
+                    ? requiredCut.apply(entry.getKey()) : null;
             if (required != null && covers(candidate.content.selectionCut(), required)) continue;
             candidate.obsolete = true;
             if (!candidate.compiling) {
