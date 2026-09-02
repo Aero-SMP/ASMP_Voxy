@@ -101,7 +101,7 @@ public final class VirtualSurfaceSelector {
     private int predictionFrame = Integer.MIN_VALUE;
     private Prediction framePrediction = new Prediction(new Vector3f(), 0.0f, 0.1f);
     private final ArrayDeque<PredictionSample> predictionSamples = new ArrayDeque<>();
-    private final ArrayDeque<PredictionSample> availablePredictionSamples = new ArrayDeque<>();
+    private PredictionSample availablePredictionSample;
     private double predictionAccuracy = 0.75;
     private long lastPredictionFeedbackSequence;
     private long predictionGeneration = Long.MIN_VALUE;
@@ -144,6 +144,7 @@ public final class VirtualSurfaceSelector {
     /** Releases session accounting; outstanding readback reservations retire in their callbacks. */
     public void unbindMemory(MemoryBudget memory) {
         if (this.memory != memory) return;
+        this.disposePredictionSamples();
         this.selectionPool.unbindMemory(memory);
         this.releaseHandoff();
         this.memory = null;
@@ -233,7 +234,7 @@ public final class VirtualSurfaceSelector {
             this.activeEpoch++;
             this.releaseHandoff();
             this.activeManifest = null;
-            this.clearPredictionSamples();
+            this.disposePredictionSamples();
             this.lastPredictionFeedbackSequence = 0;
             this.lastPredictionSampleNanos = 0;
             this.predictionGeneration = Long.MIN_VALUE;
@@ -288,7 +289,7 @@ public final class VirtualSurfaceSelector {
         this.releaseHandoff();
         this.activeManifest = pending.manifest;
         if (this.predictionGeneration != pending.manifest.generation()) {
-            this.clearPredictionSamples();
+            this.disposePredictionSamples();
             this.lastPredictionFeedbackSequence = 0;
             this.lastPredictionSampleNanos = 0;
             this.predictionGeneration = pending.manifest.generation();
@@ -523,13 +524,18 @@ public final class VirtualSurfaceSelector {
                 && !malformed && overflow == 0
                 && !currentMalformed && !predictedMalformed;
         batch.setFrontierComplete(frontierComplete);
-        if (frontierComplete
-                && Long.compareUnsigned(ticket.sequence,
-                this.lastPredictionFeedbackSequence) > 0) {
-            this.lastPredictionFeedbackSequence = ticket.sequence;
-            this.observePredictionUsefulness(ticket, batch);
+        try {
+            if (frontierComplete
+                    && Long.compareUnsigned(ticket.sequence,
+                    this.lastPredictionFeedbackSequence) > 0) {
+                this.lastPredictionFeedbackSequence = ticket.sequence;
+                this.observePredictionUsefulness(ticket, batch);
+            }
+            this.offer(batch);
+        } catch (RuntimeException | Error failure) {
+            batch.close();
+            throw failure;
         }
-        this.offer(batch);
     }
 
     static boolean decodeQueue(SelectionManifest manifest, long pointer, int queue,
@@ -588,6 +594,8 @@ public final class VirtualSurfaceSelector {
     }
 
     private void observePredictionUsefulness(SelectionTicket ticket, SelectionBatch batch) {
+        MemoryBudget memory = this.memory;
+        if (memory == null) return;
         long now = System.nanoTime();
         Iterator<PredictionSample> samples = this.predictionSamples.iterator();
         while (samples.hasNext()) {
@@ -611,10 +619,12 @@ public final class VirtualSurfaceSelector {
         }
 
         if (now - this.lastPredictionSampleNanos >= 50_000_000L) {
-            PredictionSample sample = this.availablePredictionSamples.pollFirst();
+            PredictionSample sample = this.availablePredictionSample;
+            this.availablePredictionSample = null;
             if (sample == null) sample = new PredictionSample();
             if (sample.capture(ticket.manifest.cameraVisibilityDomain(), ticket.frameId,
-                    deadline(ticket.submittedNanos, ticket.predictionHorizonSeconds), batch, 1)) {
+                    deadline(ticket.submittedNanos, ticket.predictionHorizonSeconds), batch, 1,
+                    memory)) {
                 this.predictionSamples.addLast(sample);
                 this.lastPredictionSampleNanos = now;
             } else {
@@ -626,17 +636,25 @@ public final class VirtualSurfaceSelector {
         }
     }
 
-    private void clearPredictionSamples() {
-        while (!this.predictionSamples.isEmpty()) {
-            this.recyclePredictionSample(this.predictionSamples.removeFirst());
+    private void recyclePredictionSample(PredictionSample sample) {
+        sample.reset();
+        PredictionSample retained = this.availablePredictionSample;
+        if (retained == null) {
+            this.availablePredictionSample = sample;
+        } else if (sample.storageBytes() > retained.storageBytes()) {
+            retained.dispose();
+            this.availablePredictionSample = sample;
+        } else {
+            sample.dispose();
         }
     }
 
-    private void recyclePredictionSample(PredictionSample sample) {
-        sample.reset();
-        if (this.availablePredictionSamples.size() < MAX_PREDICTION_SAMPLES) {
-            this.availablePredictionSamples.addFirst(sample);
+    private void disposePredictionSamples() {
+        while (!this.predictionSamples.isEmpty()) {
+            this.predictionSamples.removeFirst().dispose();
         }
+        if (this.availablePredictionSample != null) this.availablePredictionSample.dispose();
+        this.availablePredictionSample = null;
     }
 
     private void updatePredictionAccuracy(double usefulness) {
@@ -655,7 +673,7 @@ public final class VirtualSurfaceSelector {
         this.activeEpoch++;
         this.pendingManifest.set(null);
         this.activeManifest = null;
-        this.clearPredictionSamples();
+        this.disposePredictionSamples();
         if (this.memory != null) this.selectionPool.unbindMemory(this.memory);
         this.releaseHandoff();
         this.shader.free();
@@ -729,21 +747,28 @@ public final class VirtualSurfaceSelector {
     private record Prediction(Vector3f delta, float angularPadding, float horizonSeconds) {}
 
     private static final class PredictionSample {
+        private static final byte[] EMPTY_BYTES = new byte[0];
+        private static final int[] EMPTY_INTS = new int[0];
+        private static final long[] EMPTY_LONGS = new long[0];
+
         private long cameraDomain;
         private int frameId;
         private long deadlineNanos;
-        private long[] keys = new long[0];
-        private long[] predicted = new long[0];
-        private long[] matched = new long[0];
-        private byte[] classes = new byte[0];
-        private int[] epochs = new int[0];
+        private MemoryBudget memory;
+        private MemoryBudget.Reservation storageMemory;
+        private long accountedBytes;
+        private long[] keys = EMPTY_LONGS;
+        private long[] predicted = EMPTY_LONGS;
+        private long[] matched = EMPTY_LONGS;
+        private byte[] classes = EMPTY_BYTES;
+        private int[] epochs = EMPTY_INTS;
         private int epoch;
         private int size;
 
         private boolean capture(long cameraDomain, int frameId, long deadlineNanos,
-                                SelectionBatch batch, int queue) {
+                                SelectionBatch batch, int queue, MemoryBudget memory) {
             int capacity = tableCapacity(Math.multiplyExact(batch.inputCount(queue), 3));
-            ensureCapacity(capacity);
+            if (!ensureCapacity(capacity, memory)) return false;
             beginEpoch();
             this.cameraDomain = cameraDomain;
             this.frameId = frameId;
@@ -811,14 +836,83 @@ public final class VirtualSurfaceSelector {
             this.size = 0;
         }
 
-        private void ensureCapacity(int capacity) {
-            if (capacity <= this.keys.length) return;
-            this.keys = new long[capacity];
-            this.predicted = new long[capacity];
-            this.matched = new long[capacity];
-            this.classes = new byte[capacity];
-            this.epochs = new int[capacity];
+        private boolean ensureCapacity(int capacity, MemoryBudget memory) {
+            if (capacity <= this.keys.length) {
+                if (this.memory != memory) {
+                    throw new IllegalStateException(
+                            "prediction sample belongs to another memory budget");
+                }
+                return true;
+            }
+            long requiredBytes = storageBytes(capacity);
+            long peakBytes = Math.addExact(requiredBytes, arrayBytes(this.keys.length));
+            MemoryBudget.Allocation peak = MemoryBudget.Allocation.of(
+                    MemoryBudget.Pool.MANIFEST, peakBytes);
+            boolean newReservation = this.storageMemory == null;
+            if (newReservation) {
+                this.storageMemory = memory.tryReserve(peak).orElse(null);
+                if (this.storageMemory == null) return false;
+                this.memory = memory;
+            } else {
+                if (this.memory != memory) {
+                    throw new IllegalStateException(
+                            "prediction sample belongs to another memory budget");
+                }
+                if (!this.storageMemory.tryResizeTo(peak)) return false;
+            }
+            try {
+                long[] keys = new long[capacity];
+                long[] predicted = new long[capacity];
+                long[] matched = new long[capacity];
+                byte[] classes = new byte[capacity];
+                int[] epochs = new int[capacity];
+                this.keys = keys;
+                this.predicted = predicted;
+                this.matched = matched;
+                this.classes = classes;
+                this.epochs = epochs;
+                this.epoch = 0;
+                this.storageMemory.reduceTo(MemoryBudget.Allocation.of(
+                        MemoryBudget.Pool.MANIFEST, requiredBytes));
+                this.accountedBytes = requiredBytes;
+                return true;
+            } catch (RuntimeException | Error failure) {
+                this.dispose();
+                throw failure;
+            }
+        }
+
+        private long storageBytes() {
+            return this.accountedBytes;
+        }
+
+        private void dispose() {
+            reset();
+            this.keys = EMPTY_LONGS;
+            this.predicted = EMPTY_LONGS;
+            this.matched = EMPTY_LONGS;
+            this.classes = EMPTY_BYTES;
+            this.epochs = EMPTY_INTS;
             this.epoch = 0;
+            if (this.storageMemory != null) this.storageMemory.close();
+            this.storageMemory = null;
+            this.memory = null;
+            this.accountedBytes = 0;
+        }
+
+        private static long storageBytes(int capacity) {
+            return Math.addExact(96L, arrayBytes(capacity));
+        }
+
+        private static long arrayBytes(int capacity) {
+            long bytes = Math.multiplyExact(alignedArrayBytes(capacity, Long.BYTES), 3);
+            bytes = Math.addExact(bytes, alignedArrayBytes(capacity, Byte.BYTES));
+            return Math.addExact(bytes, alignedArrayBytes(capacity, Integer.BYTES));
+        }
+
+        private static long alignedArrayBytes(int elements, int width) {
+            long bytes = Math.addExact(16L, Math.multiplyExact((long) elements, width));
+            return Math.addExact(bytes, 7) & ~7L;
         }
 
         private static int tableCapacity(int entries) {
