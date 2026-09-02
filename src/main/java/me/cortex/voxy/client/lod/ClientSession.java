@@ -83,6 +83,7 @@ final class ClientSession {
     private static final long MESHING_SCRATCH = 5L << 20;
     private static final long MAX_NODE_GEOMETRY = 8L << 20;
     private static final long ACTIVATION_IN_FLIGHT = 512L << 10;
+    private static final int MAX_MESHING_JOBS = 1;
     private static final int MAX_BLOCK_ID = 1 << 20;
     private static final int MAX_BIOME_ID = 1 << 9;
     private static final int MAX_NAME = 4096;
@@ -1283,9 +1284,8 @@ final class ClientSession {
                 return;
             }
             ClientLodDebug.activationPass(this.activationCuts.size());
-            int submitted = 0;
             for (int cutIndex = 0; cutIndex < this.activationCuts.size(); cutIndex++) {
-                if (submitted >= 32) break;
+                if (this.compiling.size() >= MAX_MESHING_JOBS) break;
                 SpatialNode node = this.activationCuts.nodeAt(cutIndex);
                 SelectionCut desired = this.activationCuts.cutAt(cutIndex);
                 if (this.compiling.contains(node) || this.awaitingFence.containsKey(node)
@@ -1341,10 +1341,15 @@ final class ClientSession {
                         && active.orElseThrow().publication().activationFencePassed()) {
                     continue;
                 }
-                this.resources.pinRootObjects(group.root(), group.requiredHashes());
                 if (!stageActivation(group)) {
                     ClientLodDebug.activationPressure();
                     continue;
+                }
+                try {
+                    this.resources.pinRootObjects(group.root(), group.requiredHashes());
+                } catch (RuntimeException | Error failure) {
+                    this.resources.activations.cancelCandidate(group.node(), group.root());
+                    throw failure;
                 }
                 this.compiling.add(node);
                 RootToken root = this.plan.root().root();
@@ -1363,15 +1368,11 @@ final class ClientSession {
                     }
                     offer(new CompileEvent(root, node, failure));
                 });
-                submitted++;
             }
         }
 
         /** Live renderable coverage outranks disposable cache and unpinned decoded content. */
         private boolean stageActivation(ContentPipeline.ActivationGroup group) {
-            if (this.resources.activations.stage(group, MESHING_SCRATCH,
-                    MAX_NODE_GEOMETRY, ACTIVATION_IN_FLIGHT)) return true;
-            this.resources.residency.reclaimUnreferenced();
             if (this.resources.activations.stage(group, MESHING_SCRATCH,
                     MAX_NODE_GEOMETRY, ACTIVATION_IN_FLIGHT)) return true;
             this.resources.cache.disableForPressure();
