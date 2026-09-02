@@ -781,10 +781,9 @@ impl Service {
                 if let Err(error) = service
                     .object_stream(send, recv, roots, guard, limits)
                     .await
+                    && !is_quic_cancellation(&error)
                 {
-                    if !is_quic_cancellation(&error) {
-                        eprintln!("Voxy object stream ended: {error:#}");
-                    }
+                    eprintln!("Voxy object stream ended: {error:#}");
                 }
             });
         }

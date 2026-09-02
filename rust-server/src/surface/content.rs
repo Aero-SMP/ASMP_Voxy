@@ -278,7 +278,8 @@ impl Microtile {
             bail!("invalid surface production microtile metadata");
         }
         for origin in self.origin {
-            if origin as usize >= SECTION_EDGE || origin as usize % MICROTILE_EDGE != 0 {
+            if origin as usize >= SECTION_EDGE || !(origin as usize).is_multiple_of(MICROTILE_EDGE)
+            {
                 bail!("surface microtile origin is not 8-cell aligned inside its parent");
             }
         }
@@ -472,7 +473,7 @@ fn quantized_bounds(cells: &[Cell]) -> Option<QuantizedBounds> {
 
 fn boundary_summary(class_cells: &[bool]) -> (u8, Vec<u8>) {
     let mut faces = [[0u8; FACE_BYTES]; 6];
-    for face in 0..6usize {
+    for (face, summary) in faces.iter_mut().enumerate() {
         for v in 0..SECTION_EDGE {
             for u in 0..SECTION_EDGE {
                 let (x, y, z) = match face {
@@ -486,7 +487,7 @@ fn boundary_summary(class_cells: &[bool]) -> (u8, Vec<u8>) {
                 };
                 if class_cells[cell_index(x, y, z)] {
                     let bit = u + v * SECTION_EDGE;
-                    faces[face][bit / 8] |= 1 << (bit & 7);
+                    summary[bit / 8] |= 1 << (bit & 7);
                 }
             }
         }

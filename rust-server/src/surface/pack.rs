@@ -326,6 +326,9 @@ fn filter_hashes(hash: ObjectHash) -> [u64; 2] {
     [first, step]
 }
 
+type HotIndex = Box<[Option<(ObjectHash, ObjectLocation)>]>;
+type MappedIndexData = (BTreeMap<u64, u64>, Arc<MappedIndex>);
+
 #[derive(Debug)]
 struct ObjectIndex {
     /// Oldest-to-newest immutable index segments. Newer physical encodings of an identical
@@ -334,7 +337,7 @@ struct ObjectIndex {
     /// The append delta is intentionally small between transactional publication checkpoints.
     /// Existing readers continue using the immutable base while a writer appends records.
     delta: RwLock<BTreeMap<ObjectHash, ObjectLocation>>,
-    hot: Mutex<Box<[Option<(ObjectHash, ObjectLocation)>]>>,
+    hot: Mutex<HotIndex>,
 }
 
 impl ObjectIndex {
@@ -804,6 +807,10 @@ impl PackStore {
 
     pub fn len(&self) -> usize {
         self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn contains(&self, hash: ObjectHash) -> bool {
@@ -1663,7 +1670,7 @@ fn newer_location(left: ObjectLocation, right: ObjectLocation) -> bool {
     (left.pack_id, left.record_offset) > (right.pack_id, right.record_offset)
 }
 
-fn read_mapped_index(path: &Path) -> Result<Option<(BTreeMap<u64, u64>, Arc<MappedIndex>)>> {
+fn read_mapped_index(path: &Path) -> Result<Option<MappedIndexData>> {
     match fs::metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

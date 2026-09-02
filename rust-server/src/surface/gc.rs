@@ -1529,7 +1529,7 @@ fn classify_objects(
         while old_next.is_some_and(|(old_hash, _)| old_hash < hash) {
             old_next = old.next()?;
         }
-        while reachable_next.is_some_and(|reachable_hash| reachable_hash < hash) {
+        if reachable_next.is_some_and(|reachable_hash| reachable_hash < hash) {
             bail!("reachable GC closure contains a hash absent from the active object index");
         }
         if reachable_next == Some(hash) {

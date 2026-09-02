@@ -42,6 +42,8 @@ const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
 const COLUMN_FLAG_OPEN: u32 = 1 << 8;
 const DIRECTORY_FLAG_COMPLETE: u16 = 1 << 15;
 const CHUNKS_PER_REGION: usize = 1024;
+type RegionCoordinate = (i32, i32);
+type VisibilityRegions = BTreeMap<RegionCoordinate, RegionalVisibilitySummary>;
 
 const FACES: [(i32, i32, i32); 6] = [
     (-1, 0, 0),
@@ -693,9 +695,9 @@ impl VisibilityIndex {
     /// the active camera index while decoded Anvil groups are resident.
     pub fn regions_from_canonical_graph<T: AsRef<CanonicalObject>>(
         directory: &CanonicalObject,
-        wanted: &BTreeSet<(i32, i32)>,
+        wanted: &BTreeSet<RegionCoordinate>,
         mut page: impl FnMut(ObjectHash) -> Result<T>,
-    ) -> Result<(bool, BTreeMap<(i32, i32), RegionalVisibilitySummary>)> {
+    ) -> Result<(bool, VisibilityRegions)> {
         if directory.kind() != ObjectKind::VisibilityDirectory {
             bail!("root visibility directory has the wrong type");
         }
@@ -1120,7 +1122,7 @@ fn encode_page(entries: &[(&u64, &SectionLookup)]) -> Result<Vec<u8>> {
     output.extend_from_slice(PAGE_MAGIC);
     output.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     let mut previous = None;
-    for &(&packed, ref lookup) in entries {
+    for &(&packed, lookup) in entries {
         let key = SectionKey::unpack(packed)?;
         if key.level != 0 || previous.is_some_and(|value| value >= packed) {
             bail!("visibility page keys are not canonical level-zero order");

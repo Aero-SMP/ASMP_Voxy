@@ -69,6 +69,27 @@ const MAX_RETAINED_VISIBILITY_ROOTS: usize = 2;
 const REGION_PUBLICATION_BATCH: usize = 4;
 const GROUP_PUBLICATION_BATCH: usize = 1;
 type RegionOrderKey = (i64, i32, i32);
+type RegionCoordinate = (i32, i32);
+type RegionHeaders = BTreeMap<RegionCoordinate, RegionHeader>;
+type VisibilityRegions = BTreeMap<RegionCoordinate, RegionalVisibilitySummary>;
+
+struct ChangedHierarchyRequest<'a> {
+    headers: &'a RegionHeaders,
+    changed: &'a BTreeSet<RegionCoordinate>,
+    previous_regions: &'a VisibilityRegions,
+    group_batch_limit: usize,
+    force: bool,
+}
+
+struct RegionHierarchyRequest<'a> {
+    header: &'a RegionHeader,
+    expected_sources: Vec<RegionChunkSource>,
+    candidate_groups: BTreeSet<RegionCoordinate>,
+    previous_sources: Option<&'a [RegionChunkSource]>,
+    previous_source_microtiles: &'a BTreeMap<SectionKey, [ObjectHash; 64]>,
+    previous_summary: Option<&'a RegionalVisibilitySummary>,
+    force: bool,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SourceSnapshot(Vec<(i32, i32, u64)>);
@@ -420,7 +441,7 @@ impl DimensionSurface {
                 )?;
             } else {
                 let mut cursor = lock(&self.region_publication_cursor)?;
-                changed = round_robin_region_batch(changed, batch_limit, &mut *cursor);
+                changed = round_robin_region_batch(changed, batch_limit, &mut cursor);
             }
         }
         let group_batch_limit = if rebuild_all && old_state.ready {
@@ -451,12 +472,14 @@ impl DimensionSurface {
             load_changed_hierarchies(
                 &self.source,
                 registry,
-                &headers,
-                &changed,
-                &previous_changed_regions,
                 objects.active_mut(),
-                group_batch_limit,
-                rebuild_all,
+                ChangedHierarchyRequest {
+                    headers: &headers,
+                    changed: &changed,
+                    previous_regions: &previous_changed_regions,
+                    group_batch_limit,
+                    force: rebuild_all,
+                },
             )?
         };
         save_registry(registry)?;
@@ -476,12 +499,14 @@ impl DimensionSurface {
                 load_changed_hierarchies(
                     &self.source,
                     registry,
-                    &headers,
-                    &changed,
-                    &BTreeMap::new(),
                     objects.active_mut(),
-                    usize::MAX,
-                    true,
+                    ChangedHierarchyRequest {
+                        headers: &headers,
+                        changed: &changed,
+                        previous_regions: &BTreeMap::new(),
+                        group_batch_limit: usize::MAX,
+                        force: true,
+                    },
                 )?
             };
             save_registry(registry)?;
@@ -524,18 +549,15 @@ impl DimensionSurface {
         }
         let catalog = catalog_value.canonical_object()?;
 
-        let mut visibility_regions = if rebuild_all || old_state.root.is_none() {
+        let mut visibility_regions = if rebuild_all {
             BTreeMap::new()
-        } else {
+        } else if let Some(root) = old_state.root {
             {
                 let objects = lock(&self.objects)?;
-                load_visibility_regions(
-                    objects.active(),
-                    old_state.root.expect("checked root").visibility,
-                    &BTreeSet::new(),
-                )?
-                .1
+                load_visibility_regions(objects.active(), root.visibility, &BTreeSet::new())?.1
             }
+        } else {
+            BTreeMap::new()
         };
         for &coordinate in &changed {
             let Some(hierarchy) = hierarchies.get(&coordinate) else {
@@ -736,7 +758,7 @@ impl DimensionSurface {
                 root,
                 &mut sections,
                 &old_sections,
-                &changed_states,
+                changed_states,
                 &replaced_keys,
             )?;
             let manifest = build_manifest_tree(root, &sections, |object| {
@@ -988,8 +1010,8 @@ fn load_visibility_index(
 fn load_visibility_regions(
     store: &impl CanonicalObjectReader,
     directory_hash: ObjectHash,
-    wanted: &BTreeSet<(i32, i32)>,
-) -> Result<(bool, BTreeMap<(i32, i32), RegionalVisibilitySummary>)> {
+    wanted: &BTreeSet<RegionCoordinate>,
+) -> Result<(bool, VisibilityRegions)> {
     let directory = store
         .canonical(directory_hash)?
         .context("published visibility directory is missing")?;
@@ -1000,9 +1022,7 @@ fn load_visibility_regions(
     })
 }
 
-fn source_headers(
-    source: &AnvilWorld,
-) -> Result<(SourceSnapshot, BTreeMap<(i32, i32), RegionHeader>)> {
+fn source_headers(source: &AnvilWorld) -> Result<(SourceSnapshot, RegionHeaders)> {
     let headers = source.region_headers()?;
     if !headers.failed.is_empty() {
         bail!("one or more Anvil region headers are unreadable");
@@ -1293,13 +1313,16 @@ fn affected_region_groups(
 fn load_changed_hierarchies(
     source: &AnvilWorld,
     registry: &Arc<RwLock<Registry>>,
-    headers: &BTreeMap<(i32, i32), RegionHeader>,
-    changed: &BTreeSet<(i32, i32)>,
-    previous_regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
     store: &mut PackStore,
-    group_batch_limit: usize,
-    force: bool,
-) -> Result<BTreeMap<(i32, i32), LoadedHierarchy>> {
+    request: ChangedHierarchyRequest<'_>,
+) -> Result<BTreeMap<RegionCoordinate, LoadedHierarchy>> {
+    let ChangedHierarchyRequest {
+        headers,
+        changed,
+        previous_regions,
+        group_batch_limit,
+        force,
+    } = request;
     let mut output = BTreeMap::new();
     for &coordinate in changed {
         if !headers.contains_key(&coordinate) {
@@ -1336,19 +1359,21 @@ fn load_changed_hierarchies(
             let result = load_region_hierarchy(
                 source,
                 registry,
-                &header,
-                working_sources.clone(),
-                BTreeSet::from([group]),
-                summary
-                    .as_ref()
-                    .map(RegionalVisibilitySummary::source_chunks),
-                summary
-                    .as_ref()
-                    .map(RegionalVisibilitySummary::source_microtiles)
-                    .unwrap_or(&empty),
-                summary.as_ref(),
                 store,
-                force || previous.is_none(),
+                RegionHierarchyRequest {
+                    header: &header,
+                    expected_sources: working_sources.clone(),
+                    candidate_groups: BTreeSet::from([group]),
+                    previous_sources: summary
+                        .as_ref()
+                        .map(RegionalVisibilitySummary::source_chunks),
+                    previous_source_microtiles: summary
+                        .as_ref()
+                        .map(RegionalVisibilitySummary::source_microtiles)
+                        .unwrap_or(&empty),
+                    previous_summary: summary.as_ref(),
+                    force: force || previous.is_none(),
+                },
             );
             match result {
                 Ok(hierarchy) => {
@@ -1550,15 +1575,18 @@ fn apply_visibility_memberships(
 fn load_region_hierarchy(
     source: &AnvilWorld,
     registry: &Arc<RwLock<Registry>>,
-    header: &RegionHeader,
-    mut expected_sources: Vec<RegionChunkSource>,
-    candidate_groups: BTreeSet<(i32, i32)>,
-    previous_sources: Option<&[RegionChunkSource]>,
-    previous_source_microtiles: &BTreeMap<SectionKey, [ObjectHash; 64]>,
-    previous_summary: Option<&RegionalVisibilitySummary>,
     store: &mut PackStore,
-    force: bool,
+    request: RegionHierarchyRequest<'_>,
 ) -> Result<LoadedHierarchy> {
+    let RegionHierarchyRequest {
+        header,
+        mut expected_sources,
+        candidate_groups,
+        previous_sources,
+        previous_source_microtiles,
+        previous_summary,
+        force,
+    } = request;
     if header.entries.len() != 1024 || expected_sources.len() != 1024 {
         bail!("incremental region build requires 1024 header/source entries");
     }

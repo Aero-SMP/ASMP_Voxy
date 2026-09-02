@@ -93,8 +93,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompressionDictionary<'_>> {
     }
     let class = ContentClass::try_from(bytes[8])?;
     let length = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
-    if length < MIN_DICTIONARY_BYTES
-        || length > MAX_DICTIONARY_BYTES
+    if !(MIN_DICTIONARY_BYTES..=MAX_DICTIONARY_BYTES).contains(&length)
         || bytes.len() != HEADER_BYTES + length
         || !bytes[HEADER_BYTES..].starts_with(&ZSTD_DICTIONARY_MAGIC)
     {
@@ -122,7 +121,7 @@ fn seed_sample(class: ContentClass, seed: u32) -> Vec<u8> {
     value.push(class as u8);
     value.push(MICROTILE_EDGE as u8);
     value.extend_from_slice(&[
-        ((seed >> 0) & 3) as u8 * 8,
+        (seed & 3) as u8 * 8,
         ((seed >> 2) & 3) as u8 * 8,
         ((seed >> 4) & 3) as u8 * 8,
     ]);
