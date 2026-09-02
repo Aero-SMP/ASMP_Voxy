@@ -36,6 +36,13 @@ public final class ResidencyManager implements AutoCloseable {
     public record ObjectStatus(boolean compressed, boolean decoded, boolean meshing,
                                boolean renderable) {}
 
+    /** Result of an atomic root-pin update. Missing residency is recoverable demand. */
+    public enum PinResult {
+        MISSING,
+        UNCHANGED,
+        CHANGED
+    }
+
     private final MemoryBudget memory;
     private final Limits limits;
     private final Map<Hash256, ResidentObject> objects = new LinkedHashMap<>(16, 0.75f, true);
@@ -203,26 +210,23 @@ public final class ResidencyManager implements AutoCloseable {
     }
 
     /** Pins one reachable object to an immutable root until that root is released. */
-    public synchronized boolean pinRootObject(RootToken root, Hash256 hash) {
+    public synchronized PinResult pinRootObject(RootToken root, Hash256 hash) {
         ensureOpen();
         Objects.requireNonNull(root, "root");
         Hash256 value = Objects.requireNonNull(hash, "hash");
-        if (!this.objects.containsKey(value)) {
-            throw new IllegalArgumentException("cannot pin an object outside residency");
-        }
-        return pinsFor(root).add(value);
+        if (!this.objects.containsKey(value)) return PinResult.MISSING;
+        return pinsFor(root).add(value) ? PinResult.CHANGED : PinResult.UNCHANGED;
     }
 
-    public synchronized boolean pinRootObjects(RootToken root, Collection<Hash256> hashes) {
+    public synchronized PinResult pinRootObjects(RootToken root, Collection<Hash256> hashes) {
         ensureOpen();
         Objects.requireNonNull(hashes, "hashes");
         for (Hash256 hash : hashes) {
             Hash256 value = Objects.requireNonNull(hash, "root pin hash");
-            if (!this.objects.containsKey(value)) {
-                throw new IllegalArgumentException("cannot pin an object outside residency");
-            }
+            if (!this.objects.containsKey(value)) return PinResult.MISSING;
         }
-        return pinsFor(Objects.requireNonNull(root, "root")).addAll(hashes);
+        return pinsFor(Objects.requireNonNull(root, "root")).addAll(hashes)
+                ? PinResult.CHANGED : PinResult.UNCHANGED;
     }
 
     public synchronized boolean releaseRootPins(RootToken root) {
@@ -232,20 +236,21 @@ public final class ResidencyManager implements AutoCloseable {
     }
 
     /** Atomically replaces one root's exact residency ownership set. */
-    public synchronized boolean reconcileRootPins(RootToken root, Collection<Hash256> hashes) {
+    public synchronized PinResult reconcileRootPins(RootToken root,
+                                                     Collection<Hash256> hashes) {
         ensureOpen();
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(hashes, "hashes");
         LinkedHashSet<Hash256> desired = new LinkedHashSet<>();
         for (Hash256 hash : hashes) {
             Hash256 value = Objects.requireNonNull(hash, "root pin hash");
-            if (!this.objects.containsKey(value)) {
-                throw new IllegalArgumentException("cannot pin an object outside residency");
-            }
+            if (!this.objects.containsKey(value)) return PinResult.MISSING;
             desired.add(value);
         }
         Set<Hash256> existing = this.rootPins.get(root);
-        if (desired.equals(existing == null ? Set.of() : existing)) return false;
+        if (desired.equals(existing == null ? Set.of() : existing)) {
+            return PinResult.UNCHANGED;
+        }
         if (desired.isEmpty()) this.rootPins.remove(root);
         else {
             if (!this.rootPins.containsKey(root)
@@ -254,7 +259,7 @@ public final class ResidencyManager implements AutoCloseable {
             }
             this.rootPins.put(root, desired);
         }
-        return true;
+        return PinResult.CHANGED;
     }
 
     /** Visits retained-root hashes without materializing another budget-sized set. */

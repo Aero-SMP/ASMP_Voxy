@@ -404,19 +404,28 @@ final class ClientSession {
             this.authoritativeRoot = Objects.requireNonNull(root, "root");
         }
 
-        private void pinRootObject(RootToken root, Hash256 hash) {
-            if (this.residency.pinRootObject(root, hash)) this.cachePinsDirty.set(true);
+        private boolean pinRootObject(RootToken root, Hash256 hash) {
+            ResidencyManager.PinResult result = this.residency.pinRootObject(root, hash);
+            if (result == ResidencyManager.PinResult.MISSING) return false;
+            if (result == ResidencyManager.PinResult.CHANGED) this.cachePinsDirty.set(true);
             this.pinnedRoots.add(root);
+            return true;
         }
 
-        private void pinRootObjects(RootToken root, Collection<Hash256> hashes) {
-            if (this.residency.pinRootObjects(root, hashes)) this.cachePinsDirty.set(true);
+        private boolean pinRootObjects(RootToken root, Collection<Hash256> hashes) {
+            ResidencyManager.PinResult result = this.residency.pinRootObjects(root, hashes);
+            if (result == ResidencyManager.PinResult.MISSING) return false;
+            if (result == ResidencyManager.PinResult.CHANGED) this.cachePinsDirty.set(true);
             this.pinnedRoots.add(root);
+            return true;
         }
 
-        private void reconcileRootPins(RootToken root, Collection<Hash256> hashes) {
-            if (this.residency.reconcileRootPins(root, hashes)) this.cachePinsDirty.set(true);
+        private boolean reconcileRootPins(RootToken root, Collection<Hash256> hashes) {
+            ResidencyManager.PinResult result = this.residency.reconcileRootPins(root, hashes);
+            if (result == ResidencyManager.PinResult.MISSING) return false;
+            if (result == ResidencyManager.PinResult.CHANGED) this.cachePinsDirty.set(true);
             this.pinnedRoots.add(root);
+            return true;
         }
 
         private void releaseUnretainedRoots() {
@@ -1113,7 +1122,10 @@ final class ClientSession {
                     this.resources.residency.reclaimUnreferenced();
                     return false;
                 }
-                this.resources.pinRootObject(root, canonical.hash());
+                if (!this.resources.pinRootObject(root, canonical.hash())) {
+                    current.deferInFlightResponse(canonical.hash(), true);
+                    return false;
+                }
                 if (canonical.kind() == ObjectKind.ROOT_DIRECTORY) {
                     RootDirectory directory = this.resources.residency
                             .rootDirectory(canonical.hash()).orElseThrow();
@@ -1133,7 +1145,10 @@ final class ClientSession {
                 return true;
             }
 
-            this.resources.pinRootObject(root, canonical.hash());
+            if (!this.resources.pinRootObject(root, canonical.hash())) {
+                current.deferInFlightResponse(canonical.hash(), false);
+                return false;
+            }
             current.acceptObject(canonical.hash(), canonical.kind());
             if (canonical.kind() == ObjectKind.CATALOG) {
                 CatalogCodec.Catalog decoded = CatalogCodec.decode(
@@ -1169,7 +1184,9 @@ final class ClientSession {
                 Optional<CanonicalObject> canonical =
                         this.resources.residency.verifiedCanonical(object.hash());
                 if (canonical.isEmpty()) {
-                    this.plan.retryProcessedObject(object.hash());
+                    if (this.plan.retryMissingResidentObject(object.hash())) {
+                        this.manifestDirty = true;
+                    }
                     continue;
                 }
                 if (!this.resources.residency.installMicrotile(canonical.orElseThrow(),
@@ -1345,11 +1362,22 @@ final class ClientSession {
                     ClientLodDebug.activationPressure();
                     continue;
                 }
-                try {
-                    this.resources.pinRootObjects(group.root(), group.requiredHashes());
-                } catch (RuntimeException | Error failure) {
+                List<Hash256> requiredHashes = group.requiredHashes();
+                if (!this.resources.pinRootObjects(group.root(), requiredHashes)) {
                     this.resources.activations.cancelCandidate(group.node(), group.root());
-                    throw failure;
+                    ArrayList<Hash256> missing = new ArrayList<>();
+                    for (Hash256 hash : requiredHashes) {
+                        if (!this.resources.residency.contains(hash)) missing.add(hash);
+                    }
+                    if (!missing.isEmpty()) {
+                        this.plan.requestObjectsByHash(missing,
+                                this.coverageCuts.containsNode(node)
+                                        ? ContentPriority.COVERAGE
+                                        : ContentPriority.CURRENT_VIEW);
+                        this.manifestDirty = true;
+                        ClientLodDebug.activationMissing(missing.size(), 0);
+                    }
+                    continue;
                 }
                 this.compiling.add(node);
                 RootToken root = this.plan.root().root();
@@ -1552,7 +1580,17 @@ final class ClientSession {
                 this.plan.forEachMetadataPin(retained::add);
                 this.plan.forEachContentPin(retained::add);
                 this.resources.activations.forEachRetainedHash(retained::add);
-                this.resources.reconcileRootPins(this.plan.root().root(), retained);
+                var iterator = retained.iterator();
+                while (iterator.hasNext()) {
+                    Hash256 hash = iterator.next();
+                    if (!this.resources.residency.contains(hash)) {
+                        iterator.remove();
+                        if (!this.plan.retryMissingResidentObject(hash)) continue;
+                        this.manifestDirty = true;
+                    }
+                }
+                if (!this.resources.reconcileRootPins(
+                        this.plan.root().root(), retained)) return;
                 this.resources.syncCachePins();
             }
         }

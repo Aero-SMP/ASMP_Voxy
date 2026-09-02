@@ -738,14 +738,29 @@ public final class RootDemandPlan {
         enqueueExpectedObject(hash);
     }
 
-    /** Reissues processed content if disposable residency reclaimed it before section preparation. */
-    public void retryProcessedObject(Hash256 hash) {
+    /** Reissues still-required content reclaimed from disposable physical residency. */
+    public boolean retryMissingResidentObject(Hash256 hash) {
         Objects.requireNonNull(hash, "hash");
-        if (!this.processedObjects.remove(hash)) return;
-        if (!this.expectedObjects.containsKey(hash)) {
-            throw new IllegalArgumentException("cannot retry an unexpected content object");
+        ExpectedObject expected = this.expectedObjects.get(hash);
+        if (expected == null) return false;
+        boolean changed = this.processedObjects.remove(hash);
+        if (!isMicrotile(expected.kind())) {
+            enqueueExpectedObject(hash);
+            return changed;
         }
-        enqueueExpectedObject(hash);
+        ContentPriority priority = this.requestedContent.get(hash);
+        ContentPriority selected = this.selectedContent.get(hash);
+        if (selected != null) {
+            priority = priority == null ? selected : higherPriority(priority, selected);
+        }
+        ContentPriority neighbor = this.selectedNeighborContent.get(hash);
+        if (neighbor != null) {
+            priority = priority == null ? neighbor : higherPriority(priority, neighbor);
+        }
+        if (priority == null) return changed;
+        ContentPriority previous = this.requestedContent.put(hash, priority);
+        refreshContentPriority(hash);
+        return changed || previous != priority;
     }
 
     public void acceptDirectory(Hash256 hash, RootDirectory directory) {
