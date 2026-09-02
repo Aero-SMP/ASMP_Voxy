@@ -150,19 +150,18 @@ public class DownloadStream {
 
 
     public void flushWaitClear() {
-        glFinish();
-        this.tick();
-        var fence = new GlFence();
-        glFinish();
-        while (!fence.signaled()) {
+        // A completed frame's callback may enqueue another download. Since tick() creates the
+        // new frame fence after the preceding glFinish(), one additional flush is not enough:
+        // the callback-created frame is necessarily unsignaled and used to crash teardown.
+        // Renderer producers are stopped before this method is called, so draining until no
+        // queue owns work reaches a finite fixed point while preserving every callback.
+        do {
             glFinish();
-            Thread.onSpinWait();
-        }
-        fence.free();
-        this.tick();
-        if (!this.frames.isEmpty()) {
-            throw new IllegalStateException();
-        }
+            this.tick();
+        } while (!this.frames.isEmpty()
+                || !this.downloadList.isEmpty()
+                || !this.thisFrameAllocations.isEmpty()
+                || !this.thisFrameDownloadList.isEmpty());
     }
 
     private record DownloadFrame(GlFence fence, LongArrayList allocations, ArrayList<DownloadData> data) {}

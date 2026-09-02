@@ -12,8 +12,10 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.nio.IntBuffer;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -261,6 +263,25 @@ public final class ClientLodDebug {
 
     static void updaterEvent(String message) {
         emit("VOXY_UPDATER " + message);
+    }
+
+    /** Copies a coherent log snapshot on the same executor that owns every append. */
+    static boolean snapshotLog(Path destination) throws IOException, InterruptedException {
+        try {
+            return WRITER.submit(() -> {
+                if (!Files.isRegularFile(LOG)) return false;
+                Files.copy(LOG, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                return true;
+            }).get(10, TimeUnit.SECONDS);
+        } catch (TimeoutException failure) {
+            throw new IOException("timed out waiting for Voxy debug-log snapshot", failure);
+        } catch (ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof IOException io) throw io;
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            if (cause instanceof Error error) throw error;
+            throw new IOException("Voxy debug-log snapshot failed", cause);
+        }
     }
 
     private static String oneLine(String value) {

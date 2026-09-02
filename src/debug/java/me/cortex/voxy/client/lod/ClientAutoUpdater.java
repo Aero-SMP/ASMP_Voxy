@@ -203,8 +203,7 @@ final class ClientAutoUpdater {
         StringBuilder snapshotStatus = new StringBuilder()
                 .append("time=").append(Instant.now()).append('\n')
                 .append("version=").append(VoxyClient.MOD_VERSION).append('\n');
-        snapshot(gameDirectory.resolve("logs").resolve("voxy-client-debug.log"),
-                staging.resolve("voxy-client-debug.log"), sources, snapshotStatus);
+        snapshotDebugLog(staging.resolve("voxy-client-debug.log"), sources, snapshotStatus);
         snapshot(gameDirectory.resolve("logs").resolve("latest.log"),
                 staging.resolve("latest.log"), sources, snapshotStatus);
         snapshot(gameDirectory.resolve(".voxy-updater").resolve("restart.log"),
@@ -262,6 +261,22 @@ final class ClientAutoUpdater {
             status.append(source.getFileName()).append("=OK\n");
         } catch (IOException failure) {
             status.append(source.getFileName()).append("=FAILED:")
+                    .append(oneLine(failure.getMessage())).append('\n');
+        }
+    }
+
+    private static void snapshotDebugLog(Path destination, List<String> destinations,
+                                         StringBuilder status) {
+        try {
+            if (!ClientLodDebug.snapshotLog(destination)) {
+                status.append("voxy-client-debug.log=ABSENT\n");
+                return;
+            }
+            destinations.add(destination.toString());
+            status.append("voxy-client-debug.log=OK\n");
+        } catch (IOException | InterruptedException failure) {
+            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+            status.append("voxy-client-debug.log=FAILED:")
                     .append(oneLine(failure.getMessage())).append('\n');
         }
     }
