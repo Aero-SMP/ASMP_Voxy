@@ -67,6 +67,7 @@ const MAX_RETAINED_VISIBILITY_ROOTS: usize = 2;
 const RETAINED_SOURCE_ENTRY_BYTES: usize = 64 + 16 + 64 * 32;
 const RETAINED_REPLACED_KEY_BYTES: usize = 80;
 const GROUP_BUILD_WORKING_BYTES: usize = 128 * 1024 * 1024;
+const PREPARED_STATE_BOUND_BYTES: usize = 32 * 1024;
 const MAX_RETAINED_VISIBILITY_BYTES: usize = 128 * 1024 * 1024;
 /// The first serviceable generation is deliberately tiny: one completed Anvil region is enough
 /// to give clients useful terrain while the rest of an existing world is imported. Later
@@ -687,6 +688,33 @@ impl DimensionSurface {
                 .copied()
                 .filter(|root| removed_regions.contains(&(root.x, root.z))),
         );
+        // Ordinary refreshes contain only the bounded changed-group batch. Prepare their
+        // renderable state once, then reuse it while rebuilding the owning roots and any
+        // dependency-facing neighbours. A full repair can span the world, so it deliberately
+        // retains only one root-local preparation below.
+        let prepared_change_bound = hierarchy_key_count
+            .checked_mul(PREPARED_STATE_BOUND_BYTES)
+            .and_then(|bytes| bytes.checked_add(16 * 1024 * 1024))
+            .context("prepared change-state memory overflow")?;
+        let _prepared_change_memory = (!rebuild_all
+            && prepared_change_bound <= GROUP_BUILD_WORKING_BYTES)
+            .then(|| {
+                self.memory
+                    .try_reserve(MemoryClass::Build, prepared_change_bound)
+            })
+            .transpose()?;
+        let prepared_changes = if _prepared_change_memory.is_some() {
+            Some(prepare_section_states_from_sources(
+                &hierarchies,
+                None,
+                &registry_snapshot,
+                &visibility,
+                &dictionaries,
+                object_sets.active_mut(),
+            )?)
+        } else {
+            None
+        };
         let mut roots_to_rebuild = if rebuild_all {
             old_state.groups.keys().copied().collect::<BTreeSet<_>>()
         } else {
@@ -748,31 +776,45 @@ impl DimensionSurface {
                 .into_iter()
                 .collect::<BTreeSet<_>>();
             dependency_roots.insert(root);
-            let changed_states = prepare_section_states_from_sources(
-                &hierarchies,
-                &dependency_roots,
-                &registry_snapshot,
-                &visibility,
-                &dictionaries,
-                object_sets.active_mut(),
-            )?;
+            let root_changes;
+            let changed_states = if let Some(prepared) = prepared_changes.as_ref() {
+                prepared
+            } else {
+                root_changes = prepare_section_states_from_sources(
+                    &hierarchies,
+                    Some(root),
+                    &registry_snapshot,
+                    &visibility,
+                    &dictionaries,
+                    object_sets.active_mut(),
+                )?;
+                &root_changes
+            };
             let mut old_sections = BTreeMap::new();
             if !rebuild_all {
                 for dependency_root in dependency_roots.iter().copied() {
                     let Some(group) = old_state.groups.get(&dependency_root) else {
                         continue;
                     };
-                    let loaded = load_group_sections(
-                        object_sets.active(),
-                        dependency_root,
-                        group,
-                        &class_dictionaries,
-                        false,
-                    )?;
-                    old_sections.extend(loaded.into_iter().filter(|(key, _)| {
-                        dependency_root == root
-                            || touches_root_boundary(*key, root, dependency_root)
-                    }));
+                    let loaded = if dependency_root == root {
+                        load_group_sections(
+                            object_sets.active(),
+                            dependency_root,
+                            group,
+                            &class_dictionaries,
+                            false,
+                        )?
+                    } else {
+                        load_group_sections_matching(
+                            object_sets.active(),
+                            dependency_root,
+                            group,
+                            &class_dictionaries,
+                            false,
+                            |key| touches_root_boundary(key, root, dependency_root),
+                        )?
+                    };
+                    old_sections.extend(loaded);
                 }
             }
             let mut sections = if rebuild_all || removed_regions.contains(&(root.x, root.z)) {
@@ -1623,7 +1665,7 @@ fn train_dictionaries_from_sources(
 
 fn prepare_section_states_from_sources(
     hierarchies: &BTreeMap<(i32, i32), LoadedHierarchy>,
-    roots: &BTreeSet<SectionKey>,
+    root: Option<SectionKey>,
     registry: &RegistrySnapshot,
     visibility: &VisibilityIndex,
     dictionaries: &[CanonicalObject],
@@ -1635,8 +1677,11 @@ fn prepare_section_states_from_sources(
     let mut states = BTreeMap::new();
     for hierarchy in hierarchies.values() {
         for (&key, hashes) in &hierarchy.section_sources {
-            if !roots.contains(&top_root(key)) {
-                continue;
+            if let Some(root) = root {
+                let source_root = top_root(key);
+                if source_root != root && !touches_root_boundary(key, root, source_root) {
+                    continue;
+                }
             }
             let section = load_source_section(store, key, hashes, Some(registry.catalog_id))?;
             if section.is_empty() {
@@ -2165,6 +2210,24 @@ fn load_group_sections(
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
     verify_content_bytes: bool,
 ) -> Result<BTreeMap<SectionKey, SectionState>> {
+    load_group_sections_matching(
+        objects,
+        root,
+        group,
+        class_dictionaries,
+        verify_content_bytes,
+        |_| true,
+    )
+}
+
+fn load_group_sections_matching(
+    objects: &PackStore,
+    root: SectionKey,
+    group: &GroupState,
+    class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
+    verify_content_bytes: bool,
+    include: impl Fn(SectionKey) -> bool,
+) -> Result<BTreeMap<SectionKey, SectionState>> {
     let mut sections = BTreeMap::new();
     let mut visited = HashSet::new();
     load_manifest_tree(
@@ -2173,6 +2236,7 @@ fn load_group_sections(
         spatial(root),
         class_dictionaries,
         verify_content_bytes,
+        &include,
         &mut visited,
         &mut sections,
     )?;
@@ -2649,6 +2713,7 @@ fn load_manifest_tree(
     expected_root: SpatialNode,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
     verify_content_bytes: bool,
+    include: &impl Fn(SectionKey) -> bool,
     visited: &mut HashSet<ObjectHash>,
     sections: &mut BTreeMap<SectionKey, SectionState>,
 ) -> Result<()> {
@@ -2663,7 +2728,18 @@ fn load_manifest_tree(
     if manifest.root != expected_root {
         bail!("manifest graph spatial roots disagree");
     }
-    let mut pages = BTreeMap::new();
+    let mut wanted_pages = BTreeSet::new();
+    for depth in 0..manifest.levels {
+        for morton in 0..8usize.pow(u32::from(depth)) {
+            let slot = level_offset(depth) + morton;
+            if bit(&manifest.tile_availability, slot)
+                && include(key_from_morton(manifest.root, depth, morton)?)
+            {
+                wanted_pages.insert(slot / DESCRIPTOR_PAGE_SLOTS);
+            }
+        }
+    }
+    let mut page_hashes = BTreeMap::new();
     let mut dense_page = 0usize;
     for page_index in 0..manifest.descriptor_page_slots() {
         if !bit(&manifest.descriptor_page_availability, page_index) {
@@ -2671,6 +2747,16 @@ fn load_manifest_tree(
         }
         let page_hash = manifest.descriptor_pages[dense_page];
         dense_page += 1;
+        page_hashes.insert(page_index, page_hash);
+    }
+    if dense_page != manifest.descriptor_pages.len() {
+        bail!("manifest descriptor hashes disagree with page availability");
+    }
+    let mut pages = BTreeMap::new();
+    for page_index in wanted_pages {
+        let page_hash = *page_hashes
+            .get(&page_index)
+            .context("available structural tile has no descriptor page")?;
         if visited.len() >= MAX_ROOT_GRAPH_OBJECTS || !visited.insert(page_hash) {
             bail!("manifest descriptor graph is shared or exceeds its bound");
         }
@@ -2686,15 +2772,13 @@ fn load_manifest_tree(
             bail!("manifest contains a duplicate descriptor page");
         }
     }
-    if dense_page != manifest.descriptor_pages.len() {
-        bail!("manifest descriptor hashes disagree with page availability");
-    }
     for (key, state) in sections_from_manifest(
         &manifest,
         &pages,
         objects,
         class_dictionaries,
         verify_content_bytes,
+        include,
     )? {
         if sections.insert(key, state).is_some() {
             bail!("manifest graph contains a duplicate structural node");
@@ -2709,6 +2793,7 @@ fn sections_from_manifest(
     objects: &PackStore,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
     verify_content_bytes: bool,
+    include: &impl Fn(SectionKey) -> bool,
 ) -> Result<BTreeMap<SectionKey, SectionState>> {
     let mut result = BTreeMap::new();
     let mut dense = 0usize;
@@ -2721,6 +2806,9 @@ fn sections_from_manifest(
             let key = key_from_morton(manifest.root, depth, morton)?;
             let node = &manifest.nodes[dense];
             dense += 1;
+            if !include(key) {
+                continue;
+            }
             let page_index = slot / DESCRIPTOR_PAGE_SLOTS;
             let local_slot = slot % DESCRIPTOR_PAGE_SLOTS;
             let contents = pages
