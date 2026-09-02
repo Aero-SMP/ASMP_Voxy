@@ -716,6 +716,10 @@ final class ClientSession {
         private void runLoop() throws Exception {
             Logger.info("Using Virtual Surface over QUIC " + this.quic.description());
             while (this.open && SESSION.get() == this.session) {
+                // Signals arriving during the previous pass only need one follow-up pass. Drain
+                // them here, before processing their authoritative queues, so a response burst
+                // cannot leave thousands of stale permits that keep the planner spinning.
+                this.wakeup.drainPermits();
                 drainObjectHandoffs();
                 QuicClient.ControlMessage control;
                 while ((control = this.quic.pollControl()) != null) handleControl(control);
