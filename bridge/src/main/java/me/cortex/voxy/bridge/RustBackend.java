@@ -20,7 +20,6 @@ final class RustBackend {
     private static final String READY_PREFIX = "VOXY_READY transport=";
     private static final String DIRECT_READY = READY_PREFIX + "direct";
     private static final String MINECRAFT_READY = READY_PREFIX + "minecraft";
-    private static final long START_TIMEOUT_SECONDS = 120;
     static final Path CONFIG = Path.of("voxy-rust.toml").toAbsolutePath();
 
     private static volatile boolean running;
@@ -29,7 +28,6 @@ final class RustBackend {
     private static Thread supervisor;
     private static Path directory;
     private static Path binary;
-    private static Throwable startupFailure;
     private static byte expectedTransport;
 
     static {
@@ -39,24 +37,20 @@ final class RustBackend {
     private RustBackend() {}
 
     static void start(byte transport) {
-        String readyLine = switch (transport) {
-            case TransportPayload.DIRECT -> DIRECT_READY;
-            case TransportPayload.MINECRAFT -> MINECRAFT_READY;
-            default -> throw new IllegalArgumentException("invalid Rust backend transport");
-        };
+        if (transport != TransportPayload.DIRECT && transport != TransportPayload.MINECRAFT) {
+            throw new IllegalArgumentException("invalid Rust backend transport");
+        }
         Thread thread;
         synchronized (RustBackend.class) {
-            if (isReady()) {
+            if (running) {
                 if (expectedTransport != transport) {
                     throw new IllegalStateException("Rust backend is running in another transport mode");
                 }
                 return;
             }
-            if (running) throw new IllegalStateException("Rust backend is already starting");
             extract();
             running = true;
             ready = false;
-            startupFailure = null;
             expectedTransport = transport;
             thread = Thread.ofPlatform().daemon().name("Voxy Rust supervisor")
                     .unstarted(RustBackend::supervise);
@@ -72,11 +66,6 @@ final class RustBackend {
             cleanup();
             throw new IllegalStateException("Could not start the Rust supervisor", failure);
         }
-
-        Throwable failure = awaitInitialReadiness(readyLine);
-        if (failure == null) return;
-        stop();
-        throw new IllegalStateException("Rust backend did not become ready", failure);
     }
 
     private static void extract() {
@@ -98,30 +87,7 @@ final class RustBackend {
         }
     }
 
-    private static Throwable awaitInitialReadiness(String readyLine) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(START_TIMEOUT_SECONDS);
-        synchronized (RustBackend.class) {
-            while (running && !ready && startupFailure == null) {
-                long remaining = deadline - System.nanoTime();
-                if (remaining <= 0) {
-                    return new IOException("timed out after " + START_TIMEOUT_SECONDS
-                            + " seconds waiting for the Rust listener");
-                }
-                try {
-                    TimeUnit.NANOSECONDS.timedWait(RustBackend.class, remaining);
-                } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                    return exception;
-                }
-            }
-            if (ready) return null;
-            if (startupFailure != null) return startupFailure;
-            return new IOException("Rust backend stopped before announcing " + readyLine);
-        }
-    }
-
     private static void supervise() {
-        boolean becameReady = false;
         while (running) {
             Process child = null;
             try {
@@ -135,9 +101,6 @@ final class RustBackend {
                     }
                     process = child;
                 }
-                Process launched = child;
-                Thread.ofPlatform().daemon().name("Voxy Rust readiness watchdog")
-                        .start(() -> enforceReadinessDeadline(launched));
                 try (var output = new BufferedReader(new InputStreamReader(
                         child.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
@@ -147,7 +110,6 @@ final class RustBackend {
                             synchronized (RustBackend.class) {
                                 if (running && process == child) {
                                     ready = true;
-                                    becameReady = true;
                                     RustBackend.class.notifyAll();
                                 }
                             }
@@ -157,27 +119,20 @@ final class RustBackend {
                 int exit = child.waitFor();
                 clearProcess(child);
                 if (running) {
-                    if (!becameReady) {
-                        failInitial(new IOException(
-                                "Rust backend exited with code " + exit + " before readiness"));
-                        return;
-                    }
                     LOGGER.error("Rust backend exited with code {}; restarting", exit);
                     pause();
                 }
             } catch (IOException | RuntimeException exception) {
                 if (child != null) child.destroy();
                 clearProcess(child);
-                if (!becameReady) {
-                    failInitial(exception);
-                    return;
-                }
-                LOGGER.error("Could not restart the Rust backend; retrying", exception);
+                if (running) LOGGER.error("Could not start the Rust backend; retrying", exception);
                 pause();
-            } catch (InterruptedException ignored) {
+            } catch (InterruptedException exception) {
                 if (!running) return;
                 if (child != null) child.destroy();
                 clearProcess(child);
+                LOGGER.warn("Rust backend supervisor was interrupted; retrying", exception);
+                pause();
             }
         }
     }
@@ -187,44 +142,12 @@ final class RustBackend {
                 ? DIRECT_READY : MINECRAFT_READY;
     }
 
-    /** A post-crash child that starts but wedges before binding must not stop supervision. */
-    private static void enforceReadinessDeadline(Process child) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(START_TIMEOUT_SECONDS);
-        synchronized (RustBackend.class) {
-            while (running && process == child && child.isAlive() && !ready) {
-                long remaining = deadline - System.nanoTime();
-                if (remaining <= 0) {
-                    LOGGER.error("Rust backend did not become ready after {} seconds; restarting",
-                            START_TIMEOUT_SECONDS);
-                    child.destroy();
-                    return;
-                }
-                try {
-                    TimeUnit.NANOSECONDS.timedWait(RustBackend.class, remaining);
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
-    }
-
     private static void clearProcess(Process child) {
         synchronized (RustBackend.class) {
             if (process == child) process = null;
             ready = false;
             RustBackend.class.notifyAll();
         }
-    }
-
-    private static void failInitial(Throwable failure) {
-        synchronized (RustBackend.class) {
-            startupFailure = failure;
-            running = false;
-            ready = false;
-            RustBackend.class.notifyAll();
-        }
-        LOGGER.error("Rust backend failed before its listener became ready", failure);
     }
 
     private static void pause() {
@@ -271,9 +194,6 @@ final class RustBackend {
             }
         }
         cleanup();
-        synchronized (RustBackend.class) {
-            startupFailure = null;
-        }
     }
 
     private static void cleanup() {
