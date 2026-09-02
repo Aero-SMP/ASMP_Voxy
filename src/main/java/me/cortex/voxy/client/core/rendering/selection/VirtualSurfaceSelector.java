@@ -128,6 +128,7 @@ public final class VirtualSurfaceSelector {
         try {
             nodes = reserve(memory, MemoryBudget.Pool.MANIFEST, this.nodeBuffer.size());
             output = reserve(memory, MemoryBudget.Pool.MANIFEST, this.outputBuffer.size());
+            this.selectionPool.bindMemory(memory);
         } catch (RuntimeException failure) {
             if (output != null) output.close();
             if (nodes != null) nodes.close();
@@ -143,6 +144,8 @@ public final class VirtualSurfaceSelector {
     /** Releases session accounting; outstanding readback reservations retire in their callbacks. */
     public void unbindMemory(MemoryBudget memory) {
         if (this.memory != memory) return;
+        this.selectionPool.unbindMemory(memory);
+        this.releaseHandoff();
         this.memory = null;
         closeReservation(this.fixedMemory);
         closeReservation(this.nodeMemory);
@@ -574,23 +577,9 @@ public final class VirtualSurfaceSelector {
     }
 
     private void offer(SelectionBatch batch) {
-        offerLatest(this.handoff, batch);
-    }
-
-    static void offerLatest(AtomicReference<SelectionBatch> handoff, SelectionBatch batch) {
-        while (true) {
-            SelectionBatch previous = handoff.get();
-            if (previous != null && Long.compareUnsigned(previous.sequence(), batch.sequence()) >= 0) {
-                batch.close();
-                return;
-            }
-            // Every entry carries its own authority bit, so a newer snapshot can safely coalesce
-            // an unconsumed older one. Conservative/truncated batches remain additions-only.
-            if (handoff.compareAndSet(previous, batch)) {
-                if (previous != null) previous.close();
-                return;
-            }
-        }
+        // Every entry carries its own authority bit, so a newer snapshot can safely coalesce
+        // an unconsumed older one. Pool synchronization also closes the unbind/callback race.
+        this.selectionPool.offerLatest(this.handoff, batch);
     }
 
     private void releaseHandoff() {
@@ -666,8 +655,9 @@ public final class VirtualSurfaceSelector {
         this.activeEpoch++;
         this.pendingManifest.set(null);
         this.activeManifest = null;
-        this.releaseHandoff();
         this.clearPredictionSamples();
+        if (this.memory != null) this.selectionPool.unbindMemory(this.memory);
+        this.releaseHandoff();
         this.shader.free();
         this.uniformBuffer.free();
         this.outputBuffer.free();

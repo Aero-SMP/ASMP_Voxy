@@ -145,6 +145,25 @@ public final class MemoryBudget {
         this.totalUsed -= oldAllocation.totalBytes() - newAllocation.totalBytes();
     }
 
+    /** Atomically replaces one live reservation, admitting growth only when the global cap allows it. */
+    private synchronized boolean resize(Allocation oldAllocation, Allocation newAllocation) {
+        long oldTotal = oldAllocation.totalBytes();
+        long newTotal = newAllocation.totalBytes();
+        long retained = this.totalUsed - oldTotal;
+        if (retained < 0) throw new IllegalStateException("memory-budget accounting underflow");
+        if (newTotal > this.limit - retained) return false;
+        for (Pool pool : Pool.values()) {
+            long current = this.used.get(pool);
+            long oldBytes = oldAllocation.bytes(pool);
+            if (oldBytes > current) {
+                throw new IllegalStateException("memory-budget accounting underflow");
+            }
+            this.used.put(pool, Math.addExact(current - oldBytes, newAllocation.bytes(pool)));
+        }
+        this.totalUsed = Math.addExact(retained, newTotal);
+        return true;
+    }
+
     public static final class Reservation implements AutoCloseable {
         private MemoryBudget owner;
         private Allocation allocation;
@@ -165,6 +184,17 @@ public final class MemoryBudget {
                 old = this.allocation;
                 budget.reduce(old, remaining);
                 this.allocation = remaining;
+            }
+        }
+
+        /** Grows or shrinks this reservation atomically without exposing an unaccounted interval. */
+        public boolean tryResizeTo(Allocation replacement) {
+            Objects.requireNonNull(replacement, "replacement");
+            synchronized (this) {
+                if (this.owner == null) throw new IllegalStateException("reservation is closed");
+                if (!this.owner.resize(this.allocation, replacement)) return false;
+                this.allocation = replacement;
+                return true;
             }
         }
 
