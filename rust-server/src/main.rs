@@ -13,7 +13,6 @@ use voxy_rust_server::{
     server::{self, ServerState},
     surface::{
         gc::{GcMoment, GcPolicy},
-        memory::ServerMemoryBudget,
         service::Service,
     },
 };
@@ -37,7 +36,6 @@ async fn main() -> Result<()> {
     let registry = Arc::new(RwLock::new(Registry::open(
         config.data.join("surface").join("catalog"),
     )?));
-    let memory = ServerMemoryBudget::from_mib(config.managed_memory_mib)?;
     let catalog_id = read_lock(&registry)?.catalog_id();
     let discovered = discover_dimensions(&config.world, &config.dimension)?;
     let mut dimensions = BTreeMap::new();
@@ -49,30 +47,26 @@ async fn main() -> Result<()> {
         }
         dimensions.insert(
             dimension.id.clone(),
-            Arc::new(AnvilWorld::new(dimension.id, dimension.root)),
+            Arc::new(AnvilWorld::new(
+                dimension.id,
+                dimension.root,
+                config.world.clone(),
+            )),
         );
     }
-    let service = Arc::new(Service::open_with_budget_and_policies(
+    let service = Arc::new(Service::open_with_policies(
         &config.data,
         &dimensions,
         registry.clone(),
         config.poll_interval,
-        memory.clone(),
         &config.visibility_policies,
     )?);
     if config.once {
         service.refresh_all()?;
-        eprintln!("surface build complete");
         return Ok(());
     }
     service.start()?;
-    let state = Arc::new(ServerState::new(
-        &dimensions,
-        catalog_id,
-        service.clone(),
-        memory,
-        config.max_connections,
-    ));
+    let state = Arc::new(ServerState::new(&dimensions, catalog_id, service.clone()));
 
     let maintenance = service.clone();
     tokio::spawn(async move {
@@ -111,11 +105,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    tokio::select! {
-        result = server::serve(state, config.transport) => result?,
-        result = shutdown_signal() => result?,
-    }
-    Ok(())
+    let quic_identity = config.data.join("quic");
+    server::serve(state, config.listen, &quic_identity, shutdown_signal()).await
 }
 
 async fn shutdown_signal() -> Result<()> {

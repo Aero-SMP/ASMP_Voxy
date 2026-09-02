@@ -22,10 +22,9 @@ import static me.cortex.voxy.client.core.rendering.SectionKey.MAX_LOD_LAYER;
 
 
 public class NodeManager {
-    //Assumptions:
-    // all nodes have children (i.e. all nodes have at least one child existence bit set at all times)
-    // leaf nodes always contain geometry (empty geometry counts as geometry (it just doesnt take any memory to store))
-    // All nodes except top nodes have parents
+    // Leaf nodes own geometry (the empty sentinel is valid) and may advertise future children.
+    // Inner nodes own a compact child allocation matching their active child positions.
+    // All non-top-level nodes have exactly one hierarchy parent.
 
     public static final int NULL_GEOMETRY_ID = -1;
     public static final int EMPTY_GEOMETRY_ID = -2;
@@ -304,8 +303,8 @@ public class NodeManager {
                 previousChildExistence = this.nodeData.getNodeChildExistence(node);
                 previousChildExistenceKnown = true;
                 this.nodeData.setNodeGeometry(node, target.candidate.geometryId);
-                this.nodeData.setNodeChildExistence(node,
-                        target.candidate.childExistence);
+                // Existing child topology remains authoritative through the geometry fence.
+                // Finalization reconciles the old allocation with the new manifested mask.
                 this.invalidateNode(node);
             }
             this.stagedGeometry.remove(target.key);
@@ -371,13 +370,34 @@ public class NodeManager {
     }
 
     /** Releases the old allocation only after the committed node pointers crossed a GPU fence. */
-    public void finalizeStagedRoot(long sourceRevision) {
+    public boolean finalizeStagedRoot(long sourceRevision) {
+        for (Map.Entry<StagedGeometryKey, CommittedGeometry> entry
+                : this.committedGeometry.entrySet()) {
+            if (entry.getKey().sourceRevision != sourceRevision) continue;
+            int state = this.activeSectionMap.get(entry.getKey().position);
+            if (state == -1 || (state & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) continue;
+            int node = state & NODE_ID_MSK;
+            int current = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node));
+            int desired = Byte.toUnsignedInt(entry.getValue().candidateChildExistence);
+            if (current != desired
+                    && !this.canReconcileTopology(entry.getKey().position, node, desired,
+                    sourceRevision)) return false;
+        }
         this.finishPublishedRequests(sourceRevision);
         var iterator = this.committedGeometry.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<StagedGeometryKey, CommittedGeometry> entry = iterator.next();
             if (entry.getKey().sourceRevision != sourceRevision) continue;
             CommittedGeometry geometry = entry.getValue();
+            int state = this.activeSectionMap.get(entry.getKey().position);
+            if (state != -1 && (state & NODE_TYPE_MSK) != NODE_TYPE_REQUEST) {
+                int node = state & NODE_ID_MSK;
+                int current = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node));
+                int desired = Byte.toUnsignedInt(geometry.candidateChildExistence);
+                if (current != desired) {
+                    this.reconcileTopology(entry.getKey().position, node, desired);
+                }
+            }
             if (geometry.previousGeometry != geometry.candidateGeometry) {
                 removeGeometryIfAllocated(geometry.previousGeometry);
             }
@@ -391,6 +411,7 @@ public class NodeManager {
             removeGeometryIfAllocated(entry.getValue().geometryId);
             staged.remove();
         }
+        return true;
     }
 
     private record CommitTarget(StagedGeometryKey key, StagedGeometry candidate, int state,
@@ -499,6 +520,185 @@ public class NodeManager {
         this.nodeData.setAllChildrenAreLeaf(parentId, allLeaf);
         this.invalidateNode(parentId);
     }
+
+    /**
+     * A manifested topology replacement may remove only renderer-empty branches. Their activation
+     * owners retire them first; a committed or nonempty descendant keeps the parent replacement
+     * pending instead of becoming unreachable.
+     */
+    private boolean canReconcileTopology(long position, int nodeId, int desiredMask,
+                                         long sourceRevision) {
+        int state = this.activeSectionMap.get(position);
+        int type = state & NODE_TYPE_MSK;
+        if ((state & NODE_ID_MSK) != nodeId
+                || type != NODE_TYPE_LEAF && type != NODE_TYPE_INNER) {
+            throw new IllegalStateException("topology owner changed for "
+                    + SectionKey.describe(position));
+        }
+        if (type == NODE_TYPE_LEAF) return true;
+        int existingMask = this.existingChildMask(nodeId);
+        int removedMask = existingMask & ~desiredMask;
+        for (int child = 0; child < 8; child++) {
+            if ((removedMask & 1 << child) != 0
+                    && !this.canRemoveSubtree(makeChildPos(position, child), sourceRevision)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean canRemoveSubtree(long position, long sourceRevision) {
+        for (StagedGeometryKey key : this.committedPositions.values()) {
+            if (key.sourceRevision != sourceRevision && contains(position, key.position)) {
+                return false;
+            }
+        }
+        for (StagedGeometryKey key : this.stagedGeometry.keySet()) {
+            if (key.sourceRevision != sourceRevision && contains(position, key.position)) {
+                return false;
+            }
+        }
+        int state = this.activeSectionMap.get(position);
+        if (state == -1) return true;
+        int type = state & NODE_TYPE_MSK;
+        if (type == NODE_TYPE_REQUEST) return true;
+        if (type != NODE_TYPE_LEAF && type != NODE_TYPE_INNER) {
+            throw new IllegalStateException("invalid removable hierarchy state");
+        }
+        int nodeId = state & NODE_ID_MSK;
+        if (this.nodeData.getNodeGeometry(nodeId) != EMPTY_GEOMETRY_ID) return false;
+        if (type == NODE_TYPE_INNER) {
+            int pointer = this.nodeData.getChildPtr(nodeId);
+            int count = this.nodeData.getChildPtrCount(nodeId);
+            if (pointer < 0 || pointer == SENTINEL_EMPTY_CHILD_PTR) {
+                throw new IllegalStateException("inner node has no concrete children");
+            }
+            for (int index = 0; index < count; index++) {
+                if (!this.canRemoveSubtree(this.nodeData.nodePosition(pointer + index),
+                        sourceRevision)) return false;
+            }
+        }
+        return true;
+    }
+
+    private void reconcileTopology(long position, int nodeId, int desiredMask) {
+        int state = this.activeSectionMap.get(position);
+        int type = state & NODE_TYPE_MSK;
+        if ((state & NODE_ID_MSK) != nodeId
+                || type != NODE_TYPE_LEAF && type != NODE_TYPE_INNER) {
+            throw new IllegalStateException("topology owner changed for "
+                    + SectionKey.describe(position));
+        }
+        if (SectionKey.level(position) == 0 && desiredMask != 0) {
+            throw new IllegalArgumentException("LOD 0 node cannot have children");
+        }
+
+        int existingMask = type == NODE_TYPE_INNER ? this.existingChildMask(nodeId) : 0;
+        RelocatedChild[] retained = new RelocatedChild[8];
+        int retainedCount = 0;
+        if (type == NODE_TYPE_INNER) {
+            int pointer = this.nodeData.getChildPtr(nodeId);
+            int count = this.nodeData.getChildPtrCount(nodeId);
+            for (int index = 0; index < count; index++) {
+                int childId = pointer + index;
+                long childPosition = this.nodeData.nodePosition(childId);
+                int child = getChildIdx(childPosition);
+                int childState = this.activeSectionMap.get(childPosition);
+                if ((existingMask & 1 << child) == 0
+                        || (childState & NODE_ID_MSK) != childId) {
+                    throw new IllegalStateException("child allocation and hierarchy map disagree");
+                }
+                if ((desiredMask & 1 << child) == 0) {
+                    this.recurseRemoveNode(childPosition);
+                } else {
+                    retained[child] = new RelocatedChild(childPosition, childState,
+                            this.nodeData.snapshotNode(childId));
+                    retainedCount++;
+                }
+            }
+            for (RelocatedChild child : retained) {
+                if (child == null) continue;
+                int oldId = child.state & NODE_ID_MSK;
+                this.nodeData.free(oldId);
+                this.clearFreeId(oldId);
+                this.invalidateNode(oldId);
+            }
+        }
+
+        int newPointer = -1;
+        boolean allLeaf = retainedCount != 0;
+        if (retainedCount != 0) {
+            newPointer = this.nodeData.allocate(retainedCount);
+            int newId = newPointer;
+            for (RelocatedChild child : retained) {
+                if (child == null) continue;
+                this.nodeData.restoreNode(newId, child.snapshot);
+                int childType = child.state & NODE_TYPE_MSK;
+                this.transition(child.position, child.state, childType | newId);
+                this.clearAllocId(newId);
+                this.invalidateNode(newId);
+                allLeaf &= childType == NODE_TYPE_LEAF;
+                newId++;
+            }
+        }
+
+        this.nodeData.setChildPtr(nodeId, newPointer);
+        if (retainedCount != 0) this.nodeData.setChildPtrCount(nodeId, retainedCount);
+        this.nodeData.setAllChildrenAreLeaf(nodeId, allLeaf);
+        this.nodeData.setNodeChildExistence(nodeId, (byte) desiredMask);
+        int replacementType = retainedCount == 0 ? NODE_TYPE_LEAF : NODE_TYPE_INNER;
+        if (replacementType != type) {
+            this.transition(position, state, replacementType | nodeId);
+            this.refreshParentLeafState(position);
+        }
+        this.updateChildRequest(nodeId, position, desiredMask & ~existingChildMask(nodeId));
+        this.invalidateNode(nodeId);
+    }
+
+    private int existingChildMask(int nodeId) {
+        int pointer = this.nodeData.getChildPtr(nodeId);
+        if (pointer == -1) return 0;
+        if (pointer == SENTINEL_EMPTY_CHILD_PTR) {
+            throw new IllegalStateException("empty child-pointer sentinel is not a topology");
+        }
+        int mask = 0;
+        int count = this.nodeData.getChildPtrCount(nodeId);
+        for (int index = 0; index < count; index++) {
+            int childId = pointer + index;
+            if (!this.nodeData.nodeExists(childId)) {
+                throw new IllegalStateException("missing allocated child node");
+            }
+            int child = getChildIdx(this.nodeData.nodePosition(childId));
+            if ((mask & 1 << child) != 0) {
+                throw new IllegalStateException("duplicate child octant");
+            }
+            mask |= 1 << child;
+        }
+        return mask;
+    }
+
+    private void updateChildRequest(int nodeId, long position, int requiredMask) {
+        if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+            int requestId = this.nodeData.getNodeRequest(nodeId);
+            NodeRequest request = this.childRequests.get(requestId);
+            this.setRequestedChildren(requestId, request, requiredMask);
+            if (requiredMask == 0) this.releaseChildRequest(nodeId, requestId);
+            return;
+        }
+        if (requiredMask == 0) return;
+        NodeRequest request = this.beginChildRequest(nodeId, position);
+        this.setRequestedChildren(this.nodeData.getNodeRequest(nodeId), request, requiredMask);
+    }
+
+    private static boolean contains(long ancestor, long descendant) {
+        int shift = SectionKey.level(ancestor) - SectionKey.level(descendant);
+        return shift >= 0
+                && SectionKey.x(ancestor) == SectionKey.x(descendant) >> shift
+                && SectionKey.y(ancestor) == SectionKey.y(descendant) >> shift
+                && SectionKey.z(ancestor) == SectionKey.z(descendant) >> shift;
+    }
+
+    private record RelocatedChild(long position, int state, long[] snapshot) {}
 
 
     private void addRequestedChild(int requestId, NodeRequest request, int child) {
@@ -713,14 +913,27 @@ public class NodeManager {
         int oldPtr = -1;
         int oldCount = 0;
         int existing = 0;
+        RelocatedChild[] retained = new RelocatedChild[8];
         if (parentType == NODE_TYPE_INNER) {
             oldPtr = this.nodeData.getChildPtr(parentNodeId);
             oldCount = this.nodeData.getChildPtrCount(parentNodeId);
             if (oldPtr == -1) throw new IllegalStateException("Inner node has no child allocation");
             if (oldPtr != SENTINEL_EMPTY_CHILD_PTR) {
                 for (int i = 0; i < oldCount; i++) {
-                    if (!this.nodeData.nodeExists(oldPtr+i)) throw new IllegalStateException("Missing child node");
-                    existing |= 1 << getChildIdx(this.nodeData.nodePosition(oldPtr+i));
+                    int oldId = oldPtr + i;
+                    if (!this.nodeData.nodeExists(oldId)) {
+                        throw new IllegalStateException("Missing child node");
+                    }
+                    long childPosition = this.nodeData.nodePosition(oldId);
+                    int child = getChildIdx(childPosition);
+                    int childState = this.activeSectionMap.get(childPosition);
+                    if ((childState & NODE_ID_MSK) != oldId || retained[child] != null) {
+                        throw new IllegalStateException(
+                                "Child allocation does not own its hierarchy position");
+                    }
+                    retained[child] = new RelocatedChild(childPosition, childState,
+                            this.nodeData.snapshotNode(oldId));
+                    existing |= 1 << child;
                 }
             }
         }
@@ -731,23 +944,55 @@ public class NodeManager {
             throw new IllegalStateException("Child allocation does not match the existence mask");
         }
 
-        int newPtr = this.nodeData.allocate(Integer.bitCount(combined));
-        int oldId = oldPtr-1;
-        int newId = newPtr-1;
+        int combinedCount = Integer.bitCount(combined);
+        // A same-size or shrinking replacement can reuse the captured old block without
+        // temporary headroom. A growing replacement must reserve its larger block before
+        // changing the active hierarchy so allocation failure leaves parent coverage intact.
+        boolean releaseBeforeAllocation = oldPtr != -1
+                && oldPtr != SENTINEL_EMPTY_CHILD_PTR && combinedCount <= oldCount;
+        if (releaseBeforeAllocation) {
+            for (int index = 0; index < oldCount; index++) {
+                int oldId = oldPtr + index;
+                this.nodeData.free(oldId);
+                this.clearFreeId(oldId);
+                this.invalidateNode(oldId);
+            }
+        }
+
+        int newPtr = this.nodeData.allocate(combinedCount);
+        int newId = newPtr;
         boolean allLeaf = true;
         for (int child = 0; child < 8; child++) {
             int bit = 1<<child;
             if ((combined&bit) == 0) continue;
-            newId++;
             if ((requested&bit) != 0) {
                 this.installRequestedChild(requestId, request, child, newId);
             } else {
-                oldId++;
-                allLeaf &= this.relocateNode(oldId, newId);
+                RelocatedChild retainedChild = retained[child];
+                if (retainedChild == null) {
+                    throw new IllegalStateException("Missing retained child snapshot");
+                }
+                this.nodeData.restoreNode(newId, retainedChild.snapshot);
+                int childType = retainedChild.state & NODE_TYPE_MSK;
+                this.transition(retainedChild.position, retainedChild.state,
+                        childType | newId);
+                this.clearAllocId(newId);
+                this.invalidateNode(newId);
+                allLeaf &= childType == NODE_TYPE_LEAF;
+            }
+            newId++;
+        }
+
+        if (!releaseBeforeAllocation && oldPtr != -1
+                && oldPtr != SENTINEL_EMPTY_CHILD_PTR) {
+            for (int index = 0; index < oldCount; index++) {
+                int oldId = oldPtr + index;
+                this.nodeData.free(oldId);
+                this.clearFreeId(oldId);
+                this.invalidateNode(oldId);
             }
         }
 
-        if (oldPtr != -1 && oldPtr != SENTINEL_EMPTY_CHILD_PTR) this.nodeData.free(oldPtr, oldCount);
         this.nodeData.setChildPtr(parentNodeId, newPtr);
         this.nodeData.setChildPtrCount(parentNodeId, Integer.bitCount(combined));
         this.nodeData.setAllChildrenAreLeaf(parentNodeId, allLeaf);
@@ -769,22 +1014,6 @@ public class NodeManager {
         this.invalidateNode(nodeId);
     }
 
-    private boolean relocateNode(int oldId, int newId) {
-        long position = this.nodeData.nodePosition(oldId);
-        int oldState = this.activeSectionMap.get(position);
-        int type = oldState&NODE_TYPE_MSK;
-        if ((type != NODE_TYPE_LEAF && type != NODE_TYPE_INNER) || (oldState&NODE_ID_MSK) != oldId) {
-            throw new IllegalStateException("Child allocation does not own " + SectionKey.describe(position));
-        }
-        this.nodeData.copyNode(oldId, newId);
-        this.transition(position, oldState, type|newId);
-        this.clearAllocId(newId);
-        this.clearFreeId(oldId);
-        this.invalidateNode(oldId);
-        this.invalidateNode(newId);
-        return type == NODE_TYPE_LEAF;
-    }
-
     //==================================================================================================================
     public void processRequest(long pos) {
         int state = this.activeSectionMap.get(pos);
@@ -794,27 +1023,17 @@ public class NodeManager {
         if (nodeType != NODE_TYPE_LEAF && nodeType != NODE_TYPE_INNER) {
             throw new IllegalStateException("Unknown node type: " + nodeType);
         }
-        if (nodeType == NODE_TYPE_INNER || SectionKey.level(pos) == 0) return;
+        if (SectionKey.level(pos) == 0) return;
 
         int nodeId = state & NODE_ID_MSK;
         if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID
                 || this.nodeData.isNodeRequestInFlight(nodeId)) return;
-        this.makeLeafChildRequest(nodeId);
-    }
-
-    private void makeLeafChildRequest(int nodeId) {
-        long pos = this.nodeData.nodePosition(nodeId);
-        byte childExistence = this.nodeData.getNodeChildExistence(nodeId);
-
-        if (childExistence == 0) {
-            // Final manifested topology is authoritative; a zero mask is terminal.
-            this.invalidateNode(nodeId);
-            return;
-        }
-
-        var request = this.beginChildRequest(nodeId, pos);
-        int requestId = this.nodeData.getNodeRequest(nodeId);
-        this.setRequestedChildren(requestId, request, Byte.toUnsignedInt(childExistence));
+        int desired = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(nodeId));
+        int existing = nodeType == NODE_TYPE_INNER ? this.existingChildMask(nodeId) : 0;
+        int missing = desired & ~existing;
+        if (missing == 0) return;
+        NodeRequest request = this.beginChildRequest(nodeId, pos);
+        this.setRequestedChildren(this.nodeData.getNodeRequest(nodeId), request, missing);
     }
 
     //Used for raw access to the update map, internal (used in async)
@@ -872,13 +1091,4 @@ public class NodeManager {
     public int getCurrentMaxNodeId() {
         return this.nodeData.getEndNodeId();
     }
-
-
-    //==================================================================================================================
-
-    //TODO: need to figure out what happens if an inner node gets marked with child existence of 0
-    // it should become a leaf node
-    // however, if the node doesnt have geometry attached that would put it in an invalid state so need to figure out
-    // a solution for this
-
 }

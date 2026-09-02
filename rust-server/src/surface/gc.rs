@@ -9,10 +9,11 @@
 use super::{
     catalog::Catalog,
     content::{SourceMicrotile, content_kind},
-    manifest::{ContentClass, ManifestDescriptorPage, ManifestSubtree, RootDirectory},
-    memory::{MemoryClass, MemoryPermit, ServerMemoryBudget},
+    manifest::{
+        CONTENT_CLASS_COUNT, ContentClass, ManifestDescriptorPage, ManifestSubtree, RootDirectory,
+    },
     object::{CanonicalObject, ObjectHash, ObjectKind},
-    pack::{MAX_CANONICAL_OBJECT_BYTES, MAX_COMPRESSED_OBJECT_BYTES, PackStore},
+    pack::PackStore,
     root::RootRecord,
     visibility::{object_references, summary_page_references},
 };
@@ -33,8 +34,6 @@ use std::{
 };
 
 const DICTIONARY_SET_MAGIC: &[u8; 8] = b"VXYDSET\0";
-const MAX_DICTIONARIES: usize = 65_536;
-
 const SET_POINTER_MAGIC: &[u8; 8] = b"VXYSET\0\0";
 const SET_READY_MAGIC: &[u8; 8] = b"VXYREADY";
 const SET_MEMBERS_MAGIC: &[u8; 8] = b"VXYMEM\0\0";
@@ -48,11 +47,8 @@ const MARK_ENTRY_BYTES: usize = 64;
 const MARK_TRAILER_BYTES: usize = 4;
 const HARD_MAX_OBJECTS: usize = 16_000_000;
 const HARD_MAX_PINS: usize = 65_536;
-const HARD_MAX_ISSUES: usize = 4_096;
 const GC_SORT_BUFFER: usize = 16 * 1024;
 const REFERENCE_RECORD_BYTES: usize = 40;
-const GC_WORKING_BYTES: usize =
-    MAX_CANONICAL_OBJECT_BYTES + 2 * MAX_COMPRESSED_OBJECT_BYTES + 16 * 1024 * 1024;
 static NEXT_GC_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,8 +65,8 @@ impl DictionarySet {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.dictionaries.is_empty() || self.dictionaries.len() > MAX_DICTIONARIES {
-            bail!("dictionary set must contain 1..={MAX_DICTIONARIES} hashes");
+        if self.dictionaries.len() != CONTENT_CLASS_COUNT {
+            bail!("dictionary set must contain exactly {CONTENT_CLASS_COUNT} hashes");
         }
         if self
             .dictionaries
@@ -100,8 +96,7 @@ impl DictionarySet {
         }
         let mut input = &bytes[8..];
         let count = take_u32(&mut input)? as usize;
-        if count == 0
-            || count > MAX_DICTIONARIES
+        if count != CONTENT_CLASS_COUNT
             || input.len()
                 != count
                     .checked_mul(32)
@@ -154,7 +149,6 @@ pub struct GcPolicy {
     pub grace_generations: u64,
     pub max_objects: usize,
     pub max_pinned_roots: usize,
-    pub max_reported_issues: usize,
 }
 
 impl Default for GcPolicy {
@@ -165,7 +159,6 @@ impl Default for GcPolicy {
             grace_generations: 2,
             max_objects: 4_000_000,
             max_pinned_roots: 4_096,
-            max_reported_issues: 256,
         }
     }
 }
@@ -181,9 +174,6 @@ impl GcPolicy {
         if self.max_pinned_roots == 0 || self.max_pinned_roots > HARD_MAX_PINS {
             bail!("surface GC root bound must be 1..={HARD_MAX_PINS}");
         }
-        if self.max_reported_issues == 0 || self.max_reported_issues > HARD_MAX_ISSUES {
-            bail!("surface GC issue bound must be 1..={HARD_MAX_ISSUES}");
-        }
         Ok(self)
     }
 }
@@ -193,71 +183,26 @@ pub struct GcMoment {
     pub unix_seconds: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReferenceIssueKind {
-    Missing,
-    Corrupt,
-    WrongType,
-    BoundExceeded,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReferenceIssue {
-    pub hash: Option<ObjectHash>,
-    pub kind: ReferenceIssueKind,
-    pub detail: String,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MarkReport {
-    pub reachable_objects: usize,
-    pub issues: Vec<ReferenceIssue>,
-    pub issue_overflow: bool,
-    pub needs_regeneration: bool,
-}
-
-impl MarkReport {
-    pub fn conclusive(&self) -> bool {
-        !self.needs_regeneration && !self.issue_overflow && self.issues.is_empty()
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MarkState {
+    failed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GcRunReport {
-    pub mark: MarkReport,
-    pub successful_mark_cycle: Option<u64>,
-    pub active_objects_before: usize,
     pub retained_objects: usize,
-    pub grace_retained_objects: usize,
     pub reclaimed_objects: usize,
-    pub copied_objects: usize,
     pub switched: bool,
-    pub old_set_retired: bool,
 }
 
 impl GcRunReport {
-    fn inconclusive(mark: MarkReport, active_objects: usize) -> Self {
+    fn unchanged(active_objects: usize) -> Self {
         Self {
-            mark,
-            successful_mark_cycle: None,
-            active_objects_before: active_objects,
             retained_objects: active_objects,
-            grace_retained_objects: active_objects,
             reclaimed_objects: 0,
-            copied_objects: 0,
             switched: false,
-            old_set_retired: false,
         }
     }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GcRecovery {
-    pub damaged_current_pointer: bool,
-    pub damaged_previous_pointer: bool,
-    pub restored_previous_pointer: bool,
-    pub damaged_mark_history: bool,
-    pub orphaned_pack_sets: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,19 +220,10 @@ pub struct GcPackStore {
     active_identity: SetIdentity,
     active_path: PathBuf,
     active: PackStore,
-    recovery: GcRecovery,
-    memory: Arc<ServerMemoryBudget>,
 }
 
 impl GcPackStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_budget(root, ServerMemoryBudget::default_budget())
-    }
-
-    pub fn open_with_budget(
-        root: impl AsRef<Path>,
-        memory: Arc<ServerMemoryBudget>,
-    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let sets = root.join("sets");
         fs::create_dir_all(&sets).with_context(|| format!("create {}", sets.display()))?;
@@ -295,41 +231,26 @@ impl GcPackStore {
 
         let current_path = root.join("active.current");
         let previous_path = root.join("active.previous");
-        let mut recovery = GcRecovery::default();
-        let current = read_optional_identity(&current_path, SET_POINTER_MAGIC).inspect_err(|_| {
-            recovery.damaged_current_pointer = true;
-            quarantine(&current_path);
-        });
-        let previous =
-            read_optional_identity(&previous_path, SET_POINTER_MAGIC).inspect_err(|_| {
-                recovery.damaged_previous_pointer = true;
-                quarantine(&previous_path);
-            });
+        let current = read_optional_identity(&current_path, SET_POINTER_MAGIC)
+            .inspect_err(|_| quarantine(&current_path));
+        let previous = read_optional_identity(&previous_path, SET_POINTER_MAGIC)
+            .inspect_err(|_| quarantine(&previous_path));
         let current = current.unwrap_or(None);
         let previous = previous.unwrap_or(None);
 
         let chosen = match current {
-            Some(identity) => match open_identity(&sets, identity, memory.clone()) {
+            Some(identity) => match open_identity(&sets, identity) {
                 Ok(opened) => Some((identity, opened)),
-                Err(_) => {
-                    recovery.damaged_current_pointer = true;
-                    None
-                }
+                Err(_) => None,
             },
             None => None,
         };
         let chosen = match chosen {
             Some(chosen) => Some(chosen),
             None => match previous {
-                Some(identity) => match open_identity(&sets, identity, memory.clone()) {
-                    Ok(opened) => {
-                        recovery.restored_previous_pointer = true;
-                        Some((identity, opened))
-                    }
-                    Err(_) => {
-                        recovery.damaged_previous_pointer = true;
-                        None
-                    }
+                Some(identity) => match open_identity(&sets, identity) {
+                    Ok(opened) => Some((identity, opened)),
+                    Err(_) => None,
                 },
                 None => None,
             },
@@ -348,7 +269,7 @@ impl GcPackStore {
                 let path = set_path(&sets, 0);
                 fs::create_dir(&path)?;
                 sync_parent(&path)?;
-                let store = PackStore::open_with_budget(&path, memory.clone())?;
+                let store = PackStore::open(&path)?;
                 store.sync_all()?;
                 store.checkpoint()?;
                 let identity = identity_for(0, &store, HARD_MAX_OBJECTS)?;
@@ -358,14 +279,8 @@ impl GcPackStore {
                 (identity, (path, store))
             }
         };
-        if recovery.restored_previous_pointer {
+        if current != Some(active_identity) {
             write_identity(&current_path, SET_POINTER_MAGIC, active_identity)?;
-        }
-
-        for path in set_directories(&sets, HARD_MAX_OBJECTS)? {
-            if path != active_path && !previous.is_some_and(|id| resolves_to(&sets, id, &path)) {
-                recovery.orphaned_pack_sets.push(path);
-            }
         }
         Ok(Self {
             root,
@@ -373,8 +288,6 @@ impl GcPackStore {
             active_identity,
             active_path,
             active,
-            recovery,
-            memory,
         })
     }
 
@@ -386,14 +299,6 @@ impl GcPackStore {
     /// the ordinary PackStore durability barrier; GC itself seals and checkpoints replacements.
     pub fn active_mut(&mut self) -> &mut PackStore {
         &mut self.active
-    }
-
-    pub fn active_set_id(&self) -> u64 {
-        self.active_identity.id
-    }
-
-    pub fn recovery(&self) -> &GcRecovery {
-        &self.recovery
     }
 
     pub fn checkpoint_active(&self) -> Result<()> {
@@ -409,21 +314,15 @@ impl GcPackStore {
     ) -> Result<GcRunReport> {
         let policy = policy.validate()?;
         validate_pins(pins, policy.max_pinned_roots)?;
-        // One all-or-nothing maintenance reservation covers the largest decoded object, its
-        // compressed form, fixed external-sort buffers, and streaming I/O buffers. Additional
-        // pack compression reservations remain separately accounted by the same global budget.
-        let maintenance_memory = self
-            .memory
-            .try_reserve(MemoryClass::Maintenance, GC_WORKING_BYTES)?;
-        let mut marker = Marker::new(&self.active, &policy, &self.root, &maintenance_memory)?;
+        let mut marker = Marker::new(&self.active, &policy, &self.root)?;
         marker.add_roots(pins);
         marker.run();
-        let (reachable, mut mark) = marker.finish()?;
+        let (reachable, mark) = marker.finish()?;
         let all_hashes =
             SortedHashes::from_store(reachable.scratch.clone(), &self.active, policy.max_objects)?;
         let active_count = all_hashes.count;
-        if !mark.conclusive() {
-            return Ok(GcRunReport::inconclusive(mark, active_count));
+        if mark.failed {
+            return Ok(GcRunReport::unchanged(active_count));
         }
 
         // Grace is measured against authoritative published progress. A speculative building
@@ -443,7 +342,6 @@ impl GcPackStore {
                     state_path.display()
                 );
                 quarantine(&state_path);
-                self.recovery.damaged_mark_history = true;
                 None
             }
         };
@@ -458,33 +356,17 @@ impl GcPackStore {
         )?;
         let retained = classification.retained;
         let reclaim = classification.reclaim;
-        let grace_retained = classification.grace_retained;
         let cycle = classification.cycle;
 
         // A grace-retained object is still data. Verify it before advancing the successful
         // mark: if it cannot be copied, keep the old set and report regeneration instead.
+        let mut retained_valid = true;
         for_each_hash_difference(&retained, &reachable, |hash| {
-            match self.active.get_scoped(hash, &maintenance_memory) {
-                Ok(Some(_)) => {}
-                Ok(None) => marker_issue(
-                    &mut mark,
-                    policy.max_reported_issues,
-                    Some(hash),
-                    ReferenceIssueKind::Missing,
-                    "grace-retained object disappeared before copying",
-                ),
-                Err(error) => marker_issue(
-                    &mut mark,
-                    policy.max_reported_issues,
-                    Some(hash),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot verify grace-retained object: {error:#}"),
-                ),
-            }
+            retained_valid &= matches!(self.active.get(hash), Ok(Some(_)));
             Ok(())
         })?;
-        if !mark.conclusive() {
-            return Ok(GcRunReport::inconclusive(mark, active_count));
+        if !retained_valid {
+            return Ok(GcRunReport::unchanged(active_count));
         }
 
         write_mark_history(
@@ -500,17 +382,11 @@ impl GcPackStore {
                 SET_POINTER_MAGIC,
                 self.active_identity,
             )?;
-            let retired = self.reap_unreferenced_sets()?;
+            self.reap_unreferenced_sets()?;
             return Ok(GcRunReport {
-                mark,
-                successful_mark_cycle: Some(cycle),
-                active_objects_before: active_count,
                 retained_objects: retained.count,
-                grace_retained_objects: grace_retained,
                 reclaimed_objects: 0,
-                copied_objects: 0,
                 switched: false,
-                old_set_retired: retired != 0,
             });
         }
 
@@ -519,35 +395,13 @@ impl GcPackStore {
         fs::create_dir(&replacement_path)
             .with_context(|| format!("create replacement {}", replacement_path.display()))?;
         sync_parent(&replacement_path)?;
-        let mut replacement = PackStore::open_with_budget(&replacement_path, self.memory.clone())?;
+        let mut replacement = PackStore::open(&replacement_path)?;
         let mut retained_cursor = HashCursor::new(&retained)?;
         while let Some(hash) = retained_cursor.next()? {
-            let object = match self.active.get_scoped(hash, &maintenance_memory) {
+            let object = match self.active.get(hash) {
                 Ok(Some(object)) => object,
-                Ok(None) => {
-                    marker_issue(
-                        &mut mark,
-                        policy.max_reported_issues,
-                        Some(hash),
-                        ReferenceIssueKind::Missing,
-                        "retained object vanished after the successful mark",
-                    );
-                    return Ok(failed_after_mark(mark, cycle, active_count, grace_retained));
-                }
-                Err(error) => {
-                    marker_issue(
-                        &mut mark,
-                        policy.max_reported_issues,
-                        Some(hash),
-                        ReferenceIssueKind::Corrupt,
-                        format!("retained object changed after the successful mark: {error:#}"),
-                    );
-                    return Ok(failed_after_mark(mark, cycle, active_count, grace_retained));
-                }
+                Ok(None) | Err(_) => return Ok(GcRunReport::unchanged(active_count)),
             };
-            if object.hash() != hash || !object.verify() {
-                bail!("retained surface object {hash} failed independent verification");
-            }
             let location = self
                 .active
                 .location(hash)
@@ -557,7 +411,7 @@ impl GcPackStore {
             } else {
                 let dictionary = self
                     .active
-                    .get_scoped(location.dictionary, &maintenance_memory)?
+                    .get(location.dictionary)?
                     .context("retained object compression dictionary is missing")?;
                 if dictionary.kind() != ObjectKind::CompressionDictionary {
                     bail!("retained object compression dependency has the wrong type");
@@ -571,51 +425,14 @@ impl GcPackStore {
         // Reopen from the durable pack/index files and verify every copied object, rather than
         // trusting the writer's in-memory index.
         drop(replacement);
-        let replacement = PackStore::open_with_budget(&replacement_path, self.memory.clone())?;
+        let replacement = PackStore::open(&replacement_path)?;
         if !retained.equals_store(&replacement, policy.max_objects)? {
-            marker_issue(
-                &mut mark,
-                policy.max_reported_issues,
-                None,
-                ReferenceIssueKind::Corrupt,
-                "replacement surface pack-set index differs from the retained object set",
-            );
-            return Ok(failed_after_mark(mark, cycle, active_count, grace_retained));
+            return Ok(GcRunReport::unchanged(active_count));
         }
         let mut retained_cursor = HashCursor::new(&retained)?;
         while let Some(hash) = retained_cursor.next()? {
-            let object = match replacement.get_scoped(hash, &maintenance_memory) {
-                Ok(Some(object)) => object,
-                Ok(None) => {
-                    marker_issue(
-                        &mut mark,
-                        policy.max_reported_issues,
-                        Some(hash),
-                        ReferenceIssueKind::Missing,
-                        "copied object vanished before replacement verification",
-                    );
-                    return Ok(failed_after_mark(mark, cycle, active_count, grace_retained));
-                }
-                Err(error) => {
-                    marker_issue(
-                        &mut mark,
-                        policy.max_reported_issues,
-                        Some(hash),
-                        ReferenceIssueKind::Corrupt,
-                        format!("copied object failed replacement verification: {error:#}"),
-                    );
-                    return Ok(failed_after_mark(mark, cycle, active_count, grace_retained));
-                }
-            };
-            if object.hash() != hash || !object.verify() {
-                marker_issue(
-                    &mut mark,
-                    policy.max_reported_issues,
-                    Some(hash),
-                    ReferenceIssueKind::Corrupt,
-                    "copied object failed canonical verification",
-                );
-                return Ok(failed_after_mark(mark, cycle, active_count, grace_retained));
+            if !matches!(replacement.get(hash), Ok(Some(_))) {
+                return Ok(GcRunReport::unchanged(active_count));
             }
         }
         replacement.sync_all()?;
@@ -667,19 +484,13 @@ impl GcPackStore {
         }
         self.reap_unreferenced_sets()?;
         Ok(GcRunReport {
-            mark,
-            successful_mark_cycle: Some(cycle),
-            active_objects_before: active_count,
             retained_objects: retained.count,
-            grace_retained_objects: grace_retained,
             reclaimed_objects: reclaim.count,
-            copied_objects: retained.count,
             switched: true,
-            old_set_retired: true,
         })
     }
 
-    fn reap_unreferenced_sets(&mut self) -> Result<usize> {
+    fn reap_unreferenced_sets(&mut self) -> Result<()> {
         let current = read_optional_identity(&self.root.join("active.current"), SET_POINTER_MAGIC)?
             .context("cannot retire packs without a current pack-set pointer")?;
         if current != self.active_identity {
@@ -709,11 +520,8 @@ impl GcPackStore {
         }
         if removed != 0 {
             sync_parent(&self.sets.join("placeholder"))?;
-            self.recovery
-                .orphaned_pack_sets
-                .retain(|path| path.exists());
         }
-        Ok(removed)
+        Ok(())
     }
 }
 
@@ -1222,50 +1030,35 @@ struct PendingReference {
 
 struct Marker<'a> {
     store: &'a PackStore,
-    memory: &'a MemoryPermit,
     policy: &'a GcPolicy,
     scratch: Arc<GcScratch>,
     pending: Option<ReferenceSorter>,
     reachable: Option<SortedHashes>,
-    report: MarkReport,
+    state: MarkState,
 }
 
 impl<'a> Marker<'a> {
-    fn new(
-        store: &'a PackStore,
-        policy: &'a GcPolicy,
-        scratch_root: &Path,
-        memory: &'a MemoryPermit,
-    ) -> Result<Self> {
+    fn new(store: &'a PackStore, policy: &'a GcPolicy, scratch_root: &Path) -> Result<Self> {
         let scratch = GcScratch::create(scratch_root)?;
         Ok(Self {
             store,
-            memory,
             policy,
             scratch: scratch.clone(),
             pending: Some(ReferenceSorter::new(scratch)),
             reachable: None,
-            report: MarkReport::default(),
+            state: MarkState::default(),
         })
     }
 
     fn add_roots(&mut self, pins: &GcPins) {
         let expected_dimension = pins.current.first().map(|root| root.dimension);
         for root in pins.iter() {
-            if let Err(error) = root.validate() {
-                self.issue(
-                    None,
-                    ReferenceIssueKind::Corrupt,
-                    format!("invalid pinned root: {error:#}"),
-                );
+            if root.validate().is_err() {
+                self.reject();
                 continue;
             }
             if Some(root.dimension) != expected_dimension {
-                self.issue(
-                    None,
-                    ReferenceIssueKind::Corrupt,
-                    "pinned roots from different dimensions cannot share one GC history",
-                );
+                self.reject();
                 continue;
             }
             self.enqueue(root.root_manifest, ExpectedObject::RootManifest);
@@ -1283,43 +1076,27 @@ impl<'a> Marker<'a> {
 
     fn enqueue(&mut self, hash: ObjectHash, expected: ExpectedObject) {
         if hash.is_zero() {
-            self.issue(
-                None,
-                ReferenceIssueKind::Corrupt,
-                "reachable reference uses the reserved zero hash",
-            );
+            self.reject();
             return;
         }
         if let Some(location) = self.store.location(hash)
             && !expected.accepts(location.kind)
         {
-            self.issue(
-                Some(hash),
-                ReferenceIssueKind::WrongType,
-                format!("reference expected {expected:?}, found {:?}", location.kind),
-            );
+            self.reject();
         }
         let result = self
             .pending
             .as_mut()
             .context("GC reference sink is unavailable")
             .and_then(|pending| pending.push(PendingReference { hash, expected }));
-        if let Err(error) = result {
-            self.issue(
-                Some(hash),
-                ReferenceIssueKind::BoundExceeded,
-                format!("cannot spool reachable reference: {error:#}"),
-            );
+        if result.is_err() {
+            self.reject();
         }
     }
 
     fn run(&mut self) {
-        if let Err(error) = self.run_inner() {
-            self.issue(
-                None,
-                ReferenceIssueKind::BoundExceeded,
-                format!("external GC traversal failed safely: {error:#}"),
-            );
+        if self.run_inner().is_err() {
+            self.reject();
         }
     }
 
@@ -1330,15 +1107,11 @@ impl<'a> Marker<'a> {
             .context("GC initial reference sink disappeared")?
             .finish()?;
         let mut reachable = SortedHashes::empty(self.scratch.clone())?;
-        while frontier.count != 0 && !self.report.needs_regeneration {
+        while frontier.count != 0 && !self.state.failed {
             let (fresh, next_reachable) = admit_frontier(frontier, reachable)?;
             reachable = next_reachable;
             if reachable.count > self.policy.max_objects {
-                self.issue(
-                    None,
-                    ReferenceIssueKind::BoundExceeded,
-                    "reachable closure exceeds the configured object bound",
-                );
+                self.reject();
                 break;
             }
             self.pending = Some(ReferenceSorter::new(self.scratch.clone()));
@@ -1349,64 +1122,29 @@ impl<'a> Marker<'a> {
                 .context("GC next reference sink disappeared")?
                 .finish()?;
         }
-        self.report.reachable_objects = reachable.count;
         self.reachable = Some(reachable);
         Ok(())
     }
 
     fn process_reference(&mut self, reference: PendingReference) -> Result<()> {
-        let stored = match self.store.read_stored_scoped(reference.hash, self.memory) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                self.issue(
-                    Some(reference.hash),
-                    ReferenceIssueKind::Missing,
-                    "pinned closure references a missing object",
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                self.issue(
-                    Some(reference.hash),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot read reachable object: {error:#}"),
-                );
-                return Ok(());
-            }
+        let Some(location) = self.store.location(reference.hash) else {
+            self.reject();
+            return Ok(());
         };
-        if !reference.expected.accepts(stored.kind) {
-            self.issue(
-                Some(reference.hash),
-                ReferenceIssueKind::WrongType,
-                format!(
-                    "reachable object expected {:?}, found {:?}",
-                    reference.expected, stored.kind
-                ),
-            );
+        if !reference.expected.accepts(location.kind) {
+            self.reject();
             return Ok(());
         }
-        if !stored.dictionary.is_zero() {
+        if !location.dictionary.is_zero() {
             self.enqueue(
-                stored.dictionary,
+                location.dictionary,
                 ExpectedObject::Exact(ObjectKind::CompressionDictionary),
             );
         }
-        let object = match self.store.get_scoped(reference.hash, self.memory) {
+        let object = match self.store.get(reference.hash) {
             Ok(Some(object)) => object,
-            Ok(None) => {
-                self.issue(
-                    Some(reference.hash),
-                    ReferenceIssueKind::Missing,
-                    "reachable object disappeared while resolving its dictionary",
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                self.issue(
-                    Some(reference.hash),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot verify reachable object: {error:#}"),
-                );
+            Ok(None) | Err(_) => {
+                self.reject();
                 return Ok(());
             }
         };
@@ -1430,11 +1168,7 @@ impl<'a> Marker<'a> {
                         self.enqueue(entry.hash, ExpectedObject::Exact(kind));
                     }
                 }
-                Err(error) => self.issue(
-                    Some(object.hash()),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot decode root directory: {error:#}"),
-                ),
+                Err(_) => self.reject(),
             },
             ObjectKind::ManifestSubtree => match ManifestSubtree::decode(object.bytes()) {
                 Ok(manifest) => {
@@ -1445,11 +1179,7 @@ impl<'a> Marker<'a> {
                         );
                     }
                 }
-                Err(error) => self.issue(
-                    Some(object.hash()),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot decode manifest subtree: {error:#}"),
-                ),
+                Err(_) => self.reject(),
             },
             ObjectKind::ManifestDescriptorPage => {
                 match ManifestDescriptorPage::decode(object.bytes()) {
@@ -1472,11 +1202,7 @@ impl<'a> Marker<'a> {
                             }
                         }
                     }
-                    Err(error) => self.issue(
-                        Some(object.hash()),
-                        ReferenceIssueKind::Corrupt,
-                        format!("cannot decode manifest descriptor page: {error:#}"),
-                    ),
+                    Err(_) => self.reject(),
                 }
             }
             ObjectKind::DictionarySet => match DictionarySet::decode(object.bytes()) {
@@ -1488,11 +1214,7 @@ impl<'a> Marker<'a> {
                         );
                     }
                 }
-                Err(error) => self.issue(
-                    Some(object.hash()),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot decode dictionary set: {error:#}"),
-                ),
+                Err(_) => self.reject(),
             },
             ObjectKind::VisibilityDirectory => match object_references(object.bytes()) {
                 Ok(references) => {
@@ -1506,11 +1228,7 @@ impl<'a> Marker<'a> {
                         );
                     }
                 }
-                Err(error) => self.issue(
-                    Some(object.hash()),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot decode visibility directory: {error:#}"),
-                ),
+                Err(_) => self.reject(),
             },
             ObjectKind::VisibilityPage => {}
             ObjectKind::VisibilitySummaryPage => match summary_page_references(object.bytes()) {
@@ -1519,93 +1237,32 @@ impl<'a> Marker<'a> {
                         self.enqueue(source, ExpectedObject::Exact(ObjectKind::SourceMicrotile));
                     }
                 }
-                Err(error) => self.issue(
-                    Some(object.hash()),
-                    ReferenceIssueKind::Corrupt,
-                    format!("cannot decode visibility summary references: {error:#}"),
-                ),
+                Err(_) => self.reject(),
             },
             ObjectKind::SourceMicrotile => {
-                if let Err(error) = SourceMicrotile::decode(object.bytes()) {
-                    self.issue(
-                        Some(object.hash()),
-                        ReferenceIssueKind::Corrupt,
-                        format!("cannot decode source microtile: {error:#}"),
-                    );
+                if SourceMicrotile::decode(object.bytes()).is_err() {
+                    self.reject();
                 }
             }
             ObjectKind::Catalog => {
-                if let Err(error) = Catalog::decode(object.bytes()) {
-                    self.issue(
-                        Some(object.hash()),
-                        ReferenceIssueKind::Corrupt,
-                        format!("cannot decode canonical catalog: {error:#}"),
-                    );
+                if Catalog::decode(object.bytes()).is_err() {
+                    self.reject();
                 }
             }
             _ => {}
         }
     }
 
-    fn issue(
-        &mut self,
-        hash: Option<ObjectHash>,
-        kind: ReferenceIssueKind,
-        detail: impl Into<String>,
-    ) {
-        marker_issue(
-            &mut self.report,
-            self.policy.max_reported_issues,
-            hash,
-            kind,
-            detail,
-        );
+    fn reject(&mut self) {
+        self.state.failed = true;
     }
 
-    fn finish(mut self) -> Result<(SortedHashes, MarkReport)> {
+    fn finish(mut self) -> Result<(SortedHashes, MarkState)> {
         let reachable = match self.reachable.take() {
             Some(reachable) => reachable,
             None => SortedHashes::empty(self.scratch.clone())?,
         };
-        Ok((reachable, self.report))
-    }
-}
-
-fn marker_issue(
-    report: &mut MarkReport,
-    maximum: usize,
-    hash: Option<ObjectHash>,
-    kind: ReferenceIssueKind,
-    detail: impl Into<String>,
-) {
-    report.needs_regeneration = true;
-    if report.issues.len() < maximum {
-        report.issues.push(ReferenceIssue {
-            hash,
-            kind,
-            detail: detail.into(),
-        });
-    } else {
-        report.issue_overflow = true;
-    }
-}
-
-fn failed_after_mark(
-    mark: MarkReport,
-    cycle: u64,
-    active_objects: usize,
-    grace_retained_objects: usize,
-) -> GcRunReport {
-    GcRunReport {
-        mark,
-        successful_mark_cycle: Some(cycle),
-        active_objects_before: active_objects,
-        retained_objects: active_objects,
-        grace_retained_objects,
-        reclaimed_objects: 0,
-        copied_objects: 0,
-        switched: false,
-        old_set_retired: false,
+        Ok((reachable, self.state))
     }
 }
 
@@ -1846,7 +1503,6 @@ struct GcClassification {
     reclaim: SortedHashes,
     absences: AbsenceRun,
     cycle: u64,
-    grace_retained: usize,
 }
 
 fn classify_objects(
@@ -1869,7 +1525,6 @@ fn classify_objects(
     let mut retained = HashRunWriter::new(all.scratch.clone(), "retained-base")?;
     let mut absences = AbsenceRunWriter::new(all.scratch.clone())?;
     let mut all_cursor = HashCursor::new(all)?;
-    let mut grace_retained = 0usize;
     while let Some(hash) = all_cursor.next()? {
         while old_next.is_some_and(|(old_hash, _)| old_hash < hash) {
             old_next = old.next()?;
@@ -1912,7 +1567,6 @@ fn classify_objects(
         }
         retained.push(hash)?;
         absences.push(hash, absence)?;
-        grace_retained += 1;
     }
     if reachable_next.is_some() {
         bail!("reachable GC closure extends beyond the active object index");
@@ -1952,7 +1606,6 @@ fn classify_objects(
         reclaim,
         absences,
         cycle,
-        grace_retained,
     })
 }
 
@@ -2043,11 +1696,7 @@ fn read_optional_identity(path: &Path, magic: &[u8; 8]) -> Result<Option<SetIden
     )?))
 }
 
-fn open_identity(
-    sets: &Path,
-    identity: SetIdentity,
-    memory: Arc<ServerMemoryBudget>,
-) -> Result<(PathBuf, PackStore)> {
+fn open_identity(sets: &Path, identity: SetIdentity) -> Result<(PathBuf, PackStore)> {
     let path = resolve_set_path(sets, identity.id)
         .with_context(|| format!("surface pack set {} is unavailable", identity.id))?;
     let ready = read_optional_identity(&path.join("set.ready"), SET_READY_MAGIC)?
@@ -2055,7 +1704,7 @@ fn open_identity(
     if ready != identity {
         bail!("surface pack-set pointer and ready marker disagree");
     }
-    let store = PackStore::open_with_budget(&path, memory)?;
+    let store = PackStore::open(&path)?;
     // The activation snapshot remains stable even though the active set may append objects.
     // Checking exact members avoids accepting a set that lost one activated object merely
     // because later appends kept its total count above the marker's count.
@@ -2190,10 +1839,6 @@ fn resolve_set_path(sets: &Path, id: u64) -> Option<PathBuf> {
     }
     let retired = retired_path(sets, id);
     retired.is_dir().then_some(retired)
-}
-
-fn resolves_to(sets: &Path, identity: SetIdentity, candidate: &Path) -> bool {
-    resolve_set_path(sets, identity.id).as_deref() == Some(candidate)
 }
 
 fn parse_set_id(path: &Path) -> Option<u64> {

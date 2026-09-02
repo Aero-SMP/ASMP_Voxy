@@ -1,0 +1,9 @@
+world = "/srv/minecraft/world"
+data = "/srv/minecraft/voxy-rust"
+poll_ms = 2000
+rayon_threads = 16
+
+[quic]
+listen = "0.0.0.0:25587"
+advertise_host = ""
+advertise_port = 0

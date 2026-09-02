@@ -23,11 +23,6 @@ public final class ObjectCache implements AutoCloseable {
     public interface PinSource {
         void forEach(Consumer<Hash256> visitor);
     }
-    // Includes live and recovery/checkpoint map nodes, hash objects, pin-set entries, pack
-    // metadata, and one maximum synchronized cache read buffer. The cache reserves its complete
-    // worst case once instead of letting disposable metadata escape the session-wide budget.
-    private static final long INDEX_BYTES_PER_OBJECT = 656;
-    private static final long PACK_TABLE_BYTES = 8L << 20;
     public record Limits(int maxObjects, long maxStoredBytes, int maxObjectBytes) {
         public Limits {
             if (maxObjects < 1 || maxStoredBytes < 0 || maxObjectBytes < 0
@@ -39,50 +34,37 @@ public final class ObjectCache implements AutoCloseable {
     }
 
     private final PackedObjectStore store;
-    private final MemoryBudget.Reservation memory;
     private boolean enabled;
 
-    public ObjectCache(Path root, Limits limits, MemoryBudget budget) throws IOException {
+    public ObjectCache(Path root, Limits limits) throws IOException {
         Objects.requireNonNull(limits, "limits");
-        Objects.requireNonNull(budget, "budget");
-        long indexBytes = Math.addExact(PACK_TABLE_BYTES,
-                Math.multiplyExact(INDEX_BYTES_PER_OBJECT, limits.maxObjects()));
-        this.memory = budget.tryReserve(new MemoryBudget.Allocation(
-                0, indexBytes, 0, 0, 0, 0, 0, limits.maxObjectBytes()))
-                .orElseThrow(() -> new IOException(
-                        "Virtual Surface memory budget cannot admit the persistent-cache index"));
-        PackedObjectStore opened;
-        try {
-            opened = new PackedObjectStore(Objects.requireNonNull(root, "root"),
-                    limits.maxObjects(), limits.maxStoredBytes(), limits.maxObjectBytes());
-        } catch (IOException | RuntimeException failure) {
-            this.memory.close();
-            throw failure;
-        }
-        this.store = opened;
+        this.store = new PackedObjectStore(Objects.requireNonNull(root, "root"),
+                limits.maxObjects(), limits.maxStoredBytes(), limits.maxObjectBytes());
         this.enabled = true;
     }
 
     private ObjectCache() {
         this.store = null;
-        this.memory = null;
+    }
+
+    /** A disposable miss-only cache used while disk recovery is still running. */
+    static ObjectCache disabled() {
+        return new ObjectCache();
     }
 
     /** Opens the disposable cache, falling back to a no-op cache on any startup I/O failure. */
-    public static ObjectCache openBestEffort(Path root, Limits limits,
-                                                MemoryBudget budget) {
+    public static ObjectCache openBestEffort(Path root, Limits limits) {
         try {
-            return new ObjectCache(root, limits, budget);
+            return new ObjectCache(root, limits);
         } catch (IOException failure) {
             return new ObjectCache();
         }
     }
 
-    public synchronized boolean put(EncodedObject encoded, CanonicalObject canonical)
-            throws IOException {
+    synchronized boolean putVerified(EncodedObject encoded) throws IOException {
         if (!this.enabled) return false;
         try {
-            return this.store.put(encoded, canonical);
+            return this.store.put(encoded);
         } catch (IOException failure) {
             disable();
             return false;
@@ -115,11 +97,6 @@ public final class ObjectCache implements AutoCloseable {
         if (this.enabled) this.store.replacePins(source);
     }
 
-    /** Permanently yields this disposable cache's working set without closing the live session. */
-    public synchronized void disableForPressure() {
-        disable();
-    }
-
     @Override
     public synchronized void close() {
         disable();
@@ -132,8 +109,6 @@ public final class ObjectCache implements AutoCloseable {
             this.store.close();
         } catch (RuntimeException ignored) {
             // This cache is disposable. A failed checkpoint/close must not affect live terrain.
-        } finally {
-            this.memory.close();
         }
     }
 }

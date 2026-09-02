@@ -1,26 +1,25 @@
-//! Live publication and object service.
-//!
-//! Recovered roots are announced immediately, while each dimension polls its authoritative Anvil
-//! source and transactionally publishes complete roots when source content changes.
+//! Live publication, QUIC root leases, and fair positional object service.
 
 use super::{
     gc::{GcMoment, GcPolicy, GcRunReport},
-    memory::{MemoryClass, MemoryPermit, MemoryPressure, ServerMemoryBudget},
     object::{ObjectHash, ObjectKind},
+    pack::StoredObjectSource,
     root::RootRecord,
     runtime::{DimensionSurface, LeasedDictionaryMismatch},
     visibility::DimensionVisibilityPolicy,
     wire::{
-        C_CAMERA_DOMAIN, C_CREDIT, C_HELLO, C_OBJECT_REQUEST, C_PING, C_ROOT_READY,
-        C_SUBTREE_REQUEST, CameraDomainState, Frame, HEADER_LEN, MAX_BUNDLE_ENTRIES,
-        MAX_CANONICAL_OBJECT_BYTES, MAX_FRAME_PAYLOAD, MAX_MANIFEST_BYTES, Message, RootToken,
-        S_OBJECT_BUNDLE, S_SUBTREE_DATA, WRITE_TIMEOUT, WireObject, error, hello,
-        parse_control_u64, pong,
+        CameraDomainState, ControlMessage, MAX_STREAM_CANONICAL_BYTES, MAX_STREAM_COMPRESSED_BYTES,
+        OBJECT_RESPONSE_HEADER_BYTES, ObjectRequest, ObjectResponseHeader, PriorityLane, RootToken,
+        STREAM_OBJECT_REQUEST, encode_control_record, read_control, read_stream_role,
+        write_object_error, write_object_success,
     },
 };
 use crate::{anvil::AnvilWorld, lock, read_lock, registry::Registry, write_lock};
 use anyhow::{Context, Result, bail};
+use crc32c::crc32c_append;
+use quinn::{Connection, RecvStream, SendStream, VarInt};
 use std::{
+    array,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     path::Path,
@@ -30,28 +29,23 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
-    sync::{broadcast, mpsc},
-};
+use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc, oneshot, watch};
 
-const READ_TIMEOUT: Duration = Duration::from_secs(90);
-const MEMORY_RETRY_DELAY: Duration = Duration::from_millis(5);
-const MAX_CREDIT_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_PENDING_BYTES: usize = 20 * 1024 * 1024;
-const RESPONSE_LOW_WATER: usize = 4 * 1024 * 1024;
-// One canonical decode, stored compressed input, encoded frame growth/copy, dictionary-set
-// metadata, and bounded codec scratch. This permit lives until the final encoded frame has
-// taken ownership, then shrinks to the bytes retained in the pending output queue.
-const RESPONSE_WORKING_BYTES: usize =
-    MAX_CANONICAL_OBJECT_BYTES + 4 * MAX_FRAME_PAYLOAD + 8 * 1024 * 1024;
-const MAX_OUTSTANDING_HASHES: usize = 8 * 1024;
-const MAX_CLIENT_FRAMES_PER_SECOND: u32 = 128;
 const ANNOUNCEMENT_CAPACITY: usize = 1_024;
-const COMMAND_CAPACITY: usize = 32;
-// Generation + dimension hash + root hash + object count.
-const BUNDLE_FIXED_BYTES: usize = 8 + 2 * 32 + 2;
-const OBJECT_WIRE_HEADER_BYTES: usize = 32 + 17;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_CONTROL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const SCHEDULER_CAPACITY: usize = 4_096;
+const MAX_ACTIVE_DISK_TURNS: usize = 16;
+const MAX_ACTIVE_NETWORK_TURNS: usize = 16;
+const MAX_ACTIVE_NETWORK_TURNS_PER_SESSION: usize = 2;
+const NETWORK_WRITE_SLICE: Duration = Duration::from_millis(5);
+const TRANSFER_CHUNK_BYTES: usize = 32 * 1024;
+// Keep one small, coordinated stream budget on both peers. Coverage can use half of it,
+// while current-view and speculative work cannot crowd out the correctness-critical lane.
+const ACTIVE_STREAMS_PER_LANE: [usize; 3] = [4, 3, 1];
+const MAX_ACTIVE_STREAMS_PER_CONNECTION: usize = 8;
+const MAX_CONTROL_MESSAGES_PER_SECOND: u32 = 128;
 
 #[derive(Debug, Default)]
 struct SurfaceState {
@@ -61,9 +55,6 @@ struct SurfaceState {
 }
 
 impl SurfaceState {
-    /// The newest verified root is preferred, but a known-bad current generation must not turn
-    /// a recoverable restart into an empty world.  `previous` was fully verified when it was
-    /// retained, and a later request failure will withhold it as well if it has since decayed.
     fn visible(&self) -> Option<RootRecord> {
         [self.current, self.previous]
             .into_iter()
@@ -71,10 +62,6 @@ impl SurfaceState {
             .find(|root| !self.bad.contains(&RootToken::from(*root)))
     }
 
-    /// Roots named by the announcement state are GC pins even when the runtime has already
-    /// built several unannounced replacements.  This closes the rebuild/catch-up window where a
-    /// newly connected client could otherwise be offered a root whose immutable objects had
-    /// just been collected.
     fn retained_roots(&self) -> Vec<RootRecord> {
         let mut roots = [self.current, self.previous]
             .into_iter()
@@ -83,10 +70,6 @@ impl SurfaceState {
         roots.sort_unstable_by_key(|root| root.generation);
         roots.dedup();
         roots
-    }
-
-    fn is_bad(&self, token: RootToken) -> bool {
-        self.bad.contains(&token)
     }
 }
 
@@ -105,8 +88,7 @@ struct SurfaceService {
 
 impl SurfaceService {
     fn publish(&self, root: RootRecord) -> Result<bool> {
-        let expected = ObjectHash::dimension(&self.dimension)?;
-        if root.dimension != expected {
+        if root.dimension != ObjectHash::dimension(&self.dimension)? {
             bail!("surface root belongs to a different dimension");
         }
         let mut state = write_lock(&self.announced)?;
@@ -134,25 +116,47 @@ impl SurfaceService {
     }
 
     fn current(&self) -> Result<Option<RootRecord>> {
-        let state = read_lock(&self.announced)?;
-        Ok(state.visible())
+        Ok(read_lock(&self.announced)?.visible())
     }
 
     fn retained_roots(&self) -> Result<Vec<RootRecord>> {
         Ok(read_lock(&self.announced)?.retained_roots())
     }
 
-    fn is_bad(&self, token: RootToken) -> Result<bool> {
-        Ok(read_lock(&self.announced)?.is_bad(token))
-    }
-
-    fn serviceable_announcement(&self, token: RootToken) -> Result<bool> {
+    fn serviceable(&self, token: RootToken) -> Result<bool> {
         let state = read_lock(&self.announced)?;
         Ok(!state.bad.contains(&token)
             && [state.current, state.previous]
                 .into_iter()
                 .flatten()
                 .any(|record| RootToken::from(record) == token))
+    }
+
+    fn pin_if_serviceable(
+        &self,
+        token: RootToken,
+        session: &Arc<SessionPinGuard>,
+        record: RootRecord,
+    ) -> Result<Option<RequestPinGuard>> {
+        if RootToken::from(record) != token {
+            bail!("announcement token and root record disagree");
+        }
+        let state = read_lock(&self.announced)?;
+        let serviceable = !state.bad.contains(&token)
+            && [state.current, state.previous]
+                .into_iter()
+                .flatten()
+                .any(|candidate| RootToken::from(candidate) == token);
+        if !serviceable {
+            return Ok(None);
+        }
+        let pin = session.pin(record)?;
+        drop(state);
+        Ok(Some(pin))
+    }
+
+    fn is_bad(&self, token: RootToken) -> Result<bool> {
+        Ok(read_lock(&self.announced)?.bad.contains(&token))
     }
 
     fn request_repair(&self, token: RootToken) -> Result<()> {
@@ -180,16 +184,17 @@ struct PublisherWorker {
     repairs: mpsc::Receiver<()>,
 }
 
-/// All dimension surfaces and their publication workers.
+/// All dimension surfaces, publication workers, root leases, and cross-client I/O scheduling.
 pub struct Service {
     registry: Arc<RwLock<Registry>>,
     surfaces: BTreeMap<String, Arc<SurfaceService>>,
     announcements: broadcast::Sender<Announcement>,
+    shutdowns: broadcast::Sender<String>,
     workers: Mutex<Option<Vec<PublisherWorker>>>,
     poll_interval: Duration,
-    sessions: Mutex<HashMap<u64, Vec<RootRecord>>>,
+    sessions: Mutex<HashMap<u64, SessionPins>>,
     next_session: AtomicU64,
-    memory: Arc<ServerMemoryBudget>,
+    scheduler: FairScheduler,
 }
 
 impl fmt::Debug for Service {
@@ -206,49 +211,15 @@ impl Service {
         self.surfaces.keys().map(String::as_str)
     }
 
-    /// Opens exactly one immutable surface for every discovered dimension. Update receivers are
-    /// created synchronously here, before `start` can launch a potentially long initial build.
-    pub fn open(
+    pub fn open_with_policies(
         data_root: impl AsRef<Path>,
         dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
         registry: Arc<RwLock<Registry>>,
         poll_interval: Duration,
-    ) -> Result<Self> {
-        Self::open_with_budget(
-            data_root,
-            dimensions,
-            registry,
-            poll_interval,
-            ServerMemoryBudget::default_budget(),
-        )
-    }
-
-    pub fn open_with_budget(
-        data_root: impl AsRef<Path>,
-        dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
-        registry: Arc<RwLock<Registry>>,
-        poll_interval: Duration,
-        memory: Arc<ServerMemoryBudget>,
-    ) -> Result<Self> {
-        Self::open_with_budget_and_policies(
-            data_root,
-            dimensions,
-            registry,
-            poll_interval,
-            memory,
-            &BTreeMap::new(),
-        )
-    }
-
-    pub fn open_with_budget_and_policies(
-        data_root: impl AsRef<Path>,
-        dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
-        registry: Arc<RwLock<Registry>>,
-        poll_interval: Duration,
-        memory: Arc<ServerMemoryBudget>,
         visibility_policies: &BTreeMap<String, DimensionVisibilityPolicy>,
     ) -> Result<Self> {
         let (announcements, _) = broadcast::channel(ANNOUNCEMENT_CAPACITY);
+        let (shutdowns, _) = broadcast::channel(1);
         let mut surfaces = BTreeMap::new();
         let mut workers = Vec::with_capacity(dimensions.len());
         for (dimension, source) in dimensions {
@@ -257,23 +228,20 @@ impl Service {
                 dimension,
                 visibility_policies.get(dimension).copied(),
             )?;
-            let runtime_surface = Arc::new(DimensionSurface::open_with_budget_and_policy(
+            let runtime_surface = Arc::new(DimensionSurface::open_with_policy(
                 data_root.as_ref(),
                 dimension.clone(),
                 source.clone(),
-                memory.clone(),
                 visibility_policy,
             )?);
-            let recovered_current = runtime_surface.current_root()?;
-            let recovered_previous = runtime_surface.previous_root()?;
             let surface = Arc::new(SurfaceService {
                 dimension: dimension.clone(),
-                surface: runtime_surface,
                 announced: RwLock::new(SurfaceState {
-                    current: recovered_current,
-                    previous: recovered_previous,
+                    current: runtime_surface.current_root()?,
+                    previous: runtime_surface.previous_root()?,
                     bad: HashSet::new(),
                 }),
+                surface: runtime_surface,
                 repair,
             });
             workers.push(PublisherWorker {
@@ -286,15 +254,15 @@ impl Service {
             registry,
             surfaces,
             announcements,
+            shutdowns,
             workers: Mutex::new(Some(workers)),
             poll_interval,
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
-            memory,
+            scheduler: FairScheduler::start(),
         })
     }
 
-    /// Starts each pre-subscribed publisher exactly once.
     pub fn start(self: &Arc<Self>) -> Result<()> {
         let workers = lock(&self.workers)?
             .take()
@@ -310,13 +278,20 @@ impl Service {
         Ok(())
     }
 
-    /// Synchronously refreshes every dimension, used by the finite one-shot invocation before
-    /// any network listener exists.
     pub fn refresh_all(&self) -> Result<()> {
-        for surface in self.surfaces.values() {
-            surface.surface.refresh(&self.registry)?;
+        loop {
+            let mut pending = false;
+            for surface in self.surfaces.values() {
+                pending |= surface.surface.refresh(&self.registry)?;
+            }
+            if !pending {
+                return Ok(());
+            }
         }
-        Ok(())
+    }
+
+    pub fn shutdown(&self, reason: impl Into<String>) {
+        let _ = self.shutdowns.send(reason.into());
     }
 
     async fn publisher_loop(self: Arc<Self>, mut worker: PublisherWorker) -> Result<()> {
@@ -334,12 +309,12 @@ impl Service {
             })
             .await
             {
-                Ok(Ok(report)) => {
+                Ok(Ok(pending)) => {
                     repair_pending = false;
                     if let Some(root) = worker.surface.surface.current_root()? {
                         self.announce(&worker.surface, root, repairing)?;
                     }
-                    if report.pending {
+                    if pending {
                         continue;
                     }
                 }
@@ -385,29 +360,27 @@ impl Service {
         }))
     }
 
-    fn register_session(self: &Arc<Self>) -> Result<SessionPinGuard> {
+    fn register_session(self: &Arc<Self>) -> Result<Arc<SessionPinGuard>> {
         let id = self
             .next_session
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| anyhow::anyhow!("surface session identity exhausted"))?;
-        lock(&self.sessions)?.insert(id, Vec::new());
-        Ok(SessionPinGuard {
+        lock(&self.sessions)?.insert(id, SessionPins::default());
+        Ok(Arc::new(SessionPinGuard {
             service: Arc::downgrade(self),
             id,
-        })
+        }))
     }
 
-    fn update_session_pins(&self, id: u64, roots: &SessionRoots) -> Result<()> {
+    fn update_session_pins(&self, id: u64, roots: Vec<RootRecord>) -> Result<()> {
         let mut sessions = lock(&self.sessions)?;
-        let entry = sessions
+        sessions
             .get_mut(&id)
-            .context("surface session pin record disappeared")?;
-        *entry = roots.pinned();
+            .context("surface session pin record disappeared")?
+            .leased = roots;
         Ok(())
     }
 
-    /// Runs one conservative GC cycle for a serviceable dimension. A withheld surface is
-    /// skipped: repair must re-establish a verified root before any reachability decision.
     pub fn collect_garbage(
         &self,
         dimension: &str,
@@ -421,18 +394,14 @@ impl Service {
         if surface.current()?.is_none() {
             return Ok(None);
         }
-        // `DimensionSurface` pins only its own current/previous records.  During a long
-        // rebuild-and-catch-up it can advance past the last root advertised by this service, so
-        // retain both announcement records explicitly in addition to live session leases.
         let mut retained = surface.retained_roots()?;
         let identity = ObjectHash::dimension(dimension)?;
-        retained.extend(
-            lock(&self.sessions)?
-                .values()
-                .flatten()
-                .copied()
-                .filter(|root| root.dimension == identity),
-        );
+        let session_roots = lock(&self.sessions)?
+            .values()
+            .flat_map(SessionPins::roots)
+            .filter(|root| root.dimension == identity)
+            .collect::<Vec<_>>();
+        retained.extend(session_roots);
         retained.sort_unstable_by_key(|root| root.generation);
         retained.dedup();
         surface
@@ -441,580 +410,950 @@ impl Service {
             .map(Some)
     }
 
-    /// Runs one dimension-bound terrain connection. Roots from other dimensions are never
-    /// announced or leased.
-    pub async fn connection<S>(
+    /// Owns the permanent control stream and all object streams for one QUIC connection.
+    pub async fn connection(
         self: Arc<Self>,
-        mut socket: S,
+        connection: Connection,
+        control_send: SendStream,
+        control_recv: RecvStream,
         selected_dimension: String,
         server_instance: u64,
-    ) -> Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        hello(server_instance).write(&mut socket).await?;
-
-        // Subscribe first, then snapshot. A publication racing this boundary is either present
-        // in the snapshot or retained by the receiver; duplicate announcements are harmless.
-        let announcements = self.announcements.subscribe();
+    ) -> Result<()> {
+        let mut control_send = ControlOutput::new(control_send);
+        let mut announcements = self.announcements.subscribe();
+        let mut shutdowns = self.shutdowns.subscribe();
         let initial = match self.root_snapshot_for(&selected_dimension) {
-            Ok(Some(root)) => vec![root],
+            Ok(Some(root)) => root,
             Ok(None) => {
-                error(8, "selected surface dimension has no verified root")
-                    .write(&mut socket)
-                    .await?;
-                flush(&mut socket).await?;
+                self.control_write(
+                    &mut control_send,
+                    &ControlMessage::Error {
+                        code: 8,
+                        message: "selected dimension has no verified root".to_owned(),
+                    },
+                )
+                .await?;
+                drain_terminal_control(&mut control_send).await;
                 return Ok(());
             }
-            Err(failure) => {
-                error(
-                    8,
-                    &format!("selected surface dimension is unavailable: {failure}"),
+            Err(error) => {
+                self.control_write(
+                    &mut control_send,
+                    &ControlMessage::Error {
+                        code: 8,
+                        message: format!("selected dimension is unavailable: {error}"),
+                    },
                 )
-                .write(&mut socket)
                 .await?;
-                flush(&mut socket).await?;
+                drain_terminal_control(&mut control_send).await;
                 return Ok(());
             }
         };
-        let session_guard = self.register_session()?;
-        let (mut reader, writer) = tokio::io::split(socket);
-        let mut writer = BufWriter::with_capacity(256 * 1024, writer);
-        let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
-        let memory = self.memory.clone();
-        let reader_task = tokio::spawn(async move {
-            let mut frame_window = Instant::now();
-            let mut frames = 0u32;
-            loop {
-                let Some(frame) = tokio::time::timeout(
-                    READ_TIMEOUT,
-                    Frame::read_client_budgeted(&mut reader, &memory),
-                )
+        let guard = self.register_session()?;
+        let roots = Arc::new(AsyncRwLock::new(SessionRoots::default()));
+        self.control_write(
+            &mut control_send,
+            &ControlMessage::ServerHello { server_instance },
+        )
+        .await?;
+        self.send_announcement(&mut control_send, &roots, &guard, initial)
+            .await?;
+
+        let (control_input_tx, mut control_input) = mpsc::channel(1);
+        let control_reader_task = tokio::spawn(control_reader(control_recv, control_input_tx));
+
+        let accept_service = self.clone();
+        let accept_connection = connection.clone();
+        let accept_roots = roots.clone();
+        let accept_guard = guard.clone();
+        let mut accept_task = tokio::spawn(async move {
+            accept_service
+                .accept_object_streams(accept_connection, accept_roots, accept_guard)
                 .await
-                .context("surface client read timeout")??
-                else {
-                    return Ok::<(), anyhow::Error>(());
-                };
-                if frame_window.elapsed() >= Duration::from_secs(1) {
-                    frame_window = Instant::now();
-                    frames = 0;
-                }
-                frames += 1;
-                if frames > MAX_CLIENT_FRAMES_PER_SECOND {
-                    bail!("surface client frame rate exceeded");
-                }
-                let (frame, memory) = frame.into_parts();
-                let command = match frame.kind {
-                    C_CREDIT => Command::Credit(parse_control_u64(&frame.payload)?),
-                    C_PING => Command::Ping(parse_control_u64(&frame.payload)?),
-                    C_SUBTREE_REQUEST | C_OBJECT_REQUEST | C_ROOT_READY | C_CAMERA_DOMAIN => {
-                        Command::Message(Message::decode(frame.kind, &frame.payload)?)
-                    }
-                    C_HELLO => bail!("duplicate HELLO"),
-                    other => bail!("unknown client frame type {other:#06x}"),
-                };
-                commands_tx
-                    .send(BudgetedCommand {
-                        command,
-                        _memory: memory,
-                    })
-                    .await?;
-            }
         });
 
-        let result = self
-            .writer_loop(
-                &mut writer,
-                commands_rx,
-                announcements,
-                initial,
-                selected_dimension,
-                session_guard.id,
-            )
-            .await;
-        reader_task.abort();
-        result
-    }
-
-    async fn writer_loop<W>(
-        self: &Arc<Self>,
-        writer: &mut BufWriter<W>,
-        mut commands: mpsc::Receiver<BudgetedCommand>,
-        mut announcements: broadcast::Receiver<Announcement>,
-        initial: Vec<Announcement>,
-        selected_dimension: String,
-        session_id: u64,
-    ) -> Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut session_roots = SessionRoots::default();
-        for announcement in initial {
-            self.send_announcement(writer, &mut session_roots, session_id, announcement)
-                .await?;
-        }
-        flush(writer).await?;
-
-        let mut jobs = VecDeque::<RequestJob>::new();
-        let mut outstanding_hashes = 0usize;
-        let mut pending = VecDeque::<PendingFrame>::new();
-        let mut pending_bytes = 0usize;
-        let mut credit = 0u64;
-        let mut credit_stalled = None::<Instant>;
-        let mut camera_sequences = HashMap::<RootToken, u64>::new();
-        loop {
-            let mut memory_stalled = false;
-            let mut wrote = false;
-            while let Some(item) = pending.front() {
-                if !session_roots.is_requestable(item.root) {
-                    let item = pending.pop_front().unwrap();
-                    pending_bytes -= pending_frame_bytes(&item.frame);
-                    continue;
-                }
-                let cost = (item.frame.payload.len() + HEADER_LEN) as u64;
-                if cost > credit {
-                    break;
-                }
-                let item = pending.pop_front().unwrap();
-                pending_bytes -= pending_frame_bytes(&item.frame);
-                credit -= cost;
-                item.frame.write(writer).await?;
-                wrote = true;
-            }
-            if wrote {
-                credit_stalled = None;
-                flush(writer).await?;
-            }
-            if let Some(item) = pending.front() {
-                if (item.frame.payload.len() + HEADER_LEN) as u64 > credit {
-                    let since = credit_stalled.get_or_insert_with(Instant::now);
-                    if since.elapsed() > WRITE_TIMEOUT {
-                        bail!("surface client object credit stalled");
-                    }
-                }
-            } else {
-                credit_stalled = None;
-            }
-
-            if pending_bytes < RESPONSE_LOW_WATER && !jobs.is_empty() {
-                let response_memory = match self
-                    .memory
-                    .try_reserve(MemoryClass::Network, RESPONSE_WORKING_BYTES)
-                {
-                    Ok(memory) => Some(memory),
-                    Err(_) => {
-                        memory_stalled = true;
-                        None
-                    }
-                };
-                if let Some(response_memory) = response_memory {
-                    let mut job = jobs.pop_front().expect("job queue was checked above");
-                    if !session_roots.is_requestable(job.root) {
-                        outstanding_hashes = outstanding_hashes
-                            .checked_sub(job.remaining())
-                            .context("surface canceled request accounting underflow")?;
-                        continue;
-                    }
-                    let original_remaining = job.remaining();
-                    let service = self.clone();
-                    let (job, built) = tokio::task::spawn_blocking(move || {
-                        let frame = service.build_response(&mut job, response_memory);
-                        (job, frame)
-                    })
-                    .await?;
-                    let frame = match built {
-                        Ok(frame) => frame,
-                        Err(failure) => {
-                            if is_memory_pressure(&failure) {
-                                // Pressure is transient scheduling state, not evidence that the
-                                // immutable root is corrupt. Preserve the request and root lease;
-                                // the bounded delay prevents a CPU spin if another priority owns the
-                                // global budget for an extended operation.
-                                jobs.push_front(job);
-                                tokio::time::sleep(MEMORY_RETRY_DELAY).await;
-                                continue;
-                            }
-                            if is_request_rejected(&failure) {
-                                outstanding_hashes = outstanding_hashes
-                                    .checked_sub(original_remaining)
-                                    .context("surface rejected request accounting underflow")?;
-                                error(4, &format!("surface object request rejected: {failure}"))
-                                    .write(writer)
-                                    .await?;
-                                flush(writer).await?;
-                                continue;
-                            }
-                            outstanding_hashes = outstanding_hashes
-                                .checked_sub(original_remaining)
-                                .context("surface failed request accounting underflow")?;
-                            for surface in &job.surfaces {
-                                surface.request_repair(job.root)?;
-                            }
-                            session_roots.fail(job.root);
-                            self.update_session_pins(session_id, &session_roots)?;
-                            error(
-                                8,
-                                &format!("surface root object unavailable; rebuilding: {failure}"),
-                            )
-                            .write(writer)
-                            .await?;
-                            flush(writer).await?;
-                            continue;
-                        }
+        let mut camera_sequence = 0u64;
+        let (camera_jobs, camera_job_rx) = watch::channel(None::<CameraJob>);
+        let (camera_answers_tx, mut camera_answers) = mpsc::channel(1);
+        let camera_task = tokio::spawn(camera_worker(
+            camera_job_rx,
+            camera_jobs.clone(),
+            camera_answers_tx,
+        ));
+        let mut control_window = Instant::now();
+        let mut control_message_count = 0u32;
+        let result = async {
+            loop {
+                tokio::select! {
+                message = control_input.recv() => {
+                    let message = message.context("control reader stopped unexpectedly")??;
+                    let Some(message) = message else {
+                        break Ok(());
                     };
-                    let resolved = frame.resolved;
-                    outstanding_hashes = outstanding_hashes
-                        .checked_sub(resolved)
-                        .context("surface outstanding request accounting underflow")?;
-                    let bytes = pending_frame_bytes(&frame.frame);
-                    pending_bytes = pending_bytes
-                        .checked_add(bytes)
-                        .context("surface pending byte count overflow")?;
-                    if pending_bytes > MAX_PENDING_BYTES {
-                        bail!("surface pending response limit exceeded");
+                    if control_window.elapsed() >= Duration::from_secs(1) {
+                        control_window = Instant::now();
+                        control_message_count = 0;
                     }
-                    pending.push_back(PendingFrame {
-                        root: job.root,
-                        frame: frame.frame,
-                        _memory: frame.memory,
-                    });
-                    if !job.is_empty() {
-                        jobs.push_front(job);
+                    control_message_count += 1;
+                    if control_message_count > MAX_CONTROL_MESSAGES_PER_SECOND {
+                        bail!("control-message rate exceeded");
                     }
-                    continue;
-                }
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(MEMORY_RETRY_DELAY), if memory_stalled => {},
-                command = commands.recv() => {
-                    let Some(BudgetedCommand { command, _memory }) = command else {
-                        return Ok(());
-                    };
-                    let mut command_memory = Some(_memory);
-                    match command {
-                    Command::Credit(amount) => {
-                        if amount == 0 || amount > MAX_CREDIT_BYTES {
-                            bail!("invalid surface client credit grant {amount}");
-                        }
-                        credit = credit.saturating_add(amount).min(MAX_CREDIT_BYTES);
-                    }
-                    Command::Ping(nonce) => {
-                        pong(nonce).write(writer).await?;
-                        flush(writer).await?;
-                    }
-                    Command::Message(Message::RootReady { dimension, root }) => {
-                        let offer_latest = session_roots.mark_ready(&dimension, root)?;
-                        self.update_session_pins(session_id, &session_roots)?;
-                        if offer_latest
-                            && let Some(latest) = self
-                                .surfaces
-                                .get(&dimension)
-                                .context("ROOT_READY names an unavailable dimension")?
-                                .current()?
-                        {
+                    match message {
+                        ControlMessage::RootReady { dimension, root } => {
+                            let offer_latest = {
+                                let mut roots = roots.write().await;
+                                let offer = roots.mark_ready(&dimension, root)?;
+                                self.update_session_pins(guard.id, roots.pinned())?;
+                                offer
+                            };
+                            if offer_latest
+                                && let Some(latest) = self
+                                    .surfaces
+                                    .get(&dimension)
+                                    .context("ROOT_READY names an unavailable dimension")?
+                                    .current()?
+                            {
                                 self.send_announcement(
-                                    writer,
-                                    &mut session_roots,
-                                    session_id,
-                                    Announcement {
-                                        dimension: dimension.clone(),
-                                        root: latest,
-                                    },
+                                    &mut control_send,
+                                    &roots,
+                                    &guard,
+                                    Announcement { dimension, root: latest },
                                 )
                                 .await?;
-                                flush(writer).await?;
+                            }
                         }
-                    }
-                    Command::Message(Message::SubtreeRequest { root, hashes }) => {
-                        let surfaces = self.request_surfaces(&session_roots, root)?;
-                        let record = session_roots.record_for(root)?;
-                        outstanding_hashes = outstanding_hashes
-                            .checked_add(hashes.len())
-                            .context("surface outstanding request count overflow")?;
-                        if outstanding_hashes > MAX_OUTSTANDING_HASHES {
-                            bail!("surface outstanding request limit exceeded");
-                        }
-                        // The budgeted frame reader reserved both the raw payload and its
-                        // decoded ownership. The raw frame has already been dropped, so transfer
-                        // that same permit to the queued hash vector without a second admission.
-                        let memory = command_memory.take().expect("command permit is available");
-                        jobs.push_back(RequestJob::new(record, true, surfaces, hashes, memory));
-                    }
-                    Command::Message(Message::ObjectRequest { root, hashes }) => {
-                        let surfaces = self.request_surfaces(&session_roots, root)?;
-                        let record = session_roots.record_for(root)?;
-                        outstanding_hashes = outstanding_hashes
-                            .checked_add(hashes.len())
-                            .context("surface outstanding request count overflow")?;
-                        if outstanding_hashes > MAX_OUTSTANDING_HASHES {
-                            bail!("surface outstanding request limit exceeded");
-                        }
-                        let memory = command_memory.take().expect("command permit is available");
-                        jobs.push_back(RequestJob::new(record, false, surfaces, hashes, memory));
-                    }
-                    Command::Message(Message::CameraDomainRequest {
-                        root,
-                        sequence,
-                        block_x,
-                        block_y,
-                        block_z,
-                    }) => {
-                        if !session_roots.is_requestable(root) {
-                            bail!("camera-domain request names a stale or failed root");
-                        }
-                        let previous = camera_sequences.entry(root).or_default();
-                        if sequence <= *previous {
-                            bail!("camera-domain sequence did not advance monotonically");
-                        }
-                        *previous = sequence;
-                        let dimension = session_roots.dimension_for(root)?.to_owned();
-                        let record = session_roots.record_for(root)?;
-                        if dimension != selected_dimension {
-                            bail!("camera-domain root belongs to a different session dimension");
-                        }
-                        let camera = self
-                            .surfaces
-                            .get(&dimension)
-                            .context("camera-domain root belongs to an unavailable dimension")?
-                            .surface
-                            .camera_domain(record, block_x, block_y, block_z)?;
-                        let (state, domain) = camera.domain.wire();
-                        let message = Message::CameraDomain {
+                        ControlMessage::CameraDomainRequest {
                             root,
                             sequence,
-                            state: match state {
+                            block_x,
+                            block_y,
+                            block_z,
+                        } => {
+                            let (dimension, record, pin) = {
+                                let roots = roots.read().await;
+                                if !roots.is_requestable(root) {
+                                    bail!("camera-domain request names a stale root");
+                                }
+                                if sequence <= camera_sequence {
+                                    bail!("camera-domain sequence did not advance");
+                                }
+                                camera_sequence = sequence;
+                                let dimension = roots.dimension_for(root)?.to_owned();
+                                let record = roots.record_for(root)?;
+                                let pin = Arc::new(guard.pin(record)?);
+                                (dimension, record, pin)
+                            };
+                            if dimension != selected_dimension {
+                                bail!("camera-domain root belongs to another dimension");
+                            }
+                            let runtime = self
+                                .surfaces
+                                .get(&dimension)
+                                .context("camera-domain dimension is unavailable")?
+                                .surface
+                                .clone();
+                            camera_jobs.send_replace(Some(CameraJob {
+                                runtime,
+                                root,
+                                sequence,
+                                record,
+                                block_x,
+                                block_y,
+                                block_z,
+                                _pin: pin,
+                            }));
+                        }
+                        ControlMessage::Hello { .. } => bail!("duplicate control HELLO"),
+                        _ => bail!("server-only control message received from client"),
+                    }
+                }
+                answer = camera_answers.recv() => {
+                    let Some((sequence, answer)) = answer else {
+                        bail!("camera-domain worker stopped");
+                    };
+                    if sequence != camera_sequence {
+                        continue;
+                    }
+                    let answer = answer?;
+                    self.control_write(
+                        &mut control_send,
+                        &ControlMessage::CameraDomain {
+                            root: answer.root,
+                            sequence: answer.sequence,
+                            state: match answer.state {
                                 0 => CameraDomainState::Unknown,
                                 1 => CameraDomainState::Exterior,
                                 2 => CameraDomainState::Interior,
                                 _ => unreachable!(),
                             },
-                            domain,
-                            min: camera.min,
-                            max: camera.max,
-                        };
-                        Frame {
-                            kind: message.kind(),
-                            payload: message.encode()?,
-                        }
-                        .write(writer)
-                        .await?;
-                        flush(writer).await?;
-                    }
-                    Command::Message(_) => bail!("server-only surface message received from client"),
-                    }
-                    drop(command_memory);
-                },
+                            domain: answer.domain,
+                            min: answer.min,
+                            max: answer.max,
+                        },
+                    )
+                    .await?;
+                }
                 announcement = announcements.recv() => match announcement {
-                    Ok(announcement) => {
-                        if announcement.dimension != selected_dimension {
-                            continue;
-                        }
+                    Ok(announcement) if announcement.dimension == selected_dimension => {
                         self.send_announcement(
-                            writer,
-                            &mut session_roots,
-                            session_id,
+                            &mut control_send,
+                            &roots,
+                            &guard,
                             announcement,
                         )
                         .await?;
-                        flush(writer).await?;
                     }
+                    Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Root state is tiny and authoritative; recover a connection-level lag
-                        // by resending the full ready snapshot instead of requiring reconnect.
-                        if let Some(announcement) =
-                            self.root_snapshot_for(&selected_dimension)?
-                        {
+                        if let Some(announcement) = self.root_snapshot_for(&selected_dimension)? {
                             self.send_announcement(
-                                    writer,
-                                    &mut session_roots,
-                                    session_id,
-                                    announcement,
-                                )
-                                .await?;
+                                &mut control_send,
+                                &roots,
+                                &guard,
+                                announcement,
+                            )
+                            .await?;
                         }
-                        flush(writer).await?;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 },
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                shutdown = shutdowns.recv() => {
+                    let reason = shutdown
+                        .unwrap_or_else(|_| "Voxy server shutting down".to_owned());
+                    let _ = self.control_write(
+                        &mut control_send,
+                        &ControlMessage::Shutdown { message: reason },
+                    ).await;
+                    drain_terminal_control(&mut control_send).await;
+                    break Ok(());
+                },
+                accepted = &mut accept_task => {
+                    break match accepted {
+                        Ok(result) => result,
+                        Err(error) => Err(error.into()),
+                    };
+                }
+                }
             }
         }
+        .await;
+        accept_task.abort();
+        camera_task.abort();
+        control_reader_task.abort();
+        if let Err(error) = &result
+            && control_send.healthy()
+        {
+            let _ = self
+                .control_write(
+                    &mut control_send,
+                    &ControlMessage::Error {
+                        code: 1,
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+            drain_terminal_control(&mut control_send).await;
+        }
+        connection.close(VarInt::from_u32(0), b"Voxy session closed");
+        result
     }
 
-    async fn send_announcement<W: AsyncWrite + Unpin>(
+    async fn control_write(
         &self,
-        writer: &mut W,
-        session: &mut SessionRoots,
+        send: &mut ControlOutput,
+        message: &ControlMessage,
+    ) -> Result<()> {
+        send.write(message).await
+    }
+
+    async fn fail_leased_root(
+        &self,
+        surface: &SurfaceService,
+        roots: &AsyncRwLock<SessionRoots>,
         session_id: u64,
+        root: RootToken,
+    ) -> Result<()> {
+        let repair = surface.request_repair(root);
+        let mut roots = roots.write().await;
+        roots.fail(root);
+        let pins = self.update_session_pins(session_id, roots.pinned());
+        repair?;
+        pins
+    }
+
+    async fn send_announcement(
+        &self,
+        send: &mut ControlOutput,
+        roots: &AsyncRwLock<SessionRoots>,
+        session: &Arc<SessionPinGuard>,
         announcement: Announcement,
     ) -> Result<()> {
-        if !self
+        let surface = self
             .surfaces
             .get(&announcement.dimension)
-            .context("surface announcement names an unavailable dimension")?
-            .serviceable_announcement(RootToken::from(announcement.root))?
+            .context("surface announcement names an unavailable dimension")?;
+        let token = RootToken::from(announcement.root);
+        let Some(temporary_pin) = surface.pin_if_serviceable(token, session, announcement.root)?
+        else {
+            return Ok(());
+        };
+        if !surface.serviceable(token)? {
+            return Ok(());
+        }
+        let runtime = surface.surface.clone();
+        let record = announcement.root;
+        let dictionaries = match tokio::task::spawn_blocking(move || {
+            runtime.leased_dictionaries(record)
+        })
+        .await
         {
-            // A newer generation overtook this queued broadcast record. The later record (or a
-            // lag snapshot) is authoritative; never advertise an already-unpinned root.
-            return Ok(());
-        }
-        if !session.announce(announcement.dimension.clone(), announcement.root)? {
-            return Ok(());
-        }
-        // Publish the GC lease before bytes can reach the peer. A failed socket write merely
-        // retains an extra pin until SessionPinGuard removes the connection record.
-        self.update_session_pins(session_id, session)?;
-        let message = Message::RootAnnounce {
-            dimension: announcement.dimension.clone(),
-            root: RootToken::from(announcement.root),
-            catalog: announcement.root.catalog,
-            dictionary_set: announcement.root.dictionary_set,
-            visibility: announcement.root.visibility,
+            Ok(Ok(dictionaries)) => dictionaries,
+            Ok(Err(error)) => {
+                if let Err(repair) = self
+                    .fail_leased_root(surface, roots, session.id, token)
+                    .await
+                {
+                    return Err(error.context(format!(
+                        "root dictionary-set repair could not be scheduled: {repair:#}"
+                    )));
+                }
+                return Err(error.context("load the announced root dictionary set"));
+            }
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                if let Err(repair) = self
+                    .fail_leased_root(surface, roots, session.id, token)
+                    .await
+                {
+                    return Err(error.context(format!(
+                        "root dictionary-set worker failed and repair could not be scheduled: {repair:#}"
+                    )));
+                }
+                return Err(error.context("root dictionary-set worker failed"));
+            }
         };
-        let frame = Frame {
-            kind: message.kind(),
-            payload: message.encode()?,
+        let should_send = {
+            let mut roots = roots.write().await;
+            let should_send = roots.announce(
+                announcement.dimension.clone(),
+                announcement.root,
+                dictionaries,
+            )?;
+            self.update_session_pins(session.id, roots.pinned())?;
+            should_send
         };
-        frame.write(writer).await?;
+        drop(temporary_pin);
+        if should_send {
+            self.control_write(
+                send,
+                &ControlMessage::RootAnnounce {
+                    dimension: announcement.dimension,
+                    root: token,
+                    catalog: announcement.root.catalog,
+                    dictionary_set: announcement.root.dictionary_set,
+                    visibility: announcement.root.visibility,
+                },
+            )
+            .await?;
+        }
         Ok(())
     }
 
-    fn request_surfaces(
-        &self,
-        session: &SessionRoots,
-        token: RootToken,
-    ) -> Result<Vec<Arc<SurfaceService>>> {
-        let mut surfaces = session
-            .matching_dimensions(token)?
-            .into_iter()
-            .map(|dimension| {
-                self.surfaces
-                    .get(&dimension)
-                    .cloned()
-                    .context("session references an unavailable surface dimension")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // A root can remain leased by an already-connected client after a corruption report.
-        // It remains a GC pin for recovery, but must not keep consuming disk/CPU serving known
-        // bad objects while the repair worker rebuilds it.  Do not require that it is one of the
-        // service's current two roots here: old session leases are intentionally serviceable.
-        // Keep a non-bad matching surface if one exists. This is defensive against the current
-        // token's theoretical cross-dimension collision; the wire-level dimension binding
-        // is tracked separately before cutover.
-        let mut retained = Vec::with_capacity(surfaces.len());
-        for surface in surfaces.drain(..) {
-            if !surface.is_bad(token)? {
-                retained.push(surface);
-            }
+    async fn accept_object_streams(
+        self: Arc<Self>,
+        connection: Connection,
+        roots: Arc<AsyncRwLock<SessionRoots>>,
+        guard: Arc<SessionPinGuard>,
+    ) -> Result<()> {
+        let limits = Arc::new(ConnectionLimits::new());
+        loop {
+            let (send, recv) = connection.accept_bi().await?;
+            let Ok(total) = limits.total.clone().try_acquire_owned() else {
+                reject_unparsed_stream(send, recv, 2, "too many active object streams").await;
+                continue;
+            };
+            let service = self.clone();
+            let roots = roots.clone();
+            let guard = guard.clone();
+            let limits = limits.clone();
+            tokio::spawn(async move {
+                let _total = total;
+                if let Err(error) = service
+                    .object_stream(send, recv, roots, guard, limits)
+                    .await
+                {
+                    if !is_quic_cancellation(&error) {
+                        eprintln!("Voxy object stream ended: {error:#}");
+                    }
+                }
+            });
         }
-        if retained.is_empty() {
-            bail!("surface request names a root withheld for repair");
-        }
-        Ok(retained)
     }
 
-    fn build_response(&self, job: &mut RequestJob, mut memory: MemoryPermit) -> Result<BuiltFrame> {
-        let mut objects = Vec::new();
-        let mut canonical_bytes = 0usize;
-        let mut encoded_bytes = BUNDLE_FIXED_BYTES;
-        while objects.len() < MAX_BUNDLE_ENTRIES
-            && (job.carried.is_some() || !job.hashes.is_empty())
-        {
-            let loaded = match job.carried.take() {
-                Some(object) => object,
-                None => {
-                    let hash = job.hashes.pop_front().unwrap();
-                    load_object(&job.surfaces, job.record, hash, &memory)?
-                }
-            };
-            let object = loaded.wire;
-            let is_manifest = matches!(
-                object.kind,
-                ObjectKind::ManifestSubtree
-                    | ObjectKind::ManifestDescriptorPage
-                    | ObjectKind::RootDirectory
-            );
-            if is_manifest != job.manifests {
-                return Err(RequestRejected::new(
-                    "surface object type does not match its request channel",
-                )
-                .into());
+    async fn object_stream(
+        self: Arc<Self>,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        roots: Arc<AsyncRwLock<SessionRoots>>,
+        guard: Arc<SessionPinGuard>,
+        limits: Arc<ConnectionLimits>,
+    ) -> Result<()> {
+        let request = tokio::time::timeout(REQUEST_HEADER_TIMEOUT, async {
+            match read_stream_role(&mut recv).await? {
+                Some(STREAM_OBJECT_REQUEST) => ObjectRequest::read(&mut recv).await,
+                Some(other) => bail!("unexpected QUIC stream role {other}"),
+                None => bail!("empty QUIC stream"),
             }
-            let next_canonical = canonical_bytes
-                .checked_add(object.canonical_size as usize)
-                .context("surface bundle canonical byte count overflow")?;
-            let next_encoded = encoded_bytes
-                .checked_add(OBJECT_WIRE_HEADER_BYTES + object.compressed.len())
-                .context("surface bundle encoded byte count overflow")?;
-            let canonical_limit = if job.manifests {
-                MAX_MANIFEST_BYTES
-            } else {
-                MAX_CANONICAL_OBJECT_BYTES
-            };
-            if next_canonical > canonical_limit || next_encoded > MAX_FRAME_PAYLOAD {
-                if objects.is_empty() {
-                    bail!("one stored surface object cannot fit its legal response frame");
-                }
-                job.carried = Some(LoadedObject { wire: object });
-                break;
-            }
-            canonical_bytes = next_canonical;
-            encoded_bytes = next_encoded;
-            objects.push(object);
-        }
-        if objects.is_empty() {
-            bail!("surface request produced an empty response");
-        }
-        let resolved = objects.len();
-        let message = if job.manifests {
-            Message::SubtreeData {
-                root: job.root,
-                objects,
-            }
-        } else {
-            Message::ObjectBundle {
-                root: job.root,
-                objects,
-            }
-        };
-        debug_assert_eq!(
-            message.kind(),
-            if job.manifests {
-                S_SUBTREE_DATA
-            } else {
-                S_OBJECT_BUNDLE
-            }
-        );
-        let frame = Frame {
-            kind: message.kind(),
-            payload: message.encode()?,
-        };
-        let retained = pending_frame_bytes(&frame);
-        memory.shrink_to(retained);
-        Ok(BuiltFrame {
-            resolved,
-            frame,
-            memory,
         })
+        .await
+        .context("object-request header timeout")?;
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                write_object_error(&mut send, 1, &error.to_string()).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+        send.set_priority(match request.lane {
+            PriorityLane::Coverage => 2,
+            PriorityLane::Current => 1,
+            PriorityLane::Predicted => 0,
+        })
+        .context("set QUIC object-stream priority")?;
+        let lane_permit = match limits.lanes[request.lane.index()]
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                write_object_error(&mut send, 2, "priority lane is at capacity").await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+        let _lane_permit = lane_permit;
+        let roots_guard = roots.read().await;
+        let authorization = match roots_guard.authorize(request.root) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                drop(roots_guard);
+                write_object_error(&mut send, 4, &error.to_string()).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+        let request_pin = guard.pin(authorization.record)?;
+        drop(roots_guard);
+        let surface = self
+            .surfaces
+            .get(&authorization.dimension)
+            .cloned()
+            .context("leased surface dimension is unavailable")?;
+        if surface.is_bad(request.root)? {
+            drop(request_pin);
+            write_object_error(&mut send, 4, "root is withheld for repair").await?;
+            send.finish()?;
+            return Ok(());
+        }
+        let response = prepare_response(
+            &surface,
+            authorization.record,
+            &authorization.dictionaries,
+            &request.hashes,
+        );
+        // Every response now owns immutable file handles, so the root only needs to remain
+        // explicitly pinned through source acquisition rather than through network backpressure.
+        drop(request_pin);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if is_request_rejected(&error) => {
+                write_object_error(&mut send, 4, &error.to_string()).await?;
+                send.finish()?;
+                return Ok(());
+            }
+            Err(error) => {
+                self.fail_leased_root(&surface, &roots, guard.id, request.root)
+                    .await?;
+                write_object_error(&mut send, 8, "root object failed integrity checks").await?;
+                send.finish()?;
+                return Err(error);
+            }
+        };
+        write_object_success(&mut send, response.len()).await?;
+        let mut buffer = vec![0u8; TRANSFER_CHUNK_BYTES];
+        for object in response {
+            send.write_all(&object.header).await?;
+            let mut offset = 0u64;
+            let mut compressed_crc = 0u32;
+            while offset < object.source.compressed_size() {
+                let length = usize::try_from(
+                    (object.source.compressed_size() - offset).min(TRANSFER_CHUNK_BYTES as u64),
+                )?;
+                let disk_turn = tokio::select! {
+                    turn = self.scheduler.disk_turn(guard.id, request.lane) => {
+                        turn.context("object disk scheduler stopped")?
+                    }
+                    _ = send.stopped() => return Ok(()),
+                };
+                let source = object.source.clone();
+                let (returned, read) = tokio::task::spawn_blocking(move || {
+                    let read = source.read_exact_at(offset, &mut buffer[..length]);
+                    (buffer, read)
+                })
+                .await?;
+                buffer = returned;
+                drop(disk_turn);
+                if let Err(error) = read {
+                    let _ = send.reset(VarInt::from_u32(8));
+                    self.fail_leased_root(&surface, &roots, guard.id, request.root)
+                        .await?;
+                    return Err(error);
+                }
+                compressed_crc = crc32c_append(compressed_crc, &buffer[..length]);
+                if offset + length as u64 == object.source.compressed_size()
+                    && compressed_crc != object.source.compressed_crc()
+                {
+                    let _ = send.reset(VarInt::from_u32(8));
+                    self.fail_leased_root(&surface, &roots, guard.id, request.root)
+                        .await?;
+                    bail!(
+                        "stored compressed object {} failed CRC32C during streaming",
+                        object.source.hash()
+                    );
+                }
+                let mut written = 0usize;
+                while written < length {
+                    let network_turn = tokio::select! {
+                        turn = self.scheduler.network_turn(guard.id, request.lane) => {
+                            turn.context("object network scheduler stopped")?
+                        }
+                        _ = send.stopped() => return Ok(()),
+                    };
+                    let stopped = send.stopped();
+                    let write = tokio::select! {
+                        write = send.write(&buffer[written..length]) => Some(write),
+                        _ = tokio::time::sleep(NETWORK_WRITE_SLICE) => None,
+                        _ = stopped => return Ok(()),
+                    };
+                    drop(network_turn);
+                    if let Some(write) = write {
+                        let count = write?;
+                        if count == 0 {
+                            bail!("QUIC object stream made no write progress");
+                        }
+                        written += count;
+                    }
+                }
+                offset += length as u64;
+            }
+        }
+        send.finish()?;
+        Ok(())
     }
 }
 
-#[derive(Debug)]
-enum Command {
-    Credit(u64),
-    Ping(u64),
-    Message(Message),
+struct ControlOutput {
+    send: SendStream,
+    healthy: bool,
 }
 
-struct BudgetedCommand {
-    command: Command,
-    _memory: MemoryPermit,
+impl ControlOutput {
+    fn new(send: SendStream) -> Self {
+        Self {
+            send,
+            healthy: true,
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.healthy
+    }
+
+    async fn write(&mut self, message: &ControlMessage) -> Result<()> {
+        if !self.healthy {
+            bail!("control output is no longer writable");
+        }
+        let record = encode_control_record(message)?;
+        match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, self.send.write_all(&record)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(error.into())
+            }
+            Err(_) => {
+                self.poison();
+                bail!("control-stream write timeout")
+            }
+        }
+    }
+
+    fn poison(&mut self) {
+        if self.healthy {
+            self.healthy = false;
+            let _ = self.send.reset(VarInt::from_u32(1));
+        }
+    }
+}
+
+async fn control_reader(
+    mut recv: RecvStream,
+    messages: mpsc::Sender<Result<Option<ControlMessage>>>,
+) {
+    loop {
+        let message = read_control(&mut recv).await;
+        let finished = !matches!(&message, Ok(Some(_)));
+        if messages.send(message).await.is_err() || finished {
+            return;
+        }
+    }
+}
+
+async fn drain_terminal_control(output: &mut ControlOutput) {
+    if output.healthy {
+        output.healthy = false;
+        if output.send.finish().is_ok() {
+            let _ =
+                tokio::time::timeout(TERMINAL_CONTROL_DRAIN_TIMEOUT, output.send.stopped()).await;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CameraJob {
+    runtime: Arc<DimensionSurface>,
+    root: RootToken,
+    sequence: u64,
+    record: RootRecord,
+    block_x: i32,
+    block_y: i32,
+    block_z: i32,
+    _pin: Arc<RequestPinGuard>,
+}
+
+struct CameraAnswer {
+    root: RootToken,
+    sequence: u64,
+    state: u8,
+    domain: u64,
+    min: [i32; 3],
+    max: [i32; 3],
+}
+
+async fn camera_worker(
+    mut jobs: watch::Receiver<Option<CameraJob>>,
+    pending: watch::Sender<Option<CameraJob>>,
+    answers: mpsc::Sender<(u64, Result<CameraAnswer>)>,
+) {
+    while jobs.changed().await.is_ok() {
+        let Some(job) = jobs.borrow_and_update().clone() else {
+            continue;
+        };
+        let root = job.root;
+        let sequence = job.sequence;
+        pending.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|pending| pending.sequence == sequence)
+            {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            let camera =
+                job.runtime
+                    .camera_domain(job.record, job.block_x, job.block_y, job.block_z)?;
+            let (state, domain) = camera.domain.wire();
+            Ok(CameraAnswer {
+                root,
+                sequence,
+                state,
+                domain,
+                min: camera.min,
+                max: camera.max,
+            })
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        if answers.send((sequence, result)).await.is_err() {
+            return;
+        }
+    }
+}
+
+struct ConnectionLimits {
+    total: Arc<tokio::sync::Semaphore>,
+    lanes: [Arc<tokio::sync::Semaphore>; 3],
+}
+
+impl ConnectionLimits {
+    fn new() -> Self {
+        Self {
+            total: Arc::new(tokio::sync::Semaphore::new(
+                MAX_ACTIVE_STREAMS_PER_CONNECTION,
+            )),
+            lanes: array::from_fn(|lane| {
+                Arc::new(tokio::sync::Semaphore::new(ACTIVE_STREAMS_PER_LANE[lane]))
+            }),
+        }
+    }
+}
+
+async fn reject_unparsed_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    code: u16,
+    message: &str,
+) {
+    let _ = recv.stop(VarInt::from_u32(code as u32));
+    if write_object_error(&mut send, code, message).await.is_ok() {
+        let _ = send.finish();
+    } else {
+        let _ = send.reset(VarInt::from_u32(code as u32));
+    }
+}
+
+#[derive(Clone)]
+struct FairScheduler {
+    disk: FairTurnQueue,
+    network: FairTurnQueue,
+}
+
+impl FairScheduler {
+    fn start() -> Self {
+        Self {
+            disk: FairTurnQueue::start(MAX_ACTIVE_DISK_TURNS, MAX_ACTIVE_DISK_TURNS),
+            network: FairTurnQueue::start(
+                MAX_ACTIVE_NETWORK_TURNS,
+                MAX_ACTIVE_NETWORK_TURNS_PER_SESSION,
+            ),
+        }
+    }
+
+    async fn disk_turn(&self, session: u64, lane: PriorityLane) -> Result<FairTurn> {
+        self.disk.turn(session, lane).await
+    }
+
+    async fn network_turn(&self, session: u64, lane: PriorityLane) -> Result<FairTurn> {
+        self.network.turn(session, lane).await
+    }
+}
+
+#[derive(Clone)]
+struct FairTurnQueue {
+    requests: mpsc::Sender<TurnRequest>,
+}
+
+impl FairTurnQueue {
+    fn start(maximum_active: usize, maximum_active_per_session: usize) -> Self {
+        let (requests, request_rx) = mpsc::channel(SCHEDULER_CAPACITY);
+        let (completions, completion_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_scheduler(
+            request_rx,
+            completion_rx,
+            completions.clone(),
+            maximum_active,
+            maximum_active_per_session,
+        ));
+        Self { requests }
+    }
+
+    async fn turn(&self, session: u64, lane: PriorityLane) -> Result<FairTurn> {
+        let (ready, wait) = oneshot::channel();
+        self.requests
+            .send(TurnRequest {
+                session,
+                lane,
+                ready,
+            })
+            .await
+            .context("fair scheduler request queue closed")?;
+        wait.await.context("fair scheduler stopped")
+    }
+}
+
+struct TurnRequest {
+    session: u64,
+    lane: PriorityLane,
+    ready: oneshot::Sender<FairTurn>,
+}
+
+struct FairTurn {
+    session: u64,
+    completions: mpsc::UnboundedSender<u64>,
+}
+
+impl Drop for FairTurn {
+    fn drop(&mut self) {
+        let _ = self.completions.send(self.session);
+    }
+}
+
+struct SchedulerState {
+    active: usize,
+    maximum_active: usize,
+    maximum_active_per_session: usize,
+    active_by_session: HashMap<u64, usize>,
+    sessions: VecDeque<u64>,
+    waiters: HashMap<u64, [VecDeque<oneshot::Sender<FairTurn>>; 3]>,
+    completions: mpsc::UnboundedSender<u64>,
+}
+
+impl SchedulerState {
+    fn enqueue(&mut self, request: TurnRequest) {
+        let queues = self
+            .waiters
+            .entry(request.session)
+            .or_insert_with(|| array::from_fn(|_| VecDeque::new()));
+        if queues.iter().all(VecDeque::is_empty) {
+            self.sessions.push_back(request.session);
+        }
+        queues[request.lane.index()].push_back(request.ready);
+    }
+
+    fn grant(&mut self) {
+        while self.active < self.maximum_active {
+            let candidates = self.sessions.len();
+            let mut selected = None;
+            for _ in 0..candidates {
+                let session = self
+                    .sessions
+                    .pop_front()
+                    .expect("scheduler candidate count changed unexpectedly");
+                if self.active_by_session.get(&session).copied().unwrap_or(0)
+                    >= self.maximum_active_per_session
+                {
+                    self.sessions.push_back(session);
+                } else {
+                    selected = Some(session);
+                    break;
+                }
+            }
+            let Some(session) = selected else {
+                break;
+            };
+            let queues = self
+                .waiters
+                .get_mut(&session)
+                .expect("active scheduler session has waiters");
+            let lane = PriorityLane::ALL
+                .into_iter()
+                .find(|lane| !queues[lane.index()].is_empty())
+                .expect("active scheduler session has a nonempty lane")
+                .index();
+            let ready = queues[lane]
+                .pop_front()
+                .expect("selected scheduler lane is nonempty");
+            if queues.iter().all(VecDeque::is_empty) {
+                self.waiters.remove(&session);
+            } else {
+                self.sessions.push_back(session);
+            }
+            self.active += 1;
+            *self.active_by_session.entry(session).or_default() += 1;
+            let _ = ready.send(FairTurn {
+                session,
+                completions: self.completions.clone(),
+            });
+        }
+    }
+
+    fn complete(&mut self, session: u64) {
+        self.active = self
+            .active
+            .checked_sub(1)
+            .expect("scheduler completion without an active turn");
+        let active = self
+            .active_by_session
+            .get_mut(&session)
+            .expect("scheduler completion names an inactive session");
+        *active -= 1;
+        if *active == 0 {
+            self.active_by_session.remove(&session);
+        }
+    }
+}
+
+async fn run_scheduler(
+    mut requests: mpsc::Receiver<TurnRequest>,
+    mut completions: mpsc::UnboundedReceiver<u64>,
+    completion_sender: mpsc::UnboundedSender<u64>,
+    maximum_active: usize,
+    maximum_active_per_session: usize,
+) {
+    let mut state = SchedulerState {
+        active: 0,
+        maximum_active,
+        maximum_active_per_session,
+        active_by_session: HashMap::new(),
+        sessions: VecDeque::new(),
+        waiters: HashMap::new(),
+        completions: completion_sender,
+    };
+    loop {
+        state.grant();
+        tokio::select! {
+            request = requests.recv() => match request {
+                Some(request) => state.enqueue(request),
+                None => return,
+            },
+            completed = completions.recv(), if state.active != 0 => {
+                let Some(session) = completed else {
+                    return;
+                };
+                state.complete(session);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionPins {
+    leased: Vec<RootRecord>,
+    requests: Vec<(RootRecord, usize)>,
+}
+
+impl SessionPins {
+    fn roots(&self) -> impl Iterator<Item = RootRecord> + '_ {
+        self.leased
+            .iter()
+            .copied()
+            .chain(self.requests.iter().map(|&(root, _)| root))
+    }
 }
 
 struct SessionPinGuard {
     service: Weak<Service>,
     id: u64,
+}
+
+impl SessionPinGuard {
+    fn pin(self: &Arc<Self>, root: RootRecord) -> Result<RequestPinGuard> {
+        let service = self
+            .service
+            .upgrade()
+            .context("surface service stopped while pinning a request root")?;
+        let mut sessions = lock(&service.sessions)?;
+        let pins = sessions
+            .get_mut(&self.id)
+            .context("surface session pin record disappeared")?;
+        match pins.requests.iter_mut().find(|(pinned, _)| *pinned == root) {
+            Some((_, count)) => {
+                *count = count
+                    .checked_add(1)
+                    .context("request-root pin count overflow")?;
+            }
+            None => pins.requests.push((root, 1)),
+        }
+        Ok(RequestPinGuard {
+            session: self.clone(),
+            root,
+        })
+    }
 }
 
 impl Drop for SessionPinGuard {
@@ -1027,73 +1366,47 @@ impl Drop for SessionPinGuard {
     }
 }
 
-struct RequestJob {
-    root: RootToken,
-    record: RootRecord,
-    manifests: bool,
-    surfaces: Vec<Arc<SurfaceService>>,
-    hashes: VecDeque<ObjectHash>,
-    carried: Option<LoadedObject>,
-    _memory: MemoryPermit,
+struct RequestPinGuard {
+    session: Arc<SessionPinGuard>,
+    root: RootRecord,
 }
 
-impl RequestJob {
-    fn new(
-        record: RootRecord,
-        manifests: bool,
-        surfaces: Vec<Arc<SurfaceService>>,
-        hashes: Vec<ObjectHash>,
-        memory: MemoryPermit,
-    ) -> Self {
-        Self {
-            root: RootToken::from(record),
-            record,
-            manifests,
-            surfaces,
-            hashes: hashes.into(),
-            carried: None,
-            _memory: memory,
+impl Drop for RequestPinGuard {
+    fn drop(&mut self) {
+        let Some(service) = self.session.service.upgrade() else {
+            return;
+        };
+        let Ok(mut sessions) = service.sessions.lock() else {
+            return;
+        };
+        let Some(pins) = sessions.get_mut(&self.session.id) else {
+            return;
+        };
+        let Some(index) = pins
+            .requests
+            .iter()
+            .position(|(pinned, _)| *pinned == self.root)
+        else {
+            return;
+        };
+        if pins.requests[index].1 == 1 {
+            pins.requests.swap_remove(index);
+        } else {
+            pins.requests[index].1 -= 1;
         }
     }
-
-    fn is_empty(&self) -> bool {
-        self.hashes.is_empty() && self.carried.is_none()
-    }
-
-    fn remaining(&self) -> usize {
-        self.hashes.len() + usize::from(self.carried.is_some())
-    }
 }
 
-struct BuiltFrame {
-    resolved: usize,
-    frame: Frame,
-    memory: MemoryPermit,
-}
-
-struct PendingFrame {
-    root: RootToken,
-    frame: Frame,
-    _memory: MemoryPermit,
-}
-
+#[derive(Clone)]
 struct RootLease {
     record: RootRecord,
-}
-
-impl RootLease {
-    fn new(record: RootRecord) -> Self {
-        Self { record }
-    }
+    dictionaries: Arc<[ObjectHash]>,
 }
 
 #[derive(Default)]
 struct DimensionLease {
-    /// Renderable fallback retained until ROOT_READY atomically activates the incoming root.
     active: Option<RootLease>,
-    /// One unactivated root frozen until ROOT_READY so continuous publication cannot starve it.
     incoming: Option<RootLease>,
-    /// Newest publication observed while `incoming` is frozen for starvation-free completion.
     deferred: Option<RootRecord>,
 }
 
@@ -1103,51 +1416,58 @@ struct SessionRoots {
     failed: HashSet<RootToken>,
 }
 
+struct RequestAuthorization {
+    dimension: String,
+    record: RootRecord,
+    dictionaries: Arc<[ObjectHash]>,
+}
+
 impl SessionRoots {
-    /// Returns whether this announcement should be put on the wire. An in-flight incoming root
-    /// is frozen until ROOT_READY; newer generations collapse into one deferred latest record.
-    fn announce(&mut self, dimension: String, root: RootRecord) -> Result<bool> {
-        let token = RootToken::from(root);
+    fn announce(
+        &mut self,
+        dimension: String,
+        record: RootRecord,
+        dictionaries: Arc<[ObjectHash]>,
+    ) -> Result<bool> {
+        let token = RootToken::from(record);
         self.failed.remove(&token);
         let lease = self.dimensions.entry(dimension).or_default();
         if lease
             .active
             .as_ref()
-            .is_some_and(|active| active.record == root)
-        {
-            return Ok(true);
-        }
-        if lease
-            .incoming
-            .as_ref()
-            .is_some_and(|incoming| incoming.record == root)
+            .is_some_and(|active| active.record == record)
+            || lease
+                .incoming
+                .as_ref()
+                .is_some_and(|incoming| incoming.record == record)
         {
             return Ok(true);
         }
         let newest = lease
             .active
             .as_ref()
-            .map_or(0, |active| active.record.generation)
+            .map_or(0, |root| root.record.generation)
             .max(
                 lease
                     .incoming
                     .as_ref()
-                    .map_or(0, |incoming| incoming.record.generation),
+                    .map_or(0, |root| root.record.generation),
             )
-            .max(lease.deferred.map_or(0, |deferred| deferred.generation));
-        if root.generation <= newest {
+            .max(lease.deferred.map_or(0, |root| root.generation));
+        if record.generation <= newest {
             return Ok(false);
         }
         if lease.incoming.is_some() {
-            lease.deferred = Some(root);
+            lease.deferred = Some(record);
             return Ok(false);
         }
-        lease.incoming = Some(RootLease::new(root));
+        lease.incoming = Some(RootLease {
+            record,
+            dictionaries,
+        });
         Ok(true)
     }
 
-    /// Promotes one complete incoming root and reports whether newer publications were coalesced
-    /// while it loaded. The caller then immediately offers the service's actual latest root.
     fn mark_ready(&mut self, dimension: &str, root: RootToken) -> Result<bool> {
         let lease = self
             .dimensions
@@ -1172,19 +1492,36 @@ impl SessionRoots {
         Ok(lease.deferred.take().is_some())
     }
 
-    fn is_leased(&self, root: RootToken) -> bool {
-        self.dimensions.values().any(|lease| {
-            lease
+    fn is_requestable(&self, root: RootToken) -> bool {
+        self.authorize(root).is_ok()
+    }
+
+    fn authorize(&self, root: RootToken) -> Result<RequestAuthorization> {
+        if self.failed.contains(&root) {
+            bail!("request names a failed root");
+        }
+        let mut found = None;
+        for (dimension, lease) in &self.dimensions {
+            for leased in lease
                 .active
                 .as_ref()
                 .into_iter()
                 .chain(lease.incoming.as_ref())
-                .any(|entry| RootToken::from(entry.record) == root)
-        })
-    }
-
-    fn is_requestable(&self, root: RootToken) -> bool {
-        self.is_leased(root) && !self.failed.contains(&root)
+            {
+                if RootToken::from(leased.record) != root {
+                    continue;
+                }
+                if found.is_some() {
+                    bail!("one root token is leased more than once");
+                }
+                found = Some(RequestAuthorization {
+                    dimension: dimension.clone(),
+                    record: leased.record,
+                    dictionaries: leased.dictionaries.clone(),
+                });
+            }
+        }
+        found.context("request names a stale or unannounced root")
     }
 
     fn dimension_for(&self, root: RootToken) -> Result<&str> {
@@ -1195,7 +1532,7 @@ impl SessionRoots {
                 .as_ref()
                 .into_iter()
                 .chain(lease.incoming.as_ref())
-                .any(|entry| RootToken::from(entry.record) == root)
+                .any(|leased| RootToken::from(leased.record) == root)
             {
                 if found.is_some() {
                     bail!("one root token is leased for multiple dimensions");
@@ -1203,51 +1540,11 @@ impl SessionRoots {
                 found = Some(dimension.as_str());
             }
         }
-        found.context("camera-domain request names an unannounced root")
+        found.context("request names an unannounced root")
     }
 
     fn record_for(&self, root: RootToken) -> Result<RootRecord> {
-        let mut found = None;
-        for lease in self.dimensions.values() {
-            for entry in lease
-                .active
-                .as_ref()
-                .into_iter()
-                .chain(lease.incoming.as_ref())
-            {
-                if RootToken::from(entry.record) != root {
-                    continue;
-                }
-                if found.replace(entry.record).is_some() {
-                    bail!("one root token is leased more than once");
-                }
-            }
-        }
-        found.context("camera-domain request names an unannounced root")
-    }
-
-    fn matching_dimensions(&self, root: RootToken) -> Result<Vec<String>> {
-        if self.failed.contains(&root) {
-            bail!("surface request names a failed root awaiting repair");
-        }
-        let mut dimensions = Vec::new();
-        for (dimension, lease) in &self.dimensions {
-            for entry in lease
-                .active
-                .as_ref()
-                .into_iter()
-                .chain(lease.incoming.as_ref())
-            {
-                if RootToken::from(entry.record) != root {
-                    continue;
-                }
-                dimensions.push(dimension.clone());
-            }
-        }
-        if dimensions.is_empty() {
-            bail!("surface request names a stale or unannounced root");
-        }
-        Ok(dimensions)
+        Ok(self.authorize(root)?.record)
     }
 
     fn fail(&mut self, root: RootToken) {
@@ -1273,7 +1570,7 @@ impl SessionRoots {
                     .as_ref()
                     .into_iter()
                     .chain(lease.incoming.as_ref())
-                    .map(|entry| entry.record)
+                    .map(|root| root.record)
             })
             .collect::<Vec<_>>();
         roots.sort_unstable_by_key(|root| (root.dimension, root.generation));
@@ -1282,67 +1579,62 @@ impl SessionRoots {
     }
 }
 
-#[derive(Debug)]
-struct LoadedObject {
-    wire: WireObject,
+struct ResponseObject {
+    source: StoredObjectSource,
+    header: [u8; OBJECT_RESPONSE_HEADER_BYTES],
 }
 
-#[derive(Debug)]
-struct RequestRejected(String);
-
-impl RequestRejected {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl fmt::Display for RequestRejected {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        output.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for RequestRejected {}
-
-fn is_memory_pressure(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<MemoryPressure>())
-}
-
-fn is_request_rejected(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<RequestRejected>())
-}
-
-fn load_object(
-    surfaces: &[Arc<SurfaceService>],
+fn prepare_response(
+    surface: &SurfaceService,
     root: RootRecord,
-    hash: ObjectHash,
-    memory: &MemoryPermit,
-) -> Result<LoadedObject> {
-    for surface in surfaces {
-        let loaded = match surface.surface.read_wire_object(root, hash, memory) {
-            Ok(loaded) => loaded,
+    dictionaries: &[ObjectHash],
+    hashes: &[ObjectHash],
+) -> Result<Vec<ResponseObject>> {
+    let mut response = Vec::with_capacity(hashes.len());
+    let mut compressed = 0usize;
+    let mut canonical = 0usize;
+    for &hash in hashes {
+        let loaded = match surface.surface.open_wire_object(root, dictionaries, hash) {
+            Ok(value) => value,
             Err(error) if error.downcast_ref::<LeasedDictionaryMismatch>().is_some() => {
-                return Err(RequestRejected::new(error.to_string()).into());
+                return Err(RequestRejected(error.to_string()).into());
             }
             Err(error) => return Err(error),
         };
-        if let Some((object, dictionary_id, _canonical)) = loaded {
-            if !client_transferable_kind(object.kind) {
-                return Err(RequestRejected::new(format!(
-                    "surface object kind {:?} is server-internal",
-                    object.kind
-                ))
-                .into());
-            }
-            return Ok(LoadedObject {
-                wire: WireObject::from_stored_with_dictionary_id(object, dictionary_id)?,
-            });
+        let Some((source, dictionary_id)) = loaded else {
+            return Err(RequestRejected(format!("requested object {hash} is unavailable")).into());
+        };
+        if !client_transferable_kind(source.kind()) {
+            return Err(RequestRejected("requested object is server-internal".to_owned()).into());
         }
+        let canonical_size = u32::try_from(source.canonical_size())
+            .context("canonical object length does not fit the wire format")?;
+        let compressed_size = u32::try_from(source.compressed_size())
+            .context("compressed object length does not fit the wire format")?;
+        canonical = canonical
+            .checked_add(canonical_size as usize)
+            .context("object-request canonical byte count overflow")?;
+        compressed = compressed
+            .checked_add(compressed_size as usize)
+            .context("object-request compressed byte count overflow")?;
+        if canonical > MAX_STREAM_CANONICAL_BYTES || compressed > MAX_STREAM_COMPRESSED_BYTES {
+            return Err(RequestRejected(
+                "object-request response exceeds stream bounds".to_owned(),
+            )
+            .into());
+        }
+        let header = ObjectResponseHeader {
+            hash,
+            kind: source.kind(),
+            dictionary_id,
+            canonical_size,
+            compressed_size,
+            compressed_crc: source.compressed_crc(),
+        }
+        .encode()?;
+        response.push(ResponseObject { header, source });
     }
-    Err(RequestRejected::new(format!(
-        "requested surface object {hash} is absent from the leased root stores"
-    ))
-    .into())
+    Ok(response)
 }
 
 fn client_transferable_kind(kind: ObjectKind) -> bool {
@@ -1355,6 +1647,26 @@ fn client_transferable_kind(kind: ObjectKind) -> bool {
     )
 }
 
-fn pending_frame_bytes(frame: &Frame) -> usize {
-    frame.payload.capacity().saturating_add(HEADER_LEN)
+#[derive(Debug)]
+struct RequestRejected(String);
+
+impl fmt::Display for RequestRejected {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RequestRejected {}
+
+fn is_request_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<RequestRejected>())
+}
+
+fn is_quic_cancellation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<quinn::StoppedError>()
+            || cause.is::<quinn::WriteError>()
+            || cause.is::<quinn::ReadError>()
+            || cause.is::<quinn::ConnectionError>()
+    })
 }

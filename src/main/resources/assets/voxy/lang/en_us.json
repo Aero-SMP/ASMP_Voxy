@@ -14,9 +14,6 @@
   "voxy.config.general.renderDistance": "Render distance",
   "voxy.config.general.renderDistance.tooltip": "Render distance of voxy in chunks",
 
-  "voxy.config.general.virtualSurfaceMemory": "Virtual Surface memory",
-  "voxy.config.general.virtualSurfaceMemory.tooltip": "One hard memory budget shared by streamed objects, decoded microtiles, meshing, geometry, fallbacks, and network buffers",
-
   "voxy.config.general.environmental_fog": "Enable environmental fog",
   "voxy.config.general.environmental_fog.tooltip": "Enables or disables voxy rendering environmental fog",
 

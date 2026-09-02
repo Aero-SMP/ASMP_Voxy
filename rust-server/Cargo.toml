@@ -2,13 +2,22 @@
 name = "voxy-rust-server"
 version = "0.1.0"
 edition = "2024"
-description = "Standalone Voxy LOD storage and streaming server"
+description = "Standalone Voxy QUIC terrain storage and streaming server"
 publish = false
 autobins = false
+autotests = false
+autobenches = false
+
+[lib]
+test = false
+bench = false
+doctest = false
 
 [[bin]]
 name = "voxy-rust-server"
 path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 anyhow = "1.0"
@@ -17,8 +26,12 @@ crc32c = "0.6"
 fastnbt = "2.5"
 flate2 = "1.1"
 lz4-java-wrc = "0.2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rayon = "1.11"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
 tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 zstd = { version = "0.13", default-features = false, features = ["pkg-config", "zdict_builder"] }

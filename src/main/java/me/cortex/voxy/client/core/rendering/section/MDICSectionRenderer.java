@@ -11,6 +11,7 @@ import me.cortex.voxy.client.core.model.ModelStore;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.util.SharedIndexBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
+import me.cortex.voxy.client.lod.ClientLodDebug;
 import me.cortex.voxy.common.Logger;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -227,7 +228,11 @@ public final class MDICSectionRenderer {
     }
 
     public void buildDrawCalls(Viewport viewport) {
-        if (this.geometryManager.getSectionCount() == 0) return;
+        int geometrySections = this.geometryManager.getSectionCount();
+        if (geometrySections == 0) {
+            ClientLodDebug.captureRender(viewport.frameId, 0, 0, 0);
+            return;
+        }
         this.uploadUniformBuffer(viewport);
         //Can do a sneeky trick, since the sectionRenderList is a list to things to render, it invokes the culler
         // which only marks visible sections
@@ -309,6 +314,9 @@ public final class MDICSectionRenderer {
             glDispatchComputeIndirect(0);
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
         }
+
+        ClientLodDebug.captureRender(viewport.frameId, geometrySections,
+                viewport.indirectLookupBuffer.id, viewport.drawCountCallBuffer.id);
 
     }
 

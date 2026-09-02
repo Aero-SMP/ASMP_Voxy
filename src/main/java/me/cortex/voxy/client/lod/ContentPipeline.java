@@ -51,10 +51,12 @@ public final class ContentPipeline {
         }
     }
 
-    @FunctionalInterface
     public interface ModelCompatibility {
         /** Must include catalog authority and the current baked resource/model state. */
         ModelClass classify(int localBlockId);
+
+        /** True once meshing may safely read this local model and its GPU metadata. */
+        boolean ready(int localBlockId);
     }
 
     public record CatalogMappings(long catalogId, int[] blocks, int[] biomes) {
@@ -268,10 +270,10 @@ public final class ContentPipeline {
         Objects.requireNonNull(binding, "binding");
         Objects.requireNonNull(compatibility, "compatibility");
         Objects.requireNonNull(microtileLookup, "microtileLookup");
-        Map<ContentClass, Map<Integer, ContentObject>> objects = indexedObjects(binding);
-        long exterior = mask(objects.get(ContentClass.EXTERIOR));
-        long interior = mask(objects.get(ContentClass.INTERIOR));
-        long complex = mask(objects.get(ContentClass.COMPLEX));
+        ContentObject[][] objects = indexedObjects(binding);
+        long exterior = mask(objects[ContentClass.EXTERIOR.ordinal()]);
+        long interior = mask(objects[ContentClass.INTERIOR.ordinal()]);
+        long complex = mask(objects[ContentClass.COMPLEX.ordinal()]);
         long ordinary = exterior | interior;
         long unclassified = 0;
         long compatibleMask = 0;
@@ -280,21 +282,25 @@ public final class ContentPipeline {
             long bit = 1L << index;
             if ((ordinary & bit) == 0) continue;
             boolean missing = false;
+            boolean modelsPending = false;
             boolean unsafe = false;
             for (ContentClass contentClass : List.of(ContentClass.EXTERIOR,
                     ContentClass.INTERIOR)) {
-                ContentObject object = objects.get(contentClass).get(index);
+                ContentObject object = objects[contentClass.ordinal()][index];
                 if (object == null) continue;
                 Optional<MicrotileCodec.Prepared> value = Objects.requireNonNull(
                         microtileLookup.apply(object.hash()), "microtile lookup result");
                 if (value.isEmpty()) {
                     missing = true;
-                } else if (!gpuSafe(prepared(object, value.orElseThrow()).content(),
-                        compatibility)) {
-                    unsafe = true;
+                } else {
+                    MicrotileCodec.Prepared content = value.orElseThrow();
+                    if (!modelsReady(content, compatibility)) modelsPending = true;
+                    else if (!gpuSafe(content, compatibility)) unsafe = true;
                 }
             }
-            if (unsafe) {
+            if (modelsPending) {
+                unclassified |= bit;
+            } else if (unsafe) {
                 if ((complex & bit) == 0) {
                     throw new IncompatibleContentException(
                             "unsafe ordinary microtile has no complex companion at slot " + index);
@@ -322,7 +328,7 @@ public final class ContentPipeline {
                                            Function<Hash256, Optional<MicrotileCodec.Prepared>>
                                                    microtileLookup,
                                            java.util.function.Predicate<Hash256> dependencyResident)
-            throws MissingObjectsException {
+            throws MissingObjectsException, ModelsNotReadyException {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(binding, "binding");
         Objects.requireNonNull(selectionCut, "selectionCut");
@@ -359,10 +365,10 @@ public final class ContentPipeline {
                                    ModelCompatibility compatibility,
                                    PreparedLookup lookup,
                                    DependencyLookup dependencyLookup)
-            throws MicrotileCodec.DecodeException, MissingObjectsException {
+            throws MicrotileCodec.DecodeException, MissingObjectsException,
+            ModelsNotReadyException {
 
-        Map<ContentClass, Map<Integer, ContentObject>> objects = indexedObjects(binding);
-        validateCut(selectionCut, objects);
+        ContentObject[][] objects = indexedObjects(binding);
 
         ArrayList<PreparedMicrotile> selected = new ArrayList<>();
         LinkedHashSet<Hash256> missing = new LinkedHashSet<>();
@@ -371,7 +377,7 @@ public final class ContentPipeline {
         long effectiveComplex = 0;
         for (int microtileIndex = 0; microtileIndex < Long.SIZE; microtileIndex++) {
             long bit = 1L << microtileIndex;
-            ContentObject complexObject = objects.get(ContentClass.COMPLEX).get(microtileIndex);
+            ContentObject complexObject = objects[ContentClass.COMPLEX.ordinal()][microtileIndex];
             if ((selectionCut.complexMask() & bit) != 0) {
                 Optional<PreparedMicrotile> complex = lookup.load(complexObject);
                 if (complex.isEmpty()) missing.add(complexObject.hash());
@@ -387,7 +393,7 @@ public final class ContentPipeline {
             for (ContentClass contentClass : List.of(ContentClass.EXTERIOR,
                     ContentClass.INTERIOR)) {
                 if ((selectionCut.mask(contentClass) & bit) == 0) continue;
-                ContentObject object = objects.get(contentClass).get(microtileIndex);
+                ContentObject object = objects[contentClass.ordinal()][microtileIndex];
                 Optional<PreparedMicrotile> prepared = lookup.load(object);
                 if (prepared.isEmpty()) {
                     missing.add(object.hash());
@@ -489,6 +495,18 @@ public final class ContentPipeline {
             throw new MissingObjectsException(List.of(), missingDependencies,
                     missingNeighborDependencies);
         }
+        for (PreparedMicrotile microtile : selected) {
+            int pendingModel = firstUnreadyModel(microtile.content(), compatibility);
+            if (pendingModel >= 0) throw new ModelsNotReadyException(pendingModel);
+        }
+        for (DependencyMicrotile dependency : preparedDependencies) {
+            int pendingModel = firstUnreadyModel(dependency.content(), compatibility);
+            if (pendingModel >= 0) throw new ModelsNotReadyException(pendingModel);
+        }
+        for (NeighborDependencyMicrotile dependency : preparedNeighbors) {
+            int pendingModel = firstUnreadyModel(dependency.content(), compatibility);
+            if (pendingModel >= 0) throw new ModelsNotReadyException(pendingModel);
+        }
 
         SpatialNode node = RootDemandPlan.spatial(binding.sectionKey());
         SelectionCut effectiveCut = new SelectionCut(
@@ -500,38 +518,22 @@ public final class ContentPipeline {
                 preparedDependencies, preparedNeighbors, metadata);
     }
 
-    private static Map<ContentClass, Map<Integer, ContentObject>> indexedObjects(Binding binding) {
-        Map<ContentClass, Map<Integer, ContentObject>> result = new java.util.EnumMap<>(
-                ContentClass.class);
-        for (ContentClass contentClass : ContentClass.values()) {
-            result.put(contentClass, new HashMap<>());
-        }
+    private static ContentObject[][] indexedObjects(Binding binding) {
+        ContentObject[][] result = new ContentObject[ContentClass.values().length][Long.SIZE];
         for (ContentLayer layer : binding.layers()) {
-            Map<Integer, ContentObject> indexed = result.get(layer.contentClass());
+            ContentObject[] indexed = result[layer.contentClass().ordinal()];
             for (ContentObject object : layer.objects()) {
-                if (indexed.put(object.microtileIndex(), object) != null) {
-                    throw new IllegalArgumentException("manifest repeats a microtile slot");
-                }
+                indexed[object.microtileIndex()] = object;
             }
         }
         return result;
     }
 
-    private static void validateCut(SelectionCut cut,
-                                    Map<ContentClass, Map<Integer, ContentObject>> objects) {
-        for (ContentClass contentClass : ContentClass.values()) {
-            long available = 0;
-            for (int index : objects.get(contentClass).keySet()) available |= 1L << index;
-            if ((cut.mask(contentClass) & ~available) != 0) {
-                throw new IllegalArgumentException(
-                        "selection cut names an unavailable " + contentClass + " microtile");
-            }
-        }
-    }
-
-    private static long mask(Map<Integer, ContentObject> objects) {
+    private static long mask(ContentObject[] objects) {
         long result = 0;
-        for (int index : objects.keySet()) result |= 1L << index;
+        for (int index = 0; index < objects.length; index++) {
+            if (objects[index] != null) result |= 1L << index;
+        }
         return result;
     }
 
@@ -582,6 +584,20 @@ public final class ContentPipeline {
             if (!modelClass.gpuSafe()) return false;
         }
         return true;
+    }
+
+    private static boolean modelsReady(MicrotileCodec.Prepared microtile,
+                                       ModelCompatibility compatibility) {
+        return firstUnreadyModel(microtile, compatibility) < 0;
+    }
+
+    private static int firstUnreadyModel(MicrotileCodec.Prepared microtile,
+                                         ModelCompatibility compatibility) {
+        for (long cell : microtile.cellsInternal()) {
+            int block = CatalogMapper.getBlockId(cell);
+            if (!CatalogMapper.isAir(cell) && !compatibility.ready(block)) return block;
+        }
+        return -1;
     }
 
     private static Hash256 terrainIdentity(List<PreparedMicrotile> selected,
@@ -712,6 +728,19 @@ public final class ContentPipeline {
             }
             return List.copyOf(result);
         }
+    }
+
+    /** The terrain is resident, but one of its actual local block models is still baking. */
+    public static final class ModelsNotReadyException extends Exception {
+        private final int localBlockId;
+
+        public ModelsNotReadyException(int localBlockId) {
+            super("activation group is waiting for local block model " + localBlockId);
+            if (localBlockId < 0) throw new IllegalArgumentException("negative block model ID");
+            this.localBlockId = localBlockId;
+        }
+
+        public int localBlockId() { return this.localBlockId; }
     }
 
     public static final class IncompatibleContentException extends IllegalArgumentException {

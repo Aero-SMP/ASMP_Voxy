@@ -3,6 +3,8 @@ package me.cortex.voxy.client.core.rendering.hierarchical;
 import me.cortex.voxy.common.util.HierarchicalBitSet;
 import org.lwjgl.system.MemoryUtil;
 
+import java.util.Arrays;
+
 public final class NodeStore {
     public static final int EMPTY_GEOMETRY_ID = -1;
     public static final int NODE_ID_MSK = ((1<<24)-1);
@@ -90,17 +92,22 @@ public final class NodeStore {
     }
 
 
-    //Copy from allocated index A to allocated index B
-    public void copyNode(int fromId, int toId) {
-        if (!(this.allocationSet.isSet(fromId)&&this.allocationSet.isSet(toId))) {
-            throw new IllegalArgumentException();
+    /** Captures one allocated CPU node while its hierarchy owner is being relocated. */
+    long[] snapshotNode(int nodeId) {
+        if (!this.allocationSet.isSet(nodeId)) {
+            throw new IllegalArgumentException("node is not allocated: " + nodeId);
         }
-        int f = id2idx(fromId);
-        int t = id2idx(toId);
-        this.localNodeData[t  ] = this.localNodeData[f  ];
-        this.localNodeData[t+1] = this.localNodeData[f+1];
-        this.localNodeData[t+2] = this.localNodeData[f+2];
-        this.localNodeData[t+3] = this.localNodeData[f+3];
+        int index = id2idx(nodeId);
+        return Arrays.copyOfRange(this.localNodeData, index, index + LONGS_PER_NODE);
+    }
+
+    /** Restores a captured node into an already allocated slot. */
+    void restoreNode(int nodeId, long[] snapshot) {
+        if (!this.allocationSet.isSet(nodeId) || snapshot == null
+                || snapshot.length != LONGS_PER_NODE) {
+            throw new IllegalArgumentException("invalid node relocation target");
+        }
+        System.arraycopy(snapshot, 0, this.localNodeData, id2idx(nodeId), LONGS_PER_NODE);
     }
 
     public void setNodePosition(int node, long position) {

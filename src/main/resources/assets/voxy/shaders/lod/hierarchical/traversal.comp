@@ -38,78 +38,20 @@ layout(binding = RENDER_TRACKER_BINDING, std430) restrict writeonly buffer rende
     uint[] lastRenderFrame;
 };
 
-// VOXY_DEBUG_LOD_AUDIT_BEGIN
-#ifdef VOXY_DEBUG_LOD_AUDIT
-#define VOXY_AUDIT_ANOMALY_CAPACITY 128u
-#define VOXY_AUDIT_FRONTIER_CAPACITY 2048u
-layout(binding = 15, std430) restrict buffer VoxyLodAuditBuffer {
-    uint voxyAuditCounters[64];
-    uvec4 voxyAuditAnomalies[128];
-    uvec2 voxyAuditFrontier[2048];
-};
-
-void voxyAuditHash(uvec2 rawPos) {
-    atomicXor(voxyAuditCounters[21], rawPos.x * 0x9e3779b9u + rawPos.y);
-    atomicXor(voxyAuditCounters[22], rawPos.y * 0x85ebca6bu + rawPos.x);
-    atomicAdd(voxyAuditCounters[23], rawPos.x * 0xc2b2ae35u ^ rawPos.y);
-    atomicAdd(voxyAuditCounters[24], rawPos.y * 0x27d4eb2fu ^ rawPos.x);
-}
-
-void voxyAuditAnomaly(in UnpackedNode node, uint reason, float ratio) {
-    uint index = atomicAdd(voxyAuditCounters[31], 1u);
-    if (index < VOXY_AUDIT_ANOMALY_CAPACITY) {
-        uint flags = (hasRequested(node) ? 1u : 0u)
-                | (isTerminal(node) ? 2u : 0u)
-                | (hasChildren(node) ? 4u : 0u)
-                | (hasMesh(node) ? 8u : 0u)
-                | (isEmptyMesh(node) ? 16u : 0u);
-        voxyAuditAnomalies[index] = uvec4(node.rawPos,
-                (reason & 0xffu) | ((node.lodLevel & 0xfu) << 8) | (flags << 12),
-                floatBitsToUint(ratio));
-    }
-}
-
-void voxyAuditSelected(in UnpackedNode node) {
-    atomicAdd(voxyAuditCounters[16 + min(node.lodLevel, 4u)], 1u);
-    voxyAuditHash(node.rawPos);
-    if (voxyAuditCounters[63] != 0u) {
-        uint index = atomicAdd(voxyAuditCounters[30], 1u);
-        if (index < VOXY_AUDIT_FRONTIER_CAPACITY) voxyAuditFrontier[index] = node.rawPos;
-    }
-}
-
-#define VOXY_AUDIT_ADD(index, value) atomicAdd(voxyAuditCounters[index], value)
-#define VOXY_AUDIT_ANOMALY(node, reason, ratio) voxyAuditAnomaly(node, reason, ratio)
-#define VOXY_AUDIT_SELECTED(node) voxyAuditSelected(node)
-#else
-#define VOXY_AUDIT_ADD(index, value)
-#define VOXY_AUDIT_ANOMALY(node, reason, ratio)
-#define VOXY_AUDIT_SELECTED(node)
-#endif
-// VOXY_DEBUG_LOD_AUDIT_END
-
 void addRequest(inout UnpackedNode node) {
     // The requested bit protects nodes from the cleaner, but it cannot be a permanent
     // delivery acknowledgement: GPU readback is asynchronous and may be lost while the
     // hierarchy is changing. Retry on a node-staggered lease until children arrive.
     bool previouslyRequested = hasRequested(node);
     bool retry = previouslyRequested && ((frameId + getId(node)) & 31u) == 0u;
-#ifdef VOXY_DEBUG_LOD_AUDIT
-    if (previouslyRequested) VOXY_AUDIT_ADD(8, 1u);
-#endif
     if (!previouslyRequested || retry) {
         if (requestQueueIndex.x < requestQueueSize) {//Soft limit
-            VOXY_AUDIT_ADD(9, 1u);
             uint atomRes = atomicAdd(requestQueueIndex.x, 1);
             if (atomRes < MAX_REQUEST_QUEUE_SIZE) {//Hard limit
                 //Mark node as having a request submitted to prevent duplicate submissions
                 requestQueue[atomRes] = getRawPos(node);
                 markRequested(node);
-            } else {
-                VOXY_AUDIT_ADD(25, 1u);
             }
-        } else {
-            VOXY_AUDIT_ADD(10, 1u);
         }
     }
 }
@@ -121,9 +63,6 @@ void enqueueChildren(in UnpackedNode node) {
 
     uint children = getChildCount(node);
     pushNodesInit(children);
-#ifdef VOXY_DEBUG_LOD_AUDIT
-    if (nodePushIndex + children > 200000u) VOXY_AUDIT_ADD(15, 1u);
-#endif
     uint ptr = getChildPtr(node);
     for (int i = 0; i < children; i++) {
         pushNode(ptr+i);
@@ -131,20 +70,14 @@ void enqueueChildren(in UnpackedNode node) {
 }
 
 void enqueueSelfForRender(in UnpackedNode node) {
-    VOXY_AUDIT_SELECTED(node);
     if (renderQueueIndex < renderQueueMaxSize) {
         lastRenderFrame[getId(node)] = frameId;
         if (!isEmptyMesh(node)) {
             uint renderIndex = atomicAdd(renderQueueIndex, 1);
             if (renderIndex < renderQueueMaxSize) {
                 renderQueue[renderIndex] = getMesh(node);
-
-            } else {
-                VOXY_AUDIT_ADD(14, 1u);
             }
         }
-    } else {
-        VOXY_AUDIT_ADD(14, 1u);
     }
 }
 
@@ -167,31 +100,14 @@ void traverse(in UnpackedNode node) {
     //Compute screenspace
     setupScreenspace(node);
 
-#ifdef VOXY_DEBUG_LOD_AUDIT
-    if (outsideFrustum()) {
-        VOXY_AUDIT_ADD(2, 1u);
-        return;
-    }
-    if (isCulledByHiz()) {
-        VOXY_AUDIT_ADD(3, 1u);
-        return;
-    }
-    VOXY_AUDIT_ADD(4, 1u);
-    {
-#else
     if (!(outsideFrustum() || isCulledByHiz())) {
-#endif
         //It is visible, TODO: maybe do a more detailed hiz test? (or make it so that )
 
         //Only decend if not a root node
         if (node.lodLevel!=0 && !isTerminal(node) && shouldDecend()) {
-            VOXY_AUDIT_ADD(5, 1u);
             if (hasChildren(node)) {
-                VOXY_AUDIT_ADD(6, 1u);
                 enqueueChildren(node);
             } else {
-                VOXY_AUDIT_ADD(7, 1u);
-                VOXY_AUDIT_ANOMALY(node, 1u, _screenSize / max(minSSS, 0.0000001f));
                 addRequest(node);
                 //TODO: use self mesh (is error state if it doesnt have one since all leaf nodes should have a mesh)
                 // Basicly guarenteed to have a mesh, if it doesnt it is very very bad and incorect since its a violation of the graph properties
@@ -199,15 +115,12 @@ void traverse(in UnpackedNode node) {
 
                 // Keep the coarse node visible until the requested children are available.
                 // The node already passed render-distance, frustum and HiZ rejection above.
-                VOXY_AUDIT_ADD(12, 1u);
                 enqueueSelfForRender(node);
             }
         } else {
             if (hasMesh(node)) {
                 enqueueSelfForRender(node);
             } else {
-                VOXY_AUDIT_ADD(11, 1u);
-                VOXY_AUDIT_ANOMALY(node, 2u, _screenSize / max(minSSS, 0.0000001f));
                 //!! not ideal, we want to render this mesh but dont have it. If we havent sent a request
                 // then send a request for a mesh for this node.
                 addRequest(node);
@@ -227,13 +140,10 @@ void main() {
         //Fetch + decode node
         UnpackedNode node;
         unpackNode(node, nodeId);
-        VOXY_AUDIT_ADD(0, 1u);
 
         //Check if were inside the render distastance before traversince
         if (isWithinRenderDistance(node)) {
             traverse(node);
-        } else {
-            VOXY_AUDIT_ADD(1, 1u);
         }
     }
 }

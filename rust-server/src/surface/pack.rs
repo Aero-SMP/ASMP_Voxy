@@ -1,13 +1,13 @@
 use super::{
     content::content_kind,
     dictionary,
-    memory::{MemoryClass, MemoryPermit, MemoryPressure, ServerMemoryBudget},
     object::{CanonicalObject, ObjectHash, ObjectKind},
 };
 use crate::{crc::crc32c, quarantine, sync_parent};
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::{BTreeMap, HashMap},
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap},
     ffi::c_void,
     fmt,
     fs::{self, File, OpenOptions},
@@ -30,14 +30,13 @@ const RECORD_HEADER: usize = 104;
 const INDEX_ENTRY: usize = 104;
 const DEFAULT_MAX_PACK_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_CANONICAL_OBJECT_BYTES: usize = 64 * 1024 * 1024;
-/// Leaves room for a root token, object count, and one object header in a 16 MiB surface frame.
+/// Keeps one compressed object and a bounded same-lane QUIC batch below the stream data limit.
 pub const MAX_COMPRESSED_OBJECT_BYTES: usize = 16 * 1024 * 1024 - 123;
 const MAX_INDEX_ENTRIES: usize = 16_000_000;
 const MAX_PACKS: usize = 1_000_000;
 const ZSTD_LEVEL: i32 = 1;
 const PREFIXES: usize = 256;
 const MAX_INDEX_DELTA_ENTRIES: usize = 32 * 1024;
-const INDEX_DELTA_ACCOUNTED_BYTES: usize = 256;
 const HOT_INDEX_ENTRIES: usize = 4 * 1024;
 const INDEX_REBUILD_BUFFER_ENTRIES: usize = 16 * 1024;
 /// Delta indexes are immutable and cheap to publish. Periodic consolidation bounds lookup depth
@@ -45,8 +44,6 @@ const INDEX_REBUILD_BUFFER_ENTRIES: usize = 16 * 1024;
 const MAX_INDEX_SEGMENTS: usize = 64;
 // Covers the bounded object/reference/output maps retained by one append transaction. Zstd is
 // invoked sequentially so only one codec context exists inside the separate working allowance.
-const PACK_BATCH_METADATA_BYTES: usize = 32 * 1024 * 1024;
-const ZSTD_WORKING_BYTES: usize = 8 * 1024 * 1024;
 
 unsafe extern "C" {
     fn mmap(
@@ -58,10 +55,12 @@ unsafe extern "C" {
         offset: isize,
     ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> i32;
+    fn madvise(address: *mut c_void, length: usize, advice: i32) -> i32;
 }
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
+const MADV_DONTNEED: i32 = 4;
 
 /// Read-only mapping used by the fixed-record object index. Linux keeps an existing mapping
 /// valid across atomic index replacement, which gives every reader an immutable Arc snapshot.
@@ -116,6 +115,12 @@ impl ReadOnlyMap {
         // SAFETY: the mapping is immutable and valid for `length` until Drop.
         unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.length) }
     }
+
+    fn discard_resident_pages(&self) {
+        // The complete immutable index was validated once. Binary-search lookups should fault
+        // only the pages they touch instead of retaining a world-sized startup scan in RSS.
+        let _ = unsafe { madvise(self.pointer.as_ptr().cast(), self.length, MADV_DONTNEED) };
+    }
 }
 
 impl Drop for ReadOnlyMap {
@@ -152,73 +157,55 @@ pub struct StoredObject {
     pub compressed: Vec<u8>,
 }
 
-/// A stored object whose compressed allocation remains charged to the one process-wide budget
-/// for exactly as long as the caller retains it.
-#[derive(Debug)]
-pub struct BudgetedStoredObject {
-    object: StoredObject,
-    _memory: MemoryPermit,
+/// Immutable positional view of one stored compressed object. Client serving clones only the
+/// file handle and metadata; payload bytes are read directly from the pack in bounded chunks.
+#[derive(Clone, Debug)]
+pub struct StoredObjectSource {
+    hash: ObjectHash,
+    location: ObjectLocation,
+    file: Arc<File>,
 }
 
-impl BudgetedStoredObject {
-    pub fn as_object(&self) -> &StoredObject {
-        &self.object
-    }
-
-    pub fn into_parts(self) -> (StoredObject, MemoryPermit) {
-        (self.object, self._memory)
-    }
-}
-
-impl PartialEq<StoredObject> for BudgetedStoredObject {
-    fn eq(&self, other: &StoredObject) -> bool {
-        self.object == *other
-    }
-}
-
-/// A decoded canonical object whose byte allocation remains globally accounted after the read
-/// returns. Callers that already own a complete operation reservation use `get_scoped` instead.
-#[derive(Debug)]
-pub struct BudgetedCanonicalObject {
-    object: CanonicalObject,
-    _memory: MemoryPermit,
-}
-
-impl BudgetedCanonicalObject {
-    pub fn as_object(&self) -> &CanonicalObject {
-        &self.object
-    }
-
-    pub fn into_parts(self) -> (CanonicalObject, MemoryPermit) {
-        (self.object, self._memory)
+impl StoredObjectSource {
+    pub fn hash(&self) -> ObjectHash {
+        self.hash
     }
 
     pub fn kind(&self) -> ObjectKind {
-        self.object.kind()
+        self.location.kind
     }
 
-    pub fn hash(&self) -> ObjectHash {
-        self.object.hash()
+    pub fn dictionary(&self) -> ObjectHash {
+        self.location.dictionary
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        self.object.bytes()
+    pub fn canonical_size(&self) -> u64 {
+        self.location.canonical_size
     }
 
-    pub fn verify(&self) -> bool {
-        self.object.verify()
+    pub fn compressed_size(&self) -> u64 {
+        self.location.compressed_size
     }
-}
 
-impl AsRef<CanonicalObject> for BudgetedCanonicalObject {
-    fn as_ref(&self) -> &CanonicalObject {
-        &self.object
+    pub fn compressed_crc(&self) -> u32 {
+        self.location.compressed_crc
     }
-}
 
-impl PartialEq<CanonicalObject> for BudgetedCanonicalObject {
-    fn eq(&self, other: &CanonicalObject) -> bool {
-        self.object == *other
+    pub fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(output.len() as u64)
+            .context("compressed object read range overflow")?;
+        if end > self.location.compressed_size {
+            bail!("compressed object read exceeds its stored extent");
+        }
+        let absolute = self
+            .location
+            .payload_offset()
+            .checked_add(offset)
+            .context("compressed object pack offset overflow")?;
+        self.file
+            .read_exact_at(output, absolute)
+            .context("read compressed surface object")
     }
 }
 
@@ -253,24 +240,12 @@ impl StoredObject {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PackRecovery {
-    pub torn_packs: Vec<u64>,
-    pub corrupt_records: Vec<(u64, u64)>,
-    pub quarantined_packs: Vec<PathBuf>,
-    pub index_rebuilt: bool,
-}
-
 #[derive(Debug)]
 struct MappedIndex {
     map: ReadOnlyMap,
     entries_offset: usize,
     entry_count: usize,
     prefixes: [(u32, u32); PREFIXES],
-    /// Every concurrently live mmap snapshot owns its complete logical-byte reservation. Atomic
-    /// checkpoint replacement may briefly retain both old and new in-flight reader snapshots;
-    /// counting each prevents that overlap from escaping the global cap.
-    _memory: MemoryPermit,
 }
 
 impl MappedIndex {
@@ -306,38 +281,20 @@ struct ObjectIndex {
     /// Existing readers continue using the immutable base while a writer appends records.
     delta: RwLock<BTreeMap<ObjectHash, ObjectLocation>>,
     hot: Mutex<Box<[Option<(ObjectHash, ObjectLocation)>]>>,
-    /// Reserves the complete direct-mapped cache and maximum mutable B-tree delta up front, so
-    /// a durable append never becomes unindexable because a later bookkeeping allocation loses
-    /// a memory race.
-    _memory: MemoryPermit,
 }
 
 impl ObjectIndex {
     fn new(
         segments: Vec<Arc<MappedIndex>>,
         delta: BTreeMap<ObjectHash, ObjectLocation>,
-        memory: &Arc<ServerMemoryBudget>,
     ) -> Result<Self> {
         if delta.len() > MAX_INDEX_DELTA_ENTRIES {
             bail!("rebuilt surface index delta exceeds its fixed memory bound");
         }
-        let hot_bytes = HOT_INDEX_ENTRIES
-            .checked_mul(std::mem::size_of::<Option<(ObjectHash, ObjectLocation)>>())
-            .context("surface hot-index memory plan overflow")?;
-        let delta_bytes = MAX_INDEX_DELTA_ENTRIES
-            .checked_mul(INDEX_DELTA_ACCOUNTED_BYTES)
-            .context("surface index-delta memory plan overflow")?;
-        let reserved = memory.try_reserve(
-            MemoryClass::PackIndex,
-            hot_bytes
-                .checked_add(delta_bytes)
-                .context("surface object-index memory plan overflow")?,
-        )?;
         Ok(Self {
             segments: RwLock::new(segments),
             delta: RwLock::new(delta),
             hot: Mutex::new(vec![None; HOT_INDEX_ENTRIES].into_boxed_slice()),
-            _memory: reserved,
         })
     }
 
@@ -377,10 +334,6 @@ impl ObjectIndex {
             .delta
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        assert!(
-            delta.contains_key(&hash) || delta.len() < MAX_INDEX_DELTA_ENTRIES,
-            "fixed object-index delta capacity was exceeded"
-        );
         delta.insert(hash, location);
         drop(delta);
         self.hot.lock().unwrap_or_else(|poison| poison.into_inner())[hot_slot(hash)] =
@@ -408,7 +361,11 @@ impl ObjectIndex {
         })
     }
 
-    fn sorted_entries(&self, maximum: usize) -> Result<Vec<(ObjectHash, ObjectLocation)>> {
+    fn visit_sorted(
+        &self,
+        maximum: usize,
+        mut visit: impl FnMut(ObjectHash, ObjectLocation) -> Result<()>,
+    ) -> Result<usize> {
         let segments = self
             .segments
             .read()
@@ -417,52 +374,78 @@ impl ObjectIndex {
         let delta = self
             .delta
             .read()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .map(|(&hash, &location)| (hash, location))
+            .collect::<Vec<_>>();
         let upper_bound = segments
             .iter()
             .try_fold(delta.len(), |count, segment| {
                 count.checked_add(segment.entry_count)
             })
             .context("surface object index size overflow")?;
-        if upper_bound > maximum.saturating_mul(segments.len().max(1)) {
+        if upper_bound > maximum.saturating_mul(segments.len().saturating_add(1)) {
             bail!("surface object index exceeds its entry bound");
         }
-        let mut entries = BTreeMap::new();
-        for segment in segments {
-            for index in 0..segment.entry_count {
-                let (hash, location) = segment.entry(index);
-                entries.insert(hash, location);
+
+        let mut sources = segments
+            .into_iter()
+            .map(MergeSource::Segment)
+            .chain((!delta.is_empty()).then_some(MergeSource::Delta(delta)))
+            .map(|entries| MergeCursor { entries, index: 0 })
+            .collect::<Vec<_>>();
+        let mut heap = BinaryHeap::new();
+        for (source, cursor) in sources.iter().enumerate() {
+            if let Some((hash, _)) = cursor.current() {
+                heap.push(Reverse((hash, source)));
             }
         }
-        entries.extend(delta.iter().map(|(&hash, &location)| (hash, location)));
-        if entries.len() > maximum {
-            bail!("surface object index exceeds its entry bound");
-        }
-        Ok(entries.into_iter().collect())
-    }
 
-    fn visit_sorted(
-        &self,
-        maximum: usize,
-        mut visit: impl FnMut(ObjectHash, ObjectLocation) -> Result<()>,
-    ) -> Result<usize> {
-        let entries = self.sorted_entries(maximum)?;
-        let count = entries.len();
-        for (hash, location) in entries {
+        let mut count = 0usize;
+        let mut same = Vec::with_capacity(sources.len());
+        while let Some(Reverse((hash, source))) = heap.pop() {
+            let mut winner = source;
+            same.clear();
+            same.push(source);
+            while let Some(Reverse((candidate, candidate_source))) = heap.peek().copied() {
+                if candidate != hash {
+                    break;
+                }
+                heap.pop();
+                winner = winner.max(candidate_source);
+                same.push(candidate_source);
+            }
+            let location = sources[winner]
+                .current()
+                .expect("heap sources have current entries")
+                .1;
+            count = count
+                .checked_add(1)
+                .context("surface object index size overflow")?;
+            if count > maximum {
+                bail!("surface object index exceeds its entry bound");
+            }
             visit(hash, location)?;
+            for &source in &same {
+                let cursor = &mut sources[source];
+                cursor.index += 1;
+                if let Some((next, _)) = cursor.current() {
+                    heap.push(Reverse((next, source)));
+                }
+            }
         }
         Ok(count)
     }
 
     fn write_checkpoint(&self, path: &Path, pack_lengths: &BTreeMap<u64, u64>) -> Result<()> {
-        let entries = self.sorted_entries(MAX_INDEX_ENTRIES)?;
         if pack_lengths.len() > MAX_PACKS {
             bail!("surface object index exceeds its configured bounds");
         }
-        let mut writer = IndexWriter::open(path, pack_lengths, entries.len())?;
-        for (hash, location) in entries {
-            writer.entry(hash, location)?;
-        }
+        let count = self.visit_sorted(MAX_INDEX_ENTRIES, |_hash, _location| Ok(()))?;
+        let mut writer = IndexWriter::open(path, pack_lengths, count)?;
+        self.visit_sorted(MAX_INDEX_ENTRIES, |hash, location| {
+            writer.entry(hash, location)
+        })?;
         writer.finish()
     }
 
@@ -516,6 +499,27 @@ impl ObjectIndex {
     }
 }
 
+enum MergeSource {
+    Segment(Arc<MappedIndex>),
+    Delta(Vec<(ObjectHash, ObjectLocation)>),
+}
+
+struct MergeCursor {
+    entries: MergeSource,
+    index: usize,
+}
+
+impl MergeCursor {
+    fn current(&self) -> Option<(ObjectHash, ObjectLocation)> {
+        match &self.entries {
+            MergeSource::Segment(segment) => {
+                (self.index < segment.entry_count).then(|| segment.entry(self.index))
+            }
+            MergeSource::Delta(entries) => entries.get(self.index).copied(),
+        }
+    }
+}
+
 fn hot_slot(hash: ObjectHash) -> usize {
     let prefix = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
     (prefix as usize) & (HOT_INDEX_ENTRIES - 1)
@@ -533,8 +537,6 @@ pub struct PackStore {
     next_pack: u64,
     next_index_segment: AtomicU64,
     max_pack_bytes: u64,
-    recovery: PackRecovery,
-    memory: Arc<ServerMemoryBudget>,
 }
 
 /// Cloneable immutable-read handle. Append publication changes only the small delta/index Arc;
@@ -544,7 +546,6 @@ pub struct PackStore {
 pub struct PackReader {
     packs: Arc<RwLock<BTreeMap<u64, Arc<File>>>>,
     index: Arc<ObjectIndex>,
-    memory: Arc<ServerMemoryBudget>,
 }
 
 impl PackReader {
@@ -552,88 +553,39 @@ impl PackReader {
         self.index.location(hash)
     }
 
-    pub fn read_stored(&self, hash: ObjectHash) -> Result<Option<BudgetedStoredObject>> {
-        let Some(location) = self.location(hash) else {
-            return Ok(None);
-        };
-        let bytes =
-            usize::try_from(location.compressed_size).context("compressed object size overflow")?;
-        let mut memory = self.memory.try_reserve(MemoryClass::ObjectIo, bytes)?;
-        let Some(object) = read_stored_from(&self.packs, &self.index, hash)? else {
-            return Ok(None);
-        };
-        memory.shrink_to(object.compressed.capacity());
-        Ok(Some(BudgetedStoredObject {
-            object,
-            _memory: memory,
-        }))
-    }
-
-    pub fn get(&self, hash: ObjectHash) -> Result<Option<BudgetedCanonicalObject>> {
-        let Some(bytes) = read_memory_plan(&self.index, hash)? else {
-            return Ok(None);
-        };
-        let mut memory = self.memory.try_reserve(MemoryClass::ObjectIo, bytes)?;
-        let Some(object) = get_from(self, hash)? else {
-            return Ok(None);
-        };
-        memory.shrink_to(object.byte_capacity());
-        Ok(Some(BudgetedCanonicalObject {
-            object,
-            _memory: memory,
-        }))
-    }
-
-    /// Uses an enclosing all-or-nothing operation reservation whose lifetime also covers the
-    /// returned allocation. This avoids double-counting service bundles and GC transactions.
-    pub(crate) fn read_stored_scoped(
-        &self,
-        hash: ObjectHash,
-        memory: &MemoryPermit,
-    ) -> Result<Option<StoredObject>> {
-        let Some(location) = self.location(hash) else {
-            return Ok(None);
-        };
-        let bytes =
-            usize::try_from(location.compressed_size).context("compressed object size overflow")?;
-        if !memory.accounts_for(&self.memory, bytes) {
-            bail!("object read exceeds its enclosing global memory reservation");
-        }
+    pub fn read_stored(&self, hash: ObjectHash) -> Result<Option<StoredObject>> {
         read_stored_from(&self.packs, &self.index, hash)
     }
 
-    pub(crate) fn get_scoped(
-        &self,
-        hash: ObjectHash,
-        memory: &MemoryPermit,
-    ) -> Result<Option<CanonicalObject>> {
-        let Some(bytes) = read_memory_plan(&self.index, hash)? else {
+    pub fn open_stored_source(&self, hash: ObjectHash) -> Result<Option<StoredObjectSource>> {
+        let Some(location) = self.index.location(hash) else {
             return Ok(None);
         };
-        if !memory.accounts_for(&self.memory, bytes) {
-            bail!("canonical object read exceeds its enclosing global memory reservation");
-        }
+        let file = self
+            .packs
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&location.pack_id)
+            .cloned()
+            .context("object references an unavailable pack")?;
+        Ok(Some(StoredObjectSource {
+            hash,
+            location,
+            file,
+        }))
+    }
+
+    pub fn get(&self, hash: ObjectHash) -> Result<Option<CanonicalObject>> {
         get_from(self, hash)
     }
 }
 
 impl PackStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_budget(root, ServerMemoryBudget::default_budget())
+        Self::open_with_limit(root, DEFAULT_MAX_PACK_BYTES)
     }
 
-    pub fn open_with_budget(
-        root: impl AsRef<Path>,
-        memory: Arc<ServerMemoryBudget>,
-    ) -> Result<Self> {
-        Self::open_with_limit(root, DEFAULT_MAX_PACK_BYTES, memory)
-    }
-
-    fn open_with_limit(
-        root: impl AsRef<Path>,
-        max_pack_bytes: u64,
-        memory: Arc<ServerMemoryBudget>,
-    ) -> Result<Self> {
+    fn open_with_limit(root: impl AsRef<Path>, max_pack_bytes: u64) -> Result<Self> {
         if max_pack_bytes < PACK_HEADER + RECORD_HEADER as u64 + 1 {
             bail!("maximum pack size is too small");
         }
@@ -657,7 +609,7 @@ impl PackStore {
         index_paths.sort_unstable_by_key(|entry| entry.0);
         let mut packs = BTreeMap::new();
         let mut pack_lengths = BTreeMap::new();
-        let mut recovery = PackRecovery::default();
+        let mut quarantined_pack = false;
         let mut valid_paths = Vec::new();
         for (id, path) in &paths {
             match open_pack_header(path, *id) {
@@ -672,20 +624,19 @@ impl PackStore {
                         path.display()
                     );
                     quarantine(path);
-                    recovery.quarantined_packs.push(path.clone());
+                    quarantined_pack = true;
                 }
             }
         }
 
         let mut mapped_segments = Vec::new();
         let mut indexed_lengths = None;
-        let mut indexes_valid = recovery.quarantined_packs.is_empty() && !index_paths.is_empty();
+        let mut indexes_valid = !quarantined_pack && !index_paths.is_empty();
         if indexes_valid {
             for (_, path) in &index_paths {
-                match read_mapped_index(path, &memory) {
+                match read_mapped_index(path) {
                     Ok(Some((stored_lengths, segment)))
-                        if pack_lengths_cover(&pack_lengths, &stored_lengths)
-                            && mapped_locations_valid(&pack_lengths, &segment) =>
+                        if pack_lengths_cover(&pack_lengths, &stored_lengths) =>
                     {
                         indexed_lengths = Some(stored_lengths);
                         mapped_segments.push(segment);
@@ -693,9 +644,6 @@ impl PackStore {
                     Ok(_) => {
                         indexes_valid = false;
                         break;
-                    }
-                    Err(error) if error.downcast_ref::<MemoryPressure>().is_some() => {
-                        return Err(error);
                     }
                     Err(error) => {
                         eprintln!(
@@ -722,17 +670,12 @@ impl PackStore {
             for (_, path) in &index_paths {
                 quarantine(path);
             }
-            recovery.index_rebuilt = true;
             packs.clear();
             pack_lengths.clear();
-            let _scan_memory =
-                memory.try_reserve(MemoryClass::ObjectIo, MAX_COMPRESSED_OBJECT_BYTES)?;
-            let mut rebuilt = ExternalIndexBuilder::new(&root, &memory)?;
+            let mut rebuilt = ExternalIndexBuilder::new(&root)?;
             for (id, path) in valid_paths {
                 let run_count = rebuilt.begin_pack()?;
-                match scan_pack(&path, id, &mut recovery, |hash, location| {
-                    rebuilt.push(hash, location)
-                }) {
+                match scan_pack(&path, id, |hash, location| rebuilt.push(hash, location)) {
                     Ok((file, length)) => {
                         rebuilt.finish_pack()?;
                         packs.insert(id, Arc::new(file));
@@ -745,7 +688,6 @@ impl PackStore {
                             path.display()
                         );
                         quarantine(&path);
-                        recovery.quarantined_packs.push(path);
                     }
                 }
             }
@@ -758,7 +700,7 @@ impl PackStore {
             rebuilt.finish_to_checkpoint(&temporary, &pack_lengths)?;
             fs::rename(&temporary, &checkpoint_path)?;
             sync_parent(&checkpoint_path)?;
-            let (_, mapped) = read_mapped_index(&checkpoint_path, &memory)?
+            let (_, mapped) = read_mapped_index(&checkpoint_path)?
                 .context("rebuilt surface object index disappeared")?;
             (
                 vec![mapped],
@@ -767,12 +709,6 @@ impl PackStore {
                     .context("surface index-segment identifier exhausted")?,
             )
         };
-        if segments.iter().all(|segment| segment.entry_count == 0)
-            && recovery.quarantined_packs.is_empty()
-        {
-            recovery.index_rebuilt = false;
-        }
-
         let next_pack = maximum_seen.map_or(Ok(0), |value| {
             value
                 .checked_add(1)
@@ -797,25 +733,18 @@ impl PackStore {
             root,
             packs: Arc::new(RwLock::new(packs)),
             pack_lengths,
-            index: Arc::new(ObjectIndex::new(segments, BTreeMap::new(), &memory)?),
+            index: Arc::new(ObjectIndex::new(segments, BTreeMap::new())?),
             active_pack,
             next_pack,
             next_index_segment: AtomicU64::new(next_index_segment),
             max_pack_bytes,
-            recovery,
-            memory,
         })
-    }
-
-    pub fn recovery(&self) -> &PackRecovery {
-        &self.recovery
     }
 
     pub fn reader(&self) -> PackReader {
         PackReader {
             packs: self.packs.clone(),
             index: self.index.clone(),
-            memory: self.memory.clone(),
         }
     }
 
@@ -829,24 +758,6 @@ impl PackStore {
 
     pub fn location(&self, hash: ObjectHash) -> Option<ObjectLocation> {
         self.index.location(hash)
-    }
-
-    /// Returns a stable snapshot of the indexed object identities without exposing the
-    /// disposable physical index. The explicit bound keeps maintenance operations from
-    /// allocating an unbounded list when opening an untrusted or unexpectedly large store.
-    pub fn object_hashes(&self, maximum: usize) -> Result<Vec<ObjectHash>> {
-        if self.index.len() > maximum {
-            bail!(
-                "surface object store contains {} entries, exceeding the maintenance bound {maximum}",
-                self.index.len()
-            );
-        }
-        Ok(self
-            .index
-            .sorted_entries(maximum)?
-            .into_iter()
-            .map(|entry| entry.0)
-            .collect())
     }
 
     pub fn visit_hashes_sorted(
@@ -907,15 +818,9 @@ impl PackStore {
         }
         struct Prepared<'a> {
             object: &'a CanonicalObject,
-            compressed: Vec<u8>,
             output_indices: Vec<usize>,
         }
 
-        // Reserve the complete bounded bookkeeping plan before retaining iterator entries.
-        // This is deliberately one process-wide permit, not one allowance per dimension.
-        let _batch_memory = self
-            .memory
-            .try_reserve(MemoryClass::ObjectIo, PACK_BATCH_METADATA_BYTES)?;
         let mut batch = Vec::new();
         for object in objects.into_iter() {
             if batch.len() == MAX_INDEX_DELTA_ENTRIES {
@@ -931,9 +836,6 @@ impl PackStore {
         let mut prepared = Vec::<Prepared<'a>>::new();
         let mut pending = HashMap::<ObjectHash, usize>::new();
         for (output_index, object) in objects.iter().copied().enumerate() {
-            if !object.verify() {
-                bail!("refusing an object whose canonical hash is invalid");
-            }
             if object.bytes().len() > MAX_CANONICAL_OBJECT_BYTES {
                 bail!("canonical object exceeds {MAX_CANONICAL_OBJECT_BYTES} bytes");
             }
@@ -953,12 +855,8 @@ impl PackStore {
                         // physical representation so final roots consistently publish the
                         // selected class dictionary without changing the hash.
                     }
-                    Ok(Some(_)) | Ok(None) | Err(_) => {
-                        // A bit-rotted record discovered after startup must not prevent repair.
-                        self.recovery
-                            .corrupt_records
-                            .push((existing.pack_id, existing.record_offset));
-                    }
+                    // A bit-rotted record discovered after startup must not prevent repair.
+                    Ok(Some(_)) | Ok(None) | Err(_) => {}
                 }
             }
             if let Some(&prepared_index) = pending.get(&object.hash()) {
@@ -972,43 +870,25 @@ impl PackStore {
             pending.insert(object.hash(), prepared.len());
             prepared.push(Prepared {
                 object,
-                compressed: Vec::new(),
                 output_indices: vec![output_index],
             });
         }
-        debug_assert!(prepared.len() <= MAX_INDEX_DELTA_ENTRIES);
         if self.index.delta_len().saturating_add(prepared.len()) > MAX_INDEX_DELTA_ENTRIES {
             self.checkpoint()?;
         }
-        let compression_bytes = prepared
-            .iter()
-            .try_fold(0usize, |total, item| {
-                total
-                    .checked_add(zstd::zstd_safe::compress_bound(item.object.bytes().len()))
-                    .context("surface compression memory plan overflow")
-            })?
-            .checked_add(ZSTD_WORKING_BYTES)
-            .context("surface Zstd working memory plan overflow")?;
-        let _compression_memory = self
-            .memory
-            .try_reserve(MemoryClass::ObjectIo, compression_bytes)?;
-        // Sequential compression makes the codec workspace a hard single-context bound. Pack
-        // publication and index mutation were already serialized, so parallel work here only
-        // multiplied peak native memory outside the managed process budget.
-        for item in &mut prepared {
-            item.compressed = compress_zstd(item.object.bytes(), dictionary_bytes)?;
-            if item.compressed.is_empty() || item.compressed.len() > MAX_COMPRESSED_OBJECT_BYTES {
-                bail!("compressed object is empty or too large");
-            }
-        }
-
         let mut starting_lengths = BTreeMap::<u64, u64>::new();
         let mut appended = Vec::<(ObjectHash, ObjectLocation, Vec<usize>)>::new();
         let write_result = (|| -> Result<()> {
             for item in prepared {
+                // Compression and writing are deliberately sequential. Only one compressed
+                // object and one codec workspace exist regardless of publication batch size.
+                let compressed = compress_zstd(item.object.bytes(), dictionary_bytes)?;
+                if compressed.is_empty() || compressed.len() > MAX_COMPRESSED_OBJECT_BYTES {
+                    bail!("compressed object is empty or too large");
+                }
                 let record_size = RECORD_HEADER as u64
-                    + item.compressed.len() as u64
-                    + record_padding(item.compressed.len()) as u64;
+                    + compressed.len() as u64
+                    + record_padding(compressed.len()) as u64;
                 let current_length = self.pack_lengths[&self.active_pack];
                 if current_length > PACK_HEADER
                     && current_length.saturating_add(record_size) > self.max_pack_bytes
@@ -1022,20 +902,20 @@ impl PackStore {
                     pack_id,
                     record_offset,
                     canonical_size: item.object.bytes().len() as u64,
-                    compressed_size: item.compressed.len() as u64,
-                    compressed_crc: crc32c(&item.compressed),
+                    compressed_size: compressed.len() as u64,
+                    compressed_crc: crc32c(&compressed),
                     kind: item.object.kind(),
                     dictionary,
                 };
                 let header = encode_record_header(item.object.hash(), location);
                 let file = self.pack_file(pack_id)?;
                 file.write_all_at(&header, record_offset)?;
-                file.write_all_at(&item.compressed, location.payload_offset())?;
-                let padding = record_padding(item.compressed.len());
+                file.write_all_at(&compressed, location.payload_offset())?;
+                let padding = record_padding(compressed.len());
                 if padding != 0 {
                     file.write_all_at(
                         &[0; 7][..padding],
-                        location.payload_offset() + item.compressed.len() as u64,
+                        location.payload_offset() + compressed.len() as u64,
                     )?;
                 }
                 let end = record_offset + record_size;
@@ -1085,28 +965,12 @@ impl PackStore {
             .collect())
     }
 
-    pub fn read_stored(&self, hash: ObjectHash) -> Result<Option<BudgetedStoredObject>> {
+    pub fn read_stored(&self, hash: ObjectHash) -> Result<Option<StoredObject>> {
         self.reader().read_stored(hash)
     }
 
-    pub fn get(&self, hash: ObjectHash) -> Result<Option<BudgetedCanonicalObject>> {
+    pub fn get(&self, hash: ObjectHash) -> Result<Option<CanonicalObject>> {
         self.reader().get(hash)
-    }
-
-    pub(crate) fn read_stored_scoped(
-        &self,
-        hash: ObjectHash,
-        memory: &MemoryPermit,
-    ) -> Result<Option<StoredObject>> {
-        self.reader().read_stored_scoped(hash, memory)
-    }
-
-    pub(crate) fn get_scoped(
-        &self,
-        hash: ObjectHash,
-        memory: &MemoryPermit,
-    ) -> Result<Option<CanonicalObject>> {
-        self.reader().get_scoped(hash, memory)
     }
 
     pub fn sync_all(&self) -> Result<()> {
@@ -1145,9 +1009,8 @@ impl PackStore {
         }
         fs::rename(&temporary, &path)?;
         sync_parent(&path)?;
-        let (lengths, mapped) =
-            read_mapped_index(&path, &self.memory)?.context("new index disappeared")?;
-        if lengths != self.pack_lengths || !mapped_locations_valid(&lengths, &mapped) {
+        let (lengths, mapped) = read_mapped_index(&path)?.context("new index disappeared")?;
+        if lengths != self.pack_lengths {
             bail!("newly written surface object index failed validation");
         }
         if compact {
@@ -1248,36 +1111,6 @@ fn get_from(reader: &PackReader, hash: ObjectHash) -> Result<Option<CanonicalObj
         .map(Some)
 }
 
-fn read_memory_plan(index: &ObjectIndex, hash: ObjectHash) -> Result<Option<usize>> {
-    let Some(location) = index.location(hash) else {
-        return Ok(None);
-    };
-    let mut bytes = usize::try_from(location.compressed_size)
-        .context("compressed object size overflow")?
-        .checked_add(
-            usize::try_from(location.canonical_size).context("canonical object size overflow")?,
-        )
-        .and_then(|value| value.checked_add(ZSTD_WORKING_BYTES))
-        .context("canonical object read memory plan overflow")?;
-    if !location.dictionary.is_zero() {
-        let dictionary = index
-            .location(location.dictionary)
-            .context("compression dictionary is absent from the object index")?;
-        bytes = bytes
-            .checked_add(
-                usize::try_from(dictionary.compressed_size)
-                    .context("dictionary compressed size overflow")?,
-            )
-            .and_then(|value| {
-                usize::try_from(dictionary.canonical_size)
-                    .ok()
-                    .and_then(|size| value.checked_add(size))
-            })
-            .context("dictionary object read memory plan overflow")?;
-    }
-    Ok(Some(bytes))
-}
-
 fn compress_zstd(bytes: &[u8], dictionary: Option<&[u8]>) -> Result<Vec<u8>> {
     match dictionary {
         Some(dictionary) => {
@@ -1332,7 +1165,6 @@ fn open_pack_header(path: &Path, expected_id: u64) -> Result<(File, u64)> {
 fn scan_pack(
     path: &Path,
     expected_id: u64,
-    recovery: &mut PackRecovery,
     mut visit: impl FnMut(ObjectHash, ObjectLocation) -> Result<()>,
 ) -> Result<(File, u64)> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -1348,7 +1180,6 @@ fn scan_pack(
     while offset < length {
         if length - offset < RECORD_HEADER as u64 {
             truncate_tail(&file, offset)?;
-            recovery.torn_packs.push(id);
             length = offset;
             break;
         }
@@ -1365,7 +1196,6 @@ fn scan_pack(
             .context("object record length overflow")?;
         if offset.checked_add(total).is_none_or(|end| end > length) {
             truncate_tail(&file, offset)?;
-            recovery.torn_packs.push(id);
             length = offset;
             break;
         }
@@ -1384,8 +1214,6 @@ fn scan_pack(
         }
         if crc32c(&compressed) == location.compressed_crc {
             visit(hash, location)?;
-        } else {
-            recovery.corrupt_records.push((id, offset));
         }
         offset += total;
     }
@@ -1583,22 +1411,16 @@ struct ExternalIndexBuilder {
     buffer: Vec<(ObjectHash, ObjectLocation)>,
     runs: Vec<IndexRun>,
     paths: Vec<PathBuf>,
-    _memory: MemoryPermit,
 }
 
 impl ExternalIndexBuilder {
-    fn new(root: &Path, memory: &Arc<ServerMemoryBudget>) -> Result<Self> {
-        let bytes = INDEX_REBUILD_BUFFER_ENTRIES
-            .checked_mul(std::mem::size_of::<(ObjectHash, ObjectLocation)>())
-            .and_then(|bytes| bytes.checked_mul(2))
-            .context("surface external index-sort memory plan overflow")?;
+    fn new(root: &Path) -> Result<Self> {
         Ok(Self {
             root: root.to_path_buf(),
             next: 0,
             buffer: Vec::with_capacity(INDEX_REBUILD_BUFFER_ENTRIES),
             runs: Vec::new(),
             paths: Vec::new(),
-            _memory: memory.try_reserve(MemoryClass::PackIndex, bytes)?,
         })
     }
 
@@ -1787,16 +1609,12 @@ fn newer_location(left: ObjectLocation, right: ObjectLocation) -> bool {
     (left.pack_id, left.record_offset) > (right.pack_id, right.record_offset)
 }
 
-fn read_mapped_index(
-    path: &Path,
-    memory: &Arc<ServerMemoryBudget>,
-) -> Result<Option<(BTreeMap<u64, u64>, Arc<MappedIndex>)>> {
-    let mapped_bytes = match fs::metadata(path) {
-        Ok(metadata) => usize::try_from(metadata.len()).context("index length overflow")?,
+fn read_mapped_index(path: &Path) -> Result<Option<(BTreeMap<u64, u64>, Arc<MappedIndex>)>> {
+    match fs::metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
-    };
-    let reservation = memory.try_reserve(MemoryClass::PackIndex, mapped_bytes)?;
+    }
     let map = match ReadOnlyMap::open(path) {
         Ok(map) => map,
         Err(error) => {
@@ -1870,6 +1688,7 @@ fn read_mapped_index(
         }
         *bounds = (start as u32, index as u32);
     }
+    map.discard_resident_pages();
     Ok(Some((
         lengths,
         Arc::new(MappedIndex {
@@ -1877,7 +1696,6 @@ fn read_mapped_index(
             entries_offset,
             entry_count,
             prefixes,
-            _memory: reservation,
         }),
     )))
 }
@@ -1898,10 +1716,6 @@ fn location_valid(lengths: &BTreeMap<u64, u64>, location: ObjectLocation) -> boo
                 .and_then(|value| value.checked_add(record_padding(compressed) as u64))
                 .is_some_and(|end| end <= *length)
     })
-}
-
-fn mapped_locations_valid(lengths: &BTreeMap<u64, u64>, index: &MappedIndex) -> bool {
-    (0..index.entry_count).all(|entry| location_valid(lengths, index.entry(entry).1))
 }
 
 fn pack_lengths_cover(current: &BTreeMap<u64, u64>, checkpoint: &BTreeMap<u64, u64>) -> bool {

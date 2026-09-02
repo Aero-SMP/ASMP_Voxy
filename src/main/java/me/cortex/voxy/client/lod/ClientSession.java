@@ -2,11 +2,10 @@ package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
-import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.model.CatalogModelCompatibility;
 import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
-import me.cortex.voxy.client.core.rendering.selection.SelectionTelemetry;
+import me.cortex.voxy.client.core.rendering.selection.PredictionTiming;
 import me.cortex.voxy.client.lod.ContentPipeline.CompatibilityState;
 import me.cortex.voxy.client.lod.ContentPipeline.SelectionCut;
 import me.cortex.voxy.client.lod.ManifestCodec.ContentClass;
@@ -15,21 +14,14 @@ import me.cortex.voxy.client.lod.ManifestCodec.DescriptorPage;
 import me.cortex.voxy.client.lod.ManifestCodec.RootDirectory;
 import me.cortex.voxy.client.lod.ManifestCodec.SpatialNode;
 import me.cortex.voxy.client.lod.RootDemandPlan.Binding;
-import me.cortex.voxy.client.lod.RootDemandPlan.ContentObject;
 import me.cortex.voxy.client.lod.RootDemandPlan.ContentPriority;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.lod.WireMessage.EncodedObject;
 import me.cortex.voxy.client.lod.WireMessage.Hash256;
-import me.cortex.voxy.client.lod.WireMessage.Message;
-import me.cortex.voxy.client.lod.WireMessage.ObjectBundle;
 import me.cortex.voxy.client.lod.WireMessage.ObjectKind;
-import me.cortex.voxy.client.lod.WireMessage.ObjectRequest;
 import me.cortex.voxy.client.lod.WireMessage.RootAnnounce;
-import me.cortex.voxy.client.lod.WireMessage.RootReady;
 import me.cortex.voxy.client.lod.WireMessage.RootToken;
-import me.cortex.voxy.client.lod.WireMessage.SubtreeData;
-import me.cortex.voxy.client.lod.WireMessage.SubtreeRequest;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -39,15 +31,9 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 
-import java.io.DataInputStream;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -61,10 +47,12 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -76,41 +64,46 @@ import java.util.concurrent.atomic.AtomicReference;
  * bounded object residency and activated renderer publications live for the dimension session.</p>
  */
 final class ClientSession {
-    private static final long DIRECT_CREDIT = 32L << 20;
-    private static final long BRIDGE_CREDIT = (16L << 20) + (256L << 10);
     private static final int MAX_MAIN_TASKS = 512;
     private static final int MAX_MAIN_PER_TICK = 96;
-    private static final long MESHING_SCRATCH = 5L << 20;
-    private static final long MAX_NODE_GEOMETRY = 8L << 20;
-    private static final long ACTIVATION_IN_FLIGHT = 512L << 10;
     private static final int MAX_MESHING_JOBS = 1;
     private static final int MAX_BLOCK_ID = 1 << 20;
     private static final int MAX_BIOME_ID = 1 << 9;
-    private static final int MAX_NAME = 4096;
     private static final long ESTIMATED_CONTENT_REQUEST_BYTES = 8L << 10;
     private static final long ESTIMATED_SUBTREE_REQUEST_BYTES = 64L << 10;
-    private static final int MAX_OUTSTANDING_OBJECTS = 8 * 1024;
-    private static final long REQUEST_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
-    private static final long CREDIT_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
-    private static final long TELEMETRY_WINDOW_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
-    private static final int CAMERA_DOMAIN_REQUEST_BYTES = 92;
-    private static final int CAMERA_DOMAIN_RESPONSE_BYTES = 113;
+    private static final int MAX_ACTIVE_OBJECT_STREAMS = 8;
+    private static final int MAX_COVERAGE_OBJECT_STREAMS = 4;
+    private static final int MAX_CURRENT_OBJECT_STREAMS = 3;
+    private static final int MAX_PREDICTED_OBJECT_STREAMS = 1;
+    private static final int MAX_OBJECT_STREAM_FAILURE_RETRIES = 3;
+    private static final int MAX_MICROTILE_REQUEST_BATCH = WireMessage.MAX_REQUEST_ENTRIES;
+    private static final long CAMERA_DOMAIN_QUERY_INTERVAL_NANOS =
+            TimeUnit.MILLISECONDS.toNanos(100);
+    private static final long CAMERA_DOMAIN_QUERY_TIMEOUT_NANOS =
+            TimeUnit.SECONDS.toNanos(2);
+    private static final long THROUGHPUT_WINDOW_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
     private static final int MAX_RETAINED_OUTSIDE_VIEW = 256;
     private static final int MAX_RETIREMENTS_PER_PASS = 16;
-    /** Radius 16 needs only a few thousand LOD-4 roots including vertical layers. */
-    private static final int MAX_METADATA_ROOTS = 8_192;
-    /** Authoritative set, one change-only handoff snapshot, and planner-owned spatial values. */
-    private static final long METADATA_ROOT_ACCOUNTING_BYTES = MAX_METADATA_ROOTS * 320L;
-    /** Planner maps, connection cut state, and bounded immutable Java snapshot ownership. */
-    private static final long CONTROL_BYTES_PER_OBJECT = 768L;
-    private static final long CONTROL_BYTES_PER_NODE = 640L;
+    private static final int MAX_RESIDENT_OBJECTS = 131_072;
+    private static final long SHUTDOWN_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     /** One bounded authoritative renderer window; the planner copies it only on actual changes. */
     private static final Set<SpatialNode> METADATA_ROOTS = new LinkedHashSet<>();
     private static final ArrayBlockingQueue<MainTask> MAIN =
             new ArrayBlockingQueue<>(MAX_MAIN_TASKS);
+    /** Serializes cache open/close so adjacent dimension sessions never share pack files. */
+    private static final ExecutorService CACHE_LIFECYCLE =
+            Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "Voxy cache lifecycle");
+                thread.setDaemon(true);
+                return thread;
+            });
     private static final AtomicLong SESSION = new AtomicLong();
+    /** Distinguishes renderer readbacks produced by adjacent automatic QUIC connections. */
+    private static final AtomicLong SELECTION_AUTHORITIES = new AtomicLong();
     private static final Object LIFECYCLE = new Object();
+    private static final java.util.concurrent.ConcurrentLinkedQueue<RetiredSession> RETIRED =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     private static volatile Thread networkThread;
     private static volatile Connection connection;
@@ -120,6 +113,23 @@ final class ClientSession {
 
     private ClientSession() {}
 
+    /**
+     * Requests an owner-thread snapshot of the complete client pipeline. The production debug
+     * facade never calls this method; the debug JAR samples it once per second.
+     */
+    static String debugSnapshot() {
+        Connection current = connection;
+        if (current != null) return current.requestDebugSnapshot();
+        int metadataRoots;
+        synchronized (METADATA_ROOTS) {
+            metadataRoots = METADATA_ROOTS.size();
+        }
+        return "blocker=NO_CONNECTION dimension=" + String.valueOf(activeDimension)
+                + " renderer=" + (activeRenderer != null)
+                + " metadataRoots=" + metadataRoots
+                + " mainQueue=" + MAIN.size();
+    }
+
     static boolean metadataRootEntered(long key) {
         SpatialNode root = RootDemandPlan.spatial(key);
         if (root.lod() != ManifestCodec.MAX_LOD) {
@@ -127,11 +137,10 @@ final class ClientSession {
         }
         synchronized (METADATA_ROOTS) {
             if (METADATA_ROOTS.contains(root)) return false;
-            if (METADATA_ROOTS.size() >= MAX_METADATA_ROOTS) {
-                Logger.warn("Voxy manifest-root window reached its bounded limit");
-                return false;
-            }
-            return METADATA_ROOTS.add(root);
+            boolean added = METADATA_ROOTS.add(root);
+            Connection current = connection;
+            if (added && current != null) current.requestMetadataResync();
+            return added;
         }
     }
 
@@ -141,7 +150,10 @@ final class ClientSession {
             throw new IllegalArgumentException("metadata root is not top-level");
         }
         synchronized (METADATA_ROOTS) {
-            METADATA_ROOTS.remove(root);
+            if (METADATA_ROOTS.remove(root)) {
+                Connection current = connection;
+                if (current != null) current.requestMetadataResync();
+            }
         }
     }
 
@@ -153,42 +165,6 @@ final class ClientSession {
 
     static void rendererLifecycleChanged() {
         disconnect(true);
-    }
-
-    static int debugDesiredSections() {
-        synchronized (METADATA_ROOTS) {
-            return METADATA_ROOTS.size();
-        }
-    }
-
-    static int maximumMetadataRoots() {
-        return MAX_METADATA_ROOTS;
-    }
-
-    static int debugPendingSections() {
-        Connection current = connection;
-        return current == null ? 0 : current.pendingCount();
-    }
-
-    static int debugInboundFrames() {
-        Connection current = connection;
-        return MAIN.size() + (current == null ? 0 : current.state.size());
-    }
-
-    static long debugInboundKiB() {
-        SessionResources current = resources;
-        return current == null ? 0
-                : (current.memory.used(MemoryBudget.Pool.IN_FLIGHT) + 1023) >>> 10;
-    }
-
-    static long debugMemoryUsedMiB() {
-        SessionResources current = resources;
-        return current == null ? 0 : (current.memory.used() + (1L << 19)) >>> 20;
-    }
-
-    static long debugMemoryAvailableMiB() {
-        SessionResources current = resources;
-        return current == null ? 0 : (current.memory.available() + (1L << 19)) >>> 20;
     }
 
     static void disconnect() {
@@ -211,19 +187,60 @@ final class ClientSession {
             networkThread = null;
             if (thread != null) thread.interrupt();
             if (old != null) old.close();
-            Connection.awaitThread(thread);
             activeDimension = null;
             activeRenderer = null;
             MainTask task;
             while ((task = MAIN.poll()) != null) task.cancel();
             SessionResources owned = resources;
             resources = null;
-            if (owned != null) owned.close();
+            if (owned != null) {
+                // Activations own render-thread GL state and must be closed before the renderer
+                // that created them. Interrupting the network owner and deferring this close to
+                // a later tick allowed renderer shutdown to win the race on logout.
+                if (thread != null && thread != Thread.currentThread()) awaitThreadExit(thread);
+                boolean resetSelection = !clearRendererDemand;
+                if ((thread == null || !thread.isAlive())
+                        && (old == null || old.workersTerminated())) {
+                    if (old != null) old.releaseOwnedState();
+                    closeResources(owned, resetSelection);
+                } else {
+                    owned.retireCacheAfter(thread, old);
+                    RETIRED.offer(new RetiredSession(thread, old, owned, resetSelection));
+                }
+            }
+        }
+    }
+
+    private static void awaitThreadExit(Thread thread) {
+        boolean interrupted = false;
+        long deadline = System.nanoTime() + SHUTDOWN_TIMEOUT_NANOS;
+        while (thread.isAlive() && deadline - System.nanoTime() > 0) {
+            try {
+                long remaining = deadline - System.nanoTime();
+                thread.join(Math.max(1, Math.min(100,
+                        TimeUnit.NANOSECONDS.toMillis(Math.max(1, remaining)))));
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+                break;
+            }
+        }
+        if (thread.isAlive()) Logger.warn("Voxy connection owner exceeded shutdown deadline: "
+                + thread.getName());
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private static void closeResources(SessionResources owned, boolean resetSelection) {
+        try {
+            owned.close(resetSelection);
+        } catch (RuntimeException failure) {
+            // Logout and renderer replacement must remain recoverable even when one optional
+            // cache/mesher cleanup reports a failure after releasing its other resources.
+            Logger.warn("Failed to close Virtual Surface resources cleanly", failure);
         }
     }
 
     static void tick() {
-        ClientLodDebug.tick();
+        reapRetiredSessions();
         Minecraft minecraft = Minecraft.getInstance();
         ClientLevel level = minecraft.level;
         VoxyRenderSystem renderer = IGetVoxyRenderSystem.getNullable();
@@ -273,17 +290,26 @@ final class ClientSession {
         retained.releaseUnretainedRoots();
         Connection current = connection;
         if (current == null) return;
-        current.pollCatalogBakeOnMain(renderer);
-        renderer.updateSelectionTelemetry(current.selectionTelemetry());
-        SelectionManifest manifest = current.pendingManifest.getAndSet(null);
-        if (manifest != null) {
-            renderer.publishSelectionManifest(manifest);
-            current.offer(new ManifestPublishedEvent(manifest.generation(),
-                    manifest.snapshotId()));
-        }
+        current.scheduleCachePins();
+        renderer.updatePredictionTiming(current.predictionTiming());
+        // Consume the completed cut for the renderer's currently active manifest before
+        // announcing the next pending snapshot. Otherwise continuous residency updates keep
+        // every refined result one snapshot behind and permanently strip its cancellation and
+        // full-frontier authority.
         SelectionBatch selection;
         while ((selection = renderer.pollSelectionBatch()) != null) {
             current.offer(new SelectionEvent(selection));
+        }
+        SelectionManifest manifest = current.pendingManifest.getAndSet(null);
+        if (manifest != null) {
+            try {
+                renderer.publishSelectionManifest(manifest);
+            } catch (RuntimeException | Error failure) {
+                manifest.close();
+                throw failure;
+            }
+            current.offer(new ManifestPublishedEvent(manifest.generation(),
+                    manifest.snapshotId(), manifest.authorityId()));
         }
         current.pollActivationFences();
     }
@@ -291,11 +317,11 @@ final class ClientSession {
     private static void startLocked(String dimension, SessionResources retained) {
         if (networkThread != null && networkThread.isAlive()) return;
         long generation = SESSION.incrementAndGet();
+        ClientLodDebug.sessionStarted(generation, dimension);
         Thread thread = new Thread(() -> runNetwork(generation, dimension, retained),
                 "Voxy Virtual Surface");
         thread.setDaemon(true);
         networkThread = thread;
-        ClientLodDebug.sessionStarted(generation, dimension);
         thread.start();
     }
 
@@ -310,14 +336,14 @@ final class ClientSession {
                     return;
                 }
                 connection = active;
-                active.readLoop();
+                active.runLoop();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return;
             } catch (Exception failure) {
                 if (SESSION.get() != session || resources != retained) return;
                 ClientLodDebug.sessionFailed(failure);
-                Logger.warn("Virtual Surface unavailable; retrying: " + failure.getMessage());
+                Logger.warn("Virtual Surface unavailable; retrying", failure);
             } finally {
                 if (active != null) active.close();
                 if (connection == active) connection = null;
@@ -336,68 +362,98 @@ final class ClientSession {
         MAIN.put(task);
     }
 
+    /** Completes GPU/resource teardown on the render thread after its network owner exits. */
+    private static void reapRetiredSessions() {
+        int count = RETIRED.size();
+        for (int index = 0; index < count; index++) {
+            RetiredSession retired = RETIRED.poll();
+            if (retired == null) return;
+            if (retired.owner != null && retired.owner.isAlive()
+                    || retired.connection != null && !retired.connection.workersTerminated()) {
+                RETIRED.offer(retired);
+                continue;
+            }
+            if (retired.connection != null) retired.connection.releaseOwnedState();
+            closeResources(retired.resources, retired.resetSelection);
+        }
+    }
+
     private static final class SessionResources implements AutoCloseable {
-        private final MemoryBudget memory = new MemoryBudget(
-                VoxyConfig.CONFIG.virtualSurfaceMemoryBytes());
-        private final MemoryBudget.Reservation metadataRootsMemory;
-        private final MemoryBudget.Reservation controlTablesMemory;
         private final RootDemandPlan.Limits planLimits;
-        private final ObjectCache cache;
+        private final AtomicReference<ObjectCache> cache =
+                new AtomicReference<>(ObjectCache.disabled());
         private final ResidencyManager residency;
         private final MicrotileActivationManager activations;
         private final VoxyRenderSystem renderer;
         private final Set<RootToken> pinnedRoots = ConcurrentHashMap.newKeySet();
         private final AtomicBoolean cachePinsDirty = new AtomicBoolean();
+        private final AtomicBoolean cacheRetiring = new AtomicBoolean();
+        private final AtomicBoolean closed = new AtomicBoolean();
         private volatile RootToken authoritativeRoot;
 
         private SessionResources(String dimension, VoxyRenderSystem renderer) {
             this.renderer = Objects.requireNonNull(renderer, "renderer");
-            this.metadataRootsMemory = this.memory.tryReserve(MemoryBudget.Allocation.of(
-                    MemoryBudget.Pool.OBJECT_TABLE, METADATA_ROOT_ACCOUNTING_BYTES))
-                    .orElseThrow(() -> new IllegalStateException(
-                            "Virtual Surface memory budget cannot admit metadata-root state"));
             Path root = Minecraft.getInstance().gameDirectory.toPath()
                     .resolve(".voxy").resolve("virtual-surface");
-            int objectLimit = (int) Math.max(16_384L, Math.min(131_072L,
-                    this.memory.limit() >>> 13));
-            this.planLimits = new RootDemandPlan.Limits(objectLimit,
+            int objectLimit = MAX_RESIDENT_OBJECTS;
+            // Manifest reachability and physical residency are independent bounds.  Capping
+            // the planner's immutable object-handle namespace at the resident-object count
+            // allowed a handful of descriptor pages to prevent discovery of every later root.
+            this.planLimits = new RootDemandPlan.Limits(
+                    ManifestCodec.MAX_OBJECT_REFERENCES,
                     RootDemandPlan.MAX_STRUCTURAL_NODES);
-            long controlBytes = Math.addExact(
-                    Math.multiplyExact((long) objectLimit, CONTROL_BYTES_PER_OBJECT),
-                    Math.multiplyExact((long) this.planLimits.maxNodes(),
-                            CONTROL_BYTES_PER_NODE));
-            MemoryBudget.Reservation control = this.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.OBJECT_TABLE, controlBytes))
-                    .orElse(null);
-            if (control == null) {
-                this.metadataRootsMemory.close();
-                throw new IllegalStateException(
-                        "Virtual Surface memory budget cannot admit bounded control tables");
-            }
-            this.controlTablesMemory = control;
-            ObjectCache createdCache = null;
             ResidencyManager createdResidency = null;
             MicrotileActivationManager createdActivations = null;
             try {
-                createdResidency = new ResidencyManager(dimension, this.memory,
+                createdResidency = new ResidencyManager(dimension,
                         new ResidencyManager.Limits(objectLimit, objectLimit / 2));
-                createdActivations = renderer.createVirtualSurfaceActivationManager(this.memory);
-                // Persistent caching is disposable and is admitted only after every live
-                // production table and renderer-owned fixed buffer has capacity.
-                createdCache = ObjectCache.openBestEffort(root,
-                        new ObjectCache.Limits(objectLimit, 4L << 30,
-                                WireMessage.MAX_COMPRESSED_OBJECT_BYTES), this.memory);
+                createdActivations = renderer.createVirtualSurfaceActivationManager();
             } catch (RuntimeException | Error failure) {
                 if (createdActivations != null) createdActivations.close();
                 if (createdResidency != null) createdResidency.close();
-                if (createdCache != null) createdCache.close();
-                this.controlTablesMemory.close();
-                this.metadataRootsMemory.close();
                 throw failure;
             }
-            this.cache = createdCache;
             this.residency = createdResidency;
             this.activations = createdActivations;
+            ObjectCache.Limits cacheLimits = new ObjectCache.Limits(objectLimit, 4L << 30,
+                    WireMessage.MAX_COMPRESSED_OBJECT_BYTES);
+            CACHE_LIFECYCLE.execute(() -> installCache(
+                    ObjectCache.openBestEffort(root, cacheLimits)));
+        }
+
+        private ObjectCache cache() {
+            return this.cache.get();
+        }
+
+        private void installCache(ObjectCache opened) {
+            if (this.closed.get()) {
+                opened.close();
+                return;
+            }
+            ObjectCache previous = this.cache.getAndSet(opened);
+            if (this.closed.get() && this.cache.compareAndSet(opened, ObjectCache.disabled())) {
+                opened.close();
+            }
+            previous.close();
+            this.cachePinsDirty.set(true);
+        }
+
+        private void retireCacheAfter(Thread owner, Connection connection) {
+            if (!this.cacheRetiring.compareAndSet(false, true)) return;
+            CACHE_LIFECYCLE.execute(() -> {
+                boolean interrupted = false;
+                while (owner != null && owner.isAlive()
+                        || connection != null && !connection.workersTerminated()) {
+                    try {
+                        if (owner != null && owner.isAlive()) owner.join(100);
+                        else Thread.sleep(100);
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                    }
+                }
+                this.cache.getAndSet(ObjectCache.disabled()).close();
+                if (interrupted) Thread.currentThread().interrupt();
+            });
         }
 
         private void setAuthoritativeRoot(RootToken root) {
@@ -438,21 +494,15 @@ final class ClientSession {
                 this.pinnedRoots.remove(root);
             }
             this.residency.reclaimUnreferenced();
-            syncCachePins();
-        }
-
-        private void syncCachePins() {
-            if (!this.cachePinsDirty.getAndSet(false)) return;
-            try {
-                this.cache.replacePins(this.residency::forEachProtectedHash);
-            } catch (RuntimeException failure) {
-                this.cachePinsDirty.set(true);
-                throw failure;
-            }
         }
 
         @Override
         public void close() {
+            close(true);
+        }
+
+        private void close(boolean resetSelection) {
+            if (!this.closed.compareAndSet(false, true)) return;
             RuntimeException failure = null;
             try { this.activations.close(); } catch (RuntimeException closeFailure) {
                 failure = closeFailure;
@@ -460,52 +510,71 @@ final class ClientSession {
             try { this.residency.close(); } catch (RuntimeException closeFailure) {
                 if (failure == null) failure = closeFailure; else failure.addSuppressed(closeFailure);
             }
-            try { this.cache.close(); } catch (RuntimeException closeFailure) {
-                if (failure == null) failure = closeFailure; else failure.addSuppressed(closeFailure);
+            if (!this.cacheRetiring.get()) {
+                ObjectCache closingCache = this.cache.getAndSet(ObjectCache.disabled());
+                CACHE_LIFECYCLE.execute(closingCache::close);
             }
-            try { this.renderer.releaseVirtualSurfaceMemory(this.memory); }
-            catch (RuntimeException closeFailure) {
-                if (failure == null) failure = closeFailure; else failure.addSuppressed(closeFailure);
-            } finally {
-                this.controlTablesMemory.close();
-                this.metadataRootsMemory.close();
-                this.pinnedRoots.clear();
+            if (resetSelection) {
+                try { this.renderer.resetVirtualSurfaceSelection(); }
+                catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
             }
+            this.pinnedRoots.clear();
             if (failure != null) throw failure;
         }
     }
 
     private static final class Connection implements AutoCloseable {
         private final long session;
+        private final long selectionAuthority;
+        private final Thread ownerThread;
         private final String dimension;
         private final SessionResources resources;
-        private final ClientLodTransport transport;
-        private final DataInputStream input;
-        private final OutputStream output;
+        private final QuicClient quic;
         private final ExecutorService decoderWorker;
         private final ExecutorService mesherWorker;
+        private final ExecutorService cacheReadWorker;
+        private final ExecutorService cacheWriteWorker;
         private final AtomicReference<Thread> decoderThread = new AtomicReference<>();
         private final AtomicReference<Thread> mesherThread = new AtomicReference<>();
         private final ObjectDecoder decoder;
         private final ArrayBlockingQueue<StateEvent> state = new ArrayBlockingQueue<>(1024);
-        private final AtomicLong credit = new AtomicLong();
+        /**
+         * At most one signal per active object stream.  Object bodies never enter the general
+         * state queue: a full renderer/control queue must only pause that QUIC stream, not tear
+         * down unrelated streams or the connection.
+         */
+        private final ConcurrentLinkedQueue<ActiveRequest> readyRequests =
+                new ConcurrentLinkedQueue<>();
         private final AtomicLong outstandingBytes = new AtomicLong();
         private final AtomicLong roundTripMicros = new AtomicLong(
-                SelectionTelemetry.DEFAULT.roundTripMicros());
+                PredictionTiming.DEFAULT.roundTripMicros());
         private final AtomicLong throughputBytesPerSecond = new AtomicLong(
-                SelectionTelemetry.DEFAULT.throughputBytesPerSecond());
+                PredictionTiming.DEFAULT.throughputBytesPerSecond());
         private final AtomicLong meshingMicros = new AtomicLong(
-                SelectionTelemetry.DEFAULT.meshingMicros());
+                PredictionTiming.DEFAULT.meshingMicros());
         private final AtomicReference<SelectionManifest> pendingManifest = new AtomicReference<>();
+        private final SelectionManifestBuilder selectionManifestBuilder =
+                new SelectionManifestBuilder();
         private final AtomicReference<CameraPosition> cameraPosition = new AtomicReference<>();
-        private final Map<Hash256, Long> outstandingObjects = new ConcurrentHashMap<>();
+        private final AtomicReference<Throwable> asynchronousFailure = new AtomicReference<>();
+        private final java.util.concurrent.Semaphore wakeup =
+                new java.util.concurrent.Semaphore(0);
+        private final Map<Hash256, ActiveRequest> outstandingObjects = new HashMap<>();
+        private final Map<Hash256, Integer> objectStreamFailures = new HashMap<>();
+        private final Map<Hash256, DelayedRetry> delayedObjectRetries = new HashMap<>();
+        private final Set<ActiveRequest> activeRequests = new HashSet<>();
         private final Map<Integer, DictionaryCodec.Dictionary> dictionaries =
                 new ConcurrentHashMap<>();
         private final Map<Hash256, Integer> dictionaryIds = new HashMap<>();
         private final Map<SpatialNode, CompatibilityState> compatibility = new HashMap<>();
-        private final AtomicReference<PendingCatalogBake> pendingCatalogBake =
-                new AtomicReference<>();
         private final java.util.concurrent.atomic.AtomicBoolean closing =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicBoolean finalized =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicBoolean ownedStateReleased =
                 new java.util.concurrent.atomic.AtomicBoolean();
         private final java.util.concurrent.CountDownLatch shutdownStarted =
                 new java.util.concurrent.CountDownLatch(1);
@@ -525,275 +594,194 @@ final class ClientSession {
         private final Set<SpatialNode> retiring = new HashSet<>();
         private final ContentPipeline content = new ContentPipeline();
         private volatile boolean open = true;
-        private volatile Thread writer;
-        private volatile long serverInstance;
         private volatile boolean metadataResync;
         private volatile long publishedSnapshot;
         private volatile long issuedSnapshot;
+        /** Oldest snapshot allowed to cross the current camera-authority barrier. */
+        private long minimumValidSnapshot = 1;
         private volatile RootToken authoritativeRoot;
         private RootDemandPlan plan;
         private CatalogCodec.Catalog catalog;
         private ContentPipeline.CatalogMappings mappings;
         private CatalogModelCompatibility modelCompatibility;
         private long nextSnapshot = 1;
+        /** Handle namespace currently represented by the five persistent cut tables. */
+        private volatile long cutPlanRevision = Long.MIN_VALUE;
         private boolean manifestDirty;
         private volatile boolean completeFrontier;
         private boolean rootReadySent;
-        private long lastPing;
+        private boolean serverHello;
         private volatile CameraPosition queriedCameraPosition;
         private CameraDomainLease cameraDomainLease;
         private long nextCameraDomainSequence = 1;
         private long pendingCameraDomainSequence;
+        private long lastCameraDomainQueryNanos;
         private long cameraVisibilityDomain;
         private volatile long selectionEpoch;
-        private long nextRequestFrame;
-        private long lastCreditGrant;
         private long throughputWindowStart = System.nanoTime();
         private long throughputWindowBytes;
-        /** Number of objects in the wire bundle currently being decoded and admitted. */
-        private int responseBundleRemaining;
+        private int requestBatchSize = MAX_MICROTILE_REQUEST_BATCH;
+        /** Owner-thread epoch for plan selections and resident metadata that affect root pins. */
+        private long pinInputsRevision;
+        private long reconciledPinInputsRevision = Long.MIN_VALUE;
+        private long reconciledActivationRetentionRevision = Long.MIN_VALUE;
 
         private Connection(long session, String dimension, SessionResources resources)
                 throws IOException {
             this.session = session;
+            this.selectionAuthority = SELECTION_AUTHORITIES.incrementAndGet();
+            if (this.selectionAuthority == 0) {
+                throw new IllegalStateException("selection authority exhausted");
+            }
+            this.ownerThread = Thread.currentThread();
             this.dimension = dimension;
             this.resources = resources;
-            this.transport = ClientLodTransport.open(this.resources.memory);
-            this.input = new DataInputStream(this.transport.input());
-            this.output = this.transport.output();
-            this.decoderWorker = Executors.newSingleThreadExecutor(task -> {
-                Thread thread = new Thread(task, "Voxy object decoder");
-                thread.setDaemon(true);
-                this.decoderThread.set(thread);
-                return thread;
-            });
-            this.mesherWorker = Executors.newSingleThreadExecutor(task -> {
-                Thread thread = new Thread(task, "Voxy hybrid mesher");
-                thread.setDaemon(true);
-                this.mesherThread.set(thread);
-                return thread;
-            });
-            this.decoder = ObjectDecoder.withNativeZstd(this.decoderWorker,
-                    id -> Optional.ofNullable(this.dictionaries.get(id)));
-            writeFrame(FrameCodec.C_HELLO, WireMessage.encodeHello(dimension));
-            long initialCredit = Math.min(this.transport.direct()
-                            ? DIRECT_CREDIT : BRIDGE_CREDIT,
-                    Math.max(1, this.resources.memory.available()));
-            writeFrame(FrameCodec.C_CREDIT,
-                    little(Long.BYTES).putLong(initialCredit).array());
-            this.output.flush();
-            ClientLodDebug.transportOpened(this.transport.direct(),
-                    this.transport.description());
+            QuicClient openedQuic = null;
+            ExecutorService openedDecoderWorker = null;
+            ExecutorService openedMesherWorker = null;
+            ExecutorService openedCacheReader = null;
+            ExecutorService openedCacheWriter = null;
+            ObjectDecoder openedDecoder = null;
+            try {
+                openedQuic = QuicEndpointDiscovery.connect();
+                openedDecoderWorker = Executors.newSingleThreadExecutor(task -> {
+                    Thread thread = new Thread(task, "Voxy object decoder");
+                    thread.setDaemon(true);
+                    this.decoderThread.set(thread);
+                    return thread;
+                });
+                openedMesherWorker = Executors.newSingleThreadExecutor(task -> {
+                    Thread thread = new Thread(task, "Voxy hybrid mesher");
+                    thread.setDaemon(true);
+                    this.mesherThread.set(thread);
+                    return thread;
+                });
+                openedCacheReader = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
+                        new ArrayBlockingQueue<>(16), task -> {
+                    Thread thread = new Thread(task, "Voxy cache reader");
+                    thread.setDaemon(true);
+                    return thread;
+                }, new ThreadPoolExecutor.AbortPolicy());
+                openedCacheWriter = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
+                        new ArrayBlockingQueue<>(16), task -> {
+                    Thread thread = new Thread(task, "Voxy cache writer");
+                    thread.setDaemon(true);
+                    return thread;
+                }, new ThreadPoolExecutor.AbortPolicy());
+                openedDecoder = ObjectDecoder.withNativeZstd(openedDecoderWorker,
+                        id -> Optional.ofNullable(this.dictionaries.get(id)));
+                openedQuic.sendHello(dimension);
+            } catch (Throwable failure) {
+                if (openedDecoder != null) openedDecoder.close();
+                if (openedDecoderWorker != null) openedDecoderWorker.shutdownNow();
+                if (openedMesherWorker != null) openedMesherWorker.shutdownNow();
+                if (openedCacheReader != null) openedCacheReader.shutdownNow();
+                if (openedCacheWriter != null) openedCacheWriter.shutdownNow();
+                if (openedQuic != null) openedQuic.close();
+                if (failure instanceof IOException io) throw io;
+                if (failure instanceof RuntimeException runtime) throw runtime;
+                if (failure instanceof Error error) throw error;
+                throw new IOException("could not initialize Voxy client connection", failure);
+            }
+            this.quic = openedQuic;
+            this.decoderWorker = openedDecoderWorker;
+            this.mesherWorker = openedMesherWorker;
+            this.cacheReadWorker = openedCacheReader;
+            this.cacheWriteWorker = openedCacheWriter;
+            this.decoder = openedDecoder;
+            this.quic.setActivityListener(this::signalActivity);
         }
 
-        private int pendingCount() {
-            return this.compiling.size() + this.awaitingFence.size();
-        }
-
-        private SelectionTelemetry selectionTelemetry() {
-            return new SelectionTelemetry(this.roundTripMicros.get(),
+        private PredictionTiming predictionTiming() {
+            return new PredictionTiming(this.roundTripMicros.get(),
                     this.throughputBytesPerSecond.get(), this.outstandingBytes.get(),
                     this.meshingMicros.get());
         }
 
         private void updateCameraPosition(int blockX, int blockY, int blockZ) {
-            this.cameraPosition.set(new CameraPosition(blockX, blockY, blockZ));
+            CameraPosition next = new CameraPosition(blockX, blockY, blockZ);
+            if (!next.equals(this.cameraPosition.getAndSet(next))) signalActivity();
         }
 
         private void requestMetadataResync() {
             this.metadataResync = true;
+            signalActivity();
         }
 
-        private void readLoop() throws Exception {
-            try (FrameCodec.Frame hello = FrameCodec.readServer(
-                    this.input, this::reserveTransient)) {
-                ClientLodDebug.frame(hello.type(), hello.payload().length);
-                if (hello.type() != FrameCodec.S_HELLO) {
-                    throw new FrameCodec.FrameException(
-                            "terrain server did not begin with HELLO");
-                }
-                decodeHello(hello.payload());
-            }
-            ClientLodDebug.hello(this.serverInstance);
-            Thread writeThread = new Thread(this::writeLoop, "Voxy request writer");
-            writeThread.setDaemon(true);
-            this.writer = writeThread;
-            writeThread.start();
-            Logger.info("Using Virtual Surface over " + this.transport.description());
+        private String requestDebugSnapshot() {
+            if (this.open) offer(DebugSnapshotEvent.INSTANCE);
+            return ClientLodDebug.latestSnapshot();
+        }
 
+        private void runLoop() throws Exception {
+            Logger.info("Using Virtual Surface over QUIC " + this.quic.description());
             while (this.open && SESSION.get() == this.session) {
-                try (FrameCodec.Frame frame = FrameCodec.readServer(
-                        this.input, this::reserveTransient)) {
-                    ClientLodDebug.frame(frame.type(), frame.payload().length);
-                    if (frame.type() == WireMessage.S_ROOT_ANNOUNCE) {
-                        RootAnnounce root = (RootAnnounce) WireMessage.decode(
-                                frame.type(), frame.payload());
-                        if (!root.dimension().equals(this.dimension)
-                                || !root.root().dimensionHash().equals(
-                                ObjectHash.dimension(this.dimension))) {
-                            throw new FrameCodec.FrameException(
-                                    "root announcement belongs to another dimension");
-                        }
-                        ClientLodDebug.rootAnnounced(root.root().generation());
-                        offer(new RootEvent(root));
-                    } else if (frame.type() == WireMessage.S_SUBTREE_DATA
-                            || frame.type() == WireMessage.S_OBJECT_BUNDLE) {
-                        receiveObjects(frame);
-                        this.credit.addAndGet(frame.payload().length + FrameCodec.HEADER_BYTES);
-                        ClientLodDebug.credit(frame.payload().length
-                                + FrameCodec.HEADER_BYTES);
-                    } else if (frame.type() == FrameCodec.S_PONG) {
-                        requireLength(frame.payload(), Long.BYTES, "PONG");
-                        long echoed = ByteBuffer.wrap(frame.payload())
-                                .order(ByteOrder.LITTLE_ENDIAN).getLong();
-                        long elapsed = System.nanoTime() - echoed;
-                        if (elapsed > 0 && elapsed <= TimeUnit.MINUTES.toNanos(1)) {
-                            updateEwma(this.roundTripMicros,
-                                    TimeUnit.NANOSECONDS.toMicros(elapsed));
-                        }
-                    } else if (frame.type() == FrameCodec.S_CAMERA_DOMAIN) {
-                        offer(decodeCameraDomain(frame.payload()));
-                    } else if (frame.type() == FrameCodec.S_ERROR) {
-                        ServerError error = decodeError(frame.payload());
-                        throw new FrameCodec.FrameException(
-                                "terrain server error " + error.code + ": " + error.text);
-                    } else {
-                        throw new FrameCodec.FrameException(
-                                "unknown server frame 0x"
-                                        + Integer.toHexString(frame.type()));
-                    }
+                drainObjectHandoffs();
+                QuicClient.ControlMessage control;
+                while ((control = this.quic.pollControl()) != null) handleControl(control);
+                if (!this.quic.isOpen()) {
+                    throw new IOException("Voxy QUIC connection closed", this.quic.failure());
                 }
-            }
-        }
 
-        private void receiveObjects(FrameCodec.Frame frame) throws Exception {
-            // The frame owns one payload reservation. Decoding creates one retained
-            // compressed array per EncodedObject and briefly holds the bounded reader copy while
-            // the immutable envelope takes ownership, so account two additional payloads.
-            long retainedEnvelopeBytes = Math.addExact(4L << 10,
-                    Math.multiplyExact(2L, frame.payload().length));
-            try (MemoryBudget.Reservation envelopeMemory =
-                         reserveTransient(retainedEnvelopeBytes)) {
-                Message message = WireMessage.decode(frame.type(), frame.payload());
-                RootToken root;
-                List<EncodedObject> entries;
-                boolean subtree;
-                if (message instanceof SubtreeData data) {
-                    root = data.root();
-                    entries = data.entries();
-                    subtree = true;
-                } else {
-                    ObjectBundle bundle = (ObjectBundle) message;
-                    root = bundle.root();
-                    entries = bundle.entries();
-                    subtree = false;
-                }
-                this.recordInboundBytes(frame.payload().length + FrameCodec.HEADER_BYTES);
-                for (EncodedObject entry : entries) this.completeOutstanding(entry.hash());
-                EnvelopeEvent envelope = new EnvelopeEvent(root, subtree, entries);
-                offer(envelope);
-                envelope.completion.join();
-
-                // Decode and admit one object at a time.  A bundle can contain hundreds of
-                // independently addressable objects; accumulating every canonical byte array
-                // before residency admission would make the wire batch an accidental memory
-                // budget of its own.
-                for (EncodedObject encoded : entries) {
-                    try (MemoryBudget.Reservation decodeMemory =
-                                 reserveTransient(decodeScratchBytes(encoded))) {
-                        CanonicalObject canonical = this.decoder
-                                .decodeAndStore(encoded, this.resources.cache).join();
-                        ClientLodDebug.objectDecoded(encoded.kind().wireId(),
-                                encoded.compressedLength(), false);
-                        DecodedBatchEvent batch = new DecodedBatchEvent(root, subtree,
-                                List.of(new DecodedObject(encoded, canonical)));
-                        offer(batch);
-                        batch.completion.join();
-                    }
-                }
-            }
-        }
-
-        private void writeLoop() {
-            this.lastPing = this.lastCreditGrant = System.nanoTime();
-            try {
-                while (this.open && SESSION.get() == this.session) {
-                    StateEvent event;
+                StateEvent event = this.state.poll();
+                if (event != null) {
+                    handle(event);
                     while ((event = this.state.poll()) != null) handle(event);
-                    if (this.responseBundleRemaining == 0) {
-                        reconcileMetadata();
-                        updateCameraDomainQuery();
-                        pumpRequests();
-                        installMicrotiles();
-                        scheduleRetirements();
-                        prepareActivations();
-                        reconcileResidencyPins();
-                        publishManifest();
-                        maybeSendRootReady();
-                    } else {
-                        // The reader deliberately admits one canonical object at a time so a wire
-                        // bundle cannot become an unbudgeted canonical-byte batch. Wait briefly for
-                        // its next object instead of rebuilding the complete manifest and pin set
-                        // between every entry. The final entry releases one coherent reconciliation.
-                        StateEvent continuation = this.state.poll(5, TimeUnit.MILLISECONDS);
-                        if (continuation != null) {
-                            handle(continuation);
-                            continue;
-                        }
-                    }
-
-                    long now = System.nanoTime();
-                    long grant = now - this.lastCreditGrant >= CREDIT_INTERVAL_NANOS
-                            ? Math.min(this.credit.get(), this.resources.memory.available()) : 0;
-                    if (grant != 0) {
-                        this.credit.addAndGet(-grant);
-                        writeFrame(FrameCodec.C_CREDIT,
-                                little(Long.BYTES).putLong(grant).array());
-                        this.lastCreditGrant = now;
-                    }
-                    if (now - this.lastPing >= TimeUnit.SECONDS.toNanos(10)) {
-                        writeFrame(FrameCodec.C_PING,
-                                little(Long.BYTES).putLong(now).array());
-                        this.lastPing = now;
-                    }
-                    this.output.flush();
-                    if (this.state.isEmpty() && this.responseBundleRemaining == 0) Thread.sleep(1);
                 }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            } catch (Exception failure) {
-                if (this.open) Logger.warn("Virtual Surface writer failed", failure);
-                close();
+                drainObjectHandoffs();
+                if (!this.serverHello) {
+                    awaitActivity();
+                    continue;
+                }
+
+                reconcileMetadata();
+                updateCameraDomainQuery();
+                cancelObsoleteStreams();
+                releaseDelayedRetries(false);
+                pumpRequests();
+                installMicrotiles();
+                scheduleRetirements();
+                prepareActivations();
+                reconcileResidencyPins();
+                publishManifest();
+                maybeSendRootReady();
+                awaitActivity();
+            }
+            Throwable failure = this.asynchronousFailure.get();
+            if (failure != null) throw new IOException(
+                    "asynchronous Voxy QUIC client failure", failure);
+        }
+
+        private void handleControl(QuicClient.ControlMessage message) throws Exception {
+            if (!this.serverHello) {
+                if (!(message instanceof QuicClient.ServerHello)) {
+                    throw new IOException("terrain server did not begin with HELLO");
+                }
+                this.serverHello = true;
+                return;
+            }
+            if (message instanceof QuicClient.ServerHello) {
+                throw new IOException("terrain server repeated HELLO");
+            } else if (message instanceof QuicClient.RootAnnounceMessage announced) {
+                RootAnnounce root = announced.value();
+                if (!root.dimension().equals(this.dimension)
+                        || !root.root().dimensionHash().equals(ObjectHash.dimension(this.dimension))) {
+                    throw new IOException("root announcement belongs to another dimension");
+                }
+                acceptRoot(root);
+            } else if (message instanceof QuicClient.CameraDomain camera) {
+                acceptCameraDomain(cameraDomain(camera));
+            } else if (message instanceof QuicClient.ServerError error) {
+                throw new IOException("terrain server error " + error.code() + ": "
+                        + error.message());
+            } else if (message instanceof QuicClient.ServerShutdown shutdown) {
+                throw new IOException("terrain server shutdown: " + shutdown.message());
             }
         }
 
         private void handle(StateEvent event) throws Exception {
-            if (event instanceof RootEvent root) {
-                acceptRoot(root.root);
-            } else if (event instanceof EnvelopeEvent envelope) {
-                complete(envelope.completion, () -> {
-                    if (this.responseBundleRemaining != 0) {
-                        throw new IllegalStateException("overlapping object response bundles");
-                    }
-                    RootDemandPlan current = requirePlan(envelope.root);
-                    for (EncodedObject object : envelope.objects) {
-                        current.requireInFlightResponse(object.hash(), object.kind(),
-                                envelope.subtree);
-                    }
-                    this.responseBundleRemaining = envelope.objects.size();
-                });
-            } else if (event instanceof DecodedBatchEvent batch) {
-                complete(batch.completion, () -> {
-                    if (batch.objects.size() > this.responseBundleRemaining) {
-                        throw new IllegalStateException(
-                                "object response exceeds its declared bundle");
-                    }
-                    for (DecodedObject object : batch.objects) {
-                        acceptObject(batch.root, batch.subtree,
-                                object.encoded, object.canonical);
-                    }
-                    this.responseBundleRemaining -= batch.objects.size();
-                });
+            if (event instanceof CacheLookupFinishedEvent cached) {
+                finishCacheLookup(cached);
             } else if (event instanceof CatalogMappedEvent mapped) {
                 if (isCurrent(mapped.root)) {
                     this.catalog = mapped.catalog;
@@ -810,7 +798,12 @@ final class ClientSession {
             } else if (event instanceof ManifestPublishedEvent published) {
                 if (this.plan != null
                         && this.plan.root().root().generation() == published.generation
-                        && published.snapshot == this.issuedSnapshot) {
+                        && published.authority == this.selectionAuthority
+                        && this.issuedSnapshot != 0
+                        && Long.compareUnsigned(published.snapshot,
+                        this.minimumValidSnapshot) >= 0
+                        && Long.compareUnsigned(published.snapshot,
+                        this.issuedSnapshot) <= 0) {
                     this.publishedSnapshot = published.snapshot;
                 }
             } else if (event instanceof CompileEvent compiled) {
@@ -820,10 +813,7 @@ final class ClientSession {
                 } else if (compiled.failure != null) {
                     this.resources.activations.cancelCandidate(compiled.node, compiled.root);
                     throw new IOException("hybrid microtile meshing failed", compiled.failure);
-                } else {
-                    ClientLodDebug.activationCompiled(
-                            RootDemandPlan.sectionKey(compiled.node),
-                            compiled.root.generation());
+                } else if (compiled.status != MicrotileActivationManager.CompileStatus.NO_CANDIDATE) {
                     putMain(new PublishTask(this, compiled.root, compiled.node));
                 }
             } else if (event instanceof PublishEvent published) {
@@ -833,16 +823,170 @@ final class ClientSession {
                 }
                 if (published.queued) {
                     this.awaitingFence.put(published.node, published.root);
-                    ClientLodDebug.activationQueued(
-                            RootDemandPlan.sectionKey(published.node),
-                            published.root.generation());
                 }
             } else if (event instanceof RetireEvent retired) {
                 acceptRetire(retired);
             } else if (event instanceof FenceEvent fence) {
                 acceptFence(fence);
-            } else if (event instanceof CameraDomainEvent cameraDomain) {
-                acceptCameraDomain(cameraDomain);
+            } else if (event instanceof DebugSnapshotEvent) {
+                ClientLodDebug.snapshotCaptured(captureDebugSnapshot());
+            }
+        }
+
+        private String captureDebugSnapshot() {
+            CameraPosition camera = this.cameraPosition.get();
+            SpatialNode cameraRoot = camera == null ? null : new SpatialNode(
+                    ManifestCodec.MAX_LOD,
+                    Math.floorDiv(camera.blockX, 32 << ManifestCodec.MAX_LOD),
+                    Math.floorDiv(camera.blockY, 32 << ManifestCodec.MAX_LOD),
+                    Math.floorDiv(camera.blockZ, 32 << ManifestCodec.MAX_LOD));
+            RootDemandPlan.Diagnostics planState = this.plan == null || cameraRoot == null
+                    ? null : this.plan.diagnostics(cameraRoot);
+            ResidencyManager.Diagnostics residency = this.resources.residency.diagnostics();
+            MicrotileActivationManager.Diagnostics activations =
+                    this.resources.activations.diagnostics();
+
+            String blocker = pipelineBlocker(planState, camera, activations);
+            String root = this.plan == null ? "none"
+                    : Long.toUnsignedString(this.plan.root().root().generation());
+            String cameraText = camera == null ? "none"
+                    : camera.blockX + "," + camera.blockY + "," + camera.blockZ;
+            String requiredRoot = cameraRoot == null ? "none"
+                    : cameraRoot.x() + "," + cameraRoot.y() + "," + cameraRoot.z();
+            String coverage = planState == null ? "UNKNOWN"
+                    : planState.cameraCoverage().name();
+            String loadedManifestBounds = planState == null ? "none"
+                    : "x[" + planState.minRootX() + ',' + planState.maxRootX()
+                    + "]y[" + planState.minRootY() + ',' + planState.maxRootY()
+                    + "]z[" + planState.minRootZ() + ',' + planState.maxRootZ() + ']';
+            String metadata = planState == null ? "none"
+                    : "roots=" + planState.metadataRoots()
+                    + ",directories=" + planState.loadedDirectories() + '/'
+                    + planState.expectedDirectories()
+                    + ",manifests=" + planState.loadedManifests() + '/'
+                    + planState.expectedManifests()
+                    + ",pages=" + planState.loadedDescriptorPages() + '/'
+                    + planState.expectedDescriptorPages()
+                    + ",queued=" + planState.queuedMetadata()
+                    + ",inFlight=" + planState.inFlightMetadata()
+                    + ",complete=" + planState.discoveryComplete()
+                    + ",capacityBlocked=" + planState.metadataCapacityBlocked()
+                    + ",windowAvailable=" + planState.availableWindowRoots()
+                    + ",windowPending=" + planState.pendingWindowRoots()
+                    + ",windowUnadvertised=" + planState.absentWindowRoots()
+                    + ",sampleAbsent=" + spatialText(planState.sampleAbsentWindowRoot());
+            String objects = planState == null ? "none"
+                    : "processed=" + planState.processedObjects() + '/'
+                    + planState.expectedObjects()
+                    + ",queued=" + planState.queuedCoverage() + '/'
+                    + planState.queuedCurrent() + '/' + planState.queuedPredicted()
+                    + ",inFlight=" + planState.inFlightObjects();
+            String activationBlockersText = ClientLodDebug.activationSummary();
+            String renderText = ClientLodDebug.renderSummary();
+            return "blocker=" + blocker
+                    + " session=" + this.session
+                    + " dimension=" + this.dimension
+                    + " transport=QUIC"
+                    + " hello=" + this.serverHello
+                    + " rootGeneration=" + root
+                    + " camera=" + cameraText
+                    + " requiredLod4=" + requiredRoot
+                    + " cameraCoverage=" + coverage
+                    + " loadedManifestBounds=" + loadedManifestBounds
+                    + " metadata={" + metadata + '}'
+                    + " objects={" + objects + '}'
+                    + " cuts={desired=" + this.desiredCuts.size()
+                    + ",renderable=" + this.renderableCuts.size()
+                    + ",activation=" + this.activationCuts.size()
+                    + ",descriptors=" + this.descriptorDemands.size()
+                    + ",coverage=" + this.coverageCuts.size() + '}'
+                    + " selection={issued=" + this.issuedSnapshot
+                    + ",published=" + this.publishedSnapshot
+                    + ",completeFrontier=" + this.completeFrontier + '}'
+                    + " requests={streams=" + this.activeRequests.size()
+                    + ",objects=" + this.outstandingObjects.size()
+                    + ",bytes=" + this.outstandingBytes.get()
+                    + ",stateQueue=" + this.state.size()
+                    + ",mainQueue=" + MAIN.size() + '}'
+                    + " residency={objects=" + residency.objects() + '/'
+                    + residency.objectLimit() + ",decoded=" + residency.decodedObjects()
+                    + ",microtiles=" + residency.preparedMicrotiles()
+                    + ",manifests=" + residency.manifestObjects() + '/'
+                    + residency.manifestLimit() + ",pinnedRoots=" + residency.pinnedRoots()
+                    + ",pins=" + residency.pinnedObjects() + '}'
+                    + " activation={slots=" + activations.slots()
+                    + ",candidates=" + activations.candidates()
+                    + ",compiling=" + activations.compiling()
+                    + ",pending=" + activations.pendingPublications()
+                    + ",active=" + activations.active()
+                    + ",removing=" + activations.pendingRemovals()
+                    + ",retired=" + activations.retiredGroups()
+                    + ",activeBytes=" + activations.activeGeometryBytes()
+                    + ",pendingBytes=" + activations.pendingGeometryBytes() + '}'
+                    + " activationBlockers={" + activationBlockersText + '}'
+                    + " render={" + renderText + '}';
+        }
+
+        private String pipelineBlocker(RootDemandPlan.Diagnostics planState,
+                                       CameraPosition camera,
+                                       MicrotileActivationManager.Diagnostics activations) {
+            if (!this.serverHello) return "WAITING_FOR_SERVER_HELLO";
+            if (this.plan == null) return "WAITING_FOR_ROOT_ANNOUNCEMENT";
+            if (camera == null) return "WAITING_FOR_CAMERA";
+            if (planState == null) return "WAITING_FOR_METADATA_DIAGNOSTICS";
+            return switch (planState.cameraCoverage()) {
+                case OUTSIDE_CLIENT_WINDOW -> "CAMERA_ROOT_OUTSIDE_CLIENT_WINDOW";
+                case DISCOVERING -> "DISCOVERING_CAMERA_ROOT";
+                case MANIFEST_PENDING -> "DOWNLOADING_CAMERA_MANIFEST";
+                case ABSENT_FROM_PUBLISHED_ROOT -> "SERVER_ROOT_NOT_PUBLISHED";
+                case AVAILABLE -> laterPipelineBlocker(planState, activations);
+            };
+        }
+
+        private String laterPipelineBlocker(RootDemandPlan.Diagnostics planState,
+                                            MicrotileActivationManager.Diagnostics activations) {
+            if (!this.plan.bootstrapObjectsProcessed()) return "WAITING_FOR_CATALOG_OR_DICTIONARY";
+            if (this.mappings == null || this.modelCompatibility == null) {
+                return "WAITING_FOR_CATALOG_MAPPING";
+            }
+            if (!planState.discoveryComplete()) return "DISCOVERING_SELECTED_METADATA";
+            if (this.issuedSnapshot == 0) return "WAITING_TO_PUBLISH_SELECTION_MANIFEST";
+            if (this.publishedSnapshot != this.issuedSnapshot) {
+                return "WAITING_FOR_RENDERER_MANIFEST_HANDOFF";
+            }
+            if (this.desiredCuts.size() == 0) {
+                return this.completeFrontier ? "GPU_SELECTION_EMPTY" : "WAITING_FOR_GPU_SELECTION";
+            }
+            String activationBlocker = ClientLodDebug.activationBlocker();
+            if (activationBlocker != null) return activationBlocker;
+            if (!this.compiling.isEmpty()) return "MESHING";
+            if (!this.awaitingFence.isEmpty()) return "WAITING_FOR_GPU_ACTIVATION_FENCE";
+            if (activations.active() == 0) return "NO_ACTIVE_GEOMETRY";
+            String renderBlocker = ClientLodDebug.renderBlocker(activations.active());
+            if (renderBlocker != null) return renderBlocker;
+            return this.rootReadySent ? "READY" : "VISIBLE_COVERAGE_NOT_ROOT_READY";
+        }
+
+        private static String spatialText(SpatialNode node) {
+            return node == null ? "none"
+                    : node.x() + "," + node.y() + "," + node.z();
+        }
+
+        private void drainObjectHandoffs() throws Exception {
+            ActiveRequest request;
+            while ((request = this.readyRequests.poll()) != null) {
+                request.beginOwnerDrain();
+                NetworkHandoff input = request.beginNetworkDecode();
+                if (input != null) {
+                    decodeObject(request, input.encoded, input.release, false);
+                }
+                DecodedObjectEvent decoded = request.takeNetworkDecode();
+                if (decoded != null) acceptDecodedObject(decoded);
+                while ((decoded = request.takeCachedDecode()) != null) {
+                    acceptDecodedObject(decoded);
+                }
+                StreamFinishedEvent terminal = request.takeTerminal();
+                if (terminal != null) finishStream(request, terminal.failure);
             }
         }
 
@@ -856,9 +1000,12 @@ final class ClientSession {
                     if (!present.equals(announced)) {
                         throw new IllegalArgumentException("conflicting root generation");
                     }
+                    this.objectStreamFailures.clear();
+                    if (!this.delayedObjectRetries.isEmpty()) releaseDelayedRetries(true);
                     return;
                 }
             }
+            cancelAllRequests(false);
             this.resources.setAuthoritativeRoot(announced.root());
             this.authoritativeRoot = announced.root();
             synchronized (METADATA_ROOTS) {
@@ -868,29 +1015,32 @@ final class ClientSession {
             this.catalog = null;
             this.mappings = null;
             this.modelCompatibility = null;
-            this.pendingCatalogBake.set(null);
             this.dictionaries.clear();
             this.dictionaryIds.clear();
+            this.objectStreamFailures.clear();
+            this.delayedObjectRetries.clear();
             this.compatibility.clear();
-            this.outstandingObjects.clear();
-            this.outstandingBytes.set(0);
             this.desiredCuts.clear();
             this.renderableCuts.clear();
             this.activationCuts.clear();
             this.descriptorDemands.clear();
             this.coverageCuts.clear();
             invalidateSelectionAuthority();
+            clearPendingManifest();
             this.rootReadySent = false;
             this.publishedSnapshot = 0;
             this.issuedSnapshot = 0;
             this.nextSnapshot = 1;
+            this.minimumValidSnapshot = 1;
+            this.cutPlanRevision = Long.MIN_VALUE;
             this.cameraVisibilityDomain = 0;
             this.cameraDomainLease = null;
             this.pendingCameraDomainSequence = 0;
-            this.nextCameraDomainSequence = 1;
+            this.lastCameraDomainQueryNanos = 0;
             this.queriedCameraPosition = null;
             this.manifestDirty = true;
             this.metadataResync = false;
+            this.pinInputsRevision++;
         }
 
         private void updateCameraDomainQuery() throws IOException {
@@ -900,34 +1050,62 @@ final class ClientSession {
             CameraDomainLease lease = this.cameraDomainLease;
             if (lease != null && lease.root.equals(this.plan.root().root())
                     && lease.contains(position)) return;
-            if (this.pendingCameraDomainSequence != 0) return;
             long now = System.nanoTime();
-            if (now - this.nextRequestFrame < 0) return;
+            if (this.pendingCameraDomainSequence != 0
+                    && position.equals(this.queriedCameraPosition)
+                    && now - this.lastCameraDomainQueryNanos
+                    < CAMERA_DOMAIN_QUERY_TIMEOUT_NANOS) return;
+            if (now - this.lastCameraDomainQueryNanos < CAMERA_DOMAIN_QUERY_INTERVAL_NANOS) {
+                return;
+            }
             long sequence = this.nextCameraDomainSequence++;
             if (sequence == 0 || this.nextCameraDomainSequence == 0) {
                 throw new IllegalStateException("camera-domain sequence exhausted");
             }
-            writeFrame(FrameCodec.C_CAMERA_DOMAIN, encodeCameraDomainRequest(
-                    this.plan.root().root(), sequence, position));
+            this.quic.sendCameraDomain(this.plan.root().root(), sequence,
+                    position.blockX, position.blockY, position.blockZ);
             this.queriedCameraPosition = position;
             this.pendingCameraDomainSequence = sequence;
-            this.nextRequestFrame = now + REQUEST_INTERVAL_NANOS;
+            this.lastCameraDomainQueryNanos = now;
             this.cameraDomainLease = null;
             this.cameraVisibilityDomain = 0;
             // A fresh snapshot is also the async GPU authority barrier: results captured before
             // this camera position cannot retire coverage for the new view.
             invalidateSelectionAuthority();
+            clearPendingManifest();
             this.publishedSnapshot = 0;
             this.issuedSnapshot = 0;
+            this.minimumValidSnapshot = this.nextSnapshot;
             this.manifestDirty = true;
+        }
+
+        private static CameraDomainEvent cameraDomain(QuicClient.CameraDomain response) {
+            boolean paired = response.sequence() != 0 && switch (response.state()) {
+                case 0 -> response.domain() == 0;
+                case 1 -> response.domain() == 1;
+                case 2 -> Long.compareUnsigned(response.domain(), 2) >= 0;
+                default -> false;
+            };
+            if (!paired) throw new IllegalArgumentException(
+                    "CAMERA_DOMAIN state/domain pairing is invalid");
+            if (response.minX() > response.maxX() || response.minY() > response.maxY()
+                    || response.minZ() > response.maxZ()) {
+                throw new IllegalArgumentException("CAMERA_DOMAIN lease bounds are inverted");
+            }
+            return new CameraDomainEvent(response.root(), response.sequence(), response.domain(),
+                    response.minX(), response.minY(), response.minZ(),
+                    response.maxX(), response.maxY(), response.maxZ());
         }
 
         private void acceptCameraDomain(CameraDomainEvent response) {
             if (this.plan == null || !response.root.equals(this.plan.root().root())) return;
-            if (this.pendingCameraDomainSequence == 0
-                    || response.sequence != this.pendingCameraDomainSequence) {
+            if (this.pendingCameraDomainSequence == 0) return;
+            int sequenceOrder = Long.compareUnsigned(response.sequence,
+                    this.pendingCameraDomainSequence);
+            if (sequenceOrder < 0) return;
+            if (sequenceOrder > 0) {
                 throw new IllegalArgumentException(
-                        "camera-domain response does not match the outstanding request");
+                        "camera-domain response is newer than every outstanding request");
             }
             CameraPosition requested = this.queriedCameraPosition;
             if (requested == null || !response.contains(requested)) {
@@ -939,8 +1117,10 @@ final class ClientSession {
             if (this.cameraVisibilityDomain == response.domain) return;
             this.cameraVisibilityDomain = response.domain;
             invalidateSelectionAuthority();
+            clearPendingManifest();
             this.publishedSnapshot = 0;
             this.issuedSnapshot = 0;
+            this.minimumValidSnapshot = this.nextSnapshot;
             this.manifestDirty = true;
         }
 
@@ -966,208 +1146,485 @@ final class ClientSession {
             this.plan.reconcileMetadataRoots(desired);
             this.metadataResync = false;
             this.manifestDirty = true;
+            this.pinInputsRevision++;
         }
 
         private void pumpRequests() throws Exception {
             if (this.plan == null) return;
-            long now = System.nanoTime();
-            if (now - this.nextRequestFrame < 0) return;
-            int capacity = Math.min(WireMessage.MAX_REQUEST_ENTRIES,
-                    MAX_OUTSTANDING_OBJECTS - this.outstandingObjects.size());
-            if (capacity <= 0) return;
+            int attempts = 0;
+            while (this.activeRequests.size() < MAX_ACTIVE_OBJECT_STREAMS && attempts++ < 32) {
+                List<Hash256> hashes = laneStreamCount(QuicClient.Lane.COVERAGE)
+                        < MAX_COVERAGE_OBJECT_STREAMS
+                        ? this.plan.takeBootstrapObjectRequests(this.requestBatchSize)
+                        : List.of();
+                if (!hashes.isEmpty()) {
+                    startRequest(hashes, false, QuicClient.Lane.COVERAGE);
+                    this.manifestDirty = true;
+                    continue;
+                }
+                if (!this.plan.bootstrapObjectsProcessed()) break;
 
-            List<Hash256> bootstrap = this.plan.takeBootstrapObjectRequests(capacity);
-            boolean sent = requestObjects(bootstrap);
-            if (!bootstrap.isEmpty()) this.manifestDirty = true;
-            if (sent) {
-                this.nextRequestFrame = now + REQUEST_INTERVAL_NANOS;
-                return;
+                hashes = laneStreamCount(QuicClient.Lane.COVERAGE)
+                        < MAX_COVERAGE_OBJECT_STREAMS
+                        ? this.plan.takeSubtreeRequests(1) : List.of();
+                if (!hashes.isEmpty()) {
+                    startRequest(hashes, true, QuicClient.Lane.COVERAGE);
+                    continue;
+                }
+
+                QuicClient.Lane lane;
+                if (laneStreamCount(QuicClient.Lane.COVERAGE)
+                        < MAX_COVERAGE_OBJECT_STREAMS
+                        && !(hashes = this.plan.takeContentObjectRequests(
+                        ContentPriority.COVERAGE, this.requestBatchSize)).isEmpty()) {
+                    lane = QuicClient.Lane.COVERAGE;
+                } else if (laneStreamCount(QuicClient.Lane.CURRENT_VIEW)
+                        < MAX_CURRENT_OBJECT_STREAMS
+                        && !(hashes = this.plan.takeContentObjectRequests(
+                        ContentPriority.CURRENT_VIEW, this.requestBatchSize)).isEmpty()) {
+                    lane = QuicClient.Lane.CURRENT_VIEW;
+                } else if (laneStreamCount(QuicClient.Lane.PREDICTED)
+                        < MAX_PREDICTED_OBJECT_STREAMS
+                        && !(hashes = this.plan.takeContentObjectRequests(
+                        ContentPriority.PREDICTED, this.requestBatchSize)).isEmpty()) {
+                    lane = QuicClient.Lane.PREDICTED;
+                } else {
+                    break;
+                }
+                startRequest(hashes, false, lane);
+                this.manifestDirty = true;
             }
-            if (!this.plan.bootstrapObjectsProcessed()) return;
-
-            capacity = Math.min(WireMessage.MAX_REQUEST_ENTRIES,
-                    MAX_OUTSTANDING_OBJECTS - this.outstandingObjects.size());
-            if (capacity <= 0) return;
-            sent = requestSubtrees(this.plan.takeSubtreeRequests(capacity));
-            if (sent) {
-                this.nextRequestFrame = now + REQUEST_INTERVAL_NANOS;
-                return;
-            }
-
-            capacity = Math.min(WireMessage.MAX_REQUEST_ENTRIES,
-                    MAX_OUTSTANDING_OBJECTS - this.outstandingObjects.size());
-            if (capacity <= 0) return;
-            List<Hash256> content = this.plan.takeContentObjectRequests(capacity);
-            sent = requestObjects(content);
-            if (!content.isEmpty()) this.manifestDirty = true;
-            if (sent) this.nextRequestFrame = now + REQUEST_INTERVAL_NANOS;
             if (this.plan.discoveryComplete()) this.plan.sealDiscovery();
         }
 
-        private boolean requestSubtrees(List<Hash256> hashes) throws Exception {
-            if (hashes.isEmpty()) return false;
-            List<Hash256> missing = loadCached(hashes, true);
-            if (!missing.isEmpty()) {
-                send(new SubtreeRequest(this.plan.root().root(), missing));
-                this.markOutstanding(missing, ESTIMATED_SUBTREE_REQUEST_BYTES);
-                return true;
+        private int laneStreamCount(QuicClient.Lane lane) {
+            int count = 0;
+            for (ActiveRequest request : this.activeRequests) {
+                if (request.lane == lane && !request.networkFinished()) count++;
             }
-            return false;
+            return count;
         }
 
-        private boolean requestObjects(List<Hash256> hashes) throws Exception {
-            if (hashes.isEmpty()) return false;
-            List<Hash256> missing = loadCached(hashes, false);
-            if (!missing.isEmpty()) {
-                send(new ObjectRequest(this.plan.root().root(), missing));
-                this.markOutstanding(missing, ESTIMATED_CONTENT_REQUEST_BYTES);
-                return true;
-            }
-            return false;
-        }
-
-        private List<Hash256> loadCached(List<Hash256> hashes, boolean subtree) throws Exception {
-            ArrayList<Hash256> missing = new ArrayList<>();
-            for (Hash256 hash : hashes) {
-                Optional<EncodedObject> cached = this.resources.cache.getEncoded(hash);
-                if (cached.isEmpty()) {
-                    missing.add(hash);
-                    continue;
-                }
-                try (MemoryBudget.Reservation decodeMemory =
-                             reserveTransient(decodeScratchBytes(cached.orElseThrow()))) {
-                    CanonicalObject canonical;
+        private void startRequest(List<Hash256> hashes, boolean subtree,
+                                  QuicClient.Lane lane) throws Exception {
+            RootToken root = this.plan.root().root();
+            ActiveRequest request = new ActiveRequest(this, root, subtree, lane, hashes);
+            this.activeRequests.add(request);
+            try {
+                this.cacheReadWorker.execute(() -> {
+                    Throwable failure = null;
+                    ArrayList<CachedObject> cachedObjects = new ArrayList<>();
                     try {
-                        canonical = this.decoder.decode(cached.orElseThrow()).join();
-                    } catch (RuntimeException failure) {
-                        this.resources.cache.quarantine(hash);
-                        missing.add(hash);
-                        continue;
+                        for (Hash256 hash : hashes) {
+                            Optional<EncodedObject> cached =
+                                    this.resources.cache().getEncoded(hash);
+                            cached.ifPresent(object -> cachedObjects.add(
+                                    new CachedObject(hash, object)));
+                        }
+                    } catch (Throwable cause) {
+                        failure = cause;
+                    } finally {
+                        offer(new CacheLookupFinishedEvent(request,
+                                List.copyOf(cachedObjects), failure));
                     }
-                    ClientLodDebug.objectDecoded(cached.orElseThrow().kind().wireId(),
-                            cached.orElseThrow().compressedLength(), true);
-                    if (!acceptObject(this.plan.root().root(), subtree,
-                            cached.orElseThrow(), canonical)) {
-                        this.plan.deferInFlightResponse(hash, subtree);
-                    }
+                });
+            } catch (RejectedExecutionException failure) {
+                if (request.finishCacheLookup() && isCurrent(request.root)) {
+                    openNetworkRequest(request);
                 }
             }
-            return List.copyOf(missing);
         }
 
-        private MemoryBudget.Reservation reserveTransient(long bytes) throws IOException {
-            if (bytes < 0 || bytes > this.resources.memory.limit()) {
-                throw new IOException("Virtual Surface allocation exceeds the global budget");
+        private void acceptCacheLookup(ActiveRequest request, CachedObject entry) {
+            EncodedObject cached = entry.encoded;
+            if (!isCurrent(request.root) || request.cancelled()) {
+                cached.close();
+                return;
             }
-            MemoryBudget.Allocation request = MemoryBudget.Allocation.of(
-                    MemoryBudget.Pool.IN_FLIGHT, bytes);
-            boolean cacheYielded = false;
-            while (this.open && SESSION.get() == this.session) {
-                Optional<MemoryBudget.Reservation> reservation =
-                        this.resources.memory.tryReserve(request);
-                if (reservation.isPresent()) return reservation.orElseThrow();
-                this.resources.residency.reclaimUnreferenced();
-                reservation = this.resources.memory.tryReserve(request);
-                if (reservation.isPresent()) return reservation.orElseThrow();
-                if (!cacheYielded) {
-                    // The persistent cache is optional. Disabling it releases its admitted index
-                    // and read buffer; all later operations remain valid best-effort no-ops.
-                    this.resources.cache.disableForPressure();
-                    cacheYielded = true;
-                    continue;
+            try {
+                requirePlan(request.root).requireInFlightResponse(cached.hash(),
+                        cached.kind(), request.subtree);
+            } catch (IllegalArgumentException malformed) {
+                persistCacheAction(() -> this.resources.cache().quarantine(entry.hash));
+                cached.close();
+                return;
+            }
+            if (!request.beginCached(entry.hash)) {
+                cached.close();
+                return;
+            }
+            decodeObject(request, cached, () -> {}, true);
+        }
+
+        private void finishCacheLookup(CacheLookupFinishedEvent event) throws IOException {
+            ActiveRequest request = event.request;
+            int accepted = 0;
+            try {
+                for (; accepted < event.cached.size(); accepted++) {
+                    acceptCacheLookup(request, event.cached.get(accepted));
                 }
+            } finally {
+                for (; accepted < event.cached.size(); accepted++) {
+                    event.cached.get(accepted).encoded.close();
+                }
+            }
+            if (!request.finishCacheLookup() || !isCurrent(request.root)) return;
+            if (event.failure != null) {
+                Logger.warn("Voxy cache read failed; fetching objects over QUIC: "
+                        + event.failure.getMessage());
+            }
+            openNetworkRequest(request);
+        }
+
+        private void openNetworkRequest(ActiveRequest request) throws IOException {
+            List<Hash256> missing = request.remainingNetwork();
+            if (missing.isEmpty()) {
+                request.finishNetwork();
+                finishRequestIfDone(request);
+                return;
+            }
+            long estimate = request.subtree ? ESTIMATED_SUBTREE_REQUEST_BYTES
+                    : ESTIMATED_CONTENT_REQUEST_BYTES;
+            for (Hash256 hash : missing) {
+                if (this.outstandingObjects.putIfAbsent(hash, request) != null) {
+                    cancelRequest(request, true);
+                    throw new IllegalStateException(
+                            "object already belongs to an active QUIC stream");
+                }
+                this.outstandingBytes.addAndGet(estimate);
+            }
+            try {
+                request.beginNetwork(missing.size());
+                request.setHandle(this.quic.requestObjects(request.root,
+                        request.lane, missing, request));
+            } catch (IOException failure) {
+                cancelRequest(request, true);
+                throw failure;
+            } catch (RuntimeException | Error failure) {
+                cancelRequest(request, true);
+                throw failure;
+            }
+        }
+
+        private void decodeObject(ActiveRequest request, EncodedObject encoded,
+                                  Runnable release, boolean fromCache) {
+            if (isCurrent(request.root)) {
+                requirePlan(request.root).requireInFlightResponse(encoded.hash(),
+                        encoded.kind(), request.subtree);
+            }
+            if (!fromCache) {
+                request.recordResponseLatency();
+                recordInboundBytes(WireMessage.HASH_BYTES + 20L
+                        + encoded.compressedLength());
+            }
+            try {
+                this.decoder.decode(encoded).whenComplete((decoded, failure) -> {
+                    // Take cache ownership before publishing the completion: publication may
+                    // immediately release the stream's original body reference.
+                    if (!fromCache && failure == null) {
+                        persistVerifiedObject(encoded);
+                    }
+                    if (fromCache) {
+                        request.completeCachedDecode(encoded, decoded, failure, release);
+                    } else {
+                        request.completeNetworkDecode(encoded, decoded, failure, release);
+                    }
+                });
+            } catch (Throwable failure) {
+                if (fromCache) {
+                    request.completeCachedDecode(encoded, null, failure, release);
+                } else {
+                    request.completeNetworkDecode(encoded, null, failure, release);
+                }
+            }
+        }
+
+        private void acceptDecodedObject(DecodedObjectEvent event) throws Exception {
+            ActiveRequest request = event.request;
+            try {
+                if (event.fromCache && event.failure != null) {
+                    persistCacheAction(() -> this.resources.cache().quarantine(
+                            event.encoded.hash()));
+                }
+                if (isCurrent(request.root)) {
+                    RootDemandPlan current = requirePlan(request.root);
+                    if (event.failure != null
+                            || !current.inFlightResponseRelevant(event.encoded.hash(),
+                            request.subtree)) {
+                        current.deferInFlightResponse(event.encoded.hash(), request.subtree);
+                    } else {
+                        acceptObject(request.root, request.subtree,
+                                event.encoded, event.decoded);
+                        if (!event.fromCache) {
+                            this.objectStreamFailures.remove(event.encoded.hash());
+                        }
+                    }
+                }
+            } finally {
+                completeOutstanding(event.encoded.hash(), request);
+                request.processingCompleted();
+                finishRequestIfDone(request);
                 try {
-                    Thread.sleep(1);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException(
-                            "Interrupted waiting for Virtual Surface memory pressure", interrupted);
+                    event.encoded.close();
+                } finally {
+                    event.release.run();
                 }
             }
-            throw new IOException("Virtual Surface session closed during memory pressure");
         }
 
-        private static long decodeScratchBytes(EncodedObject encoded) {
-            // Java source+destination copies, native Zstd source+destination, immutable canonical
-            // ownership, dictionary staging, and a small object/header allowance.
-            return Math.addExact(64L << 10, Math.addExact(
-                    Math.multiplyExact(2L, encoded.compressedLength()),
-                    Math.multiplyExact(3L, encoded.canonicalLength())));
+        private void persistVerifiedObject(EncodedObject encoded) {
+            PersistObjectTask task = new PersistObjectTask(encoded.retain());
+            try {
+                this.cacheWriteWorker.execute(task);
+            } catch (RejectedExecutionException ignored) {
+                task.discard();
+            }
+        }
+
+        private final class PersistObjectTask implements Runnable {
+            private final EncodedObject encoded;
+            private final AtomicBoolean owned = new AtomicBoolean(true);
+
+            private PersistObjectTask(EncodedObject encoded) {
+                this.encoded = encoded;
+            }
+
+            @Override
+            public void run() {
+                if (!this.owned.compareAndSet(true, false)) return;
+                try {
+                    resources.cache().putVerified(this.encoded);
+                } catch (IOException ignored) {
+                    // The cache is disposable; live verified content remains authoritative.
+                } finally {
+                    this.encoded.close();
+                }
+            }
+
+            private void discard() {
+                if (this.owned.compareAndSet(true, false)) this.encoded.close();
+            }
+        }
+
+        private void persistCacheAction(CacheAction action) {
+            try {
+                this.cacheWriteWorker.execute(() -> {
+                    try {
+                        action.run();
+                    } catch (IOException ignored) {
+                        // The cache is disposable; live verified content remains authoritative.
+                    }
+                });
+            } catch (RejectedExecutionException ignored) {
+                // A full cache queue drops reuse work, never live terrain.
+            }
+        }
+
+        /** Snapshots pins without taking the cache's disk-I/O monitor on this thread. */
+        private void scheduleCachePins() {
+            if (!this.resources.cachePinsDirty.getAndSet(false)) return;
+            List<Hash256> protectedHashes = new ArrayList<>();
+            try {
+                this.resources.residency.forEachProtectedHash(protectedHashes::add);
+                this.cacheWriteWorker.execute(() -> {
+                    try {
+                        this.resources.cache().replacePins(protectedHashes::forEach);
+                    } catch (RuntimeException failure) {
+                        this.resources.cachePinsDirty.set(true);
+                    }
+                });
+            } catch (RejectedExecutionException failure) {
+                this.resources.cachePinsDirty.set(true);
+            } catch (RuntimeException failure) {
+                this.resources.cachePinsDirty.set(true);
+                throw failure;
+            }
+        }
+
+        private void finishStream(ActiveRequest request, Throwable failure) throws IOException {
+            request.recordResponseLatency();
+            List<Hash256> remaining = request.finishNetwork();
+            boolean currentRoot = isCurrent(request.root);
+            boolean retry = currentRoot;
+            QuicClient.ObjectStreamException streamFailure = failure
+                    instanceof QuicClient.ObjectStreamException objectFailure
+                    ? objectFailure : null;
+            if (streamFailure != null && streamFailure.code() == 1) {
+                retry = false;
+            } else if (streamFailure != null && streamFailure.code() == 2 && currentRoot) {
+                for (Hash256 hash : remaining) scheduleObjectRetry(hash, request.subtree);
+                retry = false;
+            } else if (streamFailure != null && request.networkRequestCount() == 1
+                    && currentRoot && !remaining.isEmpty()) {
+                scheduleObjectRetry(remaining.get(0), request.subtree);
+                retry = false;
+            }
+            for (Hash256 hash : remaining) {
+                completeOutstanding(hash, request);
+                if (retry) {
+                    requirePlan(request.root).deferInFlightResponse(hash, request.subtree);
+                }
+            }
+            finishRequestIfDone(request);
+            if (streamFailure != null && streamFailure.code() == 1 && this.open) {
+                Logger.warn("Voxy QUIC object request was rejected as malformed: "
+                        + failure.getMessage());
+                throw new IOException("server rejected malformed QUIC object request", failure);
+            }
+            if (failure != null && streamFailure != null && streamFailure.code() != 2
+                    && request.networkRequestCount() > 1) {
+                this.requestBatchSize = Math.min(this.requestBatchSize,
+                        Math.max(1, request.networkRequestCount() / 2));
+                Logger.warn("Voxy QUIC object batch failed; retrying smaller batches: "
+                        + failure.getMessage());
+                return;
+            }
+            if (failure != null && this.open) {
+                Logger.warn("Voxy QUIC object stream ended; only its current demand will retry: "
+                        + failure.getMessage());
+            }
+        }
+
+        private void scheduleObjectRetry(Hash256 hash, boolean subtree) {
+            int failures = this.objectStreamFailures.merge(hash, 1, Integer::sum);
+            int exponent = Math.min(failures - 1, MAX_OBJECT_STREAM_FAILURE_RETRIES + 3);
+            long delay = TimeUnit.MILLISECONDS.toNanos(100L << exponent);
+            this.delayedObjectRetries.put(hash,
+                    new DelayedRetry(subtree, System.nanoTime() + delay));
+        }
+
+        private void releaseDelayedRetries(boolean all) {
+            if (this.plan == null || this.delayedObjectRetries.isEmpty()) return;
+            long now = System.nanoTime();
+            var iterator = this.delayedObjectRetries.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Hash256, DelayedRetry> entry = iterator.next();
+                if (!all && now - entry.getValue().readyNanos < 0) continue;
+                requirePlan(this.plan.root().root()).deferInFlightResponse(
+                        entry.getKey(), entry.getValue().subtree);
+                iterator.remove();
+            }
+        }
+
+        private void cancelObsoleteStreams() {
+            if (this.plan == null) return;
+            for (ActiveRequest request : List.copyOf(this.activeRequests)) {
+                if (!isCurrent(request.root) || request.networkFinished()) continue;
+                List<Hash256> remaining = request.remainingNetwork();
+                if (remaining.isEmpty()) continue;
+                boolean required = false;
+                for (Hash256 hash : remaining) {
+                    if (this.plan.inFlightResponseRelevant(hash, request.subtree)) {
+                        required = true;
+                        break;
+                    }
+                }
+                if (!required) cancelRequest(request, true);
+            }
+        }
+
+        private void cancelAllRequests(boolean requeue) {
+            for (ActiveRequest request : List.copyOf(this.activeRequests)) {
+                cancelRequest(request, requeue);
+            }
+        }
+
+        private void cancelRequest(ActiveRequest request, boolean requeue) {
+            request.cancel();
+            for (Hash256 hash : request.finishNetwork()) {
+                completeOutstanding(hash, request);
+                if (requeue && isCurrent(request.root)) {
+                    requirePlan(request.root).deferInFlightResponse(hash, request.subtree);
+                }
+            }
+            if (!requeue) {
+                var iterator = this.outstandingObjects.entrySet().iterator();
+                while (iterator.hasNext()) {
+                    Map.Entry<Hash256, ActiveRequest> entry = iterator.next();
+                    if (entry.getValue() != request) continue;
+                    iterator.remove();
+                    this.outstandingBytes.addAndGet(request.subtree
+                            ? -ESTIMATED_SUBTREE_REQUEST_BYTES
+                            : -ESTIMATED_CONTENT_REQUEST_BYTES);
+                }
+            }
+            finishRequestIfDone(request);
+        }
+
+        private void finishRequestIfDone(ActiveRequest request) {
+            if (request.done()) this.activeRequests.remove(request);
         }
 
         private boolean acceptObject(RootToken root, boolean subtree, EncodedObject encoded,
-                                     CanonicalObject canonical) throws Exception {
+                                     DecodedObject decoded) throws Exception {
             RootDemandPlan current = requirePlan(root);
-            current.requireInFlightResponse(canonical.hash(), canonical.kind(), subtree);
-            if (!this.resources.residency.admitVerifiedObject(encoded, canonical)) {
-                current.deferInFlightResponse(canonical.hash(), subtree);
+            if (!this.resources.residency.admitVerifiedObject(encoded, decoded)) {
+                current.deferInFlightResponse(decoded.hash(), subtree);
                 return false;
             }
             if (subtree) {
-                this.resources.residency.installManifestObject(canonical);
-                boolean parsed = switch (canonical.kind()) {
+                this.resources.residency.installManifestObject(decoded);
+                boolean parsed = switch (decoded.kind()) {
                     case ROOT_DIRECTORY -> this.resources.residency
-                            .rootDirectory(canonical.hash()).isPresent();
+                            .rootDirectory(decoded.hash()).isPresent();
                     case MANIFEST_SUBTREE -> this.resources.residency
-                            .manifestSubtree(canonical.hash()).isPresent();
+                            .manifestSubtree(decoded.hash()).isPresent();
                     case MANIFEST_DESCRIPTOR_PAGE -> this.resources.residency
-                            .descriptorPage(canonical.hash()).isPresent();
+                            .descriptorPage(decoded.hash()).isPresent();
                     default -> false;
                 };
                 if (!parsed) {
-                    // Hitting the one global memory cap pauses metadata refinement. Do not pin a
-                    // canonical envelope which could otherwise prevent the reclaim needed by the
-                    // retried page.
-                    current.deferInFlightResponse(canonical.hash(), true);
+                    // A parsed metadata object may be reclaimed before this event runs. Retry it
+                    // without pinning an unusable canonical envelope.
+                    current.deferInFlightResponse(decoded.hash(), true);
                     this.resources.residency.reclaimUnreferenced();
                     return false;
                 }
-                if (!this.resources.pinRootObject(root, canonical.hash())) {
-                    current.deferInFlightResponse(canonical.hash(), true);
+                if (!this.resources.pinRootObject(root, decoded.hash())) {
+                    current.deferInFlightResponse(decoded.hash(), true);
                     return false;
                 }
-                if (canonical.kind() == ObjectKind.ROOT_DIRECTORY) {
+                if (decoded.kind() == ObjectKind.ROOT_DIRECTORY) {
                     RootDirectory directory = this.resources.residency
-                            .rootDirectory(canonical.hash()).orElseThrow();
-                    current.acceptDirectory(canonical.hash(), directory);
-                } else if (canonical.kind() == ObjectKind.MANIFEST_SUBTREE) {
+                            .rootDirectory(decoded.hash()).orElseThrow();
+                    current.acceptDirectory(decoded.hash(), directory);
+                } else if (decoded.kind() == ObjectKind.MANIFEST_SUBTREE) {
                     ManifestSubtree manifest = this.resources.residency
-                            .manifestSubtree(canonical.hash()).orElseThrow();
-                    current.acceptManifest(canonical.hash(), manifest);
-                } else if (canonical.kind() == ObjectKind.MANIFEST_DESCRIPTOR_PAGE) {
+                            .manifestSubtree(decoded.hash()).orElseThrow();
+                    current.acceptManifest(decoded.hash(), manifest);
+                } else if (decoded.kind() == ObjectKind.MANIFEST_DESCRIPTOR_PAGE) {
                     DescriptorPage page = this.resources.residency
-                            .descriptorPage(canonical.hash()).orElseThrow();
-                    current.acceptDescriptorPage(canonical.hash(), page);
+                            .descriptorPage(decoded.hash()).orElseThrow();
+                    current.acceptDescriptorPage(decoded.hash(), page);
                 } else {
                     throw new IllegalArgumentException("subtree response contains content");
                 }
                 this.manifestDirty = true;
+                this.pinInputsRevision++;
                 return true;
             }
 
-            if (!this.resources.pinRootObject(root, canonical.hash())) {
-                current.deferInFlightResponse(canonical.hash(), false);
+            if (!this.resources.pinRootObject(root, decoded.hash())) {
+                current.deferInFlightResponse(decoded.hash(), false);
                 return false;
             }
-            current.acceptObject(canonical.hash(), canonical.kind());
-            if (canonical.kind() == ObjectKind.CATALOG) {
-                CatalogCodec.Catalog decoded = CatalogCodec.decode(
-                        canonical.canonicalBytes());
-                putMain(new CatalogTask(this, root, decoded));
-            } else if (canonical.kind() == ObjectKind.DICTIONARY_SET) {
-                List<Hash256> hashes = DictionaryCodec.decodeSet(canonical.canonicalBytes());
+            current.acceptObject(decoded.hash(), decoded.kind());
+            this.pinInputsRevision++;
+            if (decoded.kind() == ObjectKind.CATALOG) {
+                putMain(new CatalogTask(this, root, decoded.catalog()));
+            } else if (decoded.kind() == ObjectKind.DICTIONARY_SET) {
+                List<Hash256> hashes = decoded.dictionarySet().hashes();
                 current.expectCompressionDictionaries(hashes);
                 this.dictionaryIds.clear();
                 for (int index = 0; index < hashes.size(); index++) {
                     this.dictionaryIds.put(hashes.get(index), index + 1);
                 }
-            } else if (canonical.kind() == ObjectKind.COMPRESSION_DICTIONARY) {
-                Integer id = this.dictionaryIds.get(canonical.hash());
+            } else if (decoded.kind() == ObjectKind.COMPRESSION_DICTIONARY) {
+                Integer id = this.dictionaryIds.get(decoded.hash());
                 if (id == null) {
                     throw new IllegalArgumentException("dictionary is outside its announced set");
                 }
-                this.dictionaries.put(id,
-                        DictionaryCodec.decodeDictionary(canonical.canonicalBytes()));
+                this.dictionaries.put(id, decoded.dictionary());
             }
             this.manifestDirty = true;
             return true;
@@ -1181,15 +1638,15 @@ final class ClientSession {
                         || this.resources.residency.decodedMicrotile(object.hash()).isPresent()) {
                     continue;
                 }
-                Optional<CanonicalObject> canonical =
-                        this.resources.residency.verifiedCanonical(object.hash());
-                if (canonical.isEmpty()) {
+                Optional<DecodedObject> decoded =
+                        this.resources.residency.decodedObject(object.hash());
+                if (decoded.isEmpty()) {
                     if (this.plan.retryMissingResidentObject(object.hash())) {
                         this.manifestDirty = true;
                     }
                     continue;
                 }
-                if (!this.resources.residency.installMicrotile(canonical.orElseThrow(),
+                if (!this.resources.residency.installMicrotile(decoded.orElseThrow(),
                         this.mappings.catalogId(), this.mappings.blocks(),
                         this.mappings.biomes())) {
                     break;
@@ -1199,30 +1656,39 @@ final class ClientSession {
         }
 
         private void acceptSelection(SelectionBatch selection) {
+            SelectionManifest source = selection.manifest();
             if (this.plan == null
-                    || selection.generation() != this.plan.root().root().generation()) return;
+                    || selection.generation() != this.plan.root().root().generation()
+                    || source.authorityId() != this.selectionAuthority) return;
+            long manifestRevision = this.plan.manifestRevision();
+            // Object and node handles belong to the exact plan revision captured by their
+            // immutable renderer manifest. Metadata pruning may compact both tables without
+            // changing the published root generation.
+            if (source.planRevision() != manifestRevision) {
+                if (this.completeFrontier) invalidateSelectionAuthority();
+                this.manifestDirty = true;
+                return;
+            }
             boolean currentSnapshot = selection.snapshotId() == this.publishedSnapshot;
             if (!currentSnapshot) {
-                // Handles and nodes are append-only for one immutable root. A readback from an
-                // older residency snapshot therefore remains exact request authority, but cannot
-                // cancel newer demand or retire fallback coverage.
+                // An older readback remains valid additions-only authority when its handle
+                // namespace is unchanged. It may not cancel newer demand or retire coverage.
                 if (selection.snapshotId() == 0 || this.issuedSnapshot == 0
+                        || Long.compareUnsigned(selection.snapshotId(),
+                        this.minimumValidSnapshot) < 0
                         || Long.compareUnsigned(selection.snapshotId(), this.issuedSnapshot) > 0) {
                     return;
                 }
                 selection.disableCancellation();
             }
-            ClientLodDebug.selection(selection.generation(), selection.snapshotId(),
-                    selection.count(SelectionBatch.Segment.DESIRED),
-                    selection.count(SelectionBatch.Segment.REQUESTS),
-                    selection.permitsCancellation());
-            long manifestRevision = this.plan.manifestRevision();
             int objectCapacity = selection.manifest().objectHandleCapacity();
             HandlePriorities selectedContent = this.selectedContentScratch.begin(objectCapacity);
             HandlePriorities requestedContent = this.requestedContentScratch.begin(objectCapacity);
             HandlePriorities selectedNeighbors = this.selectedNeighborScratch.begin(objectCapacity);
-            boolean replace = selection.permitsCancellation();
-            int nodeCapacity = selection.manifest().nodeCount();
+            boolean newHandleNamespace = this.cutPlanRevision != manifestRevision;
+            if (newHandleNamespace && this.completeFrontier) invalidateSelectionAuthority();
+            boolean replace = selection.permitsCancellation() || newHandleNamespace;
+            int nodeCapacity = selection.manifest().nodeHandleCapacity();
             this.desiredCuts.begin(replace, nodeCapacity);
             this.renderableCuts.begin(replace, nodeCapacity);
             this.activationCuts.begin(replace, nodeCapacity);
@@ -1239,7 +1705,6 @@ final class ClientSession {
                             selection.nodeHandle(desiredSegment, row), key);
                 }
                 mergeCut(this.desiredCuts, selection, desiredSegment, row);
-                mergeCut(this.activationCuts, selection, desiredSegment, row);
                 collectHandles(selectedContent, selection, desiredSegment, row, false);
                 collectSelectedNeighborHandles(selectedNeighbors, selection, desiredSegment, row);
             }
@@ -1258,6 +1723,10 @@ final class ClientSession {
                     nodeKeys.add(selection.nodeHandle(requestSegment, row),
                             selection.sectionKey(requestSegment, row));
                     mergeCut(this.activationCuts, selection, requestSegment, row);
+                    if (selectedMasks(selection, requestSegment, row) == 0) {
+                        this.descriptorDemands.add(selection.nodeHandle(requestSegment, row),
+                                selection.sectionKey(requestSegment, row));
+                    }
                 }
                 if (selection.priority(requestSegment, row) == SelectionBatch.Priority.COVERAGE) {
                     this.coverageCuts.add(selection.nodeHandle(requestSegment, row),
@@ -1266,51 +1735,88 @@ final class ClientSession {
                 collectHandles(requestedContent, selection, requestSegment, row, true);
                 collectSelectedNeighborHandles(selectedNeighbors, selection, requestSegment, row);
             }
+            // Coverage requests are emitted first and must get the first activation slots.
+            // Resident fine-detail selections follow only after their hierarchy prerequisites.
+            for (int row = 0; row < selection.count(desiredSegment); row++) {
+                mergeCut(this.activationCuts, selection, desiredSegment, row);
+            }
 
             if (selection.permitsCancellation()) {
-                this.plan.reconcileDemand(nodeKeys.keys, nodeKeys.count);
+                // Resolve every manifest-local object handle before demand reconciliation can
+                // prune metadata and compact the plan's handle tables.
                 this.plan.reconcileSelectedContent(selectedContent.handles,
                         selectedContent.priorities, selectedContent.count);
                 this.plan.reconcileSelectedNeighborContent(selectedNeighbors.handles,
                         selectedNeighbors.priorities, selectedNeighbors.count);
                 this.plan.reconcileContentRequests(requestedContent.handles,
                         requestedContent.priorities, requestedContent.count);
-                this.selectionEpoch = nextEpoch(this.selectionEpoch);
-                this.completeFrontier = true;
+                this.plan.reconcileDemand(nodeKeys.keys, nodeKeys.count);
             } else {
-                for (int index = 0; index < nodeKeys.count; index++) {
-                    this.plan.addContentDemand(nodeKeys.keys[index]);
-                }
                 this.plan.retainSelectedContent(selectedContent.handles,
                         selectedContent.priorities, selectedContent.count);
                 this.plan.retainSelectedNeighborContent(selectedNeighbors.handles,
                         selectedNeighbors.priorities, selectedNeighbors.count);
                 this.plan.requestObjectsByHandle(requestedContent.handles,
                         requestedContent.priorities, requestedContent.count);
+                for (int index = 0; index < nodeKeys.count; index++) {
+                    this.plan.addContentDemand(nodeKeys.keys[index]);
+                }
             }
-            markRelevantActiveNodes();
+            this.cutPlanRevision = manifestRevision;
             if (this.plan.discoveryComplete()) this.plan.sealDiscovery();
-            // Only object-table/topology/residency changes require a new GPU snapshot. Repeated
-            // identical refined cuts must preserve their complete-frontier authority so they can
-            // finish activation and ROOT_READY instead of continuously invalidating themselves.
-            if (this.plan.manifestRevision() != manifestRevision) this.manifestDirty = true;
+            boolean planChanged = this.plan.manifestRevision() != manifestRevision;
+            if (planChanged) {
+                this.manifestDirty = true;
+                if (this.completeFrontier) invalidateSelectionAuthority();
+            } else if (selection.permitsCancellation()) {
+                this.selectionEpoch = nextEpoch(this.selectionEpoch);
+                this.completeFrontier = true;
+            }
+            reconcileActivationCandidates();
+            markRelevantActiveNodes();
+            this.pinInputsRevision++;
         }
 
         private void prepareActivations() throws Exception {
+            boolean diagnose = ClientLodDebug.diagnosticsEnabled();
+            int debugBusy = 0;
+            int debugMissingBinding = 0;
+            int debugNoCompatibleContent = 0;
+            int debugMissingContent = 0;
+            int debugMissingNeighbors = 0;
+            int debugModelsPending = 0;
+            int debugPendingModelId = -1;
+            int debugStageBlocked = 0;
+            int debugPinBlocked = 0;
+            int debugWorkerSaturated = 0;
+            int debugAlreadyActive = 0;
+            int debugSubmitted = 0;
+            SpatialNode debugSampleNode = null;
+            Hash256 debugSampleHash = null;
             if (this.plan == null || this.mappings == null || this.modelCompatibility == null) {
+                if (diagnose) ClientLodDebug.activationPass(this.activationCuts.size(), 0, 0,
+                        0, 0, 0, 0, -1, 0, 0, 0, 0, 0, null, null);
                 return;
             }
-            ClientLodDebug.activationPass(this.activationCuts.size());
             for (int cutIndex = 0; cutIndex < this.activationCuts.size(); cutIndex++) {
-                if (this.compiling.size() >= MAX_MESHING_JOBS) break;
+                if (this.compiling.size() >= MAX_MESHING_JOBS) {
+                    if (diagnose) debugWorkerSaturated += this.activationCuts.size() - cutIndex;
+                    break;
+                }
                 SpatialNode node = this.activationCuts.nodeAt(cutIndex);
                 SelectionCut desired = this.activationCuts.cutAt(cutIndex);
                 if (this.compiling.contains(node) || this.awaitingFence.containsKey(node)
-                        || this.retiring.contains(node)) continue;
+                        || this.retiring.contains(node)) {
+                    if (diagnose) debugBusy++;
+                    continue;
+                }
                 Binding binding = this.plan.binding(RootDemandPlan.sectionKey(node))
                         .orElse(null);
                 if (binding == null) {
-                    ClientLodDebug.activationNoBinding();
+                    if (diagnose) {
+                        debugMissingBinding++;
+                        if (debugSampleNode == null) debugSampleNode = node;
+                    }
                     continue;
                 }
 
@@ -1318,14 +1824,18 @@ final class ClientSession {
                         this.modelCompatibility, this.resources.residency::decodedMicrotile);
                 CompatibilityState old = this.compatibility.put(node, state);
                 if (!state.equals(old)) this.manifestDirty = true;
-                if (state.complexRequiredMask() != 0) {
-                    this.plan.requestObjectsByHash(complexCompanions(binding,
-                            state.complexRequiredMask()), this.coverageCuts.containsNode(node)
-                            ? ContentPriority.COVERAGE : ContentPriority.CURRENT_VIEW);
-                }
-                SelectionCut effective = effectiveCut(desired, state);
+                Optional<MicrotileActivationManager.ActiveGroup> active =
+                        this.resources.activations.active(node);
+                SelectionCut retained = active
+                        .filter(group -> group.content().root().equals(this.plan.root().root()))
+                        .map(group -> union(desired, group.content().selectionCut()))
+                        .orElse(desired);
+                SelectionCut effective = effectiveCut(retained, state);
                 if (effective == null) {
-                    ClientLodDebug.activationEmptyCut();
+                    if (diagnose) {
+                        debugNoCompatibleContent++;
+                        if (debugSampleNode == null) debugSampleNode = node;
+                    }
                     continue;
                 }
                 ContentPipeline.ActivationGroup group;
@@ -1337,33 +1847,59 @@ final class ClientSession {
                                     .map(ResidencyManager.ObjectStatus::decoded)
                                     .orElse(false));
                 } catch (ContentPipeline.MissingObjectsException missing) {
-                    ClientLodDebug.activationMissing(missing.requestable().size(),
-                            missing.neighborDependencies().size());
-                    if (!missing.requestable().isEmpty()) {
-                        this.plan.requestObjectsByHash(missing.requestable(),
-                                this.coverageCuts.containsNode(node)
-                                        ? ContentPriority.COVERAGE
-                                        : ContentPriority.CURRENT_VIEW);
+                    if (diagnose) {
+                        debugMissingContent += missing.requestable().size();
+                        debugMissingNeighbors += missing.neighborDependencies().size();
+                        if (debugSampleNode == null) debugSampleNode = node;
+                        if (debugSampleHash == null) {
+                            debugSampleHash = !missing.requestable().isEmpty()
+                                    ? missing.requestable().getFirst()
+                                    : missing.neighborDependencies().isEmpty() ? null
+                                    : missing.neighborDependencies().getFirst();
+                        }
                     }
-                    // Neighbor misses are intentionally not widened into CPU-side demand here.
-                    // A subsequent GPU selection snapshot is the sole authority that may emit
-                    // their exact missing handles for the selected source microtiles.
+                    ContentPriority priority = this.coverageCuts.containsNode(node)
+                            ? ContentPriority.COVERAGE : ContentPriority.CURRENT_VIEW;
+                    if (!missing.requestable().isEmpty()) {
+                        this.plan.requestObjectsByHash(missing.requestable(), priority);
+                    }
+                    // These are exact dependencies of the selected source slots, not a
+                    // widening to unrelated content in the structural node.
+                    if (!missing.neighborDependencies().isEmpty()) {
+                        this.plan.requestObjectsByHash(
+                                missing.neighborDependencies(), priority);
+                    }
+                    continue;
+                } catch (ContentPipeline.ModelsNotReadyException pending) {
+                    if (diagnose) {
+                        debugModelsPending++;
+                        debugPendingModelId = pending.localBlockId();
+                        if (debugSampleNode == null) debugSampleNode = node;
+                    }
+                    // Catalog baking continues on the renderer threads. Other nodes whose actual
+                    // terrain models are ready may activate without waiting for this one.
                     continue;
                 }
-                Optional<MicrotileActivationManager.ActiveGroup> active =
-                        this.resources.activations.active(node);
                 if (active.isPresent()
                         && active.orElseThrow().content().terrainIdentity()
                         .equals(group.terrainIdentity())
                         && active.orElseThrow().publication().activationFencePassed()) {
+                    if (diagnose) debugAlreadyActive++;
                     continue;
                 }
                 if (!stageActivation(group)) {
-                    ClientLodDebug.activationPressure();
+                    if (diagnose) {
+                        debugStageBlocked++;
+                        if (debugSampleNode == null) debugSampleNode = node;
+                    }
                     continue;
                 }
                 List<Hash256> requiredHashes = group.requiredHashes();
                 if (!this.resources.pinRootObjects(group.root(), requiredHashes)) {
+                    if (diagnose) {
+                        debugPinBlocked++;
+                        if (debugSampleNode == null) debugSampleNode = node;
+                    }
                     this.resources.activations.cancelCandidate(group.node(), group.root());
                     ArrayList<Hash256> missing = new ArrayList<>();
                     for (Hash256 hash : requiredHashes) {
@@ -1375,17 +1911,19 @@ final class ClientSession {
                                         ? ContentPriority.COVERAGE
                                         : ContentPriority.CURRENT_VIEW);
                         this.manifestDirty = true;
-                        ClientLodDebug.activationMissing(missing.size(), 0);
                     }
                     continue;
                 }
+                if (diagnose) debugSubmitted++;
                 this.compiling.add(node);
                 RootToken root = this.plan.root().root();
                 this.mesherWorker.execute(() -> {
                     long meshingStart = System.nanoTime();
                     Throwable failure = null;
+                    MicrotileActivationManager.CompileStatus status =
+                            MicrotileActivationManager.CompileStatus.NO_CANDIDATE;
                     try {
-                        this.resources.activations.compile(node, root,
+                        status = this.resources.activations.compile(node, root,
                                 RootDemandPlan.sectionKey(node), root.generation());
                     } catch (Throwable cause) {
                         failure = cause;
@@ -1394,22 +1932,48 @@ final class ClientSession {
                                 Math.max(1, TimeUnit.NANOSECONDS.toMicros(
                                         System.nanoTime() - meshingStart)));
                     }
-                    offer(new CompileEvent(root, node, failure));
+                    offer(new CompileEvent(root, node, status, failure));
                 });
             }
+            if (diagnose) ClientLodDebug.activationPass(this.activationCuts.size(), debugBusy,
+                    debugMissingBinding, debugNoCompatibleContent, debugMissingContent,
+                    debugMissingNeighbors, debugModelsPending, debugPendingModelId,
+                    debugStageBlocked, debugPinBlocked, debugWorkerSaturated,
+                    debugAlreadyActive, debugSubmitted, debugSampleNode, debugSampleHash);
         }
 
         /** Live renderable coverage outranks disposable cache and unpinned decoded content. */
         private boolean stageActivation(ContentPipeline.ActivationGroup group) {
-            if (this.resources.activations.stage(group, MESHING_SCRATCH,
-                    MAX_NODE_GEOMETRY, ACTIVATION_IN_FLIGHT)) return true;
-            this.resources.cache.disableForPressure();
-            return this.resources.activations.stage(group, MESHING_SCRATCH,
-                    MAX_NODE_GEOMETRY, ACTIVATION_IN_FLIGHT);
+            return this.resources.activations.stage(group);
+        }
+
+        /** Prevents an asynchronous mesh for an older, narrower cut from replacing coverage. */
+        private void reconcileActivationCandidates() {
+            if (this.plan == null) return;
+            RootToken root = this.plan.root().root();
+            this.resources.activations.retainCandidates(root, this::requiredActivationCut);
+        }
+
+        private SelectionCut requiredActivationCut(SpatialNode node) {
+            SelectionCut desired = this.activationCuts.cutForNode(node);
+            CompatibilityState state = this.compatibility.get(node);
+            if (desired == null || state == null) return null;
+            Optional<MicrotileActivationManager.ActiveGroup> active =
+                    this.resources.activations.active(node);
+            SelectionCut retained = active
+                    .filter(group -> group.content().root().equals(this.plan.root().root()))
+                    .map(group -> union(desired, group.content().selectionCut()))
+                    .orElse(desired);
+            return effectiveCut(retained, state);
         }
 
         private void scheduleRetirements() throws InterruptedException {
             if (this.plan == null || !this.completeFrontier) return;
+            if (this.cutPlanRevision != this.plan.manifestRevision()) {
+                invalidateSelectionAuthority();
+                this.manifestDirty = true;
+                return;
+            }
             Set<Long> resolved = this.plan.resolvedKeys();
             ArrayList<SpatialNode> immediate = new ArrayList<>();
             ArrayList<SpatialNode> outsideCandidates = new ArrayList<>();
@@ -1470,7 +2034,8 @@ final class ClientSession {
 
         private void queueRetirement(SpatialNode node) throws InterruptedException {
             this.retiring.add(node);
-            putMain(new RetireTask(this, this.plan.root().root(), node, this.selectionEpoch));
+            putMain(new RetireTask(this, this.plan.root().root(), node, this.selectionEpoch,
+                    this.cutPlanRevision));
         }
 
         private void invalidateSelectionAuthority() {
@@ -1562,36 +2127,29 @@ final class ClientSession {
 
         private void reconcileResidencyPins() {
             if (this.plan == null) return;
-            long references = saturatingAdd(this.plan.pinReferenceCount(),
-                    this.resources.activations.retainedHashReferenceCount());
-            long temporaryBytes;
-            try {
-                temporaryBytes = Math.addExact(4_096L,
-                        Math.multiplyExact(references, 384L));
-            } catch (ArithmeticException overflow) {
-                return;
-            }
-            Optional<MemoryBudget.Reservation> temporary = this.resources.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.OBJECT_TABLE,
-                            temporaryBytes));
-            if (temporary.isEmpty()) return;
-            try (MemoryBudget.Reservation ignored = temporary.orElseThrow()) {
-                LinkedHashSet<Hash256> retained = new LinkedHashSet<>();
-                this.plan.forEachMetadataPin(retained::add);
-                this.plan.forEachContentPin(retained::add);
-                this.resources.activations.forEachRetainedHash(retained::add);
-                var iterator = retained.iterator();
-                while (iterator.hasNext()) {
-                    Hash256 hash = iterator.next();
-                    if (!this.resources.residency.contains(hash)) {
-                        iterator.remove();
-                        if (!this.plan.retryMissingResidentObject(hash)) continue;
-                        this.manifestDirty = true;
-                    }
+            long pinRevision = this.pinInputsRevision;
+            long activationRevision = this.resources.activations.retentionRevision();
+            if (pinRevision == this.reconciledPinInputsRevision
+                    && activationRevision == this.reconciledActivationRetentionRevision) return;
+            LinkedHashSet<Hash256> retained = new LinkedHashSet<>();
+            this.plan.forEachMetadataPin(retained::add);
+            this.plan.forEachContentPin(retained::add);
+            this.resources.activations.forEachRetainedHash(retained::add);
+            var iterator = retained.iterator();
+            while (iterator.hasNext()) {
+                Hash256 hash = iterator.next();
+                if (!this.resources.residency.contains(hash)) {
+                    iterator.remove();
+                    if (!this.plan.retryMissingResidentObject(hash)) continue;
+                    this.manifestDirty = true;
+                    this.pinInputsRevision++;
                 }
-                if (!this.resources.reconcileRootPins(
-                        this.plan.root().root(), retained)) return;
-                this.resources.syncCachePins();
+            }
+            if (!this.resources.reconcileRootPins(this.plan.root().root(), retained)) return;
+            if (pinRevision == this.pinInputsRevision
+                    && activationRevision == this.resources.activations.retentionRevision()) {
+                this.reconciledPinInputsRevision = pinRevision;
+                this.reconciledActivationRetentionRevision = activationRevision;
             }
         }
 
@@ -1613,22 +2171,35 @@ final class ClientSession {
 
         private void publishManifest() {
             if (!this.manifestDirty || this.plan == null || this.modelCompatibility == null) return;
-            RootDemandPlan.ManifestView view = this.plan.manifestView();
+            // The render thread consumes at most one immutable snapshot per tick. Keep folding
+            // owner-thread changes into dirty state instead of allocating and discarding complete
+            // object graphs faster than that consumer can publish them.
+            if (this.pendingManifest.get() != null) return;
+            long planRevision = this.plan.manifestRevision();
             long snapshot = this.nextSnapshot++;
-            SelectionManifest manifest = SelectionManifestBuilder.build(view,
+            if (snapshot == 0 || this.nextSnapshot == 0) {
+                throw new IllegalStateException("selection snapshot sequence exhausted");
+            }
+            SelectionManifest manifest = this.selectionManifestBuilder.build(this.plan,
                     this.resources.residency, this.resources.activations, snapshot,
-                    this.cameraVisibilityDomain,
+                    this.selectionAuthority, planRevision,
+                    this.plan.selectionTopologyRevision(), this.cameraVisibilityDomain,
                     this.compatibility);
+            if (manifest == null) return;
             this.completeFrontier = false;
             this.issuedSnapshot = snapshot;
             this.pendingManifest.set(manifest);
             this.manifestDirty = false;
         }
 
+        private void clearPendingManifest() {
+            SelectionManifest pending = this.pendingManifest.getAndSet(null);
+            if (pending != null) pending.close();
+        }
+
         private void maybeSendRootReady() throws IOException {
             if (this.rootReadySent || !this.completeFrontier || this.plan == null
-                    || !this.plan.bootstrapObjectsProcessed()
-                    || !this.plan.discoveryComplete()) return;
+                    || !this.plan.bootstrapObjectsProcessed()) return;
             for (int index = 0; index < this.desiredCuts.size(); index++) {
                 SpatialNode node = this.desiredCuts.nodeAt(index);
                 SelectionCut desired = this.desiredCuts.cutAt(index);
@@ -1643,9 +2214,8 @@ final class ClientSession {
                         || !covers(active.orElseThrow().content().selectionCut(), required)
                         || !active.orElseThrow().publication().activationFencePassed()) return;
             }
-            send(new RootReady(this.dimension, this.plan.root().root()));
+            this.quic.sendRootReady(this.dimension, this.plan.root().root());
             this.rootReadySent = true;
-            ClientLodDebug.rootActivated(this.plan.root().root().generation());
         }
 
         private void pollActivationFences() {
@@ -1674,13 +2244,9 @@ final class ClientSession {
             }
             if (this.retiring.remove(fence.node)) {
                 this.lastRelevantSelectionEpoch.remove(fence.node);
-                ClientLodDebug.activationRetired(
-                        RootDemandPlan.sectionKey(fence.node), fence.root.generation());
                 this.manifestDirty = true;
                 return;
             }
-            ClientLodDebug.activationVisible(
-                    RootDemandPlan.sectionKey(fence.node), fence.root.generation());
             this.manifestDirty = true;
         }
 
@@ -1709,26 +2275,9 @@ final class ClientSession {
             ContentPipeline.CatalogMappings mapped =
                     new ContentPipeline.CatalogMappings(catalog.catalogId(), blocks, biomes);
             renderer.requestVirtualSurfaceModelBakes(blocks);
-            PendingCatalogBake pending = new PendingCatalogBake(root, catalog, mapped, blocks);
-            this.pendingCatalogBake.set(pending);
-            pollCatalogBakeOnMain(renderer);
-        }
-
-        /** Publishes model compatibility only after every catalog model has finished baking. */
-        private void pollCatalogBakeOnMain(VoxyRenderSystem renderer) {
-            PendingCatalogBake pending = this.pendingCatalogBake.get();
-            if (pending == null) return;
-            if (!isCurrent(pending.root())) {
-                this.pendingCatalogBake.compareAndSet(pending, null);
-                return;
-            }
-            if (!renderer.virtualSurfaceModelsReady(pending.localBlocksInternal())) return;
             CatalogModelCompatibility compatibility = renderer.createVirtualSurfaceModelCompatibility(
-                    pending.catalog(), pending.mappings());
-            if (this.pendingCatalogBake.compareAndSet(pending, null)) {
-                offer(new CatalogMappedEvent(pending.root(), pending.catalog(),
-                        pending.mappings(), compatibility));
-            }
+                    catalog, mapped);
+            offer(new CatalogMappedEvent(root, catalog, mapped, compatibility));
         }
 
         private void publishOnMain(RootToken root, SpatialNode node) {
@@ -1744,8 +2293,11 @@ final class ClientSession {
             }
         }
 
-        private void retireOnMain(RootToken root, SpatialNode node, long epoch) {
+        private void retireOnMain(RootToken root, SpatialNode node, long epoch,
+                                  long planRevision) {
             if (!isCurrent(root) || epoch != this.selectionEpoch || !this.completeFrontier
+                    || this.plan == null || planRevision != this.cutPlanRevision
+                    || planRevision != this.plan.manifestRevision()
                     || !hasCurrentCameraDomainLease()) {
                 offer(new RetireEvent(root, node,
                         MicrotileActivationManager.RemovalStatus.BLOCKED, null));
@@ -1761,6 +2313,267 @@ final class ClientSession {
             }
         }
 
+        /** Owns one short-lived QUIC object stream until FIN and every decode complete. */
+        private static final class ActiveRequest implements QuicClient.ObjectReceiver {
+            private final Connection owner;
+            private final RootToken root;
+            private final boolean subtree;
+            private final QuicClient.Lane lane;
+            private final LinkedHashSet<Hash256> pendingNetwork;
+            private final long startedNanos = System.nanoTime();
+            private QuicClient.Request handle;
+            private int processing;
+            private int networkRequestCount;
+            private boolean cacheLookupFinished;
+            private boolean networkFinished;
+            private boolean terminalQueued;
+            private boolean terminalTaken;
+            private boolean cancelled;
+            private boolean latencyRecorded;
+            private boolean ownerQueued;
+            private NetworkHandoff networkHandoff;
+            private final ArrayDeque<DecodedObjectEvent> cachedDecodeHandoffs =
+                    new ArrayDeque<>();
+
+            private ActiveRequest(Connection owner, RootToken root, boolean subtree,
+                                  QuicClient.Lane lane, List<Hash256> hashes) {
+                this.owner = owner;
+                this.root = root;
+                this.subtree = subtree;
+                this.lane = lane;
+                this.pendingNetwork = new LinkedHashSet<>(hashes);
+                if (this.pendingNetwork.size() != hashes.size()) {
+                    throw new IllegalArgumentException("duplicate object request hash");
+                }
+            }
+
+            private synchronized void setHandle(QuicClient.Request handle) {
+                this.handle = Objects.requireNonNull(handle, "handle");
+                if (this.cancelled) handle.cancel();
+            }
+
+            private synchronized void beginNetwork(int count) {
+                if (count < 1 || this.networkRequestCount != 0 || this.networkFinished) {
+                    throw new IllegalStateException("invalid QUIC network request transition");
+                }
+                this.networkRequestCount = count;
+            }
+
+            private synchronized int networkRequestCount() {
+                return this.networkRequestCount;
+            }
+
+            private synchronized boolean beginCached(Hash256 hash) {
+                if (this.cancelled || this.cacheLookupFinished
+                        || !this.pendingNetwork.remove(hash)) return false;
+                this.processing++;
+                return true;
+            }
+
+            private synchronized boolean finishCacheLookup() {
+                if (this.cancelled || this.cacheLookupFinished) return false;
+                this.cacheLookupFinished = true;
+                return true;
+            }
+
+            private synchronized boolean cancelled() {
+                return this.cancelled;
+            }
+
+            @Override
+            public void object(EncodedObject object, Runnable release) {
+                Throwable malformed = null;
+                synchronized (this) {
+                    if (this.cancelled || this.networkFinished) {
+                        object.close();
+                        release.run();
+                        return;
+                    }
+                    if (this.networkHandoff != null) {
+                        malformed = new IOException(
+                                "QUIC provider delivered an object before releasing its predecessor");
+                    } else if (!this.pendingNetwork.remove(object.hash())) {
+                        malformed = new IOException(
+                                "QUIC stream returned an unrequested object");
+                    } else {
+                        this.processing++;
+                        this.networkHandoff = new NetworkHandoff(object, release);
+                    }
+                }
+                if (malformed != null) {
+                    queueTerminal(malformed);
+                    object.close();
+                    release.run();
+                } else {
+                    signalOwner();
+                }
+            }
+
+            @Override
+            public synchronized void complete() {
+                queueTerminal(null);
+            }
+
+            @Override
+            public synchronized void failed(Throwable failure) {
+                queueTerminal(failure == null
+                        ? new IOException("QUIC object stream failed") : failure);
+            }
+
+            private void queueTerminal(Throwable failure) {
+                synchronized (this) {
+                    if (this.terminalQueued || this.cancelled) return;
+                    this.terminalQueued = true;
+                    this.terminalFailure = failure;
+                }
+                signalOwner();
+            }
+
+            private Throwable terminalFailure;
+
+            private void signalOwner() {
+                synchronized (this) {
+                    if (this.ownerQueued) return;
+                    this.ownerQueued = true;
+                }
+                this.owner.readyRequests.offer(this);
+                this.owner.signalActivity();
+            }
+
+            private synchronized void beginOwnerDrain() {
+                this.ownerQueued = false;
+            }
+
+            private synchronized NetworkHandoff beginNetworkDecode() {
+                if (this.networkHandoff == null || this.networkHandoff.stage != 0) return null;
+                this.networkHandoff.stage = 1;
+                return this.networkHandoff;
+            }
+
+            private void completeNetworkDecode(EncodedObject encoded, DecodedObject decoded,
+                                               Throwable failure, Runnable release) {
+                synchronized (this) {
+                    NetworkHandoff handoff = this.networkHandoff;
+                    if (handoff == null || handoff.stage != 1
+                            || handoff.encoded != encoded || handoff.release != release) {
+                        encoded.close();
+                        release.run();
+                        return;
+                    }
+                    handoff.decoded = decoded;
+                    handoff.failure = failure;
+                    handoff.stage = 2;
+                }
+                signalOwner();
+            }
+
+            private void completeCachedDecode(EncodedObject encoded, DecodedObject decoded,
+                                              Throwable failure, Runnable release) {
+                boolean discard;
+                synchronized (this) {
+                    discard = this.cancelled;
+                    if (discard) {
+                        if (this.processing > 0) this.processing--;
+                    } else {
+                        this.cachedDecodeHandoffs.addLast(new DecodedObjectEvent(
+                                this, encoded, decoded, failure, release, true));
+                    }
+                }
+                if (discard) {
+                    try {
+                        encoded.close();
+                    } finally {
+                        release.run();
+                    }
+                } else {
+                    signalOwner();
+                }
+            }
+
+            private synchronized DecodedObjectEvent takeNetworkDecode() {
+                NetworkHandoff handoff = this.networkHandoff;
+                if (handoff == null || handoff.stage != 2) return null;
+                this.networkHandoff = null;
+                return new DecodedObjectEvent(this, handoff.encoded, handoff.decoded,
+                        handoff.failure, handoff.release, false);
+            }
+
+            private synchronized DecodedObjectEvent takeCachedDecode() {
+                return this.cachedDecodeHandoffs.pollFirst();
+            }
+
+            private synchronized StreamFinishedEvent takeTerminal() {
+                if (!this.terminalQueued || this.terminalTaken) return null;
+                this.terminalTaken = true;
+                return new StreamFinishedEvent(this, this.terminalFailure);
+            }
+
+            private void releaseOwnedHandoff() {
+                Runnable release = null;
+                ArrayList<DecodedObjectEvent> cached = new ArrayList<>();
+                synchronized (this) {
+                    if (this.networkHandoff != null) {
+                        release = this.networkHandoff.release;
+                        this.networkHandoff.encoded.close();
+                        this.networkHandoff = null;
+                        if (this.processing > 0) this.processing--;
+                    }
+                    DecodedObjectEvent event;
+                    while ((event = this.cachedDecodeHandoffs.pollFirst()) != null) {
+                        cached.add(event);
+                        if (this.processing > 0) this.processing--;
+                    }
+                }
+                if (release != null) release.run();
+                for (DecodedObjectEvent event : cached) {
+                    try {
+                        event.encoded.close();
+                    } finally {
+                        event.release.run();
+                    }
+                }
+            }
+
+            private synchronized List<Hash256> finishNetwork() {
+                if (this.networkFinished) return List.of();
+                this.networkFinished = true;
+                List<Hash256> remaining = List.copyOf(this.pendingNetwork);
+                this.pendingNetwork.clear();
+                return remaining;
+            }
+
+            private synchronized List<Hash256> remainingNetwork() {
+                return List.copyOf(this.pendingNetwork);
+            }
+
+            private synchronized boolean networkFinished() {
+                return this.networkFinished;
+            }
+
+            private synchronized void processingCompleted() {
+                if (this.processing <= 0) throw new IllegalStateException(
+                        "object decode completion has no owned input");
+                this.processing--;
+            }
+
+            private synchronized boolean done() {
+                return this.networkFinished && this.processing == 0;
+            }
+
+            private synchronized void cancel() {
+                if (this.cancelled) return;
+                this.cancelled = true;
+                if (this.handle != null) this.handle.cancel();
+            }
+
+            private synchronized void recordResponseLatency() {
+                if (this.latencyRecorded) return;
+                this.latencyRecorded = true;
+                updateEwma(this.owner.roundTripMicros, Math.max(1,
+                        TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - this.startedNanos)));
+            }
+        }
+
         private RootDemandPlan requirePlan(RootToken root) {
             if (!isCurrent(root)) {
                 throw new IllegalArgumentException("response names an unretained root");
@@ -1772,87 +2585,18 @@ final class ClientSession {
             return Objects.equals(this.authoritativeRoot, root);
         }
 
-        private void send(Message message) throws IOException {
-            writeFrame(message.frameType(), WireMessage.encode(message));
-        }
-
-        private void writeFrame(int type, byte[] payload) throws IOException {
-            FrameCodec.write(this.output, type, payload);
-        }
-
-        private static byte[] encodeCameraDomainRequest(RootToken root, long sequence,
-                                                        CameraPosition position) {
-            if (sequence == 0) throw new IllegalArgumentException(
-                    "camera-domain sequence must be nonzero");
-            return ByteBuffer.allocate(CAMERA_DOMAIN_REQUEST_BYTES)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .putLong(root.generation())
-                    .put(root.dimensionHash().toBytes())
-                    .put(root.rootHash().toBytes())
-                    .putLong(sequence)
-                    .putInt(position.blockX)
-                    .putInt(position.blockY)
-                    .putInt(position.blockZ)
-                    .array();
-        }
-
-        private static CameraDomainEvent decodeCameraDomain(byte[] payload)
-                throws FrameCodec.FrameException {
-            requireLength(payload, CAMERA_DOMAIN_RESPONSE_BYTES, "CAMERA_DOMAIN");
-            try {
-                ByteBuffer input = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
-                RootToken root = new RootToken(input.getLong(), readHash(input), readHash(input));
-                long sequence = input.getLong();
-                int state = Byte.toUnsignedInt(input.get());
-                long domain = input.getLong();
-                int minX = input.getInt();
-                int minY = input.getInt();
-                int minZ = input.getInt();
-                int maxX = input.getInt();
-                int maxY = input.getInt();
-                int maxZ = input.getInt();
-                boolean paired = sequence != 0 && switch (state) {
-                    case 0 -> domain == 0;
-                    case 1 -> domain == 1;
-                    case 2 -> Long.compareUnsigned(domain, 2) >= 0;
-                    default -> false;
-                };
-                if (!paired) throw new FrameCodec.FrameException(
-                        "CAMERA_DOMAIN state/domain pairing is invalid");
-                if (minX > maxX || minY > maxY || minZ > maxZ) {
-                    throw new FrameCodec.FrameException(
-                            "CAMERA_DOMAIN lease bounds are inverted");
-                }
-                return new CameraDomainEvent(root, sequence, domain,
-                        minX, minY, minZ, maxX, maxY, maxZ);
-            } catch (IllegalArgumentException failure) {
-                throw new FrameCodec.FrameException(
-                        "CAMERA_DOMAIN contains an invalid root token");
+        private void completeOutstanding(Hash256 hash, ActiveRequest request) {
+            if (this.outstandingObjects.remove(hash, request)) {
+                this.outstandingBytes.addAndGet(request.subtree
+                    ? -ESTIMATED_SUBTREE_REQUEST_BYTES : -ESTIMATED_CONTENT_REQUEST_BYTES);
             }
-        }
-
-        private static Hash256 readHash(ByteBuffer input) {
-            return new Hash256(input.getLong(), input.getLong(), input.getLong(), input.getLong());
-        }
-
-        private void markOutstanding(List<Hash256> hashes, long estimatedBytes) {
-            for (Hash256 hash : hashes) {
-                if (this.outstandingObjects.putIfAbsent(hash, estimatedBytes) == null) {
-                    this.outstandingBytes.addAndGet(estimatedBytes);
-                }
-            }
-        }
-
-        private void completeOutstanding(Hash256 hash) {
-            Long estimated = this.outstandingObjects.remove(hash);
-            if (estimated != null) this.outstandingBytes.addAndGet(-estimated);
         }
 
         private void recordInboundBytes(long bytes) {
             long now = System.nanoTime();
             this.throughputWindowBytes = saturatingAdd(this.throughputWindowBytes, bytes);
             long elapsed = now - this.throughputWindowStart;
-            if (elapsed < TELEMETRY_WINDOW_NANOS) return;
+            if (elapsed < THROUGHPUT_WINDOW_NANOS) return;
             long rate = (long) Math.min(Long.MAX_VALUE,
                     this.throughputWindowBytes * (1_000_000_000.0 / elapsed));
             updateEwma(this.throughputBytesPerSecond, Math.max(1, rate));
@@ -1860,23 +2604,57 @@ final class ClientSession {
             this.throughputWindowBytes = 0;
         }
 
-        private void decodeHello(byte[] payload) throws FrameCodec.FrameException {
-            requireLength(payload, Long.BYTES, "HELLO");
-            ByteBuffer input = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
-            this.serverInstance = input.getLong();
-        }
-
-        private void offer(StateEvent event) {
-            if (!this.open || !this.state.offer(event)) {
-                reject(event, new IOException("state queue is closed or full"));
-                close();
+        private boolean offer(StateEvent event) {
+            if (this.open && this.state.offer(event)) {
+                signalActivity();
+                return true;
             }
+            IOException failure = new IOException("state queue is closed or full");
+            reject(event, failure);
+            requestClose(failure);
+            return false;
         }
 
         private void fail(String message, Throwable failure) {
-            ClientLodDebug.failure(message);
             if (failure == null) Logger.warn(message); else Logger.warn(message, failure);
-            close();
+            requestClose(failure == null ? new IOException(message) : failure);
+        }
+
+        private void requestClose(Throwable failure) {
+            this.asynchronousFailure.compareAndSet(null, failure);
+            this.open = false;
+            this.quic.close();
+            signalActivity();
+        }
+
+        private void signalActivity() {
+            this.wakeup.release();
+        }
+
+        private void awaitActivity() throws InterruptedException {
+            long deadline = nextDeadlineNanos();
+            if (deadline == Long.MAX_VALUE) {
+                this.wakeup.acquire();
+                return;
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining > 0) this.wakeup.tryAcquire(remaining, TimeUnit.NANOSECONDS);
+        }
+
+        private long nextDeadlineNanos() {
+            long deadline = Long.MAX_VALUE;
+            if (this.plan != null && this.cameraPosition.get() != null
+                    && !hasCurrentCameraDomainLease()) {
+                long cameraDeadline = this.lastCameraDomainQueryNanos
+                        + (this.pendingCameraDomainSequence == 0
+                        ? CAMERA_DOMAIN_QUERY_INTERVAL_NANOS
+                        : CAMERA_DOMAIN_QUERY_TIMEOUT_NANOS);
+                deadline = Math.min(deadline, cameraDeadline);
+            }
+            for (DelayedRetry retry : this.delayedObjectRetries.values()) {
+                deadline = Math.min(deadline, retry.readyNanos);
+            }
+            return deadline;
         }
 
         @Override
@@ -1884,85 +2662,115 @@ final class ClientSession {
             boolean initiator = this.closing.compareAndSet(false, true);
             if (initiator) {
                 this.open = false;
-                this.pendingCatalogBake.set(null);
-                try {
-                    this.transport.close();
-                } catch (IOException ignored) {}
-                Thread thread = this.writer;
-                if (thread != null && thread != Thread.currentThread()) thread.interrupt();
-                try {
-                    this.decoder.close();
-                } catch (RuntimeException failure) {
-                    Logger.warn("Failed to close the object decoder cleanly", failure);
-                } finally {
-                    this.decoderWorker.shutdownNow();
-                    this.mesherWorker.shutdownNow();
-                    this.shutdownStarted.countDown();
-                }
+                this.quic.close();
+                signalActivity();
+                this.shutdownStarted.countDown();
             } else {
                 awaitLatch(this.shutdownStarted);
             }
 
+            // Lifecycle calls on Minecraft's thread only signal shutdown. The connection owner
+            // performs potentially unbounded worker/disk drainage before its resources are
+            // reaped on a later render tick.
+            if (Thread.currentThread() != this.ownerThread
+                    || !this.finalized.compareAndSet(false, true)) return;
+
+            cancelAllRequests(false);
+            try {
+                this.decoder.close();
+            } catch (RuntimeException failure) {
+                Logger.warn("Failed to close the object decoder cleanly", failure);
+            } finally {
+                this.decoderWorker.shutdownNow();
+                this.mesherWorker.shutdownNow();
+                this.cacheReadWorker.shutdownNow();
+                for (Runnable abandoned : this.cacheWriteWorker.shutdownNow()) {
+                    if (abandoned instanceof PersistObjectTask persisted) persisted.discard();
+                }
+            }
+
             Thread current = Thread.currentThread();
             boolean worker = current == this.decoderThread.get() || current == this.mesherThread.get();
+            long shutdownDeadline = System.nanoTime() + SHUTDOWN_TIMEOUT_NANOS;
             if (!worker) {
-                awaitTermination(this.decoderWorker);
-                awaitTermination(this.mesherWorker);
-                awaitThread(this.writer);
+                awaitTermination(this.decoderWorker, shutdownDeadline, "object decoder");
+                awaitTermination(this.mesherWorker, shutdownDeadline, "hybrid mesher");
+                awaitTermination(this.cacheReadWorker, shutdownDeadline, "cache reader");
+                awaitTermination(this.cacheWriteWorker, shutdownDeadline, "cache writer");
             } else if (initiator) {
                 ExecutorService other = current == this.decoderThread.get()
                         ? this.mesherWorker : this.decoderWorker;
-                awaitTermination(other);
+                awaitTermination(other, shutdownDeadline, "other Voxy worker");
+                awaitTermination(this.cacheReadWorker, shutdownDeadline, "cache reader");
+                awaitTermination(this.cacheWriteWorker, shutdownDeadline, "cache writer");
             }
 
-            if (initiator) {
-                this.outstandingObjects.clear();
-                this.outstandingBytes.set(0);
-                StateEvent event;
-                while ((event = this.state.poll()) != null) {
-                    reject(event, new IOException("session closed"));
-                }
+            if (workersTerminated()) releaseOwnedState();
+            else Logger.warn("Voxy workers remain owned after the shutdown deadline; "
+                    + "resources will be reaped after they terminate");
+        }
+
+        private boolean workersTerminated() {
+            return this.quic.isTerminated()
+                    && this.decoderWorker.isTerminated() && this.mesherWorker.isTerminated()
+                    && this.cacheReadWorker.isTerminated() && this.cacheWriteWorker.isTerminated();
+        }
+
+        /** Releases stream bodies only after no worker can still read or publish them. */
+        private void releaseOwnedState() {
+            if (!this.ownedStateReleased.compareAndSet(false, true)) return;
+            clearPendingManifest();
+            for (ActiveRequest request : List.copyOf(this.activeRequests)) {
+                request.releaseOwnedHandoff();
+            }
+            this.activeRequests.clear();
+            this.readyRequests.clear();
+            this.outstandingObjects.clear();
+            this.outstandingBytes.set(0);
+            StateEvent event;
+            while ((event = this.state.poll()) != null) {
+                reject(event, new IOException("session closed"));
             }
         }
 
         private static void awaitLatch(java.util.concurrent.CountDownLatch latch) {
             boolean interrupted = false;
-            while (true) {
+            long deadline = System.nanoTime() + SHUTDOWN_TIMEOUT_NANOS;
+            while (latch.getCount() != 0 && deadline - System.nanoTime() > 0) {
                 try {
-                    latch.await();
+                    latch.await(Math.max(1, deadline - System.nanoTime()),
+                            TimeUnit.NANOSECONDS);
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
                     break;
-                } catch (InterruptedException ignored) {
-                    interrupted = true;
                 }
             }
+            if (latch.getCount() != 0) Logger.warn("Voxy shutdown coordination timed out");
             if (interrupted) Thread.currentThread().interrupt();
         }
 
-        private static void awaitTermination(ExecutorService executor) {
+        private static void awaitTermination(ExecutorService executor, long deadline,
+                                             String label) {
             boolean interrupted = false;
-            while (!executor.isTerminated()) {
+            while (!executor.isTerminated() && deadline - System.nanoTime() > 0) {
                 try {
-                    executor.awaitTermination(100, TimeUnit.MILLISECONDS);
+                    executor.awaitTermination(Math.max(1, deadline - System.nanoTime()),
+                            TimeUnit.NANOSECONDS);
                 } catch (InterruptedException ignored) {
                     interrupted = true;
+                    break;
                 }
             }
+            if (!executor.isTerminated()) Logger.warn("Voxy " + label
+                    + " exceeded shutdown deadline");
             if (interrupted) Thread.currentThread().interrupt();
         }
 
-        private static void awaitThread(Thread thread) {
-            if (thread == null || thread == Thread.currentThread()) return;
-            boolean interrupted = false;
-            while (thread.isAlive()) {
-                try {
-                    thread.join();
-                } catch (InterruptedException ignored) {
-                    interrupted = true;
-                }
-            }
-            if (interrupted) Thread.currentThread().interrupt();
-        }
     }
+
+    private record RetiredSession(Thread owner, Connection connection, SessionResources resources,
+                                  boolean resetSelection) {}
+    private record DelayedRetry(boolean subtree, long readyNanos) {}
 
     private sealed interface MainTask permits CatalogTask, PublishTask, RetireTask {
         Connection connection();
@@ -1996,11 +2804,13 @@ final class ClientSession {
     }
 
     private record RetireTask(Connection connection, RootToken root,
-                              SpatialNode node, long selectionEpoch) implements MainTask {
+                              SpatialNode node, long selectionEpoch,
+                              long planRevision) implements MainTask {
         @Override
         public void apply(ClientLevel level, VoxyRenderSystem renderer,
                           SessionResources resources) {
-            this.connection.retireOnMain(this.root, this.node, this.selectionEpoch);
+            this.connection.retireOnMain(this.root, this.node, this.selectionEpoch,
+                    this.planRevision);
         }
 
         @Override
@@ -2010,50 +2820,41 @@ final class ClientSession {
         }
     }
 
-    private sealed interface StateEvent permits RootEvent, EnvelopeEvent, DecodedBatchEvent,
+    private sealed interface StateEvent permits CacheLookupFinishedEvent,
             CatalogMappedEvent, SelectionEvent, ManifestPublishedEvent, CompileEvent,
-            PublishEvent, RetireEvent, FenceEvent, CameraDomainEvent {}
+            PublishEvent, RetireEvent, FenceEvent, DebugSnapshotEvent {}
 
-    private record RootEvent(RootAnnounce root) implements StateEvent {}
-    private record EnvelopeEvent(RootToken root, boolean subtree, List<EncodedObject> objects,
-                                 CompletableFuture<Void> completion) implements StateEvent {
-        private EnvelopeEvent(RootToken root, boolean subtree, List<EncodedObject> objects) {
-            this(root, subtree, List.copyOf(objects), new CompletableFuture<>());
-        }
-    }
-    private record DecodedObject(EncodedObject encoded, CanonicalObject canonical) {}
-    private record PendingCatalogBake(RootToken root, CatalogCodec.Catalog catalog,
-                                      ContentPipeline.CatalogMappings mappings,
-                                      int[] localBlocks) {
-        private PendingCatalogBake {
-            Objects.requireNonNull(root, "root");
-            Objects.requireNonNull(catalog, "catalog");
-            Objects.requireNonNull(mappings, "mappings");
-            localBlocks = Objects.requireNonNull(localBlocks, "localBlocks").clone();
-        }
+    private enum DebugSnapshotEvent implements StateEvent { INSTANCE }
 
-        @Override
-        public int[] localBlocks() {
-            return this.localBlocks.clone();
-        }
+    private record CachedObject(Hash256 hash, EncodedObject encoded) {}
+    private record CacheLookupFinishedEvent(Connection.ActiveRequest request,
+                                            List<CachedObject> cached,
+                                            Throwable failure) implements StateEvent {}
+    private record DecodedObjectEvent(Connection.ActiveRequest request, EncodedObject encoded,
+                                      DecodedObject decoded, Throwable failure,
+                                      Runnable release, boolean fromCache) {}
+    private record StreamFinishedEvent(Connection.ActiveRequest request, Throwable failure) {}
+    private static final class NetworkHandoff {
+        private final EncodedObject encoded;
+        private final Runnable release;
+        private DecodedObject decoded;
+        private Throwable failure;
+        /** 0 = awaiting owner, 1 = decoding, 2 = decoded. */
+        private int stage;
 
-        private int[] localBlocksInternal() {
-            return this.localBlocks;
-        }
-    }
-    private record DecodedBatchEvent(RootToken root, boolean subtree,
-                                     List<DecodedObject> objects,
-                                     CompletableFuture<Void> completion) implements StateEvent {
-        private DecodedBatchEvent(RootToken root, boolean subtree, List<DecodedObject> objects) {
-            this(root, subtree, List.copyOf(objects), new CompletableFuture<>());
+        private NetworkHandoff(EncodedObject encoded, Runnable release) {
+            this.encoded = Objects.requireNonNull(encoded, "encoded");
+            this.release = Objects.requireNonNull(release, "release");
         }
     }
     private record CatalogMappedEvent(RootToken root, CatalogCodec.Catalog catalog,
                                       ContentPipeline.CatalogMappings mappings,
                                       CatalogModelCompatibility compatibility) implements StateEvent {}
     private record SelectionEvent(SelectionBatch selection) implements StateEvent {}
-    private record ManifestPublishedEvent(long generation, long snapshot) implements StateEvent {}
+    private record ManifestPublishedEvent(long generation, long snapshot, long authority)
+            implements StateEvent {}
     private record CompileEvent(RootToken root, SpatialNode node,
+                                MicrotileActivationManager.CompileStatus status,
                                 Throwable failure) implements StateEvent {}
     private record PublishEvent(RootToken root, SpatialNode node, boolean queued,
                                 Throwable failure) implements StateEvent {}
@@ -2064,7 +2865,7 @@ final class ClientSession {
                               Throwable failure) implements StateEvent {}
     private record CameraDomainEvent(RootToken root, long sequence, long domain,
                                      int minX, int minY, int minZ,
-                                     int maxX, int maxY, int maxZ) implements StateEvent {
+                                     int maxX, int maxY, int maxZ) {
         private boolean contains(CameraPosition position) {
             return position.blockX >= this.minX && position.blockX <= this.maxX
                     && position.blockY >= this.minY && position.blockY <= this.maxY
@@ -2093,32 +2894,19 @@ final class ClientSession {
         }
     }
     private record CameraPosition(int blockX, int blockY, int blockZ) {}
-    private record ServerError(int code, String text) {}
 
     @FunctionalInterface
-    private interface CheckedAction {
-        void run() throws Exception;
-    }
-
-    private static void complete(CompletableFuture<Void> completion, CheckedAction action)
-            throws Exception {
-        try {
-            action.run();
-            completion.complete(null);
-        } catch (Throwable failure) {
-            completion.completeExceptionally(failure);
-            if (failure instanceof Exception exception) throw exception;
-            throw (Error) failure;
-        }
+    private interface CacheAction {
+        void run() throws IOException;
     }
 
     private static void reject(StateEvent event, Throwable failure) {
-        if (event instanceof EnvelopeEvent envelope) {
-            envelope.completion.completeExceptionally(failure);
-        } else if (event instanceof DecodedBatchEvent batch) {
-            batch.completion.completeExceptionally(failure);
-        } else if (event instanceof SelectionEvent selection) {
+        if (event instanceof SelectionEvent selection) {
             selection.selection.close();
+        } else if (event instanceof CacheLookupFinishedEvent cached) {
+            for (CachedObject object : cached.cached) {
+                object.encoded.close();
+            }
         }
     }
 
@@ -2145,16 +2933,19 @@ final class ClientSession {
                                        SelectionBatch batch, SelectionBatch.Segment segment,
                                        int row, boolean requestsOnly) {
         ContentPriority priority = contentPriority(batch.priority(segment, row));
+        int nodeIndex = batch.nodeIndex(segment, row);
+        SelectionManifest manifest = batch.manifest();
         for (int ordinal = 0; ordinal < 3; ordinal++) {
             var contentClass = contentClass(ordinal);
             long selected = batch.selectedMask(segment, row, contentClass);
             if (selected == 0) continue;
-            var state = batch.contentState(segment, row, contentClass);
-            addSelectedObjects(result, state, selected, priority, requestsOnly);
-            addDependencies(result, state.dependencyHandlesInternal(),
-                    state.residentDependenciesInternal(), state.inFlightDependenciesInternal(),
+            var layout = batch.contentLayout(segment, row, contentClass);
+            addSelectedObjects(result, manifest, nodeIndex, contentClass, layout,
+                    selected, priority, requestsOnly);
+            addDependencies(result, manifest, nodeIndex, contentClass, layout,
                     priority, requestsOnly);
-            if (requestsOnly) addSelectedNeighbors(result, state, selected, priority, true);
+            if (requestsOnly) addSelectedNeighbors(result, manifest, nodeIndex,
+                    contentClass, layout, selected, priority, true);
         }
     }
 
@@ -2163,50 +2954,63 @@ final class ClientSession {
             HandlePriorities result, SelectionBatch batch,
             SelectionBatch.Segment segment, int row) {
         ContentPriority priority = contentPriority(batch.priority(segment, row));
+        int nodeIndex = batch.nodeIndex(segment, row);
+        SelectionManifest manifest = batch.manifest();
         for (int ordinal = 0; ordinal < 3; ordinal++) {
             var contentClass = contentClass(ordinal);
             long selected = batch.selectedMask(segment, row, contentClass);
-            if (selected != 0) addSelectedNeighbors(result,
-                    batch.contentState(segment, row, contentClass), selected, priority, false);
+            if (selected != 0) addSelectedNeighbors(result, manifest, nodeIndex,
+                    contentClass, batch.contentLayout(segment, row, contentClass),
+                    selected, priority, false);
         }
     }
 
     private static void addSelectedObjects(HandlePriorities target,
-                                           me.cortex.voxy.client.core.rendering.selection.SelectionManifest.ContentState state,
+                                           SelectionManifest manifest, int nodeIndex,
+                                           SelectionManifest.ContentClass contentClass,
+                                           SelectionManifest.ContentLayout state,
                                            long selected, ContentPriority priority,
                                            boolean missingOnly) {
         long accepted = missingOnly
-                ? selected & ~(state.residentMask() | state.inFlightMask()) : selected;
+                ? selected & ~(manifest.residentMask(nodeIndex, contentClass)
+                | manifest.inFlightMask(nodeIndex, contentClass)) : selected;
         int dense = 0;
         int[] handles = state.objectHandlesInternal();
         for (int microtile = 0; microtile < Long.SIZE; microtile++) {
             long bit = 1L << microtile;
-            if ((state.availableMask() & bit) == 0) continue;
+            if ((state.declaredMask() & bit) == 0) continue;
             int handle = handles[dense++];
             if ((accepted & bit) != 0) mergePriority(target, handle, priority);
         }
     }
 
-    private static void addDependencies(HandlePriorities target, int[] handles,
-                                        java.util.BitSet resident, java.util.BitSet inFlight,
+    private static void addDependencies(HandlePriorities target,
+                                        SelectionManifest manifest, int nodeIndex,
+                                        SelectionManifest.ContentClass contentClass,
+                                        SelectionManifest.ContentLayout state,
                                         ContentPriority priority, boolean missingOnly) {
+        int[] handles = state.dependencyHandlesInternal();
         for (int index = 0; index < handles.length; index++) {
-            if (!missingOnly || !resident.get(index) && !inFlight.get(index)) {
+            if (!missingOnly
+                    || !manifest.dependencyResident(nodeIndex, contentClass, index)
+                    && !manifest.dependencyInFlight(nodeIndex, contentClass, index)) {
                 mergePriority(target, handles[index], priority);
             }
         }
     }
 
     private static void addSelectedNeighbors(HandlePriorities target,
-                                             me.cortex.voxy.client.core.rendering.selection.SelectionManifest.ContentState state,
+                                             SelectionManifest manifest, int nodeIndex,
+                                             SelectionManifest.ContentClass contentClass,
+                                             SelectionManifest.ContentLayout state,
                                              long selected, ContentPriority priority,
                                              boolean missingOnly) {
         int[] handles = state.neighborDependencyHandlesInternal();
         int[] sources = state.neighborDependencySourcesInternal();
         for (int index = 0; index < handles.length; index++) {
             if ((selected & 1L << sources[index]) == 0) continue;
-            if (missingOnly && (state.residentNeighborDependenciesInternal().get(index)
-                    || state.inFlightNeighborDependenciesInternal().get(index))) continue;
+            if (missingOnly && (manifest.neighborResident(nodeIndex, contentClass, index)
+                    || manifest.neighborInFlight(nodeIndex, contentClass, index))) continue;
             mergePriority(target, handles[index], priority);
         }
     }
@@ -2244,6 +3048,7 @@ final class ClientSession {
         private int[] activeEpochs = new int[0];
         private int[] activeHandles = new int[0];
         private long[] keyTable = new long[0];
+        private int[] keyHandles = new int[0];
         private byte[] keyStates = new byte[0];
         private int epoch = 1;
         private int count;
@@ -2280,7 +3085,7 @@ final class ClientSession {
             } else {
                 this.activeEpochs[handle] = this.epoch;
                 this.activeHandles[this.count++] = handle;
-                insertKey(key);
+                insertKey(key, handle);
             }
             if (this.nodesByHandle[handle] == null || this.keysByHandle[handle] != key) {
                 this.keysByHandle[handle] = key;
@@ -2315,15 +3120,38 @@ final class ClientSession {
             return false;
         }
 
-        private void insertKey(long key) {
+        private SelectionCut cutForNode(SpatialNode node) {
+            if (this.keyTable.length == 0) return null;
+            long key = RootDemandPlan.sectionKey(node);
             int mask = this.keyTable.length - 1;
             int slot = mix(key) & mask;
             while (this.keyStates[slot] != 0) {
-                if (this.keyTable[slot] == key) return;
+                if (this.keyTable[slot] == key) {
+                    int handle = this.keyHandles[slot];
+                    return this.activeEpochs[handle] == this.epoch
+                            ? this.cutsByHandle[handle] : null;
+                }
+                slot = slot + 1 & mask;
+            }
+            return null;
+        }
+
+        private void insertKey(long key, int handle) {
+            int mask = this.keyTable.length - 1;
+            int slot = mix(key) & mask;
+            while (this.keyStates[slot] != 0) {
+                if (this.keyTable[slot] == key) {
+                    if (this.keyHandles[slot] != handle) {
+                        throw new IllegalArgumentException(
+                                "one section key has multiple selection handles");
+                    }
+                    return;
+                }
                 slot = slot + 1 & mask;
             }
             this.keyStates[slot] = 1;
             this.keyTable[slot] = key;
+            this.keyHandles[slot] = handle;
         }
 
         private void ensureCapacity(int handleCapacity) {
@@ -2339,9 +3167,11 @@ final class ClientSession {
                 tableCapacity = Math.multiplyExact(tableCapacity, 2);
             }
             this.keyTable = new long[tableCapacity];
+            this.keyHandles = new int[tableCapacity];
             this.keyStates = new byte[tableCapacity];
             for (int index = 0; index < this.count; index++) {
-                insertKey(this.keysByHandle[this.activeHandles[index]]);
+                int handle = this.activeHandles[index];
+                insertKey(this.keysByHandle[handle], handle);
             }
         }
 
@@ -2570,40 +3400,10 @@ final class ClientSession {
                 ? null : new SelectionCut(exterior, interior, complex);
     }
 
-    private static List<Hash256> complexCompanions(Binding binding, long mask) {
-        ArrayList<Hash256> hashes = new ArrayList<>();
-        for (RootDemandPlan.ContentLayer layer : binding.layers()) {
-            if (layer.contentClass() != ContentClass.COMPLEX) continue;
-            for (ContentObject object : layer.objects()) {
-                if ((mask & 1L << object.microtileIndex()) != 0) hashes.add(object.hash());
-            }
-        }
-        return List.copyOf(hashes);
-    }
-
     private static boolean isMicrotile(ObjectKind kind) {
         return kind == ObjectKind.EXTERIOR_MICROTILE
                 || kind == ObjectKind.INTERIOR_MICROTILE
                 || kind == ObjectKind.COMPLEX_MICROTILE;
-    }
-
-    private static ServerError decodeError(byte[] payload)
-            throws FrameCodec.FrameException {
-        if (payload.length < Integer.BYTES || payload.length > Integer.BYTES + MAX_NAME) {
-            throw new FrameCodec.FrameException("invalid ERROR payload");
-        }
-        ByteBuffer input = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
-        int code = input.getInt();
-        byte[] text = new byte[input.remaining()];
-        input.get(text);
-        try {
-            return new ServerError(code, StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(ByteBuffer.wrap(text)).toString());
-        } catch (CharacterCodingException failure) {
-            throw new FrameCodec.FrameException("ERROR text is not UTF-8");
-        }
     }
 
     private static BlockState parseCanonicalState(String canonical) {
@@ -2655,14 +3455,4 @@ final class ClientSession {
         return id.toString();
     }
 
-    private static void requireLength(byte[] payload, int expected, String label)
-            throws FrameCodec.FrameException {
-        if (payload.length != expected) {
-            throw new FrameCodec.FrameException(label + " has an invalid length");
-        }
-    }
-
-    private static ByteBuffer little(int bytes) {
-        return ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
-    }
 }

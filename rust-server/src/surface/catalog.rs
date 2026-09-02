@@ -90,7 +90,6 @@ impl Catalog {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
         output.extend_from_slice(&self.catalog_id.to_le_bytes());

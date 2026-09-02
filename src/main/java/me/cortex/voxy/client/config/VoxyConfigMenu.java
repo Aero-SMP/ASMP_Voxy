@@ -30,7 +30,6 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
     private static final ResourceLocation IRIS_RELOAD = id("iris_reload");
     private static final ResourceLocation RENDERING = id("rendering");
     private static final ResourceLocation RENDER_DISTANCE = id("render_distance");
-    private static final ResourceLocation MEMORY_BUDGET = id("virtual_surface_memory");
     private static final ResourceLocation RENDER_RELOAD = OptionFlag.REQUIRES_RENDERER_RELOAD.getId();
 
     @Override
@@ -70,15 +69,6 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 value -> CFG.sectionRenderDistance = (float) value / 16, RENDER_DISTANCE)
                 .setRange(new Range(10, 64 * 16, 1))
                 .setValueFormatter(value -> Component.literal(Integer.toString(value * 2)))
-                .setImpact(OptionImpact.MEDIUM)
-                .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
-
-        var memoryBudget = option(builder.createIntegerOption(MEMORY_BUDGET),
-                "voxy.config.general.virtualSurfaceMemory", () -> CFG.virtualSurfaceMemoryMiB,
-                value -> CFG.virtualSurfaceMemoryMiB = value, RENDER_RELOAD)
-                .setRange(new Range(VoxyConfig.MIN_VIRTUAL_SURFACE_MEMORY_MIB,
-                        VoxyConfig.MAX_VIRTUAL_SURFACE_MEMORY_MIB, 64))
-                .setValueFormatter(value -> Component.literal(value + " MiB"))
                 .setImpact(OptionImpact.MEDIUM)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
@@ -132,7 +122,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
-                .addOptionGroup(group(builder, subdivisionSize, renderDistance, memoryBudget))
+                .addOptionGroup(group(builder, subdivisionSize, renderDistance))
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
                 .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));

@@ -20,7 +20,6 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    mem::size_of,
     sync::Arc,
 };
 
@@ -262,13 +261,6 @@ pub struct VisibilityIndex {
     columns: BTreeMap<(i32, i32), ColumnCoverage>,
 }
 
-#[derive(Clone, Debug)]
-pub struct VisibilityObjectGraph {
-    pub directory: CanonicalObject,
-    pub pages: Vec<CanonicalObject>,
-    pub summary_pages: Vec<CanonicalObject>,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct PageReference {
     first: u64,
@@ -301,48 +293,6 @@ pub struct RegionChunkSource {
 }
 
 impl RegionalVisibilitySummary {
-    /// Conservative retained-heap accounting used to transfer a completed regional build from
-    /// its temporary reservation into the root-lifetime reservation before temporary memory is
-    /// released.
-    pub fn retained_bytes(&self) -> Result<usize> {
-        let mut bytes = size_of::<Self>()
-            .checked_add(self.source_chunks.capacity() * size_of::<RegionChunkSource>())
-            .and_then(|value| {
-                value.checked_add(
-                    self.generated_coverage.len() * (64 + size_of::<((i32, i32), u8)>()),
-                )
-            })
-            .and_then(|value| {
-                value.checked_add(
-                    self.source_microtiles.len()
-                        * (64 + size_of::<SectionKey>() + 64 * size_of::<ObjectHash>()),
-                )
-            })
-            .context("regional visibility memory estimate overflow")?;
-        for local in self.locals.values() {
-            bytes = bytes
-                .checked_add(64 + size_of::<SectionKey>() + size_of::<LocalSection>())
-                .context("regional visibility memory estimate overflow")?;
-            if let LocalLabels::Runs(labels) = &local.labels {
-                bytes = bytes
-                    .checked_add(labels.capacity() * size_of::<LabelRun>())
-                    .context("regional visibility memory estimate overflow")?;
-            }
-            bytes = bytes
-                .checked_add(local.components.capacity() * size_of::<Component>())
-                .context("regional visibility memory estimate overflow")?;
-            for component in &local.components {
-                bytes = bytes
-                    .checked_add(
-                        component.adjacent.len()
-                            * (64 + size_of::<SectionKey>() + size_of::<u64>()),
-                    )
-                    .context("regional visibility memory estimate overflow")?;
-            }
-        }
-        Ok(bytes)
-    }
-
     pub fn source_chunks(&self) -> &[RegionChunkSource] {
         &self.source_chunks
     }
@@ -492,12 +442,6 @@ impl RegionalVisibilitySummary {
 }
 
 #[derive(Clone, Debug)]
-pub struct RecoveredVisibility {
-    pub index: VisibilityIndex,
-    pub regions: BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-}
-
-#[derive(Clone, Debug)]
 struct RegionReference {
     region_x: i32,
     region_z: i32,
@@ -507,392 +451,26 @@ struct RegionReference {
 }
 
 impl VisibilityIndex {
-    pub fn exact_build_memory_bound(
-        regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-    ) -> Result<usize> {
-        let mut retained = 0usize;
-        let mut sections = 0usize;
-        let mut components = 0usize;
-        let mut adjacency = 0usize;
-        let mut columns = 0usize;
-        for region in regions.values() {
-            retained = retained
-                .checked_add(region.retained_bytes()?)
-                .context("visibility-build estimate overflow")?;
-            sections = sections
-                .checked_add(region.locals.len())
-                .context("visibility-build estimate overflow")?;
-            columns = columns
-                .checked_add(region.generated_coverage.len())
-                .context("visibility-build estimate overflow")?;
-            for local in region.locals.values() {
-                components = components
-                    .checked_add(local.components.len())
-                    .context("visibility-build estimate overflow")?;
-                adjacency = adjacency
-                    .checked_add(
-                        local
-                            .components
-                            .iter()
-                            .map(|component| component.adjacent.len())
-                            .sum::<usize>(),
-                    )
-                    .context("visibility-build estimate overflow")?;
-            }
-        }
-        // Covers the cloned local graph, DSU/root tables, five tile levels, and temporary
-        // parent-level builders. The 64-tile term is a true structural maximum per section.
-        let section_bytes = sections
-            .checked_mul(64 * 96 + 256)
-            .context("visibility-build estimate overflow")?;
-        let component_bytes = components
-            .checked_mul(160)
-            .context("visibility-build estimate overflow")?;
-        let adjacency_bytes = adjacency
-            .checked_mul(128)
-            .context("visibility-build estimate overflow")?;
-        let column_bytes = columns
-            .checked_mul(128)
-            .context("visibility-build estimate overflow")?;
-        retained
-            .checked_add(section_bytes)
-            .and_then(|value| value.checked_add(component_bytes))
-            .and_then(|value| value.checked_add(adjacency_bytes))
-            .and_then(|value| value.checked_add(column_bytes))
-            .and_then(|value| value.checked_add(32 * 1024 * 1024))
-            .context("visibility-build estimate overflow")
-    }
-
-    pub fn conservative_build_memory_bound(
-        regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-    ) -> Result<usize> {
-        let columns = regions.values().try_fold(0usize, |total, region| {
-            total
-                .checked_add(region.generated_coverage.len())
-                .context("visibility-build estimate overflow")
-        })?;
-        columns
-            .checked_mul(128)
-            .and_then(|value| value.checked_add(1024 * 1024))
-            .context("visibility-build estimate overflow")
-    }
-
-    /// Creates a root-local conservative index without joining the regional portal graph. This
-    /// is the mandatory first publication after terrain changes and the pressure fallback for
-    /// an exact rebuild: all content is marked UNKNOWN until a later complete root is ready.
-    pub fn conservative_from_regions(
-        dimension: &str,
-        regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-    ) -> Result<Self> {
-        Self::conservative_from_regions_with_policy(
-            dimension,
-            DimensionVisibilityPolicy::for_dimension(dimension),
-            regions,
-        )
-    }
-
     pub fn conservative_from_regions_with_policy(
         dimension: &str,
         policy: DimensionVisibilityPolicy,
         regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
     ) -> Result<Self> {
-        let policy = DimensionVisibilityPolicy::configured(dimension, Some(policy))?;
-        if regions.len() > MAX_REGIONS {
-            bail!("visibility source region count exceeds {MAX_REGIONS}");
-        }
-        let mut columns = BTreeMap::new();
-        for (&coordinate, region) in regions {
-            if coordinate != (region.region_x, region.region_z) {
-                bail!("visibility region map key disagrees with its summary");
-            }
-            for (&column, &chunks) in region.generated_coverage.iter() {
-                if columns
-                    .insert(
-                        column,
-                        ColumnCoverage {
-                            top: region.level_zero_y_bounds.map(|(_, max)| max),
-                            chunks,
-                        },
-                    )
-                    .is_some()
-                {
-                    bail!("two regional visibility summaries contain one column");
-                }
-            }
-        }
-        Ok(Self {
-            policy,
-            complete: false,
-            levels: std::array::from_fn(|_| BTreeMap::new()),
-            sections: BTreeMap::new(),
-            columns,
-        })
+        // A partial import does not make known local visibility useless. The ordinary portal
+        // join already marks open/missing region faces UNKNOWN while preserving a proven sky
+        // connection. Keep those conservative classifications so outdoor clients do not fetch
+        // caves merely because some unrelated region has not been imported yet.
+        let mut index = Self::from_regions_with_policy(dimension, policy, regions)?;
+        index.complete = false;
+        Ok(index)
     }
 
     pub fn is_complete(&self) -> bool {
         self.complete
     }
 
-    pub fn retained_bytes(&self) -> Result<usize> {
-        let mut bytes = size_of::<Self>();
-        for level in &self.levels {
-            for visibility in level.values() {
-                bytes = bytes
-                    .checked_add(64 + size_of::<TileCoordinate>() + size_of::<TileVisibility>())
-                    .and_then(|value| {
-                        value.checked_add(visibility.domains.capacity() * size_of::<u64>())
-                    })
-                    .context("visibility-index memory estimate overflow")?;
-            }
-        }
-        for lookup in self.sections.values() {
-            bytes = bytes
-                .checked_add(64 + size_of::<u64>() + size_of::<SectionLookup>())
-                .and_then(|value| value.checked_add(lookup.runs.capacity() * size_of::<LabelRun>()))
-                .and_then(|value| {
-                    value.checked_add(lookup.components.capacity() * size_of::<CameraDomain>())
-                })
-                .context("visibility-index memory estimate overflow")?;
-        }
-        bytes = bytes
-            .checked_add(
-                self.columns.len() * (64 + size_of::<(i32, i32)>() + size_of::<ColumnCoverage>()),
-            )
-            .context("visibility-index memory estimate overflow")?;
-        Ok(bytes)
-    }
-
-    pub fn canonical_bytes_bound(
-        &self,
-        regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-    ) -> Result<usize> {
-        // Page encoders never retain more than the decoded lookup/source data plus fixed record
-        // framing and one hash table. A factor of two covers canonical Vec capacities and the
-        // simultaneously retained CanonicalObject wrappers.
-        let region_bytes = regions.values().try_fold(0usize, |total, region| {
-            total
-                .checked_add(region.retained_bytes()?)
-                .context("visibility canonical-size estimate overflow")
-        })?;
-        self.retained_bytes()?
-            .checked_add(region_bytes)
-            .and_then(|value| value.checked_mul(2))
-            .and_then(|value| value.checked_add(16 * 1024 * 1024))
-            .context("visibility canonical-size estimate overflow")
-    }
-
-    pub fn build(
-        dimension: &str,
-        hierarchy: &BTreeMap<SectionKey, Section>,
-        registry: &RegistrySnapshot,
-        generated_coverage: &BTreeMap<(i32, i32), u8>,
-        level_zero_y_bounds: Option<(i32, i32)>,
-    ) -> Result<Self> {
-        let level_zero = hierarchy
-            .iter()
-            .filter(|(key, _)| key.level == 0)
-            .map(|(&key, section)| (key, section))
-            .collect::<BTreeMap<_, _>>();
-        if generated_coverage
-            .values()
-            .any(|coverage| *coverage == 0 || *coverage & !0x0f != 0)
-        {
-            bail!("visibility generated-chunk coverage is invalid");
-        }
-        let mut columns = generated_coverage
-            .iter()
-            .map(|(&column, &chunks)| {
-                (
-                    column,
-                    ColumnCoverage {
-                        top: level_zero_y_bounds.map(|(_, max)| max),
-                        chunks,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for key in level_zero.keys() {
-            let column = columns
-                .get_mut(&(key.x, key.z))
-                .context("level-zero section is outside generated chunk coverage")?;
-            column.top = Some(column.top.map_or(key.y, |top| top.max(key.y)));
-        }
-
-        let mut locals = BTreeMap::<SectionKey, LocalSection>::new();
-        for (&key, section) in &level_zero {
-            let coverage = columns
-                .get(&(key.x, key.z))
-                .context("level-zero section has no generated coverage")?
-                .chunks;
-            locals.insert(key, analyze_section(key, section, registry, coverage)?);
-        }
-        if let Some((min_y, max_y)) = level_zero_y_bounds {
-            if min_y > max_y {
-                bail!("visibility level-zero y bounds are reversed");
-            }
-            let height = i64::from(max_y) - i64::from(min_y) + 1;
-            let total = i64::try_from(columns.len())
-                .context("visibility column count overflow")?
-                .checked_mul(height)
-                .context("visibility generated-volume size overflow")?;
-            if total > MAX_SECTIONS as i64 {
-                bail!("visibility generated volume exceeds {MAX_SECTIONS} sections");
-            }
-            for (&(x, z), column) in &columns {
-                for y in min_y..=max_y {
-                    let key = SectionKey::new(0, x, y, z)?;
-                    locals
-                        .entry(key)
-                        .or_insert_with(|| empty_local_section(column.chunks));
-                }
-            }
-        }
-        if locals.len() > MAX_SECTIONS {
-            bail!("visibility graph exceeds {MAX_SECTIONS} sections");
-        }
-        finalize_visibility(
-            dimension,
-            DimensionVisibilityPolicy::for_dimension(dimension),
-            locals,
-            columns,
-        )
-    }
-
-    /// Produces the immutable local connectivity/portal summary for one Anvil region. It is
-    /// deliberately independent from neighboring regions, allowing unchanged source regions
-    /// to survive restarts and later publications without reparsing their chunks.
-    pub fn analyze_region(
-        region_x: i32,
-        region_z: i32,
-        source_marker: u64,
-        source_chunks: Vec<RegionChunkSource>,
-        hierarchy: &BTreeMap<SectionKey, Section>,
-        registry: &RegistrySnapshot,
-        generated_coverage: &BTreeMap<(i32, i32), u8>,
-        level_zero_y_bounds: Option<(i32, i32)>,
-        source_microtiles: BTreeMap<SectionKey, [ObjectHash; 64]>,
-    ) -> Result<RegionalVisibilitySummary> {
-        if source_chunks.len() != CHUNKS_PER_REGION {
-            bail!("regional visibility source table must contain 1024 chunks");
-        }
-        if coverage_from_sources(region_x, region_z, &source_chunks)? != *generated_coverage {
-            bail!("regional visibility coverage disagrees with its chunk source table");
-        }
-        if generated_coverage.iter().any(|(&(x, z), &coverage)| {
-            x.div_euclid(16) != region_x
-                || z.div_euclid(16) != region_z
-                || coverage == 0
-                || coverage & !0x0f != 0
-        }) {
-            bail!("regional visibility coverage is outside its Anvil region or invalid");
-        }
-        let level_zero = hierarchy
-            .iter()
-            .filter(|(key, _)| key.level == 0)
-            .map(|(&key, section)| (key, section))
-            .collect::<BTreeMap<_, _>>();
-        if level_zero
-            .keys()
-            .any(|key| key.x.div_euclid(16) != region_x || key.z.div_euclid(16) != region_z)
-        {
-            bail!("regional visibility hierarchy crosses an Anvil-region boundary");
-        }
-        let mut locals = BTreeMap::new();
-        for (&key, section) in &level_zero {
-            let coverage = *generated_coverage
-                .get(&(key.x, key.z))
-                .context("regional level-zero section has no generated coverage")?;
-            locals.insert(key, analyze_section(key, section, registry, coverage)?);
-        }
-        if locals.keys().ne(source_microtiles.keys()) {
-            bail!("regional visibility and exact source-state section keys disagree");
-        }
-        Ok(RegionalVisibilitySummary {
-            region_x,
-            region_z,
-            source_marker,
-            source_chunks: Arc::new(source_chunks),
-            generated_coverage: Arc::new(generated_coverage.clone()),
-            level_zero_y_bounds,
-            locals: Arc::new(locals),
-            source_microtiles: Arc::new(source_microtiles),
-        })
-    }
-
-    /// Replaces only locally changed 32³ groups inside one persisted regional summary. The
-    /// unchanged local flood-fill/portal summaries remain immutable and are reused verbatim.
-    pub fn refresh_region(
-        previous: &RegionalVisibilitySummary,
-        source_marker: u64,
-        source_chunks: Vec<RegionChunkSource>,
-        affected_groups: &BTreeSet<(i32, i32)>,
-        changed_hierarchy: &BTreeMap<SectionKey, Section>,
-        changed_source_microtiles: BTreeMap<SectionKey, [ObjectHash; 64]>,
-        registry: &RegistrySnapshot,
-    ) -> Result<RegionalVisibilitySummary> {
-        if source_chunks.len() != CHUNKS_PER_REGION {
-            bail!("regional visibility source table must contain 1024 chunks");
-        }
-        if affected_groups.iter().any(|&(x, z)| {
-            x.div_euclid(16) != previous.region_x || z.div_euclid(16) != previous.region_z
-        }) {
-            bail!("affected visibility group is outside its persisted source region");
-        }
-        let mut locals = previous.locals.as_ref().clone();
-        locals.retain(|key, _| !affected_groups.contains(&(key.x, key.z)));
-        let mut persisted_sources = previous.source_microtiles.as_ref().clone();
-        persisted_sources.retain(|key, _| !affected_groups.contains(&(key.x, key.z)));
-        let level_zero = changed_hierarchy
-            .iter()
-            .filter(|(key, _)| key.level == 0)
-            .map(|(&key, section)| (key, section))
-            .collect::<BTreeMap<_, _>>();
-        let generated_coverage =
-            coverage_from_sources(previous.region_x, previous.region_z, &source_chunks)?;
-        for (&key, section) in &level_zero {
-            if !affected_groups.contains(&(key.x, key.z)) {
-                bail!("changed visibility hierarchy contains an unaffected group");
-            }
-            let coverage = *generated_coverage
-                .get(&(key.x, key.z))
-                .context("changed level-zero section has no generated coverage")?;
-            locals.insert(key, analyze_section(key, section, registry, coverage)?);
-        }
-        if level_zero.keys().ne(changed_source_microtiles.keys()) {
-            bail!("changed visibility and exact source-state section keys disagree");
-        }
-        persisted_sources.extend(changed_source_microtiles);
-        let level_zero_y_bounds = locals
-            .keys()
-            .map(|key| key.y)
-            .fold(None::<(i32, i32)>, |bounds, y| {
-                Some(bounds.map_or((y, y), |(min, max)| (min.min(y), max.max(y))))
-            });
-        Ok(RegionalVisibilitySummary {
-            region_x: previous.region_x,
-            region_z: previous.region_z,
-            source_marker,
-            source_chunks: Arc::new(source_chunks),
-            generated_coverage: Arc::new(generated_coverage),
-            level_zero_y_bounds,
-            locals: Arc::new(locals),
-            source_microtiles: Arc::new(persisted_sources),
-        })
-    }
-
     /// Reconnects immutable local summaries into exact global domains. Only this inexpensive
     /// component/portal join is global; Anvil parsing and local flood fills remain incremental.
-    pub fn from_regions(
-        dimension: &str,
-        regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-    ) -> Result<Self> {
-        Self::from_regions_with_policy(
-            dimension,
-            DimensionVisibilityPolicy::for_dimension(dimension),
-            regions,
-        )
-    }
-
     pub fn from_regions_with_policy(
         dimension: &str,
         policy: DimensionVisibilityPolicy,
@@ -959,7 +537,7 @@ impl VisibilityIndex {
     }
 
     pub fn descriptor(&self, key: SectionKey, content_mask: u64) -> DescriptorVisibility {
-        if !self.complete || self.policy == DimensionVisibilityPolicy::Conservative {
+        if self.policy == DimensionVisibilityPolicy::Conservative {
             return DescriptorVisibility {
                 exterior_mask: 0,
                 unknown_mask: content_mask,
@@ -996,27 +574,6 @@ impl VisibilityIndex {
             })
             .collect();
         value
-    }
-
-    pub fn canonical_objects(
-        &self,
-        regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-    ) -> Result<VisibilityObjectGraph> {
-        let mut pages = Vec::new();
-        let mut summary_pages = Vec::new();
-        let directory = self.canonical_objects_to(regions, |object| {
-            match object.kind() {
-                ObjectKind::VisibilityPage => pages.push(object.clone()),
-                ObjectKind::VisibilitySummaryPage => summary_pages.push(object.clone()),
-                _ => bail!("visibility page sink received a non-page object"),
-            }
-            Ok(())
-        })?;
-        Ok(VisibilityObjectGraph {
-            directory,
-            pages,
-            summary_pages,
-        })
     }
 
     /// Emits bounded pages immediately. Publication therefore retains only compact page
@@ -1093,130 +650,6 @@ impl VisibilityIndex {
         )
     }
 
-    pub fn from_canonical_graph<T: AsRef<CanonicalObject>>(
-        directory: &CanonicalObject,
-        mut page: impl FnMut(ObjectHash) -> Result<T>,
-    ) -> Result<RecoveredVisibility> {
-        if directory.kind() != ObjectKind::VisibilityDirectory {
-            bail!("root visibility directory has the wrong type");
-        }
-        let (policy, complete, references, columns, region_references) =
-            decode_directory(directory.bytes())?;
-        let mut sections = BTreeMap::new();
-        for reference in references {
-            let object = page(reference.hash)?;
-            let object = object.as_ref();
-            if object.kind() != ObjectKind::VisibilityPage {
-                bail!("root visibility page has the wrong type");
-            }
-            let decoded = decode_page(object.bytes())?;
-            if decoded.first().map(|entry| entry.0.packed()) != Some(reference.first)
-                || decoded.last().map(|entry| entry.0.packed()) != Some(reference.last)
-            {
-                bail!("visibility page range disagrees with its directory");
-            }
-            for (key, lookup) in decoded {
-                if sections.insert(key.packed(), lookup).is_some() {
-                    bail!("visibility graph contains a duplicate section");
-                }
-            }
-        }
-        let mut regions = BTreeMap::new();
-        for reference in region_references {
-            let mut locals = BTreeMap::new();
-            let mut source_microtiles = BTreeMap::new();
-            let mut source_chunks = None;
-            for hash in &reference.pages {
-                let object = page(*hash)?;
-                let object = object.as_ref();
-                if object.kind() != ObjectKind::VisibilitySummaryPage {
-                    bail!("regional visibility summary has the wrong type");
-                }
-                let decoded =
-                    decode_summary_page(object.bytes(), reference.region_x, reference.region_z)?;
-                if let Some(chunks) = decoded.source_chunks {
-                    if source_chunks.replace(chunks).is_some() {
-                        bail!("regional visibility graph contains two source tables");
-                    }
-                }
-                for (key, local) in decoded.locals {
-                    if locals.insert(key, local).is_some() {
-                        bail!("regional visibility pages contain a duplicate section");
-                    }
-                }
-                for (key, hashes) in decoded.source_microtiles {
-                    if source_microtiles.insert(key, hashes).is_some() {
-                        bail!("regional source-state pages contain a duplicate section");
-                    }
-                }
-            }
-            let source_chunks =
-                source_chunks.context("regional visibility graph has no source table")?;
-            let generated_coverage = columns
-                .iter()
-                .filter(|((x, z), _)| {
-                    x.div_euclid(16) == reference.region_x && z.div_euclid(16) == reference.region_z
-                })
-                .map(|(&coordinate, coverage)| (coordinate, coverage.chunks))
-                .collect::<BTreeMap<_, _>>();
-            if locals
-                .keys()
-                .any(|key| !generated_coverage.contains_key(&(key.x, key.z)))
-            {
-                bail!("regional visibility summary contains an ungenerated section");
-            }
-            if locals.keys().ne(source_microtiles.keys()) {
-                bail!("regional visibility and source-state section keys disagree");
-            }
-            let recovered_y_bounds = locals
-                .keys()
-                .map(|key| key.y)
-                .fold(None::<(i32, i32)>, |bounds, y| {
-                    Some(bounds.map_or((y, y), |(min, max)| (min.min(y), max.max(y))))
-                });
-            if recovered_y_bounds != reference.level_zero_y_bounds {
-                bail!("regional visibility y bounds disagree with its persisted sections");
-            }
-            if coverage_from_sources(reference.region_x, reference.region_z, &source_chunks)?
-                != generated_coverage
-            {
-                bail!("regional visibility coverage disagrees with its persisted source table");
-            }
-            let summary = RegionalVisibilitySummary {
-                region_x: reference.region_x,
-                region_z: reference.region_z,
-                source_marker: reference.source_marker,
-                source_chunks: Arc::new(source_chunks),
-                generated_coverage: Arc::new(generated_coverage),
-                level_zero_y_bounds: reference.level_zero_y_bounds,
-                locals: Arc::new(locals),
-                source_microtiles: Arc::new(source_microtiles),
-            };
-            if regions
-                .insert((reference.region_x, reference.region_z), summary)
-                .is_some()
-            {
-                bail!("visibility directory contains a duplicate source region");
-            }
-        }
-        if columns
-            .keys()
-            .any(|&(x, z)| !regions.contains_key(&(x.div_euclid(16), z.div_euclid(16))))
-        {
-            bail!("visibility directory column has no source-region marker");
-        }
-        Ok(RecoveredVisibility {
-            index: Self {
-                policy,
-                complete,
-                levels: std::array::from_fn(|_| BTreeMap::new()),
-                sections,
-                columns,
-            },
-            regions,
-        })
-    }
-
     /// Loads only the root-bound camera lookup. Regional summaries are internal publication
     /// state and can be much larger than the bounded lookup needed by a leased client root.
     pub fn from_canonical_index<T: AsRef<CanonicalObject>>(
@@ -1262,11 +695,11 @@ impl VisibilityIndex {
         directory: &CanonicalObject,
         wanted: &BTreeSet<(i32, i32)>,
         mut page: impl FnMut(ObjectHash) -> Result<T>,
-    ) -> Result<BTreeMap<(i32, i32), RegionalVisibilitySummary>> {
+    ) -> Result<(bool, BTreeMap<(i32, i32), RegionalVisibilitySummary>)> {
         if directory.kind() != ObjectKind::VisibilityDirectory {
             bail!("root visibility directory has the wrong type");
         }
-        let (_, _, _, columns, references) = decode_directory(directory.bytes())?;
+        let (_, complete, _, columns, references) = decode_directory(directory.bytes())?;
         let mut regions = BTreeMap::new();
         for reference in references {
             let coordinate = (reference.region_x, reference.region_z);
@@ -1339,7 +772,7 @@ impl VisibilityIndex {
                 },
             );
         }
-        Ok(regions)
+        Ok((complete, regions))
     }
 
     pub fn camera_domain(&self, block_x: i32, block_y: i32, block_z: i32) -> CameraDomainLease {
@@ -1349,7 +782,7 @@ impl VisibilityIndex {
             min: point,
             max: point,
         };
-        if !self.complete || self.policy == DimensionVisibilityPolicy::Conservative {
+        if self.policy == DimensionVisibilityPolicy::Conservative {
             return single(CameraDomain::Unknown);
         }
         let section_x = block_x.div_euclid(SECTION_EDGE as i32);
@@ -1443,13 +876,6 @@ impl VisibilityIndex {
             min,
             max: min.map(|value| value.saturating_add(MICROTILE_EDGE as i32 - 1)),
         }
-    }
-
-    pub fn camera_metadata_matches(&self, other: &Self) -> bool {
-        self.policy == other.policy
-            && self.complete == other.complete
-            && self.sections == other.sections
-            && self.columns == other.columns
     }
 
     /// Returns the level-four roots whose persisted manifest memberships differ. `None` means
@@ -2758,13 +2184,24 @@ fn passable(cell: Cell, registry: &RegistrySnapshot) -> bool {
 }
 
 fn microtile(x: usize, y: usize, z: usize) -> usize {
-    (x / MICROTILE_EDGE) | ((z / MICROTILE_EDGE) << 2) | ((y / MICROTILE_EDGE) << 4)
+    let x = x / MICROTILE_EDGE;
+    let y = y / MICROTILE_EDGE;
+    let z = z / MICROTILE_EDGE;
+    debug_assert!(x < MICROTILES_PER_SECTION_EDGE as usize);
+    debug_assert!(y < MICROTILES_PER_SECTION_EDGE as usize);
+    debug_assert!(z < MICROTILES_PER_SECTION_EDGE as usize);
+    let high = (x >> 1) | ((y >> 1) << 1) | ((z >> 1) << 2);
+    let low = (x & 1) | ((y & 1) << 1) | ((z & 1) << 2);
+    (high << 3) | low
 }
 
 fn tile_coordinate(key: SectionKey, tile: usize) -> TileCoordinate {
-    let x = tile & 3;
-    let z = (tile >> 2) & 3;
-    let y = (tile >> 4) & 3;
+    debug_assert!(tile < (MICROTILES_PER_SECTION_EDGE as usize).pow(3));
+    let high = tile >> 3;
+    let low = tile & 7;
+    let x = ((high & 1) << 1) | (low & 1);
+    let y = (((high >> 1) & 1) << 1) | ((low >> 1) & 1);
+    let z = (((high >> 2) & 1) << 1) | ((low >> 2) & 1);
     TileCoordinate {
         x: key.x * MICROTILES_PER_SECTION_EDGE + x as i32,
         y: key.y * MICROTILES_PER_SECTION_EDGE + y as i32,

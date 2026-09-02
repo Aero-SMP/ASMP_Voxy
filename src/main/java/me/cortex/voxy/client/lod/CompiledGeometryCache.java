@@ -15,7 +15,6 @@ import java.util.Optional;
 public final class CompiledGeometryCache implements AutoCloseable {
     private static final byte[] KEY_DOMAIN =
             "Voxy compiled geometry cache key\0".getBytes(StandardCharsets.UTF_8);
-    private static final long ENTRY_OVERHEAD_BYTES = 192;
 
     public record Key(Hash256 terrainIdentity, Hash256 resourceModelFingerprint,
                       Hash256 identity) {
@@ -37,13 +36,11 @@ public final class CompiledGeometryCache implements AutoCloseable {
         }
     }
 
-    private final MemoryBudget memory;
     private final int maxEntries;
     private final Map<Key, Entry> entries = new LinkedHashMap<>(16, 0.75f, true);
     private boolean closed;
 
-    public CompiledGeometryCache(MemoryBudget memory, int maxEntries) {
-        this.memory = Objects.requireNonNull(memory, "memory");
+    public CompiledGeometryCache(int maxEntries) {
         if (maxEntries < 1) throw new IllegalArgumentException("maxEntries must be positive");
         this.maxEntries = maxEntries;
     }
@@ -66,24 +63,17 @@ public final class CompiledGeometryCache implements AutoCloseable {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(section, "section");
         if (this.entries.containsKey(key)) return false;
-        long geometryBytes = section.geometryBuffer == null ? 0 : section.geometryBuffer.size;
-        long bytes = Math.addExact(ENTRY_OVERHEAD_BYTES,
-                Math.addExact(geometryBytes,
-                        section.offsets == null ? 0 : (long) section.offsets.length * Integer.BYTES));
-        MemoryBudget.Reservation reservation = reserveAfterEviction(bytes);
-        if (reservation == null) return false;
         MemoryBuffer geometry = null;
         try {
             geometry = section.geometryBuffer == null ? null : section.geometryBuffer.copy();
             Entry entry = new Entry(section.aabb, geometry,
-                    section.offsets == null ? null : section.offsets.clone(), reservation);
+                    section.offsets == null ? null : section.offsets.clone());
             geometry = null;
             this.entries.put(key, entry);
             while (this.entries.size() > this.maxEntries) evictEldest();
             return true;
         } catch (RuntimeException | Error failure) {
             if (geometry != null) geometry.free();
-            reservation.close();
             throw failure;
         }
     }
@@ -94,16 +84,6 @@ public final class CompiledGeometryCache implements AutoCloseable {
         this.closed = true;
         for (Entry entry : this.entries.values()) entry.close();
         this.entries.clear();
-    }
-
-    private MemoryBudget.Reservation reserveAfterEviction(long bytes) {
-        while (true) {
-            Optional<MemoryBudget.Reservation> reservation = this.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.COMPILED_CACHE, bytes));
-            if (reservation.isPresent()) return reservation.orElseThrow();
-            if (this.entries.isEmpty()) return null;
-            evictEldest();
-        }
     }
 
     private void evictEldest() {
@@ -132,20 +112,16 @@ public final class CompiledGeometryCache implements AutoCloseable {
         private final int aabb;
         private final MemoryBuffer geometry;
         private final int[] offsets;
-        private final MemoryBudget.Reservation memory;
 
-        private Entry(int aabb, MemoryBuffer geometry, int[] offsets,
-                      MemoryBudget.Reservation memory) {
+        private Entry(int aabb, MemoryBuffer geometry, int[] offsets) {
             this.aabb = aabb;
             this.geometry = geometry;
             this.offsets = offsets;
-            this.memory = memory;
         }
 
         @Override
         public void close() {
             if (this.geometry != null) this.geometry.free();
-            this.memory.close();
         }
     }
 }

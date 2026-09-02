@@ -11,12 +11,11 @@ import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
-import me.cortex.voxy.client.core.rendering.selection.SelectionTelemetry;
+import me.cortex.voxy.client.core.rendering.selection.PredictionTiming;
 import me.cortex.voxy.client.core.rendering.selection.VirtualSurfaceSelector;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.client.lod.MemoryBudget;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.client.core.rendering.SectionKey;
@@ -264,20 +263,16 @@ public class HierarchicalOcclusionTraverser {
         this.virtualSurfaceSelector.clear(generation, snapshotId);
     }
 
-    public void updateSelectionTelemetry(SelectionTelemetry telemetry) {
-        this.virtualSurfaceSelector.updateTelemetry(telemetry);
+    public void updatePredictionTiming(PredictionTiming timing) {
+        this.virtualSurfaceSelector.updatePredictionTiming(timing);
     }
 
     public SelectionBatch pollSelectionBatch() {
         return this.virtualSurfaceSelector.poll();
     }
 
-    public void bindVirtualSurfaceMemory(MemoryBudget memory) {
-        this.virtualSurfaceSelector.bindMemory(memory);
-    }
-
-    public void unbindVirtualSurfaceMemory(MemoryBudget memory) {
-        this.virtualSurfaceSelector.unbindMemory(memory);
+    public void resetVirtualSurfaceSelection() {
+        this.virtualSurfaceSelector.resetSession();
     }
 
     private void traverseInternal() {

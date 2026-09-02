@@ -1,6 +1,3 @@
-use crate::surface::memory::{
-    DEFAULT_MANAGED_MEMORY_MIB, MAX_MANAGED_MEMORY_MIB, MIN_MANAGED_MEMORY_MIB,
-};
 use crate::surface::visibility::DimensionVisibilityPolicy;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -9,21 +6,13 @@ use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, time::Dura
 const MAX_VISIBILITY_POLICY_OVERRIDES: usize = 256;
 
 #[derive(Clone, Debug)]
-pub enum Transport {
-    Direct(SocketAddr),
-    Minecraft(PathBuf),
-}
-
-#[derive(Clone, Debug)]
 pub struct Config {
     pub world: PathBuf,
     pub data: PathBuf,
-    pub transport: Transport,
+    pub listen: SocketAddr,
     pub dimension: String,
     pub poll_interval: Duration,
     pub rayon_threads: usize,
-    pub managed_memory_mib: usize,
-    pub max_connections: usize,
     pub visibility_policies: BTreeMap<String, DimensionVisibilityPolicy>,
     pub once: bool,
 }
@@ -33,7 +22,6 @@ pub struct Config {
 struct FileConfig {
     world: PathBuf,
     data: PathBuf,
-    transport: String,
     #[serde(default = "default_dimension")]
     dimension: String,
     #[serde(default = "default_poll_ms")]
@@ -41,64 +29,30 @@ struct FileConfig {
     #[serde(default)]
     rayon_threads: usize,
     #[serde(default)]
-    memory: MemoryConfig,
-    #[serde(default)]
     visibility: BTreeMap<String, DimensionVisibilityPolicy>,
     #[serde(default)]
     once: bool,
     #[serde(default)]
-    direct: DirectConfig,
-    #[serde(default)]
-    minecraft: MinecraftConfig,
+    quic: QuicConfig,
 }
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct DirectConfig {
+struct QuicConfig {
     listen: SocketAddr,
     /// Advertised by the authenticated Minecraft controller; the native listener does not use
     /// it, but accepting it keeps one strict shared configuration file for both processes.
     advertise_host: String,
-    /// Public port advertised by the Minecraft controller. Zero reuses `listen.port()`.
+    /// Public port advertised by the controller. Zero uses the actual UDP port in VOXY_READY.
     advertise_port: u16,
 }
 
-impl Default for DirectConfig {
+impl Default for QuicConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:25587".parse().unwrap(),
             advertise_host: String::new(),
             advertise_port: 0,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct MinecraftConfig {
-    socket: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct MemoryConfig {
-    managed_mib: usize,
-    max_connections: usize,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            managed_mib: DEFAULT_MANAGED_MEMORY_MIB,
-            max_connections: 256,
-        }
-    }
-}
-
-impl Default for MinecraftConfig {
-    fn default() -> Self {
-        Self {
-            socket: "voxy-rust.sock".into(),
         }
     }
 }
@@ -124,32 +78,15 @@ impl Config {
     }
 
     fn from_file(file: FileConfig, once: bool) -> Result<Self> {
-        let transport = match file.transport.as_str() {
-            "direct" => {
-                if file.direct.advertise_host.len() > 253 {
-                    bail!("direct.advertise_host is too long");
-                }
-                // Parsed for the strict shared controller configuration; the native listener
-                // binds only `listen` and does not advertise itself.
-                let _advertise_port = file.direct.advertise_port;
-                Transport::Direct(file.direct.listen)
-            }
-            "minecraft" => Transport::Minecraft(file.minecraft.socket),
-            _ => bail!("transport must be either \"direct\" or \"minecraft\""),
-        };
+        if file.quic.advertise_host.len() > 253 {
+            bail!("quic.advertise_host is too long");
+        }
+        let _advertise_port = file.quic.advertise_port;
         if file.poll_ms < 100 {
             bail!("poll_ms must be at least 100");
         }
         if file.rayon_threads > 256 {
             bail!("rayon_threads must be between 1 and 256, or 0 for the Rayon default");
-        }
-        if !(MIN_MANAGED_MEMORY_MIB..=MAX_MANAGED_MEMORY_MIB).contains(&file.memory.managed_mib) {
-            bail!(
-                "memory.managed_mib must be between {MIN_MANAGED_MEMORY_MIB} and {MAX_MANAGED_MEMORY_MIB}"
-            );
-        }
-        if !(1..=4096).contains(&file.memory.max_connections) {
-            bail!("memory.max_connections must be between 1 and 4096");
         }
         if file.dimension.is_empty()
             || file.dimension.len() > crate::surface::wire::MAX_DIMENSION_BYTES
@@ -160,12 +97,10 @@ impl Config {
         Ok(Self {
             world: file.world,
             data: file.data,
-            transport,
+            listen: file.quic.listen,
             dimension: file.dimension,
             poll_interval: Duration::from_millis(file.poll_ms),
             rayon_threads: file.rayon_threads,
-            managed_memory_mib: file.memory.managed_mib,
-            max_connections: file.memory.max_connections,
             visibility_policies: file.visibility,
             once: once || file.once,
         })

@@ -36,5 +36,5 @@ jobs:
           name: voxy-artifacts
           path: |
             build/libs/*.jar
-            bridge/build/libs/*.jar
+            server/build/libs/*.jar
           archive: false

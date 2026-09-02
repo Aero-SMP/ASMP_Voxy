@@ -20,7 +20,7 @@ import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTr
 import me.cortex.voxy.client.core.rendering.hierarchical.NodeCleaner;
 import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
-import me.cortex.voxy.client.core.rendering.selection.SelectionTelemetry;
+import me.cortex.voxy.client.core.rendering.selection.PredictionTiming;
 import me.cortex.voxy.client.core.rendering.section.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.section.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
@@ -30,7 +30,6 @@ import me.cortex.voxy.client.lod.MicrotileActivationManager;
 import me.cortex.voxy.client.lod.CatalogCodec;
 import me.cortex.voxy.client.lod.CompiledGeometryCache;
 import me.cortex.voxy.client.lod.ContentPipeline;
-import me.cortex.voxy.client.lod.MemoryBudget;
 import me.cortex.voxy.client.lod.ManifestCodec.SpatialNode;
 import me.cortex.voxy.client.lod.RootDemandPlan;
 import me.cortex.voxy.client.lod.ClientLodClient;
@@ -44,7 +43,6 @@ import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
 
-import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Optional;
@@ -87,17 +85,17 @@ public class VoxyRenderSystem {
         this.traversal.clearSelectionManifest(generation, snapshotId);
     }
 
-    public void updateSelectionTelemetry(SelectionTelemetry telemetry) {
-        this.traversal.updateSelectionTelemetry(telemetry);
+    public void updatePredictionTiming(PredictionTiming timing) {
+        this.traversal.updatePredictionTiming(timing);
     }
 
     public SelectionBatch pollSelectionBatch() {
         return this.traversal.pollSelectionBatch();
     }
 
-    /** Direct publication bridge for final microtile geometry. */
-    public MicrotileActivationManager.RendererBridge virtualSurfaceRendererBridge() {
-        return new MicrotileActivationManager.RendererBridge() {
+    /** Direct publication adapter for final microtile geometry. */
+    public MicrotileActivationManager.Renderer virtualSurfaceRenderer() {
+        return new MicrotileActivationManager.Renderer() {
             @Override
             public MicrotileActivationManager.Publication publishAtomically(
                     SpatialNode node, BuiltSection geometry,
@@ -114,36 +112,30 @@ public class VoxyRenderSystem {
     }
 
     /** Creates the connection-lifetime activation owner; callers must retain it across roots. */
-    public MicrotileActivationManager createVirtualSurfaceActivationManager(
-            MemoryBudget memory) {
-        Objects.requireNonNull(memory, "memory");
+    public MicrotileActivationManager createVirtualSurfaceActivationManager() {
         if (!RenderSystem.isOnRenderThread()) {
             throw new IllegalStateException(
                     "Virtual Surface GPU resources must be created on the render thread");
         }
-        this.traversal.bindVirtualSurfaceMemory(memory);
-        CompiledGeometryCache cache = new CompiledGeometryCache(memory,
-                VIRTUAL_SURFACE_CACHE_ENTRIES);
+        CompiledGeometryCache cache = new CompiledGeometryCache(VIRTUAL_SURFACE_CACHE_ENTRIES);
         try {
             HybridMeshingDispatcher dispatcher = new HybridMeshingDispatcher(
                     new GpuMicrotileMesher(this.modelService.factory,
-                            Minecraft.getInstance()::execute, memory),
+                            Minecraft.getInstance()::execute),
                     new CpuMicrotileMesher(this.modelService.factory),
                     new GeometryMerger(), cache);
-            return new MicrotileActivationManager(memory, dispatcher,
-                    virtualSurfaceRendererBridge());
+            return new MicrotileActivationManager(dispatcher, virtualSurfaceRenderer());
         } catch (RuntimeException | Error failure) {
             cache.close();
-            this.traversal.unbindVirtualSurfaceMemory(memory);
             throw failure;
         }
     }
 
-    public void releaseVirtualSurfaceMemory(MemoryBudget memory) {
-        this.traversal.unbindVirtualSurfaceMemory(Objects.requireNonNull(memory, "memory"));
+    public void resetVirtualSurfaceSelection() {
+        this.traversal.resetVirtualSurfaceSelection();
     }
 
-    /** Captures catalog authority and the current renderer/model resource identity. */
+    /** Captures catalog authority and this renderer session's model-resource namespace. */
     public CatalogModelCompatibility createVirtualSurfaceModelCompatibility(
             CatalogCodec.Catalog catalog,
             ContentPipeline.CatalogMappings mappings) {
@@ -152,12 +144,7 @@ public class VoxyRenderSystem {
         if (catalog.catalogId() != mappings.catalogId()) {
             throw new IllegalArgumentException("catalog mappings belong to another catalog");
         }
-        int[] blocks = mappings.blocks();
-        if (!virtualSurfaceModelsReady(blocks)) {
-            throw new IllegalStateException(
-                    "Virtual Surface model compatibility is still waiting for catalog bakes");
-        }
-        return CatalogModelCompatibility.create(catalog, blocks, mappings.biomes(),
+        return CatalogModelCompatibility.create(catalog, mappings.blocks(), mappings.biomes(),
                 this.modelService.factory);
     }
 
@@ -169,15 +156,6 @@ public class VoxyRenderSystem {
                 this.modelService.requestBlockBake(block);
             }
         }
-    }
-
-    /** Main-thread readiness barrier for the immutable resource/model compatibility identity. */
-    public boolean virtualSurfaceModelsReady(int[] localBlockIds) {
-        Objects.requireNonNull(localBlockIds, "localBlockIds");
-        for (int block : localBlockIds) {
-            if (block > 0 && !this.modelService.factory.isModelReadyForBlockId(block)) return false;
-        }
-        return true;
     }
 
     private MicrotileActivationManager.Publication publishVirtualSurface(
@@ -250,7 +228,6 @@ public class VoxyRenderSystem {
         private final AtomicBoolean closeRequested = new AtomicBoolean();
         private final AtomicBoolean removalQueued = new AtomicBoolean();
         private final AtomicBoolean failureRecoveryQueued = new AtomicBoolean();
-        private final ArrayDeque<Runnable> safeReleases = new ArrayDeque<>();
         private volatile Throwable failure;
 
         private VirtualSurfacePublication(AsyncNodeManager renderer, long position,
@@ -275,18 +252,6 @@ public class VoxyRenderSystem {
         @Override
         public boolean retirementFencePassed() {
             return this.retired.get();
-        }
-
-        @Override
-        public void releaseWhenSafe(Runnable release) {
-            Objects.requireNonNull(release, "release");
-            synchronized (this.safeReleases) {
-                if (!this.retired.get() && this.failure == null) {
-                    this.safeReleases.addLast(release);
-                    return;
-                }
-            }
-            release.run();
         }
 
         @Override
@@ -324,14 +289,7 @@ public class VoxyRenderSystem {
         }
 
         private void markSafeToRelease() {
-            ArrayDeque<Runnable> releases;
-            synchronized (this.safeReleases) {
-                this.retired.set(true);
-                if (this.safeReleases.isEmpty()) return;
-                releases = new ArrayDeque<>(this.safeReleases);
-                this.safeReleases.clear();
-            }
-            for (Runnable release : releases) release.run();
+            this.retired.set(true);
         }
     }
 
@@ -427,8 +385,7 @@ public class VoxyRenderSystem {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
                 int maxSec = (Minecraft.getInstance().level.getMaxSection() - 1) >> 5;
 
-                this.renderDistanceTracker = new RenderDistanceTracker(40,
-                        minSec,
+                this.renderDistanceTracker = new RenderDistanceTracker(minSec,
                         maxSec,
                         position -> {
                             this.nodeManager.addTopLevel(position);

@@ -133,7 +133,7 @@ public class AllocationArena {
             long endAddr = (slot>>>SIZE_BITS)+(slot&SIZE_MSK);
             long delta = (next>>>SIZE_BITS) - endAddr;
             if (extra <= delta) {
-                this.FREE.remove((delta<<ADDR_BITS)|endAddr);//Should assert this
+                this.FREE.remove((delta<<ADDR_BITS)|endAddr);
                 // Restore the iterator to the current allocation before removing it.
                 iter.previousLong();
                 iter.previousLong();

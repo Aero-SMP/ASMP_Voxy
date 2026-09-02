@@ -12,7 +12,6 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 
@@ -67,7 +66,7 @@ public final class CatalogModelCompatibility implements ModelCompatibility {
         this.rendererIdentity = new RendererIdentity(bakedFingerprint);
     }
 
-    /** Creates the conservative production classifier for the currently baked renderer state. */
+    /** Creates the conservative classifier for this renderer session. */
     public static CatalogModelCompatibility create(CatalogCodec.Catalog catalog,
                                                int[] blockTranslations,
                                                int[] biomeTranslations,
@@ -78,7 +77,7 @@ public final class CatalogModelCompatibility implements ModelCompatibility {
                 // template path reproduces it. Only an explicit, independently validated
                 // template registry may populate this set; unknown shapes stay on the CPU path.
                 Set.of(),
-                resourceFingerprint(blockTranslations, models));
+                Hash256.fromBytes(new Blake3.Hasher().update(RESOURCE_DOMAIN).digest()));
     }
 
     @Override
@@ -107,30 +106,15 @@ public final class CatalogModelCompatibility implements ModelCompatibility {
         return ModelClass.SAFE_OPAQUE_CUBE;
     }
 
-    public RendererIdentity rendererIdentity() {
-        return this.rendererIdentity;
+    @Override
+    public boolean ready(int localBlockId) {
+        return localBlockId == 0 || localBlockId > 0
+                && localBlockId < this.catalogAuthoritative.length
+                && this.models.isModelReadyForBlockId(localBlockId);
     }
 
-    private static Hash256 resourceFingerprint(int[] translations, ModelFactory models) {
-        HashSet<Integer> distinct = new HashSet<>();
-        for (int local : translations) {
-            if (local >= 0) distinct.add(local);
-        }
-        int[] localIds = distinct.stream().mapToInt(Integer::intValue).sorted().toArray();
-        Blake3.Hasher hasher = new Blake3.Hasher().update(RESOURCE_DOMAIN);
-        for (int localId : localIds) {
-            int modelId = models.hasModelForBlockId(localId)
-                    ? models.getModelId(localId) : -1;
-            ByteBuffer value = ByteBuffer.allocate(Integer.BYTES + Long.BYTES * 2)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .putInt(localId)
-                    .putLong(modelId < 0 ? -1L
-                            : models.getModelMetadataFromClientId(modelId))
-                    .putLong(modelId < 0 ? -1L
-                            : models.getModelResourceFingerprint(modelId));
-            hasher.update(value.array());
-        }
-        return Hash256.fromBytes(hasher.digest());
+    public RendererIdentity rendererIdentity() {
+        return this.rendererIdentity;
     }
 
     private Hash256 fingerprint(CatalogCodec.Catalog catalog, int[] translations,
@@ -147,15 +131,11 @@ public final class CatalogModelCompatibility implements ModelCompatibility {
             CatalogCodec.Block block = catalog.blocks().get(remote);
             int local = translations[remote];
             byte[] canonical = block.canonical().getBytes(StandardCharsets.UTF_8);
-            int modelId = local >= 0 && this.models.hasModelForBlockId(local)
-                    ? this.models.getModelId(local) : -1;
-            long metadata = modelId < 0 ? 0 : this.models.getModelMetadataFromClientId(modelId);
-            ModelClass classification = local < 0 ? ModelClass.UNKNOWN : classify(local);
-            ByteBuffer scalar = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+            ByteBuffer scalar = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
                     .putInt(remote).putInt(local).putInt(canonical.length)
-                    .putInt(modelId).putLong(metadata).put((byte) block.opacity())
+                    .putInt(block.opacity())
                     .put((byte) (block.authoritative() ? 1 : 0))
-                    .put((byte) classification.ordinal()).put((byte) 0);
+                    .put((byte) 0).putShort((short) 0);
             hasher.update(scalar.array()).update(canonical);
         }
         hasher.update(ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN)

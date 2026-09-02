@@ -43,7 +43,13 @@ public final class DictionaryCodec {
         }
     }
 
-    public static List<Hash256> decodeSet(byte[] canonical) throws DecodeException {
+    public record DictionarySet(List<Hash256> hashes) {
+        public DictionarySet {
+            hashes = List.copyOf(Objects.requireNonNull(hashes, "hashes"));
+        }
+    }
+
+    public static DictionarySet decodeSet(byte[] canonical) throws DecodeException {
         Objects.requireNonNull(canonical, "canonical");
         if (canonical.length != 12 + DICTIONARY_COUNT * WireMessage.HASH_BYTES) {
             throw new DecodeException("dictionary set has the wrong production size");
@@ -73,7 +79,7 @@ public final class DictionaryCodec {
             hashes.add(hash);
             previous = hash;
         }
-        return List.copyOf(hashes);
+        return new DictionarySet(hashes);
     }
 
     public static Dictionary decodeDictionary(byte[] canonical) throws DecodeException {

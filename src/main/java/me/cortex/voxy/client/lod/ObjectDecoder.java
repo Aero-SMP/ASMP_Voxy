@@ -10,9 +10,9 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.lwjgl.util.zstd.Zstd.ZSTD_createDCtx;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_decompressDCtx;
@@ -21,7 +21,7 @@ import static org.lwjgl.util.zstd.Zstd.ZSTD_freeDCtx;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_getErrorName;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_isError;
 
-/** Bounded off-thread decode, authentication, durable-cache, and residency admission pipeline. */
+/** Bounded off-thread decompression, authentication, and canonical typed decoding. */
 public final class ObjectDecoder implements AutoCloseable {
 
     @FunctionalInterface
@@ -35,14 +35,14 @@ public final class ObjectDecoder implements AutoCloseable {
     @FunctionalInterface
     public interface ZstdBackend extends AutoCloseable {
         /** Returns the exact number of canonical bytes written. */
-        int decompress(byte[] compressed, byte[] canonical, byte[] dictionary) throws IOException;
+        int decompress(ByteBuffer compressed, byte[] canonical, byte[] dictionary)
+                throws IOException;
 
         @Override
         default void close() {}
     }
 
     public enum Failure {
-        WIRE_CHECKSUM,
         MISSING_DICTIONARY,
         DICTIONARY_MISMATCH,
         MALFORMED_COMPRESSION,
@@ -54,7 +54,7 @@ public final class ObjectDecoder implements AutoCloseable {
     private final Executor worker;
     private final DictionaryResolver dictionaries;
     private final ZstdBackend zstd;
-    private final Set<CompletableFuture<?>> pending = ConcurrentHashMap.newKeySet();
+    private final Set<DecodeTask> pending = ConcurrentHashMap.newKeySet();
     private volatile boolean closed;
 
     public ObjectDecoder(Executor worker, DictionaryResolver dictionaries,
@@ -70,43 +70,26 @@ public final class ObjectDecoder implements AutoCloseable {
     }
 
     /** Decodes and authenticates on the configured worker executor. */
-    public CompletableFuture<CanonicalObject> decode(EncodedObject encoded) {
+    public CompletableFuture<DecodedObject> decode(EncodedObject encoded) {
         Objects.requireNonNull(encoded, "encoded");
         if (this.closed) throw new IllegalStateException("object decoder is closed");
-        return track(CompletableFuture.supplyAsync(() -> {
-            try {
-                return decodeOnWorker(encoded);
-            } catch (DecodeException exception) {
-                throw new CompletionException(exception);
-            }
-        }, this.worker));
+        EncodedObject retained = encoded.retain();
+        DecodeTask task = new DecodeTask(retained);
+        this.pending.add(task);
+        try {
+            this.worker.execute(task);
+        } catch (RuntimeException | Error failure) {
+            task.cancel();
+            throw failure;
+        }
+        if (this.closed) task.cancel();
+        return task.result;
     }
 
-    /**
-     * Offers the verified envelope to the disposable disk cache. A full pinned cache is
-     * backpressure for persistence only; it must never reject otherwise valid terrain that can
-     * still enter the separately bounded in-memory residency manager.
-     */
-    public CompletableFuture<CanonicalObject> decodeAndStore(EncodedObject encoded,
-                                                                ObjectCache cache) {
-        Objects.requireNonNull(cache, "cache");
-        return track(decode(encoded).thenApplyAsync(object -> {
-            try {
-                cache.put(encoded, object);
-            } catch (IOException ignored) {
-                // Disk persistence is disposable; verified live content continues to residency.
-            }
-            return object;
-        }, this.worker));
-    }
-
-    private CanonicalObject decodeOnWorker(EncodedObject encoded) throws DecodeException {
+    private DecodedObject decodeOnWorker(EncodedObject encoded) throws DecodeException {
         if (this.closed) throw new DecodeException(Failure.MALFORMED_COMPRESSION,
                 "object decoder is closed");
-        byte[] compressed = encoded.compressedBytes();
-        if (WireMessage.checksum(compressed) != encoded.compressedChecksum()) {
-            throw new DecodeException(Failure.WIRE_CHECKSUM, "compressed object CRC32C mismatch");
-        }
+        ByteBuffer compressed = encoded.compressedBufferInternal();
 
         byte[] dictionary = new byte[0];
         boolean microtile = encoded.kind() == WireMessage.ObjectKind.EXTERIOR_MICROTILE
@@ -157,28 +140,26 @@ public final class ObjectDecoder implements AutoCloseable {
                     "Zstd output length does not match canonical length");
         }
 
-        CanonicalObject object;
-        try {
-            object = new CanonicalObject(encoded.hash(), encoded.kind(), canonical);
-        } catch (IllegalArgumentException exception) {
+        if (!ObjectHash.verifies(encoded.hash(), encoded.kind(), canonical)) {
             throw new DecodeException(Failure.HASH_MISMATCH,
-                    "canonical object BLAKE3 identity mismatch", exception);
+                    "canonical object BLAKE3 identity mismatch");
         }
 
         try {
-            switch (encoded.kind()) {
+            Object decoded = switch (encoded.kind()) {
                 case ROOT_DIRECTORY -> ManifestCodec.decodeRootDirectory(canonical);
                 case MANIFEST_SUBTREE -> ManifestCodec.decodeManifestSubtree(canonical);
                 case MANIFEST_DESCRIPTOR_PAGE -> ManifestCodec.decodeDescriptorPage(canonical);
                 case CATALOG -> CatalogCodec.decode(canonical);
                 case DICTIONARY_SET -> DictionaryCodec.decodeSet(canonical);
                 case EXTERIOR_MICROTILE, INTERIOR_MICROTILE, COMPLEX_MICROTILE ->
-                        MicrotileCodec.inspect(canonical, encoded.kind());
+                        MicrotileCodec.decodeCanonical(canonical, encoded.kind());
                 case COMPRESSION_DICTIONARY -> DictionaryCodec.decodeDictionary(canonical);
                 case VISIBILITY_DIRECTORY, VISIBILITY_PAGE, VISIBILITY_SUMMARY_PAGE ->
                         throw new IllegalArgumentException(
                                 "server-owned visibility graphs are not client content");
-            }
+            };
+            return new DecodedObject(encoded.hash(), encoded.kind(), canonical.length, decoded);
         } catch (ManifestCodec.DecodeException | CatalogCodec.DecodeException
                  | DictionaryCodec.DecodeException
                  | MicrotileCodec.DecodeException
@@ -186,25 +167,52 @@ public final class ObjectDecoder implements AutoCloseable {
             throw new DecodeException(Failure.MALFORMED_CANONICAL,
                     "canonical " + encoded.kind() + " structure is invalid", exception);
         }
-        return object;
     }
 
     @Override
     public void close() {
         if (this.closed) return;
         this.closed = true;
-        for (CompletableFuture<?> operation : this.pending) operation.cancel(true);
+        for (DecodeTask task : this.pending) task.cancel();
         this.zstd.close();
     }
 
-    private <T> CompletableFuture<T> track(CompletableFuture<T> operation) {
-        this.pending.add(operation);
-        operation.whenComplete((ignored, failure) -> this.pending.remove(operation));
-        // Covers a close racing between scheduling and registration after close() traversed the
-        // concurrent set. Cancellation completes queued stages even if executor shutdown removes
-        // their Runnable before it begins.
-        if (this.closed) operation.cancel(true);
-        return operation;
+    /** Retains the body until the actual worker stops, even if its result is cancelled early. */
+    private final class DecodeTask implements Runnable {
+        private static final int QUEUED = 0;
+        private static final int RUNNING = 1;
+        private static final int DONE = 2;
+        private static final int CANCELLED = 3;
+
+        private final EncodedObject encoded;
+        private final CompletableFuture<DecodedObject> result = new CompletableFuture<>();
+        private final AtomicInteger state = new AtomicInteger(QUEUED);
+
+        private DecodeTask(EncodedObject encoded) {
+            this.encoded = encoded;
+        }
+
+        @Override
+        public void run() {
+            if (!this.state.compareAndSet(QUEUED, RUNNING)) return;
+            try {
+                this.result.complete(decodeOnWorker(this.encoded));
+            } catch (Throwable failure) {
+                this.result.completeExceptionally(failure);
+            } finally {
+                this.encoded.close();
+                this.state.set(DONE);
+                pending.remove(this);
+            }
+        }
+
+        private void cancel() {
+            this.result.cancel(false);
+            if (this.state.compareAndSet(QUEUED, CANCELLED)) {
+                this.encoded.close();
+                pending.remove(this);
+            }
+        }
     }
 
     public static final class DecodeException extends Exception {
@@ -237,7 +245,7 @@ public final class ObjectDecoder implements AutoCloseable {
         private int activeCalls;
 
         @Override
-        public int decompress(byte[] compressed, byte[] canonical, byte[] dictionary)
+        public int decompress(ByteBuffer compressed, byte[] canonical, byte[] dictionary)
                 throws IOException {
             Objects.requireNonNull(compressed, "compressed");
             Objects.requireNonNull(canonical, "canonical");
@@ -248,12 +256,18 @@ public final class ObjectDecoder implements AutoCloseable {
                 context = this.local.get();
                 this.activeCalls++;
             }
-            ByteBuffer source = null;
+            ByteBuffer allocatedSource = null;
             ByteBuffer destination = null;
             ByteBuffer dictionaryBuffer = null;
             try {
-                source = MemoryUtil.memAlloc(compressed.length);
-                source.put(compressed).flip();
+                ByteBuffer source;
+                if (compressed.isDirect()) {
+                    source = compressed.duplicate();
+                } else {
+                    allocatedSource = MemoryUtil.memAlloc(compressed.remaining());
+                    allocatedSource.put(compressed.duplicate()).flip();
+                    source = allocatedSource;
+                }
                 destination = MemoryUtil.memAlloc(canonical.length);
                 if (dictionary.length != 0) {
                     dictionaryBuffer = MemoryUtil.memAlloc(dictionary.length);
@@ -277,7 +291,7 @@ public final class ObjectDecoder implements AutoCloseable {
             } finally {
                 if (dictionaryBuffer != null) MemoryUtil.memFree(dictionaryBuffer);
                 if (destination != null) MemoryUtil.memFree(destination);
-                if (source != null) MemoryUtil.memFree(source);
+                if (allocatedSource != null) MemoryUtil.memFree(allocatedSource);
                 releaseCall();
             }
         }

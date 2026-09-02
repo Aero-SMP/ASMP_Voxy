@@ -81,9 +81,12 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
             return;
         }
         try {
+            // Clear demand owned by the previous renderer before the new tracker publishes its
+            // initial window. Clearing it after construction discards that new window and leaves
+            // the QUIC session with no manifest roots, so it never requests terrain.
+            ClientLodClient.rendererLifecycleChanged();
             VoxyRenderSystem created = new VoxyRenderSystem(mapper);
             this.renderer = created;
-            ClientLodClient.rendererLifecycleChanged();
         } catch (RuntimeException e) {
             // Renderer setup runs inside Minecraft's login packet.  Propagating a shader or
             // driver failure leaves the connection with a level but no player, causing a

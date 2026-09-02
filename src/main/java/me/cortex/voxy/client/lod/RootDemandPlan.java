@@ -35,14 +35,14 @@ import java.util.function.Consumer;
 /**
  * One immutable root's bounded structural metadata and exact-object request plan.
  *
- * <p>Manifest ingestion registers every typed capability without requesting it. Selector-expanded
- * handles enqueue only the chosen fixed-8-cubed microtiles, general dependencies, and the exact
- * missing neighbor dependencies emitted for selected source microtiles by the GPU.</p>
+ * <p>Descriptor pages authenticate the immutable object references they contain. Only exact
+ * renderer demand registers those references as live capabilities and selector-expanded handles
+ * enqueue the chosen fixed-8-cubed microtiles and dependencies.</p>
  */
 public final class RootDemandPlan {
     public static final int MAX_STRUCTURAL_NODES = 262_144;
 
-    /** Hard cardinality limits backed by the session's single control-table reservation. */
+    /** Protocol cardinality limits for one immutable root. */
     public record Limits(int maxObjects, int maxNodes) {
         public Limits {
             if (maxObjects < 1 || maxNodes < 1 || maxNodes > MAX_STRUCTURAL_NODES) {
@@ -91,6 +91,29 @@ public final class RootDemandPlan {
             Objects.requireNonNull(spatial, "spatial");
             Objects.requireNonNull(manifestNode, "manifestNode");
         }
+    }
+
+    /** Owner-thread diagnostic view. It never grants request authority. */
+    public record Diagnostics(int metadataRoots, int demandedNodes, int resolvedNodes,
+                              int expectedDirectories, int expectedManifests,
+                              int expectedDescriptorPages, int loadedDirectories,
+                              int loadedManifests, int loadedDescriptorPages,
+                              int queuedMetadata, int inFlightMetadata,
+                              int expectedObjects, int processedObjects,
+                              int queuedCoverage, int queuedCurrent, int queuedPredicted,
+                              int inFlightObjects, boolean metadataCapacityBlocked,
+                              boolean discoveryComplete, CameraCoverage cameraCoverage,
+                              int availableWindowRoots, int pendingWindowRoots,
+                              int absentWindowRoots, SpatialNode sampleAbsentWindowRoot,
+                              int minRootX, int maxRootX, int minRootY, int maxRootY,
+                              int minRootZ, int maxRootZ) {}
+
+    public enum CameraCoverage {
+        OUTSIDE_CLIENT_WINDOW,
+        DISCOVERING,
+        MANIFEST_PENDING,
+        AVAILABLE,
+        ABSENT_FROM_PUBLISHED_ROOT
     }
 
     /** Immutable renderer/selection input for every structural node currently loaded. */
@@ -229,6 +252,8 @@ public final class RootDemandPlan {
     private final LinkedHashSet<SpatialNode> metadataRoots = new LinkedHashSet<>();
     private final PrimitiveLongSet demanded = new PrimitiveLongSet();
     private final PrimitiveLongSet demandScratch = new PrimitiveLongSet();
+    /** Reused desired selector topology; manifests remain resident outside this working cut. */
+    private final PrimitiveLongSet admittedScratch = new PrimitiveLongSet();
     private final Map<Hash256, TopRootBounds> expectedDirectories = new LinkedHashMap<>();
     private final Map<Hash256, SpatialNode> expectedManifests = new LinkedHashMap<>();
     private final Map<Hash256, ExpectedDescriptorPage> expectedDescriptorPages =
@@ -237,6 +262,7 @@ public final class RootDemandPlan {
     private final Set<Hash256> subtreeInFlight = new HashSet<>();
     private final Map<Hash256, RootDirectory> directories = new HashMap<>();
     private final Map<Hash256, ManifestSubtree> manifests = new HashMap<>();
+    private final Map<SpatialNode, ManifestSubtree> manifestsByRoot = new HashMap<>();
     private final Map<Hash256, DescriptorPage> descriptorPages = new HashMap<>();
     /** Verified manifests retained until bounded planner tables have room for one atomic install. */
     private final Map<Hash256, ManifestSubtree> deferredManifests = new LinkedHashMap<>();
@@ -246,6 +272,7 @@ public final class RootDemandPlan {
     private final Map<Hash256, Integer> objectHandles = new LinkedHashMap<>();
     private final ArrayList<Hash256> objectsByHandle = new ArrayList<>();
     private final Map<SpatialNode, Integer> nodeHandles = new LinkedHashMap<>();
+    private final ArrayList<SpatialNode> nodesByHandle = new ArrayList<>();
     private final LinkedHashSet<Hash256> bootstrapQueue = new LinkedHashSet<>();
     private final LinkedHashSet<Hash256> coverageQueue = new LinkedHashSet<>();
     private final LinkedHashSet<Hash256> currentViewQueue = new LinkedHashSet<>();
@@ -261,7 +288,9 @@ public final class RootDemandPlan {
     private final Map<Hash256, LinkedHashSet<Long>> bindingsByObject = new HashMap<>();
     private final Map<Long, Optional<Binding>> resolutions = new LinkedHashMap<>();
     private boolean metadataCapacityBlocked;
-    private long manifestRevision;
+    private volatile long manifestRevision;
+    /** Changes only when the selector's immutable node/object namespace changes. */
+    private volatile long selectionTopologyRevision;
 
     /** Metadata roots discover structure; only exact contentDemand entries enqueue microtiles. */
     public RootDemandPlan(RootAnnounce root, Collection<SpatialNode> metadataRoots,
@@ -299,6 +328,73 @@ public final class RootDemandPlan {
     public RootAnnounce root() { return this.root; }
     /** Monotonic epoch for structural topology or object-handle table mutations. */
     public long manifestRevision() { return this.manifestRevision; }
+    public long selectionTopologyRevision() { return this.selectionTopologyRevision; }
+
+    /**
+     * Captures the exact first-stage state used by debug builds. In particular, this separates
+     * an empty GPU selection from a server root that does not advertise the camera's LOD-4 root.
+     */
+    public Diagnostics diagnostics(SpatialNode cameraRoot) {
+        Objects.requireNonNull(cameraRoot, "camera root");
+        if (cameraRoot.lod() != ManifestCodec.MAX_LOD) {
+            throw new IllegalArgumentException("camera diagnostic root must be LOD 4");
+        }
+        Set<SpatialNode> loadedRoots = new HashSet<>();
+        for (ManifestSubtree manifest : this.manifests.values()) {
+            loadedRoots.add(manifest.root());
+        }
+        Set<SpatialNode> expectedRoots = new HashSet<>(this.expectedManifests.values());
+        boolean windowed = this.metadataRoots.contains(cameraRoot);
+        boolean loaded = loadedRoots.contains(cameraRoot);
+        boolean expected = expectedRoots.contains(cameraRoot);
+        boolean complete = discoveryComplete();
+        CameraCoverage coverage = !windowed ? CameraCoverage.OUTSIDE_CLIENT_WINDOW
+                : loaded ? CameraCoverage.AVAILABLE
+                : expected ? CameraCoverage.MANIFEST_PENDING
+                : complete ? CameraCoverage.ABSENT_FROM_PUBLISHED_ROOT
+                : CameraCoverage.DISCOVERING;
+
+        int availableWindowRoots = 0;
+        int pendingWindowRoots = 0;
+        int absentWindowRoots = 0;
+        SpatialNode sampleAbsentWindowRoot = null;
+        for (SpatialNode metadataRoot : this.metadataRoots) {
+            if (loadedRoots.contains(metadataRoot)) {
+                availableWindowRoots++;
+            } else if (!complete || expectedRoots.contains(metadataRoot)) {
+                pendingWindowRoots++;
+            } else {
+                absentWindowRoots++;
+                if (sampleAbsentWindowRoot == null) sampleAbsentWindowRoot = metadataRoot;
+            }
+        }
+
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+        for (ManifestSubtree manifest : this.manifests.values()) {
+            SpatialNode root = manifest.root();
+            minX = Math.min(minX, root.x());
+            maxX = Math.max(maxX, root.x());
+            minY = Math.min(minY, root.y());
+            maxY = Math.max(maxY, root.y());
+            minZ = Math.min(minZ, root.z());
+            maxZ = Math.max(maxZ, root.z());
+        }
+        if (this.manifests.isEmpty()) minX = maxX = minY = maxY = minZ = maxZ = 0;
+        return new Diagnostics(this.metadataRoots.size(), this.demanded.size(),
+                this.resolutions.size(), this.expectedDirectories.size(),
+                this.expectedManifests.size(), this.expectedDescriptorPages.size(),
+                this.directories.size(), this.manifests.size(), this.descriptorPages.size(),
+                this.subtreeQueue.size(), this.subtreeInFlight.size(),
+                this.expectedObjects.size(), this.processedObjects.size(),
+                this.coverageQueue.size(), this.currentViewQueue.size(),
+                this.predictedQueue.size(), this.objectInFlight.size(),
+                this.metadataCapacityBlocked, complete, coverage,
+                availableWindowRoots, pendingWindowRoots, absentWindowRoots,
+                sampleAbsentWindowRoot,
+                minX, maxX, minY, maxY, minZ, maxZ);
+    }
     public boolean hasMetadataRoots(Collection<SpatialNode> roots) {
         Objects.requireNonNull(roots, "roots");
         return roots.size() == this.metadataRoots.size() && this.metadataRoots.containsAll(roots);
@@ -374,6 +470,7 @@ public final class RootDemandPlan {
         for (int index = 0; index < this.demandScratch.size(); index++) {
             this.demanded.add(this.demandScratch.valueAt(index));
         }
+        rebuildAdmittedNodes();
         pruneIrrelevantMetadata(topologyWasComplete);
         refreshMetadataDiscovery();
     }
@@ -389,6 +486,10 @@ public final class RootDemandPlan {
                 if (keys.isEmpty()) this.bindingsByObject.remove(hash);
             }
         }
+        if (oldBinding != null) {
+            this.manifestRevision++;
+            this.selectionTopologyRevision++;
+        }
         return true;
     }
 
@@ -402,12 +503,17 @@ public final class RootDemandPlan {
         return List.copyOf(result);
     }
 
-    public List<Hash256> takeContentObjectRequests(int maximum) {
+    /** Drains one priority lane without destroying the request scheduling class. */
+    public List<Hash256> takeContentObjectRequests(ContentPriority priority, int maximum) {
+        Objects.requireNonNull(priority, "priority");
         if (!bootstrapObjectsProcessed()) return List.of();
         ArrayList<Hash256> result = new ArrayList<>(maximum);
-        drainSet(this.coverageQueue, this.objectInFlight, maximum, result);
-        drainSet(this.currentViewQueue, this.objectInFlight, maximum, result);
-        drainSet(this.predictedQueue, this.objectInFlight, maximum, result);
+        LinkedHashSet<Hash256> queue = switch (priority) {
+            case COVERAGE -> this.coverageQueue;
+            case CURRENT_VIEW -> this.currentViewQueue;
+            case PREDICTED -> this.predictedQueue;
+        };
+        drainSet(queue, this.objectInFlight, maximum, result);
         return List.copyOf(result);
     }
 
@@ -415,9 +521,7 @@ public final class RootDemandPlan {
     public void requestObjectsByHandle(Collection<Integer> handles, ContentPriority priority) {
         Objects.requireNonNull(handles, "handles");
         Objects.requireNonNull(priority, "priority");
-        ArrayList<Hash256> hashes = new ArrayList<>(handles.size());
-        for (int handle : handles) hashes.add(hashForObjectHandle(handle));
-        requestObjectsByHash(hashes, priority);
+        for (int handle : handles) requestSelectorObject(hashForObjectHandle(handle), priority);
     }
 
     /** Primitive selector handoff; avoids boxing every final missing object handle. */
@@ -426,15 +530,23 @@ public final class RootDemandPlan {
         for (int index = 0; index < count; index++) {
             Hash256 hash = validatedMicrotileHandle(handles[index]);
             ContentPriority priority = primitivePriority(priorities[index]);
-            boolean wasProcessed = this.processedObjects.remove(hash);
-            ContentPriority previous = this.requestedContent.get(hash);
-            if (previous == null || previous.queuePriority < priority.queuePriority) {
-                this.requestedContent.put(hash, priority);
-            }
-            ContentPriority effective = this.requestedContent.get(hash);
-            if (wasProcessed || previous != effective || !queuedAt(hash, effective)) {
-                refreshContentPriority(hash);
-            }
+            requestSelectorObject(hash, priority);
+        }
+    }
+
+    private void requestSelectorObject(Hash256 hash, ContentPriority priority) {
+        ContentPriority previous = this.requestedContent.get(hash);
+        if (previous == null || previous.queuePriority < priority.queuePriority) {
+            this.requestedContent.put(hash, priority);
+        }
+        ContentPriority effective = this.requestedContent.get(hash);
+        // GPU selection readback is asynchronous. Its missing mask may have been captured
+        // before this immutable object completed, so selector demand must not revoke completed
+        // residency and turn the same object back into network work. A confirmed physical
+        // residency miss uses retryMissingResidentObject() instead.
+        if (!this.processedObjects.contains(hash)
+                && (previous != effective || !queuedAt(hash, effective))) {
+            refreshContentPriority(hash);
         }
     }
 
@@ -488,9 +600,13 @@ public final class RootDemandPlan {
             removeFromContentQueues(old);
         }
         for (Map.Entry<Hash256, ContentPriority> entry : desired.entrySet()) {
-            this.processedObjects.remove(entry.getKey());
-            this.requestedContent.put(entry.getKey(), entry.getValue());
-            refreshContentPriority(entry.getKey());
+            Hash256 hash = entry.getKey();
+            ContentPriority priority = entry.getValue();
+            ContentPriority previous = this.requestedContent.put(hash, priority);
+            if (!this.processedObjects.contains(hash)
+                    && (previous != priority || !queuedAt(hash, priority))) {
+                refreshContentPriority(hash);
+            }
         }
     }
 
@@ -511,9 +627,9 @@ public final class RootDemandPlan {
             int handle = desired.handles[index];
             Hash256 hash = validatedMicrotileHandle(handle);
             ContentPriority priority = primitivePriority(desired.priorities[index]);
-            boolean wasProcessed = this.processedObjects.remove(hash);
             ContentPriority previous = this.requestedContent.put(hash, priority);
-            if (wasProcessed || previous != priority || !queuedAt(hash, priority)) {
+            if (!this.processedObjects.contains(hash)
+                    && (previous != priority || !queuedAt(hash, priority))) {
                 refreshContentPriority(hash);
             }
         }
@@ -713,7 +829,17 @@ public final class RootDemandPlan {
         }
     }
 
-    /** Returns an authorized response to its bounded request queue after admission backpressure. */
+    /** Whether a not-yet-received stream item still contributes to the current exact demand. */
+    public boolean inFlightResponseRelevant(Hash256 hash, boolean subtree) {
+        Objects.requireNonNull(hash, "hash");
+        if (subtree) return this.subtreeInFlight.contains(hash) && subtreeRelevant(hash);
+        if (!this.objectInFlight.contains(hash)) return false;
+        ExpectedObject expected = this.expectedObjects.get(hash);
+        return expected != null && (!isMicrotile(expected.kind())
+                || this.requestedContent.containsKey(hash));
+    }
+
+    /** Returns an authorized response to its request queue for a later retry. */
     public void deferInFlightResponse(Hash256 hash, boolean subtree) {
         Objects.requireNonNull(hash, "hash");
         if (subtree) {
@@ -862,6 +988,26 @@ public final class RootDemandPlan {
             if (!discoveryComplete && !resolutionAvailable(key)) continue;
             requireNodeCapacity((long) this.resolutions.size() + 1, "resolved demand");
             Optional<Binding> binding = resolve(key);
+            LinkedHashMap<Hash256, ExpectedObject> additions = new LinkedHashMap<>();
+            binding.ifPresent(value -> {
+                for (ContentLayer layer : value.layers()) {
+                    ExpectedObject expected = new ExpectedObject(
+                            MicrotileCodec.objectKind(layer.contentClass()));
+                    for (ContentObject object : layer.objects()) {
+                        validateManifestReference(object.hash(), expected, additions);
+                    }
+                    for (Hash256 dependency : layer.dependencies()) {
+                        validateManifestReference(dependency, expected, additions);
+                    }
+                    ExpectedObject complex = new ExpectedObject(
+                            ObjectKind.COMPLEX_MICROTILE);
+                    for (NeighborDependency dependency : layer.neighborDependencies()) {
+                        validateManifestReference(dependency.hash(), complex, additions);
+                    }
+                }
+            });
+            requireObjectCapacity((long) this.expectedObjects.size() + additions.size(),
+                    "resolved content object table");
             this.resolutions.put(key, binding);
             binding.ifPresent(value -> {
                 for (ContentLayer layer : value.layers()) {
@@ -878,6 +1024,10 @@ public final class RootDemandPlan {
                     }
                 }
             });
+            // Descriptor visibility changes the immutable renderer manifest even when every
+            // referenced object was already registered by another selected node.
+            this.manifestRevision++;
+            this.selectionTopologyRevision++;
         }
     }
 
@@ -936,15 +1086,20 @@ public final class RootDemandPlan {
 
     public ManifestView manifestView() {
         ArrayList<NodeView> nodes = new ArrayList<>(this.nodeHandles.size());
-        for (ManifestSubtree manifest : this.manifests.values()) {
-            for (int slot = 0; slot < manifest.structuralSlots(); slot++) {
-                Optional<ManifestCodec.ManifestNode> node = combinedNode(manifest, slot);
-                if (node.isEmpty()) continue;
-                SpatialNode spatial = spatialAtSlot(manifest, slot);
-                Integer handle = this.nodeHandles.get(spatial);
-                if (handle == null) throw new IllegalStateException("manifest node lacks a handle");
-                nodes.add(new NodeView(handle, spatial, node.orElseThrow()));
+        for (Map.Entry<SpatialNode, Integer> entry : this.nodeHandles.entrySet()) {
+            SpatialNode spatial = entry.getKey();
+            ManifestSubtree manifest = manifestFor(spatial);
+            int slot = structuralSlot(manifest, spatial);
+            Optional<ManifestCodec.ManifestNode> structural = manifest.node(slot);
+            if (structural.isEmpty()) {
+                throw new IllegalStateException("admitted manifest node is absent");
             }
+            // A loaded page may cover 64 siblings, but its content becomes selectable only
+            // after this exact node was demanded and resolved. Exposing every sibling here
+            // would register the entire page's object graph rather than the visible working cut.
+            Optional<ManifestCodec.ManifestNode> node = this.resolutions.containsKey(
+                    sectionKey(spatial)) ? combinedNode(manifest, slot) : structural;
+            nodes.add(new NodeView(entry.getValue(), spatial, node.orElseThrow()));
         }
         nodes.sort(java.util.Comparator.comparingInt(NodeView::handle));
         ArrayList<ObjectView> objects = new ArrayList<>(this.objectHandles.size());
@@ -960,6 +1115,44 @@ public final class RootDemandPlan {
                 discoveryComplete());
     }
 
+    /** Allocation-free selector topology access; valid only on the owning state thread. */
+    int selectionNodeCount() {
+        return this.nodesByHandle.size();
+    }
+
+    SpatialNode selectionSpatial(int handle) {
+        if (handle < 0 || handle >= this.nodesByHandle.size()) {
+            throw new IllegalArgumentException("selection node handle is outside this root");
+        }
+        return this.nodesByHandle.get(handle);
+    }
+
+    ManifestCodec.ManifestNode selectionStructuralNode(int handle) {
+        SpatialNode spatial = selectionSpatial(handle);
+        ManifestSubtree manifest = manifestFor(spatial);
+        return manifest.node(structuralSlot(manifest, spatial)).orElseThrow(() ->
+                new IllegalStateException("admitted selection node is absent"));
+    }
+
+    Binding selectionBinding(int handle) {
+        Optional<Binding> binding = this.resolutions.get(sectionKey(selectionSpatial(handle)));
+        return binding == null ? null : binding.orElse(null);
+    }
+
+    int selectionHandle(SpatialNode spatial) {
+        return this.nodeHandles.getOrDefault(Objects.requireNonNull(spatial, "spatial node"), -1);
+    }
+
+    int selectionObjectHandle(Hash256 hash) {
+        Integer handle = this.objectHandles.get(Objects.requireNonNull(hash, "object hash"));
+        if (handle == null) throw new IllegalStateException("manifest object lacks a handle");
+        return handle;
+    }
+
+    boolean selectionObjectInFlight(Hash256 hash) {
+        return this.objectInFlight.contains(Objects.requireNonNull(hash, "object hash"));
+    }
+
     /** Allocation-free indexed access for state-thread residency installation. */
     public int objectHandleCount() {
         return this.objectsByHandle.size();
@@ -971,15 +1164,6 @@ public final class RootDemandPlan {
         if (expected == null) throw new IllegalStateException("object handle lacks capability");
         return new ObjectView(handle, hash, expected, this.processedObjects.contains(hash),
                 this.objectInFlight.contains(hash));
-    }
-
-    /** Metadata/catalog/dictionaries whose parsed or canonical state the live planner owns. */
-    public long pinReferenceCount() {
-        return (long) this.directories.size() + this.manifests.size()
-                + this.descriptorPages.size() + this.deferredManifests.size()
-                + this.deferredDescriptorPages.size()
-                + this.expectedObjects.size() + this.requestedContent.size()
-                + this.selectedContent.size() + this.selectedNeighborContent.size() + 2;
     }
 
     public void forEachMetadataPin(Consumer<Hash256> visitor) {
@@ -1162,40 +1346,31 @@ public final class RootDemandPlan {
         return true;
     }
 
-    /** Installs the complete five-level structure or none of it when a hard table is full. */
+    /** Retains the complete five-level manifest while admitting only its root into the GPU cut. */
     private boolean tryInstallManifest(Hash256 hash, ManifestSubtree manifest) {
         if (this.manifests.containsKey(hash)) return true;
-        int addedNodes = 0;
-        for (int slot = 0; slot < manifest.structuralSlots(); slot++) {
-            Optional<ManifestCodec.ManifestNode> manifestNode = manifest.node(slot);
-            if (manifestNode.isEmpty()) continue;
-            SpatialNode spatial = spatialAtSlot(manifest, slot);
-            if (this.nodeHandles.containsKey(spatial)) {
-                throw new IllegalArgumentException("loaded manifests overlap a structural node");
-            }
-            addedNodes++;
-        }
         long loadedMetadata = loadedMetadataCount()
                 + (this.deferredManifests.containsKey(hash) ? 0 : 1);
-        if (!hasObjectCapacity(loadedMetadata)
-                || !hasNodeCapacity((long) this.nodeHandles.size() + addedNodes)) {
-            return false;
+        if (!hasObjectCapacity(loadedMetadata)) return false;
+        ManifestSubtree previous = this.manifestsByRoot.get(manifest.root());
+        if (previous != null && previous != manifest) {
+            throw new IllegalArgumentException("loaded manifests overlap a top-level root");
         }
 
         this.deferredManifests.remove(hash);
         this.manifests.put(hash, manifest);
+        this.manifestsByRoot.put(manifest.root(), manifest);
         this.manifestRevision++;
-        for (int slot = 0; slot < manifest.structuralSlots(); slot++) {
-            Optional<ManifestCodec.ManifestNode> manifestNode = manifest.node(slot);
-            if (manifestNode.isEmpty()) continue;
-            registerNode(spatialAtSlot(manifest, slot));
-        }
+        rebuildAdmittedNodes();
         return true;
     }
 
-    /** Installs one descriptor page and all of its typed object capabilities atomically. */
+    /** Installs one descriptor page without widening the exact renderer demand. */
     private boolean tryInstallDescriptorPage(Hash256 hash, DescriptorPage page) {
         if (this.descriptorPages.containsKey(hash)) return true;
+        // Validate the immutable page at its trust boundary, but do not widen live demand to
+        // every object referenced by all 64 descriptor slots.  Only bindings selected by the
+        // renderer are registered below in resolveAvailableDemands().
         LinkedHashMap<Hash256, ExpectedObject> additions = new LinkedHashMap<>();
         for (int localSlot = 0; localSlot < page.slotCount(); localSlot++) {
             for (Map.Entry<ContentClass, ContentDescriptor> content
@@ -1217,29 +1392,11 @@ public final class RootDemandPlan {
         }
         long loadedMetadata = loadedMetadataCount()
                 + (this.deferredDescriptorPages.containsKey(hash) ? 0 : 1);
-        if (!hasObjectCapacity(loadedMetadata)
-                || !hasObjectCapacity((long) this.expectedObjects.size() + additions.size())) {
+        if (!hasObjectCapacity(loadedMetadata)) {
             return false;
         }
         this.deferredDescriptorPages.remove(hash);
         this.descriptorPages.put(hash, page);
-        for (int localSlot = 0; localSlot < page.slotCount(); localSlot++) {
-            for (Map.Entry<ContentClass, ContentDescriptor> content
-                    : page.contents(localSlot).entrySet()) {
-                ObjectKind kind = MicrotileCodec.objectKind(content.getKey());
-                for (Hash256 object : content.getValue().objects()) {
-                    registerExpectedObject(object, kind, false);
-                }
-                for (Hash256 dependency : content.getValue().dependencies()) {
-                    registerExpectedObject(dependency, kind, false);
-                }
-                for (NeighborDependency dependency
-                        : content.getValue().neighborDependencies()) {
-                    registerExpectedObject(dependency.hash(), ObjectKind.COMPLEX_MICROTILE,
-                            false);
-                }
-            }
-        }
         this.manifestRevision++;
         return true;
     }
@@ -1351,22 +1508,15 @@ public final class RootDemandPlan {
                 || kind == ObjectKind.COMPLEX_MICROTILE;
     }
 
-    private void registerNode(SpatialNode spatial) {
-        if (this.nodeHandles.containsKey(spatial)) return;
-        requireNodeCapacity((long) this.nodeHandles.size() + 1,
-                "structural node table");
-        this.nodeHandles.put(spatial, this.nodeHandles.size());
-    }
-
     private void requireObjectCapacity(long count, String label) {
         if (!hasObjectCapacity(count)) {
-            throw new IllegalStateException(label + " exceeds its global-budget table");
+            throw new IllegalStateException(label + " exceeds its protocol limit");
         }
     }
 
     private void requireNodeCapacity(long count, String label) {
         if (!hasNodeCapacity(count)) {
-            throw new IllegalStateException(label + " exceeds its global-budget table");
+            throw new IllegalStateException(label + " exceeds its protocol limit");
         }
     }
 
@@ -1448,12 +1598,14 @@ public final class RootDemandPlan {
                 !relevant(entry.getValue().root())
                         && !this.subtreeInFlight.contains(entry.getKey()));
         rebuildReachableRegistries();
+        boolean handleNamespaceChanged = !previousNodeHandles.equals(this.nodeHandles)
+                || !previousObjectHandles.equals(this.objectHandles);
         if (topologyWasComplete != discoveryComplete()
                 || !previousManifests.equals(this.manifests.keySet())
                 || !previousDescriptorPages.equals(this.descriptorPages.keySet())
-                || !previousNodeHandles.equals(this.nodeHandles)
-                || !previousObjectHandles.equals(this.objectHandles)) {
+                || handleNamespaceChanged) {
             this.manifestRevision++;
+            if (handleNamespaceChanged) this.selectionTopologyRevision++;
         }
     }
 
@@ -1464,23 +1616,23 @@ public final class RootDemandPlan {
                 putExpected(retained, entry.getKey(), entry.getValue());
             }
         }
-        for (DescriptorPage page : this.descriptorPages.values()) {
-            for (int localSlot = 0; localSlot < page.slotCount(); localSlot++) {
-                for (Map.Entry<ContentClass, ContentDescriptor> content
-                        : page.contents(localSlot).entrySet()) {
-                    ExpectedObject expected = new ExpectedObject(
-                            MicrotileCodec.objectKind(content.getKey()));
-                    for (Hash256 hash : content.getValue().objects()) {
-                        putExpected(retained, hash, expected);
-                    }
-                    for (Hash256 hash : content.getValue().dependencies()) {
-                        putExpected(retained, hash, expected);
-                    }
-                    for (NeighborDependency dependency
-                            : content.getValue().neighborDependencies()) {
-                        putExpected(retained, dependency.hash(), new ExpectedObject(
-                                ObjectKind.COMPLEX_MICROTILE));
-                    }
+        // Descriptor pages describe capabilities; resolved renderer demand owns the live
+        // object namespace.  Retaining every object in every resident page recreates the same
+        // capacity leak during pruning.
+        for (Optional<Binding> resolution : this.resolutions.values()) {
+            if (resolution.isEmpty()) continue;
+            for (ContentLayer layer : resolution.orElseThrow().layers()) {
+                ExpectedObject expected = new ExpectedObject(
+                        MicrotileCodec.objectKind(layer.contentClass()));
+                for (ContentObject object : layer.objects()) {
+                    putExpected(retained, object.hash(), expected);
+                }
+                for (Hash256 hash : layer.dependencies()) {
+                    putExpected(retained, hash, expected);
+                }
+                for (NeighborDependency dependency : layer.neighborDependencies()) {
+                    putExpected(retained, dependency.hash(), new ExpectedObject(
+                            ObjectKind.COMPLEX_MICROTILE));
                 }
             }
         }
@@ -1533,27 +1685,123 @@ public final class RootDemandPlan {
             this.objectsByHandle.add(hash);
         }
 
-        ArrayList<SpatialNode> spatialNodes = new ArrayList<>();
+        this.manifestsByRoot.clear();
         for (ManifestSubtree manifest : this.manifests.values()) {
-            for (int slot = 0; slot < manifest.structuralSlots(); slot++) {
-                if (manifest.node(slot).isPresent()) {
-                    spatialNodes.add(spatialAtSlot(manifest, slot));
+            if (this.manifestsByRoot.put(manifest.root(), manifest) != null) {
+                throw new IllegalStateException("loaded manifests overlap a top-level root");
+            }
+        }
+        rebuildAdmittedNodes();
+    }
+
+    /**
+     * Rebuilds the bounded selector working cut. Existing demanded coverage and all of its
+     * ancestors are admitted first; top-level window roots follow; only then are the immediate
+     * children of demanded nodes admitted for progressive refinement.
+     */
+    private void rebuildAdmittedNodes() {
+        this.admittedScratch.clear();
+        boolean blocked = false;
+
+        // Preserve the complete path for every currently selected/renderable node before using
+        // capacity on new roots or finer detail.
+        for (int index = 0; index < this.demanded.size(); index++) {
+            SpatialNode target = spatial(this.demanded.valueAt(index));
+            for (int lod = ManifestCodec.MAX_LOD; lod >= target.lod(); lod--) {
+                blocked |= !admitIfPresent(ancestorAt(target, lod));
+            }
+        }
+        for (SpatialNode root : this.metadataRoots) {
+            blocked |= !admitIfPresent(root);
+        }
+
+        // Demand order comes from the score-sorted selector frontier. If refinement reaches the
+        // bound, lower-priority children wait while every already selected node remains present.
+        for (int index = 0; index < this.demanded.size(); index++) {
+            SpatialNode parent = spatial(this.demanded.valueAt(index));
+            if (parent.lod() == 0) continue;
+            ManifestSubtree manifest = manifestForOrNull(parent);
+            if (manifest == null) continue;
+            Optional<ManifestCodec.ManifestNode> node = manifest.node(
+                    structuralSlot(manifest, parent));
+            if (node.isEmpty()) continue;
+            int childMask = node.orElseThrow().childMask();
+            for (int child = 0; child < 8; child++) {
+                if ((childMask & 1 << child) == 0) continue;
+                SpatialNode childNode = new SpatialNode(parent.lod() - 1,
+                        parent.x() * 2 + (child & 1),
+                        parent.y() * 2 + (child >>> 1 & 1),
+                        parent.z() * 2 + (child >>> 2 & 1));
+                blocked |= !admitIfPresent(childNode);
+            }
+        }
+
+        boolean changed = this.nodeHandles.size() != this.admittedScratch.size();
+        if (!changed) {
+            for (int index = 0; index < this.admittedScratch.size(); index++) {
+                SpatialNode node = spatial(this.admittedScratch.valueAt(index));
+                Integer handle = this.nodeHandles.get(node);
+                if (handle == null || handle != index) {
+                    changed = true;
+                    break;
                 }
             }
         }
-        spatialNodes.sort((left, right) -> {
-            int compared = Integer.compare(left.lod(), right.lod());
-            if (compared == 0) compared = Integer.compare(left.x(), right.x());
-            if (compared == 0) compared = Integer.compare(left.y(), right.y());
-            if (compared == 0) compared = Integer.compare(left.z(), right.z());
-            return compared;
-        });
-        this.nodeHandles.clear();
-        for (SpatialNode node : spatialNodes) {
-            if (this.nodeHandles.put(node, this.nodeHandles.size()) != null) {
-                throw new IllegalStateException("loaded manifests overlap a structural node");
+        if (changed) {
+            this.nodeHandles.clear();
+            this.nodesByHandle.clear();
+            for (int index = 0; index < this.admittedScratch.size(); index++) {
+                SpatialNode node = spatial(this.admittedScratch.valueAt(index));
+                if (this.nodeHandles.put(node, index) != null) {
+                    throw new IllegalStateException("admitted structural node is duplicated");
+                }
+                this.nodesByHandle.add(node);
             }
+            this.manifestRevision++;
+            this.selectionTopologyRevision++;
         }
+        this.metadataCapacityBlocked |= blocked;
+    }
+
+    /** Returns false only when a present node cannot enter the bounded working cut. */
+    private boolean admitIfPresent(SpatialNode node) {
+        ManifestSubtree manifest = manifestForOrNull(node);
+        if (manifest == null) return true;
+        int depth = manifest.root().lod() - node.lod();
+        if (depth < 0 || depth >= manifest.levels()) return true;
+        if (manifest.node(structuralSlot(manifest, node)).isEmpty()) return true;
+        long key = sectionKey(node);
+        if (this.admittedScratch.contains(key)) return true;
+        if (this.admittedScratch.size() >= this.limits.maxNodes()) return false;
+        this.admittedScratch.add(key);
+        return true;
+    }
+
+    private ManifestSubtree manifestFor(SpatialNode node) {
+        ManifestSubtree manifest = manifestForOrNull(node);
+        if (manifest == null) {
+            throw new IllegalStateException("node has no resident top-level manifest");
+        }
+        return manifest;
+    }
+
+    private ManifestSubtree manifestForOrNull(SpatialNode node) {
+        return this.manifestsByRoot.get(topRoot(node));
+    }
+
+    private static SpatialNode ancestorAt(SpatialNode node, int lod) {
+        if (lod < node.lod() || lod > ManifestCodec.MAX_LOD) {
+            throw new IllegalArgumentException("invalid structural ancestor level");
+        }
+        int x = node.x();
+        int y = node.y();
+        int z = node.z();
+        for (int current = node.lod(); current < lod; current++) {
+            x = Math.floorDiv(x, 2);
+            y = Math.floorDiv(y, 2);
+            z = Math.floorDiv(z, 2);
+        }
+        return new SpatialNode(lod, x, y, z);
     }
 
     private static void putExpected(Map<Hash256, ExpectedObject> expectedObjects,
@@ -1607,9 +1855,9 @@ public final class RootDemandPlan {
         for (Map.Entry<Hash256, ManifestSubtree> entry : this.manifests.entrySet()) {
             ManifestSubtree manifest = entry.getValue();
             if (!relevant(manifest.root())) continue;
-            // Page zero supplies the top-level cold-coverage fallback. Other pages are fetched
-            // only after the complete structural selector returns an exact descriptorless node.
-            expectDescriptorPage(entry.getKey(), manifest, 0);
+            // Structural metadata is sufficient for the GPU to choose a descriptorless node.
+            // Fetch only the pages containing exact renderer demand; eagerly loading page zero
+            // for every root makes a large render window consume content capacity off-screen.
             for (int demandIndex = 0; demandIndex < this.demanded.size(); demandIndex++) {
                 long key = this.demanded.valueAt(demandIndex);
                 SpatialNode target = spatial(key);
@@ -1626,6 +1874,7 @@ public final class RootDemandPlan {
         if (!this.deferredManifests.isEmpty() || !this.deferredDescriptorPages.isEmpty()) {
             this.metadataCapacityBlocked = true;
         }
+        rebuildAdmittedNodes();
         if (topologyWasComplete != discoveryComplete()) this.manifestRevision++;
         resolveAvailableDemands();
     }

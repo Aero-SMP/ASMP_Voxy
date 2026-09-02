@@ -21,3 +21,6 @@ __pycache__/
 # Rust server build output and local state
 rust-server/target/
 rust-server/voxy-server.toml
+
+# Local Codex architecture and correctness work queue
+/project_audit/

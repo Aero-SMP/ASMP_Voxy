@@ -15,9 +15,6 @@ import java.nio.file.Path;
 import java.util.Locale;
 
 public class VoxyConfig {
-    /** Smallest budget that can retain fixed metadata and still make visible-terrain progress. */
-    public static final int MIN_VIRTUAL_SURFACE_MEMORY_MIB = 768;
-    public static final int MAX_VIRTUAL_SURFACE_MEMORY_MIB = 4096;
     private static final Gson GSON = new GsonBuilder()
             .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .setPrettyPrinting()
@@ -35,8 +32,6 @@ public class VoxyConfig {
     public float fogDensity = 0.0f;
     public boolean adaptCloudDistance = true;
     public int cloudDistance = 0;
-    /** One aggregate cap for all resident and in-flight Virtual Surface client data. */
-    public int virtualSurfaceMemoryMiB = 768;
 
     public String ssaoMode;
 
@@ -86,7 +81,6 @@ public class VoxyConfig {
             return;
         }
 
-        this.virtualSurfaceMemoryMiB = boundedVirtualSurfaceMemoryMiB();
         try {
             Files.writeString(getConfigPath(), GSON.toJson(this));
         } catch (IOException e) {
@@ -102,12 +96,4 @@ public class VoxyConfig {
         return VoxyClient.isAvailable() && this.enabled && this.enableRendering;
     }
 
-    public long virtualSurfaceMemoryBytes() {
-        return (long) boundedVirtualSurfaceMemoryMiB() << 20;
-    }
-
-    private int boundedVirtualSurfaceMemoryMiB() {
-        return Math.max(MIN_VIRTUAL_SURFACE_MEMORY_MIB,
-                Math.min(MAX_VIRTUAL_SURFACE_MEMORY_MIB, this.virtualSurfaceMemoryMiB));
-    }
 }

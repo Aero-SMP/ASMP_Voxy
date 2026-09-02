@@ -11,7 +11,7 @@ public final class ClientLodClient {
     private ClientLodClient() {}
 
     public static void init(IEventBus modBus) {
-        ClientLodTransport.register(modBus);
+        QuicEndpointDiscovery.register(modBus);
         NeoForge.EVENT_BUS.register(ClientLodClient.class);
     }
 
@@ -23,6 +23,7 @@ public final class ClientLodClient {
     @SubscribeEvent
     public static void onTick(ClientTickEvent.Post event) {
         ClientSession.tick();
+        ClientLodDebug.tick();
     }
 
     public static void disconnect() {
@@ -46,24 +47,4 @@ public final class ClientLodClient {
     public static void rendererLifecycleChanged() {
         ClientSession.rendererLifecycleChanged();
     }
-
-    static int debugDesiredSections() {
-        return ClientSession.debugDesiredSections();
-    }
-
-    static int debugPendingSections() {
-        return ClientSession.debugPendingSections();
-    }
-
-    static int debugInboundFrames() {
-        return ClientSession.debugInboundFrames();
-    }
-
-    static long debugInboundKiB() {
-        return ClientSession.debugInboundKiB();
-    }
-
-    static int debugMasterDesiredSections() { return ClientSession.debugDesiredSections(); }
-    static int debugMaximumDemand() { return ClientSession.maximumMetadataRoots(); }
-
 }

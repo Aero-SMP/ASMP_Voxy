@@ -10,16 +10,15 @@ import me.cortex.voxy.client.core.rendering.selection.SelectionBatch.Priority;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.client.lod.MemoryBudget;
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest.ContentClass;
-import me.cortex.voxy.client.core.rendering.selection.SelectionManifest.ContentState;
+import me.cortex.voxy.client.core.rendering.selection.SelectionManifest.ContentLayout;
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest.Node;
+import me.cortex.voxy.common.Logger;
 import org.joml.Vector3d;
 import org.joml.Vector3f;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayDeque;
-import java.util.BitSet;
 import java.util.Iterator;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
@@ -59,6 +58,7 @@ public final class VirtualSurfaceSelector {
     private static final int OUTPUT_HEADER_BYTES = 16 * Integer.BYTES;
     private static final int OUTPUT_ENTRY_BYTES = 12 * Integer.BYTES;
     private static final int OUTPUT_QUEUES = 2;
+    private static final int OUTPUT_SLOT_COUNT = 4;
     private static final int UNIFORM_BYTES = 320;
     private static final int NO_NODE = -1;
     private static final int MAX_PREDICTION_SAMPLES = 64;
@@ -73,19 +73,14 @@ public final class VirtualSurfaceSelector {
             .add(ShaderType.COMPUTE, "voxy:lod/selection/manifest_cut.comp")
             .compile();
     private final GlBuffer uniformBuffer = new GlBuffer(UNIFORM_BYTES).zero();
-    private GlBuffer outputBuffer = new GlBuffer(outputBytes(1)).zero();
     private GlBuffer nodeBuffer = new GlBuffer(Integer.BYTES).zero();
     private final int hizSampler = glGenSamplers();
-
-    /** Bound only for the lifetime of the session that owns these GPU resources. */
-    private MemoryBudget memory;
-    private MemoryBudget.Reservation fixedMemory;
-    private MemoryBudget.Reservation nodeMemory;
-    private MemoryBudget.Reservation outputMemory;
+    private final OutputSlot[] outputSlots = new OutputSlot[OUTPUT_SLOT_COUNT];
+    private int nextOutputSlot;
 
     private final AtomicReference<PendingManifest> pendingManifest = new AtomicReference<>();
-    private final AtomicReference<SelectionTelemetry> telemetry =
-            new AtomicReference<>(SelectionTelemetry.DEFAULT);
+    private final AtomicReference<PredictionTiming> predictionTiming =
+            new AtomicReference<>(PredictionTiming.DEFAULT);
     private final AtomicReference<SelectionBatch> handoff = new AtomicReference<>();
     private final SelectionBatch.Pool selectionPool = new SelectionBatch.Pool(3);
 
@@ -108,68 +103,47 @@ public final class VirtualSurfaceSelector {
     private long lastPredictionSampleNanos;
 
     public VirtualSurfaceSelector() {
+        for (int index = 0; index < this.outputSlots.length; index++) {
+            this.outputSlots[index] = new OutputSlot();
+        }
         glSamplerParameteri(this.hizSampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
         glSamplerParameteri(this.hizSampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glSamplerParameteri(this.hizSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glSamplerParameteri(this.hizSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
-    /** Accounts already-created fixed buffers before a session may publish manifested terrain. */
-    public void bindMemory(MemoryBudget memory) {
-        Objects.requireNonNull(memory, "memory");
-        if (this.memory == memory) return;
-        if (this.memory != null) {
-            throw new IllegalStateException("another session still owns selector memory");
-        }
-        MemoryBudget.Reservation fixed = reserve(memory, MemoryBudget.Pool.MANIFEST,
-                this.uniformBuffer.size());
-        MemoryBudget.Reservation nodes = null;
-        MemoryBudget.Reservation output = null;
-        try {
-            nodes = reserve(memory, MemoryBudget.Pool.MANIFEST, this.nodeBuffer.size());
-            output = reserve(memory, MemoryBudget.Pool.MANIFEST, this.outputBuffer.size());
-            this.selectionPool.bindMemory(memory);
-        } catch (RuntimeException failure) {
-            if (output != null) output.close();
-            if (nodes != null) nodes.close();
-            fixed.close();
-            throw failure;
-        }
-        this.memory = memory;
-        this.fixedMemory = fixed;
-        this.nodeMemory = nodes;
-        this.outputMemory = output;
-    }
-
-    /** Releases session accounting; outstanding readback reservations retire in their callbacks. */
-    public void unbindMemory(MemoryBudget memory) {
-        if (this.memory != memory) return;
+    /** Drops pooled selection state between world sessions. */
+    public void resetSession() {
+        this.activeEpoch++;
+        releasePendingManifest();
+        SelectionManifest active = this.activeManifest;
+        this.activeManifest = null;
+        if (active != null) active.close();
         this.disposePredictionSamples();
-        this.selectionPool.unbindMemory(memory);
         this.releaseHandoff();
-        this.memory = null;
-        closeReservation(this.fixedMemory);
-        closeReservation(this.nodeMemory);
-        closeReservation(this.outputMemory);
-        this.fixedMemory = null;
-        this.nodeMemory = null;
-        this.outputMemory = null;
+        this.selectionPool.clear();
+        this.lastPredictionFeedbackSequence = 0;
+        this.lastPredictionSampleNanos = 0;
+        this.predictionGeneration = Long.MIN_VALUE;
     }
 
     /** May be called from the state thread; only the newest unpublished snapshot is retained. */
     public void publish(SelectionManifest manifest) {
         Objects.requireNonNull(manifest, "manifest");
-        this.pendingManifest.set(new PendingManifest(manifest, manifest.generation(),
-                manifest.snapshotId()));
+        PendingManifest previous = this.pendingManifest.getAndSet(new PendingManifest(
+                manifest, manifest.generation(), manifest.snapshotId()));
+        if (previous != null && previous.manifest != null) previous.manifest.close();
     }
 
     /** Clears selection authority without allowing an older asynchronous result to reappear. */
     public void clear(long generation, long snapshotId) {
-        this.pendingManifest.set(new PendingManifest(null, generation, snapshotId));
+        PendingManifest previous = this.pendingManifest.getAndSet(
+                new PendingManifest(null, generation, snapshotId));
+        if (previous != null && previous.manifest != null) previous.manifest.close();
     }
 
-    public void updateTelemetry(SelectionTelemetry telemetry) {
-        this.telemetry.set(Objects.requireNonNull(telemetry, "telemetry"));
+    public void updatePredictionTiming(PredictionTiming timing) {
+        this.predictionTiming.set(Objects.requireNonNull(timing, "timing"));
     }
 
     /** Returns and removes the latest atomic handoff; intermediate snapshots may be coalesced. */
@@ -183,111 +157,88 @@ public final class VirtualSurfaceSelector {
         Objects.requireNonNull(pass, "pass");
         this.installPendingManifest();
         SelectionManifest manifest = this.activeManifest;
-        if (manifest == null || manifest.nodes().isEmpty()) return;
+        if (manifest == null || manifest.nodeCount() == 0) return;
 
-        Prediction prediction = this.predictionForFrame(viewport, this.telemetry.get());
-        int outputCapacity = pass == Pass.REFINED ? manifest.nodes().size()
-                : Math.min(manifest.nodes().size(), CONSERVATIVE_OUTPUT_CAPACITY);
-        long downloadBytes = outputBytes(outputCapacity);
-        MemoryBudget memory = this.memory;
-        if (memory == null) return;
-        MemoryBudget.Reservation readbackMemory = memory.tryReserve(
-                MemoryBudget.Allocation.of(MemoryBudget.Pool.IN_FLIGHT,
-                        Math.addExact(downloadBytes, 64L))).orElse(null);
-        if (readbackMemory == null) return;
-        this.uploadUniforms(viewport, hiz, manifest, prediction, pass, outputCapacity);
-        this.outputBuffer.zeroRange(0, OUTPUT_HEADER_BYTES);
-
-        this.shader.bind();
-        glBindBufferBase(GL_UNIFORM_BUFFER, SCENE_BINDING, this.uniformBuffer.id);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, NODE_BINDING, this.nodeBuffer.id);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, OUTPUT_BINDING, this.outputBuffer.id);
-        glBindTextureUnit(0, hiz.getHizTextureId());
-        glBindSampler(0, this.hizSampler);
-        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
-        glDispatchCompute((manifest.nodes().size() + 127) / 128, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-        SelectionTicket ticket = new SelectionTicket(manifest, this.activeEpoch,
-                ++this.sequence, viewport.frameId, pass, outputCapacity, downloadBytes,
-                System.nanoTime(), prediction.horizonSeconds, readbackMemory);
+        Prediction prediction = this.predictionForFrame(viewport, this.predictionTiming.get());
+        int outputCapacity = pass == Pass.REFINED ? manifest.nodeCount()
+                : Math.min(manifest.nodeCount(), CONSERVATIVE_OUTPUT_CAPACITY);
+        OutputSlot output = this.acquireOutputSlot(outputBytes(outputCapacity));
+        if (output == null) return;
+        SelectionTicket ticket = output.ticket;
+        SelectionManifest retained = manifest.retain();
         try {
-            DownloadStream.INSTANCE.download(this.outputBuffer, 0, downloadBytes,
-                    (pointer, size) -> this.acceptDownload(ticket, pointer, size));
+            ticket.begin(retained, this.activeEpoch, ++this.sequence, viewport.frameId,
+                    pass, outputCapacity, System.nanoTime(), prediction.horizonSeconds);
         } catch (RuntimeException | Error failure) {
-            readbackMemory.close();
+            retained.close();
+            output.busy = false;
             throw failure;
         }
-        glBindSampler(0, 0);
-        glBindTextureUnit(0, 0);
+        try {
+            this.uploadUniforms(viewport, hiz, manifest, prediction, pass, outputCapacity);
+            output.buffer.zeroRange(0, OUTPUT_HEADER_BYTES);
+
+            this.shader.bind();
+            glBindBufferBase(GL_UNIFORM_BUFFER, SCENE_BINDING, this.uniformBuffer.id);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, NODE_BINDING, this.nodeBuffer.id);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, OUTPUT_BINDING, output.buffer.id);
+            glBindTextureUnit(0, hiz.getHizTextureId());
+            glBindSampler(0, this.hizSampler);
+            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+            glDispatchCompute((manifest.nodeCount() + 127) / 128, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            DownloadStream.INSTANCE.download(output.buffer, 0, OUTPUT_HEADER_BYTES,
+                    (pointer, size) -> this.acceptHeader(ticket, pointer, size));
+        } catch (RuntimeException | Error failure) {
+            this.releaseTicket(ticket);
+            throw failure;
+        } finally {
+            glBindSampler(0, 0);
+            glBindTextureUnit(0, 0);
+        }
     }
 
     private void installPendingManifest() {
         PendingManifest pending = this.pendingManifest.getAndSet(null);
         if (pending == null) return;
-        if (pending.manifest != null && this.memory == null) {
-            this.pendingManifest.compareAndSet(null, pending);
-            return;
-        }
-
         if (pending.manifest == null) {
             this.activeEpoch++;
             this.releaseHandoff();
+            SelectionManifest active = this.activeManifest;
             this.activeManifest = null;
+            if (active != null) active.close();
             this.disposePredictionSamples();
             this.lastPredictionFeedbackSequence = 0;
             this.lastPredictionSampleNanos = 0;
             this.predictionGeneration = Long.MIN_VALUE;
             this.offer(SelectionBatch.empty(pending.generation, pending.snapshotId,
-                    ++this.sequence, 0, Pass.REFINED, true));
+                    ++this.sequence, true));
             return;
         }
 
         long requiredBytes = Math.max(Integer.BYTES,
-                Math.multiplyExact((long) pending.manifest.nodes().size(), NODE_BYTES));
-        long requiredOutputBytes = outputBytes(Math.max(1, pending.manifest.nodes().size()));
-        MemoryBudget.Reservation replacementNodeMemory = this.memory.tryReserve(
-                MemoryBudget.Allocation.of(MemoryBudget.Pool.MANIFEST,
-                        requiredBytes)).orElse(null);
-        if (replacementNodeMemory == null) {
-            this.pendingManifest.compareAndSet(null, pending);
-            return;
-        }
-        MemoryBudget.Reservation replacementOutputMemory = null;
-        if (this.outputBuffer.size() != requiredOutputBytes) {
-            replacementOutputMemory = this.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.MANIFEST,
-                            requiredOutputBytes)).orElse(null);
-            if (replacementOutputMemory == null) {
-                replacementNodeMemory.close();
-                this.pendingManifest.compareAndSet(null, pending);
-                return;
-            }
-        }
+                Math.multiplyExact((long) pending.manifest.nodeCount(), NODE_BYTES));
 
         GlBuffer replacement = null;
-        GlBuffer replacementOutput = null;
         try {
             replacement = new GlBuffer(requiredBytes).zero();
-            if (!pending.manifest.nodes().isEmpty()) {
+            if (pending.manifest.nodeCount() != 0) {
                 long pointer = UploadStream.INSTANCE.upload(replacement, 0, requiredBytes);
                 this.writeManifest(pending.manifest, pointer);
                 UploadStream.INSTANCE.commit();
             }
-            if (replacementOutputMemory != null) {
-                replacementOutput = new GlBuffer(requiredOutputBytes).zero();
-            }
         } catch (RuntimeException | Error failure) {
-            if (replacementOutput != null) replacementOutput.free();
             if (replacement != null) replacement.free();
-            if (replacementOutputMemory != null) replacementOutputMemory.close();
-            replacementNodeMemory.close();
+            pending.manifest.close();
             throw failure;
         }
 
         this.activeEpoch++;
         this.releaseHandoff();
+        SelectionManifest oldManifest = this.activeManifest;
         this.activeManifest = pending.manifest;
+        if (oldManifest != null) oldManifest.close();
         if (this.predictionGeneration != pending.manifest.generation()) {
             this.disposePredictionSamples();
             this.lastPredictionFeedbackSequence = 0;
@@ -295,27 +246,16 @@ public final class VirtualSurfaceSelector {
             this.predictionGeneration = pending.manifest.generation();
         }
         GlBuffer oldNode = this.nodeBuffer;
-        MemoryBudget.Reservation oldNodeMemory = this.nodeMemory;
         this.nodeBuffer = replacement;
-        this.nodeMemory = replacementNodeMemory;
         oldNode.free();
-        closeReservation(oldNodeMemory);
-        if (replacementOutput != null) {
-            GlBuffer oldOutput = this.outputBuffer;
-            MemoryBudget.Reservation oldOutputMemory = this.outputMemory;
-            this.outputBuffer = replacementOutput;
-            this.outputMemory = replacementOutputMemory;
-            oldOutput.free();
-            closeReservation(oldOutputMemory);
-        }
-        if (pending.manifest.nodes().isEmpty()) {
-            this.offer(SelectionBatch.empty(pending.generation, pending.snapshotId,
-                    ++this.sequence, 0, Pass.REFINED, true));
+        if (pending.manifest.nodeCount() == 0) {
+            this.offer(SelectionBatch.empty(pending.manifest, ++this.sequence, true));
         }
     }
 
     private void writeManifest(SelectionManifest manifest, long pointer) {
-        for (Node node : manifest.nodes()) {
+        for (int nodeIndex = 0; nodeIndex < manifest.nodeCount(); nodeIndex++) {
+            Node node = manifest.nodeAt(nodeIndex);
             long base = pointer;
             putInt(pointer, (int) (node.sectionKey() >>> 32)); pointer += 4;
             putInt(pointer, (int) node.sectionKey()); pointer += 4;
@@ -347,22 +287,20 @@ public final class VirtualSurfaceSelector {
             long geometryBytes = 0;
             long completionMicros = 0;
             for (ContentClass contentClass : ContentClass.values()) {
-                ContentState state = node.content(contentClass);
-                putLongWords(pointer, state.availableMask()); pointer += 8;
-                putLongWords(pointer, state.residentMask()); pointer += 8;
-                putLongWords(pointer, state.renderableMask()); pointer += 8;
-                putLongWords(pointer, state.inFlightMask()); pointer += 8;
+                ContentLayout state = node.layout(contentClass);
+                putLongWords(pointer, manifest.availableMask(nodeIndex, contentClass)); pointer += 8;
+                putLongWords(pointer, manifest.residentMask(nodeIndex, contentClass)); pointer += 8;
+                putLongWords(pointer, manifest.renderableMask(nodeIndex, contentClass)); pointer += 8;
+                putLongWords(pointer, manifest.inFlightMask(nodeIndex, contentClass)); pointer += 8;
                 int meta = 0;
-                if (state.residentDependenciesInternal().cardinality()
-                        == state.dependencyHandlesInternal().length) meta |= 1 << 2;
-                if (state.residentNeighborDependenciesInternal().cardinality()
-                        == state.neighborDependencyHandlesInternal().length) meta |= 1 << 3;
-                if (hasRequestableDependency(state.residentDependenciesInternal(),
-                        state.inFlightDependenciesInternal(),
-                        state.dependencyHandlesInternal().length)) meta |= 1 << 4;
-                if (hasRequestableDependency(state.residentNeighborDependenciesInternal(),
-                        state.inFlightNeighborDependenciesInternal(),
-                        state.neighborDependencyHandlesInternal().length)) meta |= 1 << 5;
+                if (allDependenciesResident(manifest, nodeIndex, contentClass,
+                        state.dependencyCount(), false)) meta |= 1 << 2;
+                if (allDependenciesResident(manifest, nodeIndex, contentClass,
+                        state.neighborDependencyCount(), true)) meta |= 1 << 3;
+                if (hasRequestableDependency(manifest, nodeIndex, contentClass,
+                        state.dependencyCount(), false)) meta |= 1 << 4;
+                if (hasRequestableDependency(manifest, nodeIndex, contentClass,
+                        state.neighborDependencyCount(), true)) meta |= 1 << 5;
                 meta |= state.boundaryFaceMask() << 8;
                 putInt(pointer, meta); pointer += 4;
                 // Two reserved words retain the stable GPU node stride. Per-microtile camera
@@ -400,7 +338,7 @@ public final class VirtualSurfaceSelector {
         }
         prediction.delta.getToAddress(pointer); pointer += 12;
         MemoryUtil.memPutFloat(pointer, prediction.angularPadding); pointer += 4;
-        putInt(pointer, manifest.nodes().size()); pointer += 4;
+        putInt(pointer, manifest.nodeCount()); pointer += 4;
         putInt(pointer, viewport.frameId); pointer += 4;
         putInt(pointer, pass.ordinal()); pointer += 4;
         putInt(pointer, (int) manifest.cameraVisibilityDomain()); pointer += 4;
@@ -424,7 +362,7 @@ public final class VirtualSurfaceSelector {
         UploadStream.INSTANCE.commit();
     }
 
-    private Prediction predictionForFrame(Viewport viewport, SelectionTelemetry telemetry) {
+    private Prediction predictionForFrame(Viewport viewport, PredictionTiming timing) {
         if (this.predictionFrame == viewport.frameId) return this.framePrediction;
         this.predictionFrame = viewport.frameId;
         long now = System.nanoTime();
@@ -455,14 +393,14 @@ public final class VirtualSurfaceSelector {
         this.lastMotionNanos = now;
 
         double transferSeconds;
-        if (telemetry.throughputBytesPerSecond() == 0) {
-            transferSeconds = telemetry.outstandingBytes() == 0 ? 0.0 : 1.0;
+        if (timing.throughputBytesPerSecond() == 0) {
+            transferSeconds = timing.outstandingBytes() == 0 ? 0.0 : 1.0;
         } else {
-            transferSeconds = (double) telemetry.outstandingBytes()
-                    / telemetry.throughputBytesPerSecond();
+            transferSeconds = (double) timing.outstandingBytes()
+                    / timing.throughputBytesPerSecond();
         }
-        double baseHorizon = telemetry.roundTripMicros() / 1_000_000.0
-                + transferSeconds + telemetry.meshingMicros() / 1_000_000.0;
+        double baseHorizon = timing.roundTripMicros() / 1_000_000.0
+                + transferSeconds + timing.meshingMicros() / 1_000_000.0;
         double confidence = 0.2 + 0.8 * this.predictionAccuracy;
         float horizon = (float) Math.max(0.1, Math.min(1.0, baseHorizon * confidence));
         Vector3f delta = new Vector3f((float) (this.velocity.x * horizon),
@@ -474,57 +412,102 @@ public final class VirtualSurfaceSelector {
         return this.framePrediction = new Prediction(delta, angularPadding, horizon);
     }
 
-    private void acceptDownload(SelectionTicket ticket, long pointer, long size) {
+    private void acceptHeader(SelectionTicket ticket, long pointer, long size) {
         try {
-            acceptDownloadRetained(ticket, pointer, size);
-        } finally {
-            ticket.readbackMemory.close();
+            SelectionManifest active = this.activeManifest;
+            if (size != OUTPUT_HEADER_BYTES || active == null
+                    || ticket.manifest.generation() != active.generation()) {
+                this.releaseTicket(ticket);
+                return;
+            }
+            long currentUnsigned = Integer.toUnsignedLong(MemoryUtil.memGetInt(pointer));
+            long predictedUnsigned = Integer.toUnsignedLong(MemoryUtil.memGetInt(pointer + 4));
+            ticket.headerMalformed = currentUnsigned > ticket.outputCapacity
+                    || predictedUnsigned > ticket.outputCapacity;
+            for (int word = 3; word < OUTPUT_HEADER_BYTES / Integer.BYTES; word++) {
+                ticket.headerMalformed |= MemoryUtil.memGetInt(pointer + (long) word * 4) != 0;
+            }
+            ticket.currentCount = (int) Math.min(currentUnsigned, ticket.outputCapacity);
+            ticket.predictedCount = (int) Math.min(predictedUnsigned, ticket.outputCapacity);
+            ticket.overflow = MemoryUtil.memGetInt(pointer + 8);
+            int inputCapacity = Math.addExact(ticket.currentCount, ticket.predictedCount);
+            int plannedCapacity = Math.addExact(Math.multiplyExact(ticket.currentCount, 4),
+                    ticket.predictedCount);
+            ticket.batch = this.selectionPool.acquire(ticket.manifest, inputCapacity,
+                    plannedCapacity);
+            if (ticket.batch == null) {
+                this.releaseTicket(ticket);
+                return;
+            }
+            ticket.batch.begin(ticket.manifest.generation(), ticket.manifest.snapshotId(),
+                    ticket.sequence, false);
+            if (ticket.currentCount == 0) ticket.batch.beginInput(0);
+            if (ticket.predictedCount == 0) ticket.batch.beginInput(1);
+
+            this.scheduleQueue(ticket, 0, ticket.currentCount);
+            this.scheduleQueue(ticket, 1, ticket.predictedCount);
+            if (ticket.pendingQueues == 0) this.finishTicket(ticket);
+        } catch (RuntimeException | Error failure) {
+            this.abandonTicket(ticket, failure);
         }
     }
 
-    private void acceptDownloadRetained(SelectionTicket ticket, long pointer, long size) {
-        SelectionManifest active = this.activeManifest;
-        if (active == null || ticket.manifest.generation() != active.generation()
-                || size < ticket.outputBytes) return;
-        // Object residency and descriptor discovery may replace the immutable GPU snapshot while
-        // an asynchronous readback is in flight. Handles are append-only within one root, so the
-        // old result is still safe for requesting/retaining content. It is not, however, current
-        // enough to cancel demand or retire coverage. Only an exact active-snapshot result may be
-        // published as a complete frontier below.
-        boolean currentSnapshot = ticket.epoch == this.activeEpoch
-                && ticket.manifest == active;
-        boolean malformed = false;
-        long currentUnsigned = Integer.toUnsignedLong(MemoryUtil.memGetInt(pointer));
-        long predictedUnsigned = Integer.toUnsignedLong(MemoryUtil.memGetInt(pointer + 4));
-        malformed |= currentUnsigned > ticket.outputCapacity
-                || predictedUnsigned > ticket.outputCapacity;
-        int currentCount = (int) Math.min(currentUnsigned, ticket.outputCapacity);
-        int predictedCount = (int) Math.min(predictedUnsigned, ticket.outputCapacity);
-        int overflow = MemoryUtil.memGetInt(pointer + 8);
-        int inputCapacity = Math.addExact(currentCount, predictedCount);
-        int outputCapacity = Math.addExact(Math.multiplyExact(currentCount, 4), predictedCount);
-        SelectionBatch batch = this.selectionPool.acquire(ticket.manifest, inputCapacity,
-                outputCapacity);
-        if (batch == null) return;
-        batch.begin(ticket.manifest.generation(), ticket.manifest.snapshotId(), ticket.sequence,
-                ticket.frameId, ticket.pass, false);
-        boolean currentMalformed;
-        boolean predictedMalformed;
+    private void scheduleQueue(SelectionTicket ticket, int queue, int count) {
+        if (count == 0 || ticket.failed) return;
+        long offset = OUTPUT_HEADER_BYTES
+                + (long) queue * ticket.outputCapacity * OUTPUT_ENTRY_BYTES;
+        long bytes = (long) count * OUTPUT_ENTRY_BYTES;
+        ticket.pendingQueues++;
         try {
-            currentMalformed = this.decodeQueue(ticket.manifest, pointer, 0, currentCount,
-                    ticket.outputCapacity, ticket.pass, batch);
-            predictedMalformed = this.decodeQueue(ticket.manifest, pointer, 1, predictedCount,
-                    ticket.outputCapacity, ticket.pass, batch);
-            SelectionCutPlanner.plan(ticket.manifest, batch);
+            DownloadStream.INSTANCE.download(ticket.slot.buffer, offset, bytes,
+                    (pointer, size) -> this.acceptQueue(ticket, queue, count, pointer, size));
         } catch (RuntimeException | Error failure) {
-            batch.close();
+            ticket.pendingQueues--;
             throw failure;
         }
-        boolean frontierComplete = currentSnapshot && ticket.pass == Pass.REFINED
-                && !malformed && overflow == 0
-                && !currentMalformed && !predictedMalformed;
-        batch.setFrontierComplete(frontierComplete);
+    }
+
+    private void acceptQueue(SelectionTicket ticket, int queue, int count,
+                             long pointer, long size) {
         try {
+            if (!ticket.failed) {
+                if (size != (long) count * OUTPUT_ENTRY_BYTES) {
+                    ticket.queueMalformed[queue] = true;
+                    ticket.batch.beginInput(queue);
+                } else {
+                    ticket.queueMalformed[queue] = decodeQueue(ticket.manifest, pointer, queue,
+                            count, ticket.pass, ticket.batch);
+                }
+            }
+        } catch (RuntimeException | Error failure) {
+            ticket.failed = true;
+            Logger.error("Selection output decode failed", failure);
+        } finally {
+            ticket.pendingQueues--;
+            if (ticket.pendingQueues == 0) {
+                if (ticket.failed) this.releaseTicket(ticket);
+                else this.finishTicket(ticket);
+            }
+        }
+    }
+
+    private void finishTicket(SelectionTicket ticket) {
+        SelectionBatch batch = ticket.batch;
+        if (batch == null) {
+            this.releaseTicket(ticket);
+            return;
+        }
+        try {
+            SelectionManifest active = this.activeManifest;
+            if (active == null || ticket.manifest.generation() != active.generation()) return;
+            SelectionCutPlanner.plan(ticket.manifest, batch);
+            boolean currentSnapshot = active != null
+                    && ticket.epoch == this.activeEpoch && ticket.manifest == active;
+            boolean frontierComplete = currentSnapshot && ticket.pass == Pass.REFINED
+                    && !ticket.headerMalformed && ticket.overflow == 0
+                    && !ticket.queueMalformed[0] && !ticket.queueMalformed[1]
+                    && !batch.structureIncomplete();
+            batch.setFrontierComplete(frontierComplete);
             if (frontierComplete
                     && Long.compareUnsigned(ticket.sequence,
                     this.lastPredictionFeedbackSequence) > 0) {
@@ -532,17 +515,39 @@ public final class VirtualSurfaceSelector {
                 this.observePredictionUsefulness(ticket, batch);
             }
             this.offer(batch);
+            ticket.batch = null;
         } catch (RuntimeException | Error failure) {
-            batch.close();
-            throw failure;
+            Logger.error("Selection output planning failed", failure);
+        } finally {
+            if (ticket.batch != null) {
+                ticket.batch.close();
+                ticket.batch = null;
+            }
+            this.releaseTicket(ticket);
         }
     }
 
-    static boolean decodeQueue(SelectionManifest manifest, long pointer, int queue,
-                               int count, int outputCapacity, Pass expectedPass,
-                               SelectionBatch batch) {
-        long base = pointer + OUTPUT_HEADER_BYTES
-                + (long) queue * outputCapacity * OUTPUT_ENTRY_BYTES;
+    private void abandonTicket(SelectionTicket ticket, Throwable failure) {
+        ticket.failed = true;
+        Logger.error("Selection readback failed", failure);
+        if (ticket.pendingQueues == 0) this.releaseTicket(ticket);
+    }
+
+    private void releaseTicket(SelectionTicket ticket) {
+        if (ticket.released) return;
+        ticket.released = true;
+        if (ticket.batch != null) {
+            ticket.batch.close();
+            ticket.batch = null;
+        }
+        SelectionManifest manifest = ticket.manifest;
+        ticket.manifest = null;
+        if (manifest != null) manifest.close();
+        ticket.slot.busy = false;
+    }
+
+    static boolean decodeQueue(SelectionManifest manifest, long base, int queue,
+                               int count, Pass expectedPass, SelectionBatch batch) {
         batch.beginInput(queue);
         boolean malformed = false;
         for (int entry = 0; entry < count; entry++) {
@@ -554,25 +559,32 @@ public final class VirtualSurfaceSelector {
             long exterior = getLongWords(address + 16);
             long interior = getLongWords(address + 24);
             long complex = getLongWords(address + 32);
-            if (nodeIndex < 0 || nodeIndex >= manifest.nodes().size()
+            int entryFlags = MemoryUtil.memGetInt(address + 40);
+            int reserved = MemoryUtil.memGetInt(address + 44);
+            if (nodeIndex < 0 || nodeIndex >= manifest.nodeCount()
                     || (classes & ~7) != 0
                     || encodedPass != expectedPass.ordinal()
-                    || !Float.isFinite(score) || score < 0.0f) {
+                    || !Float.isFinite(score) || score < 0.0f
+                    || (entryFlags & ~1) != 0 || reserved != 0) {
                 malformed = true;
                 continue;
             }
-            Node node = manifest.nodes().get(nodeIndex);
+            if (queue == 0 && (entryFlags & 1) != 0) batch.markStructureIncomplete();
+            Node node = manifest.nodeAt(nodeIndex);
             int maskClasses = 0;
             if (exterior != 0) maskClasses |= 1;
             if (interior != 0) maskClasses |= 2;
             if (complex != 0) maskClasses |= 4;
-            boolean invalidMask = (exterior & ~node.exterior().availableMask()) != 0
-                    || (interior & ~node.interior().availableMask()) != 0
-                    || (complex & ~node.complex().availableMask()) != 0;
-            boolean missingDescriptorDemand = !node.descriptorReady()
-                    && classes == 0 && maskClasses == 0;
+            boolean invalidMask = (exterior & ~manifest.availableMask(
+                    nodeIndex, ContentClass.EXTERIOR)) != 0
+                    || (interior & ~manifest.availableMask(
+                    nodeIndex, ContentClass.INTERIOR)) != 0
+                    || (complex & ~manifest.availableMask(
+                    nodeIndex, ContentClass.COMPLEX)) != 0;
+            boolean metadataDemand = classes == 0 && maskClasses == 0
+                    && (!node.descriptorReady() || (entryFlags & 1) != 0);
             if (invalidMask || classes != maskClasses
-                    || classes == 0 && !missingDescriptorDemand
+                    || classes == 0 && !metadataDemand
                     || classes != 0 && !node.descriptorReady()) {
                 malformed = true;
                 continue;
@@ -594,8 +606,6 @@ public final class VirtualSurfaceSelector {
     }
 
     private void observePredictionUsefulness(SelectionTicket ticket, SelectionBatch batch) {
-        MemoryBudget memory = this.memory;
-        if (memory == null) return;
         long now = System.nanoTime();
         Iterator<PredictionSample> samples = this.predictionSamples.iterator();
         while (samples.hasNext()) {
@@ -623,8 +633,7 @@ public final class VirtualSurfaceSelector {
             this.availablePredictionSample = null;
             if (sample == null) sample = new PredictionSample();
             if (sample.capture(ticket.manifest.cameraVisibilityDomain(), ticket.frameId,
-                    deadline(ticket.submittedNanos, ticket.predictionHorizonSeconds), batch, 1,
-                    memory)) {
+                    deadline(ticket.submittedNanos, ticket.predictionHorizonSeconds), batch, 1)) {
                 this.predictionSamples.addLast(sample);
                 this.lastPredictionSampleNanos = now;
             } else {
@@ -671,32 +680,73 @@ public final class VirtualSurfaceSelector {
 
     public void free() {
         this.activeEpoch++;
-        this.pendingManifest.set(null);
+        releasePendingManifest();
+        SelectionManifest active = this.activeManifest;
         this.activeManifest = null;
+        if (active != null) active.close();
         this.disposePredictionSamples();
-        if (this.memory != null) this.selectionPool.unbindMemory(this.memory);
+        this.selectionPool.clear();
         this.releaseHandoff();
+        for (OutputSlot slot : this.outputSlots) {
+            if (slot.busy) {
+                throw new IllegalStateException("selection output is still owned during free");
+            }
+        }
         this.shader.free();
         this.uniformBuffer.free();
-        this.outputBuffer.free();
+        for (OutputSlot slot : this.outputSlots) {
+            slot.buffer.free();
+        }
         this.nodeBuffer.free();
-        closeReservation(this.fixedMemory);
-        closeReservation(this.outputMemory);
-        closeReservation(this.nodeMemory);
-        this.fixedMemory = null;
-        this.outputMemory = null;
-        this.nodeMemory = null;
-        this.memory = null;
         glDeleteSamplers(this.hizSampler);
     }
 
 
-    private static boolean hasRequestableDependency(BitSet resident, BitSet inFlight,
-                                                    int count) {
+    private static boolean allDependenciesResident(SelectionManifest manifest, int nodeIndex,
+                                                   ContentClass contentClass, int count,
+                                                   boolean neighbor) {
         for (int index = 0; index < count; index++) {
-            if (!resident.get(index) && !inFlight.get(index)) return true;
+            if (!(neighbor ? manifest.neighborResident(nodeIndex, contentClass, index)
+                    : manifest.dependencyResident(nodeIndex, contentClass, index))) return false;
+        }
+        return true;
+    }
+
+    private static boolean hasRequestableDependency(SelectionManifest manifest, int nodeIndex,
+                                                    ContentClass contentClass, int count,
+                                                    boolean neighbor) {
+        for (int index = 0; index < count; index++) {
+            boolean resident = neighbor
+                    ? manifest.neighborResident(nodeIndex, contentClass, index)
+                    : manifest.dependencyResident(nodeIndex, contentClass, index);
+            boolean inFlight = neighbor
+                    ? manifest.neighborInFlight(nodeIndex, contentClass, index)
+                    : manifest.dependencyInFlight(nodeIndex, contentClass, index);
+            if (!resident && !inFlight) return true;
         }
         return false;
+    }
+
+    private void releasePendingManifest() {
+        PendingManifest pending = this.pendingManifest.getAndSet(null);
+        if (pending != null && pending.manifest != null) pending.manifest.close();
+    }
+
+    private OutputSlot acquireOutputSlot(long requiredBytes) {
+        for (int offset = 0; offset < this.outputSlots.length; offset++) {
+            int index = (this.nextOutputSlot + offset) % this.outputSlots.length;
+            OutputSlot slot = this.outputSlots[index];
+            if (slot.busy) continue;
+            if (slot.buffer.size() < requiredBytes) {
+                GlBuffer replacement = new GlBuffer(requiredBytes).zero();
+                slot.buffer.free();
+                slot.buffer = replacement;
+            }
+            slot.busy = true;
+            this.nextOutputSlot = (index + 1) % this.outputSlots.length;
+            return slot;
+        }
+        return null;
     }
 
     private static long saturatingAdd(long left, long right) {
@@ -710,18 +760,6 @@ public final class VirtualSurfaceSelector {
         }
         return OUTPUT_HEADER_BYTES
                 + (long) capacity * OUTPUT_ENTRY_BYTES * OUTPUT_QUEUES;
-    }
-
-    private static MemoryBudget.Reservation reserve(MemoryBudget memory,
-                                                       MemoryBudget.Pool pool,
-                                                       long bytes) {
-        return memory.tryReserve(MemoryBudget.Allocation.of(pool, bytes))
-                .orElseThrow(() -> new IllegalStateException(
-                        "Virtual Surface memory budget cannot admit selector buffers"));
-    }
-
-    private static void closeReservation(MemoryBudget.Reservation reservation) {
-        if (reservation != null) reservation.close();
     }
 
     private static void putInt(long pointer, int value) {
@@ -739,11 +777,64 @@ public final class VirtualSurfaceSelector {
     }
 
     private record PendingManifest(SelectionManifest manifest, long generation, long snapshotId) {}
-    private record SelectionTicket(SelectionManifest manifest, long epoch, long sequence,
-                                   int frameId, Pass pass, int outputCapacity,
-                                   long outputBytes, long submittedNanos,
-                                   float predictionHorizonSeconds,
-                                   MemoryBudget.Reservation readbackMemory) {}
+
+    private static final class OutputSlot {
+        private GlBuffer buffer = new GlBuffer(outputBytes(1)).zero();
+        private final SelectionTicket ticket = new SelectionTicket(this);
+        private boolean busy;
+    }
+
+    private static final class SelectionTicket {
+        private final OutputSlot slot;
+        private final boolean[] queueMalformed = new boolean[OUTPUT_QUEUES];
+        private SelectionManifest manifest;
+        private SelectionBatch batch;
+        private long epoch;
+        private long sequence;
+        private int frameId;
+        private Pass pass;
+        private int outputCapacity;
+        private long submittedNanos;
+        private float predictionHorizonSeconds;
+        private int currentCount;
+        private int predictedCount;
+        private int overflow;
+        private int pendingQueues;
+        private boolean headerMalformed;
+        private boolean failed;
+        private boolean released = true;
+
+        private SelectionTicket(OutputSlot slot) {
+            this.slot = slot;
+        }
+
+        private void begin(SelectionManifest manifest, long epoch, long sequence, int frameId,
+                           Pass pass, int outputCapacity, long submittedNanos,
+                           float predictionHorizonSeconds) {
+            if (!this.released || this.slot.busy && this.manifest != null) {
+                throw new IllegalStateException("selection output ticket is already owned");
+            }
+            this.manifest = manifest;
+            this.batch = null;
+            this.epoch = epoch;
+            this.sequence = sequence;
+            this.frameId = frameId;
+            this.pass = pass;
+            this.outputCapacity = outputCapacity;
+            this.submittedNanos = submittedNanos;
+            this.predictionHorizonSeconds = predictionHorizonSeconds;
+            this.currentCount = 0;
+            this.predictedCount = 0;
+            this.overflow = 0;
+            this.pendingQueues = 0;
+            this.headerMalformed = false;
+            this.queueMalformed[0] = false;
+            this.queueMalformed[1] = false;
+            this.failed = false;
+            this.released = false;
+        }
+    }
+
     private record Prediction(Vector3f delta, float angularPadding, float horizonSeconds) {}
 
     private static final class PredictionSample {
@@ -754,8 +845,6 @@ public final class VirtualSurfaceSelector {
         private long cameraDomain;
         private int frameId;
         private long deadlineNanos;
-        private MemoryBudget memory;
-        private MemoryBudget.Reservation storageMemory;
         private long accountedBytes;
         private long[] keys = EMPTY_LONGS;
         private long[] predicted = EMPTY_LONGS;
@@ -766,9 +855,9 @@ public final class VirtualSurfaceSelector {
         private int size;
 
         private boolean capture(long cameraDomain, int frameId, long deadlineNanos,
-                                SelectionBatch batch, int queue, MemoryBudget memory) {
+                                SelectionBatch batch, int queue) {
             int capacity = tableCapacity(Math.multiplyExact(batch.inputCount(queue), 3));
-            if (!ensureCapacity(capacity, memory)) return false;
+            ensureCapacity(capacity);
             beginEpoch();
             this.cameraDomain = cameraDomain;
             this.frameId = frameId;
@@ -836,30 +925,9 @@ public final class VirtualSurfaceSelector {
             this.size = 0;
         }
 
-        private boolean ensureCapacity(int capacity, MemoryBudget memory) {
-            if (capacity <= this.keys.length) {
-                if (this.memory != memory) {
-                    throw new IllegalStateException(
-                            "prediction sample belongs to another memory budget");
-                }
-                return true;
-            }
+        private void ensureCapacity(int capacity) {
+            if (capacity <= this.keys.length) return;
             long requiredBytes = storageBytes(capacity);
-            long peakBytes = Math.addExact(requiredBytes, arrayBytes(this.keys.length));
-            MemoryBudget.Allocation peak = MemoryBudget.Allocation.of(
-                    MemoryBudget.Pool.MANIFEST, peakBytes);
-            boolean newReservation = this.storageMemory == null;
-            if (newReservation) {
-                this.storageMemory = memory.tryReserve(peak).orElse(null);
-                if (this.storageMemory == null) return false;
-                this.memory = memory;
-            } else {
-                if (this.memory != memory) {
-                    throw new IllegalStateException(
-                            "prediction sample belongs to another memory budget");
-                }
-                if (!this.storageMemory.tryResizeTo(peak)) return false;
-            }
             try {
                 long[] keys = new long[capacity];
                 long[] predicted = new long[capacity];
@@ -872,10 +940,7 @@ public final class VirtualSurfaceSelector {
                 this.classes = classes;
                 this.epochs = epochs;
                 this.epoch = 0;
-                this.storageMemory.reduceTo(MemoryBudget.Allocation.of(
-                        MemoryBudget.Pool.MANIFEST, requiredBytes));
                 this.accountedBytes = requiredBytes;
-                return true;
             } catch (RuntimeException | Error failure) {
                 this.dispose();
                 throw failure;
@@ -894,9 +959,6 @@ public final class VirtualSurfaceSelector {
             this.classes = EMPTY_BYTES;
             this.epochs = EMPTY_INTS;
             this.epoch = 0;
-            if (this.storageMemory != null) this.storageMemory.close();
-            this.storageMemory = null;
-            this.memory = null;
             this.accountedBytes = 0;
         }
 

@@ -11,6 +11,7 @@ use std::borrow::Borrow;
 const MAGIC: &[u8; 8] = b"VXYDICT\0";
 const HEADER_BYTES: usize = 14;
 const TRAINED_BYTES: usize = 8 * 1024;
+const MIN_DICTIONARY_BYTES: usize = 1024;
 const MAX_DICTIONARY_BYTES: usize = 64 * 1024;
 const MAX_CORPUS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SAMPLES: usize = 2_048;
@@ -67,8 +68,8 @@ where
     if samples.len() < 8 || corpus_bytes < TRAINED_BYTES * 8 {
         bail!("insufficient bounded corpus for a compression dictionary");
     }
-    let trained = zstd::dict::from_samples(&samples, TRAINED_BYTES)
-        .context("train Zstd dictionary")?;
+    let trained =
+        zstd::dict::from_samples(&samples, TRAINED_BYTES).context("train Zstd dictionary")?;
     if trained.len() > MAX_DICTIONARY_BYTES || !trained.starts_with(&ZSTD_DICTIONARY_MAGIC) {
         bail!("Zstd produced an invalid or oversized trained dictionary");
     }
@@ -92,7 +93,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompressionDictionary<'_>> {
     }
     let class = ContentClass::try_from(bytes[8])?;
     let length = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
-    if length == 0
+    if length < MIN_DICTIONARY_BYTES
         || length > MAX_DICTIONARY_BYTES
         || bytes.len() != HEADER_BYTES + length
         || !bytes[HEADER_BYTES..].starts_with(&ZSTD_DICTIONARY_MAGIC)

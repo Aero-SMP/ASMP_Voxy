@@ -130,15 +130,6 @@ impl CanonicalObject {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-
-    /// Exact retained heap capacity used by the process-wide memory budget.
-    pub(crate) fn byte_capacity(&self) -> usize {
-        self.bytes.capacity()
-    }
-
-    pub fn verify(&self) -> bool {
-        self.hash == hash_object(self.kind, &self.bytes)
-    }
 }
 
 impl AsRef<CanonicalObject> for CanonicalObject {

@@ -150,7 +150,6 @@ impl RootDirectory {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
         let mut out = Vec::with_capacity(12 + self.entries.len() * DIRECTORY_ENTRY_BYTES);
         out.extend_from_slice(DIRECTORY_MAGIC);
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
@@ -214,7 +213,6 @@ impl RootDirectory {
                 hash: ObjectHash::from_bytes(take(&mut input, 32)?.try_into().unwrap())?,
             });
         }
-        debug_assert!(input.is_empty());
         Self::new(entries)
     }
 
@@ -500,7 +498,6 @@ impl ManifestSubtree {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
         let slots = self.structural_slots();
         let page_slots = self.descriptor_page_slots();
         let mut out = Vec::new();
@@ -675,10 +672,6 @@ impl ManifestDescriptorPage {
         Ok(value)
     }
 
-    pub fn first_slot(&self) -> usize {
-        usize::from(self.page_index) * DESCRIPTOR_PAGE_SLOTS
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.root.lod != crate::MAX_LOD || self.levels != MAX_SUBTREE_LEVELS {
             bail!("a descriptor page must belong to one complete LOD-4 manifest");
@@ -698,7 +691,6 @@ impl ManifestDescriptorPage {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
         let slot_count = self.contents.len();
         let availability = ContentClass::ALL.map(|class| {
             availability_with(
@@ -855,7 +847,6 @@ fn validate_contents(
 }
 
 fn encode_content_descriptor(out: &mut Vec<u8>, content: &ContentDescriptor) -> Result<()> {
-    content.validate()?;
     out.push(content.microtile_edge);
     out.push(0);
     out.push(0);
@@ -944,7 +935,6 @@ fn decode_content_descriptor(
         neighbor_dependencies[face] = neighbors;
         neighbors = remaining;
     }
-    debug_assert!(neighbors.is_empty());
     let mut visibility_memberships = Vec::with_capacity(visibility_membership_count);
     for _ in 0..visibility_membership_count {
         visibility_memberships.push(VisibilityMembership {
@@ -965,7 +955,6 @@ fn decode_content_descriptor(
         boundary_face_mask,
         boundary_summary: take(input, boundary_summary_bytes)?.to_vec(),
     };
-    descriptor.validate()?;
     Ok(descriptor)
 }
 

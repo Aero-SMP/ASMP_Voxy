@@ -1,0 +1,24 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="All-Rights-Reserved"
+
+[[mods]]
+modId="voxy_server"
+version="${version}"
+displayName="Voxy Server"
+description='''Runs the Rust Voxy backend and advertises its authenticated QUIC endpoint.'''
+displayTest="IGNORE_ALL_VERSION"
+
+[[dependencies.voxy_server]]
+modId="neoforge"
+type="required"
+versionRange="[$neoforge,)"
+ordering="NONE"
+side="SERVER"
+
+[[dependencies.voxy_server]]
+modId="minecraft"
+type="required"
+versionRange="[$minecraft]"
+ordering="NONE"
+side="SERVER"

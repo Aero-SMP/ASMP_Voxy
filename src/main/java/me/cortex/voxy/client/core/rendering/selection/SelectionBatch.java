@@ -1,10 +1,7 @@
 package me.cortex.voxy.client.core.rendering.selection;
 
-import me.cortex.voxy.client.lod.MemoryBudget;
-
 import java.util.ArrayDeque;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -23,50 +20,30 @@ public final class SelectionBatch implements AutoCloseable {
     public static final class Pool {
         private final int maximum;
         private final ArrayDeque<SelectionBatch> available = new ArrayDeque<>();
-        private MemoryBudget memory;
         private int created;
-        private long allocatedBytes;
 
         public Pool(int maximum) {
             if (maximum <= 0) throw new IllegalArgumentException("pool maximum must be positive");
             this.maximum = maximum;
         }
 
-        public synchronized void bindMemory(MemoryBudget memory) {
-            Objects.requireNonNull(memory, "memory");
-            if (this.memory == memory) return;
-            if (this.memory != null) {
-                throw new IllegalStateException("another session still owns selection batches");
-            }
-            this.memory = memory;
-        }
-
-        public synchronized void unbindMemory(MemoryBudget memory) {
-            if (this.memory != memory) return;
-            this.memory = null;
+        public synchronized void clear() {
             while (!this.available.isEmpty()) dispose(this.available.removeFirst());
         }
 
         public synchronized SelectionBatch acquire(SelectionManifest manifest, int inputCapacity,
                                                     int outputCapacity) {
             Objects.requireNonNull(manifest, "manifest");
-            if (this.memory == null) return null;
             SelectionBatch batch = this.available.pollFirst();
             if (batch == null) {
                 if (this.created >= this.maximum) return null;
                 batch = new SelectionBatch(this);
                 this.created++;
             }
-            long before = batch.storageBytes();
             try {
-                if (!batch.prepare(manifest, inputCapacity, outputCapacity, this.memory)) {
-                    this.available.addFirst(batch);
-                    return null;
-                }
-                this.allocatedBytes += batch.storageBytes() - before;
+                batch.prepare(manifest, inputCapacity, outputCapacity);
                 return batch;
             } catch (RuntimeException | Error failure) {
-                this.allocatedBytes -= before;
                 this.created--;
                 batch.dispose();
                 throw failure;
@@ -75,10 +52,6 @@ public final class SelectionBatch implements AutoCloseable {
 
         private synchronized void release(SelectionBatch batch) {
             batch.reset();
-            if (this.memory != batch.memory) {
-                dispose(batch);
-                return;
-            }
             SelectionBatch retained = this.available.peekFirst();
             if (retained == null) {
                 this.available.addFirst(batch);
@@ -93,10 +66,6 @@ public final class SelectionBatch implements AutoCloseable {
 
         synchronized void offerLatest(AtomicReference<SelectionBatch> handoff,
                                       SelectionBatch batch) {
-            if (batch.owner == this && this.memory != batch.memory) {
-                batch.close();
-                return;
-            }
             while (true) {
                 SelectionBatch previous = handoff.get();
                 if (previous != null
@@ -112,26 +81,19 @@ public final class SelectionBatch implements AutoCloseable {
         }
 
         private void dispose(SelectionBatch batch) {
-            this.allocatedBytes -= batch.storageBytes();
             this.created--;
             batch.dispose();
         }
-
-        public synchronized int created() { return this.created; }
-        public synchronized long allocatedBytes() { return this.allocatedBytes; }
     }
 
     private final Pool owner;
-    private MemoryBudget memory;
-    private MemoryBudget.Reservation storageMemory;
     private long accountedBytes;
     private SelectionManifest manifest;
     private long generation;
     private long snapshotId;
     private long sequence;
-    private int frameId;
-    private Pass pass;
     private boolean frontierComplete;
+    private boolean structureIncomplete;
     private boolean released = true;
 
     private final int[] segmentOffsets = new int[3];
@@ -170,19 +132,31 @@ public final class SelectionBatch implements AutoCloseable {
     private SelectionBatch(Pool owner) { this.owner = owner; }
 
     public static SelectionBatch empty(long generation, long snapshotId, long sequence,
-                                       int frameId, Pass pass, boolean complete) {
+                                       boolean complete) {
         SelectionBatch batch = new SelectionBatch(null);
-        batch.manifest = new SelectionManifest(generation, snapshotId, 0, List.of());
+        batch.manifest = SelectionManifest.empty(generation, snapshotId);
         batch.released = false;
-        batch.begin(generation, snapshotId, sequence, frameId, pass, complete);
+        batch.begin(generation, snapshotId, sequence, complete);
         batch.beginSegment(Segment.DESIRED);
         batch.beginSegment(Segment.RENDERABLE);
         batch.beginSegment(Segment.REQUESTS);
         return batch;
     }
 
-    private boolean prepare(SelectionManifest manifest, int inputCapacity, int outputCapacity,
-                            MemoryBudget memory) {
+    public static SelectionBatch empty(SelectionManifest manifest, long sequence,
+                                       boolean complete) {
+        Objects.requireNonNull(manifest, "manifest");
+        SelectionBatch batch = new SelectionBatch(null);
+        batch.manifest = manifest.retain();
+        batch.released = false;
+        batch.begin(manifest.generation(), manifest.snapshotId(), sequence, complete);
+        batch.beginSegment(Segment.DESIRED);
+        batch.beginSegment(Segment.RENDERABLE);
+        batch.beginSegment(Segment.REQUESTS);
+        return batch;
+    }
+
+    private void prepare(SelectionManifest manifest, int inputCapacity, int outputCapacity) {
         if (inputCapacity < 0 || outputCapacity < 0) {
             throw new IllegalArgumentException("negative selection capacity");
         }
@@ -192,18 +166,6 @@ public final class SelectionBatch implements AutoCloseable {
         int nodes = grow(this.groupEpoch.length, manifest.nodeHandleCapacity());
         int objects = grow(this.costEpoch.length, manifest.objectHandleCapacity());
         long requiredBytes = storageBytes(inputs, outputs, candidates, nodes, objects);
-        MemoryBudget.Allocation allocation = MemoryBudget.Allocation.of(
-                MemoryBudget.Pool.MANIFEST, requiredBytes);
-        if (this.storageMemory == null) {
-            this.storageMemory = memory.tryReserve(allocation).orElse(null);
-            if (this.storageMemory == null) return false;
-            this.memory = memory;
-        } else {
-            if (this.memory != memory) {
-                throw new IllegalStateException("selection batch belongs to another memory budget");
-            }
-            if (!this.storageMemory.tryResizeTo(allocation)) return false;
-        }
         this.accountedBytes = requiredBytes;
 
         if (inputs != this.inputNodeIndexes.length) {
@@ -240,27 +202,27 @@ public final class SelectionBatch implements AutoCloseable {
             this.costValues = new long[objects];
             this.costingEpoch = 0;
         }
-        this.manifest = manifest;
+        this.manifest = manifest.retain();
         this.released = false;
+        this.structureIncomplete = false;
         this.inputSize = 0;
         this.outputSize = 0;
         Arrays.fill(this.inputCounts, 0);
         Arrays.fill(this.segmentCounts, 0);
-        return true;
     }
 
-    public void begin(long generation, long snapshotId, long sequence, int frameId,
-                      Pass pass, boolean frontierComplete) {
+    public void begin(long generation, long snapshotId, long sequence,
+                      boolean frontierComplete) {
         ensureOwned();
         this.generation = generation;
         this.snapshotId = snapshotId;
         this.sequence = sequence;
-        this.frameId = frameId;
-        this.pass = Objects.requireNonNull(pass, "pass");
         this.frontierComplete = frontierComplete;
     }
 
     void setFrontierComplete(boolean value) { this.frontierComplete = value; }
+    void markStructureIncomplete() { this.structureIncomplete = true; }
+    boolean structureIncomplete() { return this.structureIncomplete; }
     void beginInput(int queue) { this.inputOffsets[queue] = this.inputSize; this.inputCounts[queue] = 0; }
 
     void appendInput(int queue, int nodeIndex, float score,
@@ -302,9 +264,6 @@ public final class SelectionBatch implements AutoCloseable {
     public long generation() { ensureOwned(); return this.generation; }
     public long snapshotId() { ensureOwned(); return this.snapshotId; }
     public long sequence() { ensureOwned(); return this.sequence; }
-    public int frameId() { ensureOwned(); return this.frameId; }
-    public Pass pass() { ensureOwned(); return this.pass; }
-    public boolean frontierComplete() { ensureOwned(); return this.frontierComplete; }
     public boolean permitsCancellation() { ensureOwned(); return this.frontierComplete; }
     public void disableCancellation() { ensureOwned(); this.frontierComplete = false; }
     public int count(Segment segment) { ensureOwned(); return this.segmentCounts[segment.ordinal()]; }
@@ -319,14 +278,13 @@ public final class SelectionBatch implements AutoCloseable {
             default -> throw new IllegalStateException("invalid selection priority");
         };
     }
-    public float score(Segment segment, int row) { return this.outputScores[absolute(segment, row)]; }
     public long selectedMask(Segment segment, int row,
                              SelectionManifest.ContentClass contentClass) {
         return this.outputMasks[absolute(segment, row) * 3 + contentClass.ordinal()];
     }
-    public SelectionManifest.ContentState contentState(Segment segment, int row,
-                                                       SelectionManifest.ContentClass contentClass) {
-        return this.manifest.nodeAt(nodeIndex(segment, row)).content(contentClass);
+    public SelectionManifest.ContentLayout contentLayout(
+            Segment segment, int row, SelectionManifest.ContentClass contentClass) {
+        return this.manifest.contentLayout(nodeIndex(segment, row), contentClass);
     }
 
     int inputOffset(int queue) { return this.inputOffsets[queue]; }
@@ -361,8 +319,9 @@ public final class SelectionBatch implements AutoCloseable {
     }
 
     private void reset() {
+        SelectionManifest retained = this.manifest;
         this.manifest = null;
-        this.pass = null;
+        if (retained != null) retained.close();
         this.inputSize = 0;
         this.outputSize = 0;
         Arrays.fill(this.inputCounts, 0);
@@ -399,9 +358,6 @@ public final class SelectionBatch implements AutoCloseable {
         this.costValues = EMPTY_LONGS;
         this.groupingEpoch = 0;
         this.costingEpoch = 0;
-        if (this.storageMemory != null) this.storageMemory.close();
-        this.storageMemory = null;
-        this.memory = null;
         this.accountedBytes = 0;
     }
 

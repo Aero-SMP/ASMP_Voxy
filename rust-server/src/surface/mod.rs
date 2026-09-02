@@ -5,7 +5,6 @@ pub mod content;
 pub mod dictionary;
 pub mod gc;
 pub mod manifest;
-pub mod memory;
 pub mod object;
 pub mod pack;
 pub mod root;

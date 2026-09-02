@@ -193,16 +193,8 @@ impl Registry {
         }
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     pub fn opacity_table(&self) -> Vec<u8> {
         self.blocks.iter().map(|entry| entry.opacity).collect()
-    }
-
-    pub fn counts(&self) -> (usize, usize) {
-        (self.blocks.len(), self.biomes.len())
     }
 
     pub fn catalog_id(&self) -> u64 {

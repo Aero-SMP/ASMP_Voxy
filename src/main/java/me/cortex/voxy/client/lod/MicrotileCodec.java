@@ -36,17 +36,34 @@ public final class MicrotileCodec {
         }
     }
 
+    /** Structurally validated canonical data awaiting client-catalog translation. */
+    static final class Decoded {
+        private final Metadata metadata;
+        private final long catalogId;
+        private final int[] blocks;
+        private final int[] biomes;
+        private final byte[] lights;
+        private final short[] paletteIndexes;
+
+        private Decoded(Metadata metadata, long catalogId, int[] blocks, int[] biomes,
+                        byte[] lights, short[] paletteIndexes) {
+            this.metadata = metadata;
+            this.catalogId = catalogId;
+            this.blocks = blocks;
+            this.biomes = biomes;
+            this.lights = lights;
+            this.paletteIndexes = paletteIndexes;
+        }
+
+    }
+
     public static final class Prepared {
         private final Metadata metadata;
         private final int nonEmptyBlockCount;
         private final long[] cells;
 
         private Prepared(Metadata metadata, int nonEmptyBlockCount, long[] cells) {
-            this.metadata = Objects.requireNonNull(metadata, "metadata");
-            if (nonEmptyBlockCount < 0 || nonEmptyBlockCount > CELL_COUNT
-                    || cells.length != CELL_COUNT) {
-                throw new IllegalArgumentException("invalid prepared microtile");
-            }
+            this.metadata = metadata;
             this.nonEmptyBlockCount = nonEmptyBlockCount;
             this.cells = cells;
         }
@@ -68,29 +85,51 @@ public final class MicrotileCodec {
         }
     }
 
-    /** Validates canonical structure before catalog translation is available. */
-    public static Metadata inspect(byte[] canonical, ObjectKind expectedKind)
+    /** Parses and validates canonical bytes once, before catalog translation is available. */
+    static Decoded decodeCanonical(byte[] canonical, ObjectKind expectedKind)
             throws DecodeException {
-        Objects.requireNonNull(canonical, "canonical");
-        if (canonical.length < 20) throw new DecodeException("microtile is truncated");
-        long catalogId = ByteBuffer.wrap(canonical).order(ByteOrder.LITTLE_ENDIAN).getLong(8);
-        return inspect(canonical, expectedKind, catalogId);
+        return parse(canonical, expectedKind);
     }
 
-    /** Validates canonical structure and its announced catalog identity. */
-    public static Metadata inspect(byte[] canonical, ObjectKind expectedKind,
-                                   long expectedCatalogId) throws DecodeException {
-        return parse(canonical, expectedKind, expectedCatalogId, null, null, false).metadata();
-    }
-
-    public static Prepared decode(byte[] canonical, ObjectKind expectedKind,
-                                  long expectedCatalogId, int[] blockTranslations,
-                                  int[] biomeTranslations, boolean countNonAir)
-            throws DecodeException {
+    /** Translates a validated canonical microtile without rereading its byte representation. */
+    static Prepared prepare(Decoded decoded, long expectedCatalogId,
+                            int[] blockTranslations, int[] biomeTranslations,
+                            boolean countNonAir) throws DecodeException {
+        Objects.requireNonNull(decoded, "decoded");
         Objects.requireNonNull(blockTranslations, "blockTranslations");
         Objects.requireNonNull(biomeTranslations, "biomeTranslations");
-        return parse(canonical, expectedKind, expectedCatalogId, blockTranslations,
-                biomeTranslations, countNonAir);
+        if (expectedCatalogId == 0 || decoded.catalogId != expectedCatalogId) {
+            throw new DecodeException("microtile belongs to another catalog");
+        }
+        int paletteSize = decoded.metadata.paletteSize();
+        long[] palette = new long[paletteSize];
+        for (int index = 0; index < paletteSize; index++) {
+            long remoteBlock = Integer.toUnsignedLong(decoded.blocks[index]);
+            long remoteBiome = Integer.toUnsignedLong(decoded.biomes[index]);
+            if (remoteBlock >= blockTranslations.length || remoteBiome >= biomeTranslations.length) {
+                throw new DecodeException("microtile references an unknown catalog entry");
+            }
+            int block = blockTranslations[(int) remoteBlock];
+            int biome = biomeTranslations[(int) remoteBiome];
+            if (block < 0 || biome < 0) {
+                throw new DecodeException("microtile references an untranslated catalog entry");
+            }
+            try {
+                palette[index] = CatalogMapper.composeMappingId(decoded.lights[index], block, biome);
+            } catch (IllegalArgumentException exception) {
+                throw new DecodeException("translated microtile mapping is out of bounds",
+                        exception);
+            }
+        }
+
+        long[] cells = new long[CELL_COUNT];
+        int nonAir = 0;
+        for (int index = 0; index < CELL_COUNT; index++) {
+            long value = palette[Short.toUnsignedInt(decoded.paletteIndexes[index])];
+            cells[index] = value;
+            if (countNonAir && !CatalogMapper.isAir(value)) nonAir++;
+        }
+        return new Prepared(decoded.metadata, nonAir, cells);
     }
 
     public static ObjectKind objectKind(ContentClass contentClass) {
@@ -124,9 +163,7 @@ public final class MicrotileCodec {
         return high << 3 | low;
     }
 
-    private static Prepared parse(byte[] canonical, ObjectKind expectedKind,
-                                  long expectedCatalogId, int[] blockTranslations,
-                                  int[] biomeTranslations, boolean countNonAir)
+    private static Decoded parse(byte[] canonical, ObjectKind expectedKind)
             throws DecodeException {
         Objects.requireNonNull(canonical, "canonical");
         ContentClass expectedClass;
@@ -135,7 +172,7 @@ public final class MicrotileCodec {
         } catch (IllegalArgumentException exception) {
             throw new DecodeException(exception.getMessage(), exception);
         }
-        if (expectedCatalogId == 0 || canonical.length < HEADER_BYTES + 12
+        if (canonical.length < HEADER_BYTES + 12
                 || canonical.length > MAX_ENCODED_BYTES) {
             throw new DecodeException("microtile is truncated or oversized");
         }
@@ -152,15 +189,15 @@ public final class MicrotileCodec {
         int paletteSize = Short.toUnsignedInt(input.getShort());
         int bits = Byte.toUnsignedInt(input.get());
         long rawWordCount = Integer.toUnsignedLong(input.getInt());
-        if (!java.util.Arrays.equals(magic, MAGIC)
-                || catalogId != expectedCatalogId || rawClass != expectedClass.ordinal()
-                || edge != EDGE
-                || rawCellCount != CELL_COUNT || paletteSize < 1 || paletteSize > CELL_COUNT
-                || bits != minimumBits(paletteSize)) {
+        if (!java.util.Arrays.equals(magic, MAGIC) || catalogId == 0
+                || rawClass != expectedClass.ordinal()
+                || edge != EDGE || rawCellCount != CELL_COUNT) {
             throw new DecodeException("invalid microtile identity or palette metadata");
         }
+        Metadata metadata;
         try {
-            validateOrigin(originX, originY, originZ);
+            metadata = new Metadata(expectedClass, originX, originY, originZ,
+                    paletteSize, bits);
         } catch (IllegalArgumentException exception) {
             throw new DecodeException(exception.getMessage(), exception);
         }
@@ -171,34 +208,22 @@ public final class MicrotileCodec {
             throw new DecodeException("microtile word count or canonical length is invalid");
         }
 
-        long[] palette = new long[paletteSize];
+        int[] blocks = new int[paletteSize];
+        int[] biomes = new int[paletteSize];
+        byte[] lights = new byte[paletteSize];
         HashSet<RemoteCell> uniquePalette = new HashSet<>(paletteSize * 2);
-        boolean translate = blockTranslations != null;
         for (int index = 0; index < paletteSize; index++) {
-            long remoteBlock = Integer.toUnsignedLong(input.getInt());
-            long remoteBiome = Integer.toUnsignedLong(input.getInt());
+            int block = input.getInt();
+            int biome = input.getInt();
             byte light = input.get();
-            if (!uniquePalette.add(new RemoteCell(remoteBlock, remoteBiome,
+            if (!uniquePalette.add(new RemoteCell(Integer.toUnsignedLong(block),
+                    Integer.toUnsignedLong(biome),
                     Byte.toUnsignedInt(light)))) {
                 throw new DecodeException("microtile palette is noncanonical");
             }
-            if (translate) {
-                if (remoteBlock >= blockTranslations.length
-                        || remoteBiome >= biomeTranslations.length) {
-                    throw new DecodeException("microtile references an unknown catalog entry");
-                }
-                int block = blockTranslations[(int) remoteBlock];
-                int biome = biomeTranslations[(int) remoteBiome];
-                if (block < 0 || biome < 0) {
-                    throw new DecodeException("microtile references an untranslated catalog entry");
-                }
-                try {
-                    palette[index] = CatalogMapper.composeMappingId(light, block, biome);
-                } catch (IllegalArgumentException exception) {
-                    throw new DecodeException("translated microtile mapping is out of bounds",
-                            exception);
-                }
-            }
+            blocks[index] = block;
+            biomes[index] = biome;
+            lights[index] = light;
         }
 
         int wordsOffset = input.position();
@@ -212,15 +237,12 @@ public final class MicrotileCodec {
                 }
             }
         }
-        long[] cells = new long[CELL_COUNT];
+        short[] paletteIndexes = new short[CELL_COUNT];
         boolean[] paletteUsed = new boolean[paletteSize];
         int nextCanonicalPalette = 0;
-        int nonAir = 0;
         if (bits == 0) {
-            java.util.Arrays.fill(cells, palette[0]);
             paletteUsed[0] = true;
             nextCanonicalPalette = 1;
-            if (translate && countNonAir && !CatalogMapper.isAir(palette[0])) nonAir = CELL_COUNT;
         } else {
             long mask = (1L << bits) - 1;
             for (int index = 0; index < CELL_COUNT; index++) {
@@ -244,17 +266,13 @@ public final class MicrotileCodec {
                     paletteUsed[selected] = true;
                     nextCanonicalPalette++;
                 }
-                long value = palette[selected];
-                cells[index] = value;
-                if (translate && countNonAir && !CatalogMapper.isAir(value)) nonAir++;
+                paletteIndexes[index] = (short) selected;
             }
         }
         if (nextCanonicalPalette != paletteSize) {
             throw new DecodeException("microtile contains unused palette entries");
         }
-        Metadata metadata = new Metadata(expectedClass, originX, originY, originZ,
-                paletteSize, bits);
-        return new Prepared(metadata, nonAir, cells);
+        return new Decoded(metadata, catalogId, blocks, biomes, lights, paletteIndexes);
     }
 
     private static int minimumBits(int paletteSize) {

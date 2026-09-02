@@ -13,17 +13,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Bounded dependency-complete activation of final microtile groups.
  *
- * <p>A replacement reserves scratch plus its full geometry limit before compilation. Publication
- * swaps exactly one complete node group. The replaced renderer allocation and its budget remain
- * owned until the renderer fence reports safe retirement.</p>
+ * <p>Publication swaps exactly one complete node group. Replaced renderer allocations remain
+ * owned until their retirement fence reports that no submitted work can reference them.</p>
  */
 public final class MicrotileActivationManager implements AutoCloseable {
-    private static final long SLOT_BYTES = 384;
-
     /** A renderer publication became irrelevant before it acquired a hierarchy owner. */
     public static final class PublicationCancelledException extends RuntimeException {
         public PublicationCancelledException(String message) {
@@ -41,18 +39,11 @@ public final class MicrotileActivationManager implements AutoCloseable {
         /** True only after no submitted renderer work can reference this publication. */
         boolean retirementFencePassed();
 
-        /**
-         * Transfers an accounting release to the renderer lifetime. The callback runs exactly
-         * once, and never before the publication is retired or a failed publication has been
-         * rolled back completely.
-         */
-        void releaseWhenSafe(Runnable release);
-
         @Override
         void close();
     }
 
-    public interface RendererBridge {
+    public interface Renderer {
         /**
          * Atomically publishes the complete replacement and returns its retained renderer handle.
          * On success ownership of {@code geometry} transfers to the returned publication. The
@@ -86,64 +77,74 @@ public final class MicrotileActivationManager implements AutoCloseable {
         }
     }
 
-    private final MemoryBudget memory;
+    /** Compact, point-in-time activation pipeline state for debug diagnostics. */
+    public record Diagnostics(int slots, int candidates, int compiling,
+                              int pendingPublications, int active, int pendingRemovals,
+                              int retiredGroups, int retiredRemovals,
+                              long activeGeometryBytes, long pendingGeometryBytes) {}
+
     private final HybridMeshingDispatcher dispatcher;
-    private final RendererBridge renderer;
+    private final Renderer renderer;
     private final Map<SpatialNode, Slot> slots = new HashMap<>();
-    private final int maximumSlots;
     private final ArrayDeque<Retired> retired = new ArrayDeque<>();
     private final ArrayDeque<Publication> retiredRemovals = new ArrayDeque<>();
     private int compilingCandidates;
+    private long retentionRevision;
     private boolean dispatcherClosed;
     private boolean closed;
 
-    public MicrotileActivationManager(MemoryBudget memory,
-                                        HybridMeshingDispatcher dispatcher,
-                                        RendererBridge renderer) {
-        this.memory = Objects.requireNonNull(memory, "memory");
+    public MicrotileActivationManager(HybridMeshingDispatcher dispatcher, Renderer renderer) {
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.renderer = Objects.requireNonNull(renderer, "renderer");
-        this.maximumSlots = (int) Math.max(1_024L,
-                Math.min(262_144L, memory.limit() >>> 12));
     }
 
-    /** All pools are reserved together; failure leaves the currently active group untouched. */
-    public synchronized boolean stage(ActivationGroup group, long meshingScratchBytes,
-                                      long maximumGeometryBytes, long inFlightBytes) {
+    /** Stages a complete candidate while leaving the currently active group untouched. */
+    public synchronized boolean stage(ActivationGroup group) {
         ensureOpen();
         Objects.requireNonNull(group, "group");
-        if ((meshingScratchBytes | maximumGeometryBytes | inFlightBytes) < 0) {
-            throw new IllegalArgumentException("activation memory bounds cannot be negative");
-        }
         Slot slot = this.slots.get(group.node());
         if (slot != null && (slot.pending != null
                 || slot.pendingRemoval != null
                 || slot.candidate != null && slot.candidate.compiling)) return false;
         if (slot != null && compareAuthority(group.root(), slot.authority) < 0) return false;
-        MemoryBudget.Allocation allocation = new MemoryBudget.Allocation(
-                0, 0, 0, 0, meshingScratchBytes, maximumGeometryBytes, 0,
-                inFlightBytes);
-        Optional<MemoryBudget.Reservation> reservation = this.memory.tryReserve(allocation);
-        if (reservation.isEmpty()) return false;
         if (slot == null) {
-            if (this.slots.size() >= this.maximumSlots) {
-                reservation.orElseThrow().close();
-                return false;
-            }
-            Optional<MemoryBudget.Reservation> slotMemory = this.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.OBJECT_TABLE, SLOT_BYTES));
-            if (slotMemory.isEmpty()) {
-                reservation.orElseThrow().close();
-                return false;
-            }
-            slot = new Slot(slotMemory.orElseThrow());
+            slot = new Slot();
             this.slots.put(group.node(), slot);
         }
         if (slot.candidate != null) slot.candidate.close();
         slot.authority = group.root();
-        slot.candidate = new Candidate(group, maximumGeometryBytes, inFlightBytes,
-                reservation.orElseThrow());
+        slot.candidate = new Candidate(group);
+        this.retentionRevision++;
         return true;
+    }
+
+    /**
+     * Retains only candidates that still cover the latest accepted renderer cut. A compiler
+     * keeps ownership until it returns, at which point an obsolete result is discarded.
+     */
+    public synchronized void retainCandidates(
+            RootToken authority, Function<SpatialNode, ContentPipeline.SelectionCut> requiredCut) {
+        ensureOpen();
+        Objects.requireNonNull(authority, "authority");
+        Objects.requireNonNull(requiredCut, "requiredCut");
+        var iterator = this.slots.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<SpatialNode, Slot> entry = iterator.next();
+            Slot slot = entry.getValue();
+            Candidate candidate = slot.candidate;
+            if (candidate == null || !candidate.content.root().equals(authority)) continue;
+            ContentPipeline.SelectionCut required = requiredCut.apply(entry.getKey());
+            if (required != null && covers(candidate.content.selectionCut(), required)) continue;
+            candidate.obsolete = true;
+            if (!candidate.compiling) {
+                candidate.close();
+                slot.candidate = null;
+                this.retentionRevision++;
+                if (slot.active == null && slot.pending == null && slot.pendingRemoval == null) {
+                    iterator.remove();
+                }
+            }
+        }
     }
 
     /** Runs the already-classified hybrid compiler; intended for a bounded meshing worker. */
@@ -183,13 +184,15 @@ public final class MicrotileActivationManager implements AutoCloseable {
                     geometry.free();
                     return CompileStatus.NO_CANDIDATE;
                 }
-                if (geometryBytes > candidate.maximumGeometryBytes) {
-                    throw new IllegalStateException(
-                            "compiled geometry exceeds its pre-admitted bound");
+                if (candidate.obsolete) {
+                    geometry.free();
+                    geometry = null;
+                    candidate.close();
+                    slot.candidate = null;
+                    this.retentionRevision++;
+                    removeSlotIfEmpty(node, slot);
+                    return CompileStatus.NO_CANDIDATE;
                 }
-                candidate.memory.reduceTo(new MemoryBudget.Allocation(
-                        0, 0, 0, 0, 0, geometryBytes, 0,
-                        candidate.inFlightBytes));
                 candidate.geometry = geometry;
                 candidate.geometryBytes = geometryBytes;
                 candidate.compiling = false;
@@ -208,7 +211,7 @@ public final class MicrotileActivationManager implements AutoCloseable {
                 }
                 // close() cannot release a candidate while its compiler owns it. If meshing
                 // failed after the manager shut down, the normal success path never reaches
-                // the closed-manager branch above, so the compiler must release that admission.
+                // the closed-manager branch above, so the compiler must close the candidate.
                 closeCandidate = this.closed;
                 closeDispatcher = this.closed && this.compilingCandidates == 0
                         && !this.dispatcherClosed;
@@ -226,15 +229,14 @@ public final class MicrotileActivationManager implements AutoCloseable {
         Slot slot = this.slots.get(Objects.requireNonNull(node, "node"));
         if (slot == null || slot.pending != null || slot.pendingRemoval != null
                 || slot.candidate == null || slot.candidate.geometry == null
+                || slot.candidate.obsolete
                 || !slot.candidate.content.root().equals(authority)) return false;
         Candidate candidate = slot.candidate;
         Publication publication = Objects.requireNonNull(this.renderer.publishAtomically(node,
                 candidate.geometry, Optional.ofNullable(slot.active)
                         .map(active -> active.publication)), "renderer publication");
         candidate.geometry = null;
-        Active pending = new Active(candidate.content, publication, candidate.geometryBytes,
-                candidate.memory);
-        candidate.transferred = true;
+        Active pending = new Active(candidate.content, publication, candidate.geometryBytes);
         slot.candidate = null;
         slot.pending = pending;
         candidate.close();
@@ -258,6 +260,7 @@ public final class MicrotileActivationManager implements AutoCloseable {
         if (slot.candidate != null) {
             slot.candidate.close();
             slot.candidate = null;
+            this.retentionRevision++;
         }
         slot.authority = authority;
         if (slot.active == null) {
@@ -293,7 +296,14 @@ public final class MicrotileActivationManager implements AutoCloseable {
             removal.close();
             count++;
         }
+        if (count != 0) this.retentionRevision++;
         return count;
+    }
+
+    /** Changes only when the set of content hashes retained by this manager may have changed. */
+    public synchronized long retentionRevision() {
+        ensureOpen();
+        return this.retentionRevision;
     }
 
     public synchronized Optional<ActiveGroup> active(SpatialNode node) {
@@ -318,6 +328,39 @@ public final class MicrotileActivationManager implements AutoCloseable {
         return slot != null && slot.active != null;
     }
 
+    /**
+     * Captures one synchronized pipeline snapshot. Pending geometry includes compiled candidates
+     * and publications waiting for their activation fence; retired geometry remains represented
+     * by the retired-group count until its retirement fence completes.
+     */
+    public synchronized Diagnostics diagnostics() {
+        ensureOpen();
+        int candidates = 0;
+        int pendingPublications = 0;
+        int active = 0;
+        int pendingRemovals = 0;
+        long activeGeometryBytes = 0;
+        long pendingGeometryBytes = 0;
+        for (Slot slot : this.slots.values()) {
+            if (slot.candidate != null) {
+                candidates++;
+                pendingGeometryBytes += slot.candidate.geometryBytes;
+            }
+            if (slot.pending != null) {
+                pendingPublications++;
+                pendingGeometryBytes += slot.pending.geometryBytes;
+            }
+            if (slot.active != null) {
+                active++;
+                activeGeometryBytes += slot.active.geometryBytes;
+            }
+            if (slot.pendingRemoval != null) pendingRemovals++;
+        }
+        return new Diagnostics(this.slots.size(), candidates, this.compilingCandidates,
+                pendingPublications, active, pendingRemovals, this.retired.size(),
+                this.retiredRemovals.size(), activeGeometryBytes, pendingGeometryBytes);
+    }
+
     public synchronized boolean retainsRoot(RootToken root) {
         ensureOpen();
         Objects.requireNonNull(root, "root");
@@ -330,20 +373,6 @@ public final class MicrotileActivationManager implements AutoCloseable {
             if (value.active.content.root().equals(root)) return true;
         }
         return false;
-    }
-
-    public synchronized long retainedHashReferenceCount() {
-        ensureOpen();
-        long count = 0;
-        for (Slot slot : this.slots.values()) {
-            if (slot.candidate != null) count += slot.candidate.content.requiredHashes().size();
-            if (slot.pending != null) count += slot.pending.content.requiredHashes().size();
-            if (slot.active != null) count += slot.active.content.requiredHashes().size();
-        }
-        for (Retired value : this.retired) {
-            count += value.active.content.requiredHashes().size();
-        }
-        return count;
     }
 
     public synchronized void forEachRetainedHash(Consumer<Hash256> visitor) {
@@ -381,8 +410,6 @@ public final class MicrotileActivationManager implements AutoCloseable {
         if (slot.pending.publication.activationFailure().isPresent()
                 || !slot.pending.publication.activationFencePassed()) return false;
         if (slot.active != null) this.retired.addLast(new Retired(slot.active));
-        slot.pending.memory.reduceTo(MemoryBudget.Allocation.of(
-                MemoryBudget.Pool.GEOMETRY, slot.pending.geometryBytes));
         slot.active = slot.pending;
         slot.pending = null;
         return true;
@@ -407,6 +434,7 @@ public final class MicrotileActivationManager implements AutoCloseable {
                 && slot.pending.publication.activationFailure().isPresent()) {
             slot.pending.close();
             slot.pending = null;
+            this.retentionRevision++;
             removeSlotIfEmpty(node, slot);
             return true;
         }
@@ -431,6 +459,7 @@ public final class MicrotileActivationManager implements AutoCloseable {
         }
         slot.candidate.close();
         slot.candidate = null;
+        this.retentionRevision++;
         removeSlotIfEmpty(node, slot);
         return true;
     }
@@ -484,40 +513,33 @@ public final class MicrotileActivationManager implements AutoCloseable {
         return freshness;
     }
 
+    private static boolean covers(ContentPipeline.SelectionCut available,
+                                  ContentPipeline.SelectionCut required) {
+        return (available.exteriorMask() & required.exteriorMask()) == required.exteriorMask()
+                && (available.interiorMask() & required.interiorMask()) == required.interiorMask()
+                && (available.complexMask() & required.complexMask()) == required.complexMask();
+    }
+
     private static final class Slot implements AutoCloseable {
-        private final MemoryBudget.Reservation memory;
         private RootToken authority;
         private Active active;
         private Active pending;
         private Publication pendingRemoval;
         private Candidate candidate;
 
-        private Slot(MemoryBudget.Reservation memory) {
-            this.memory = memory;
-        }
-
         @Override
-        public void close() {
-            this.memory.close();
-        }
+        public void close() {}
     }
 
     private static final class Candidate implements AutoCloseable {
         private final ActivationGroup content;
-        private final long maximumGeometryBytes;
-        private final long inFlightBytes;
-        private final MemoryBudget.Reservation memory;
         private BuiltSection geometry;
         private long geometryBytes;
         private boolean compiling;
-        private boolean transferred;
+        private boolean obsolete;
 
-        private Candidate(ActivationGroup content, long maximumGeometryBytes, long inFlightBytes,
-                          MemoryBudget.Reservation memory) {
+        private Candidate(ActivationGroup content) {
             this.content = content;
-            this.maximumGeometryBytes = maximumGeometryBytes;
-            this.inFlightBytes = inFlightBytes;
-            this.memory = memory;
         }
 
         @Override
@@ -526,7 +548,6 @@ public final class MicrotileActivationManager implements AutoCloseable {
                 this.geometry.free();
                 this.geometry = null;
             }
-            if (!this.transferred) this.memory.close();
         }
     }
 
@@ -534,15 +555,11 @@ public final class MicrotileActivationManager implements AutoCloseable {
         private final ActivationGroup content;
         private final Publication publication;
         private final long geometryBytes;
-        private final MemoryBudget.Reservation memory;
 
-        private Active(ActivationGroup content, Publication publication, long geometryBytes,
-                       MemoryBudget.Reservation memory) {
+        private Active(ActivationGroup content, Publication publication, long geometryBytes) {
             this.content = content;
             this.publication = publication;
             this.geometryBytes = geometryBytes;
-            this.memory = memory;
-            this.publication.releaseWhenSafe(this.memory::close);
         }
 
         @Override

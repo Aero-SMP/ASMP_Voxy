@@ -1,41 +1,54 @@
-//! Direct and Minecraft-bridge transports.
+//! Direct QUIC endpoint and persistent certificate identity.
 
 use crate::{
     anvil::AnvilWorld,
-    config::Transport,
     crc::crc32c,
+    quarantine, replace_synced,
     surface::{
-        memory::ServerMemoryBudget,
         service::Service,
-        wire::{C_HELLO, Frame, error},
+        wire::{
+            ALPN, ControlMessage, STREAM_CONTROL, encode_control_record, read_control,
+            read_stream_role,
+        },
     },
+    sync_parent,
 };
 use anyhow::{Context, Result, bail};
+use quinn::{Endpoint, IdleTimeout, VarInt, crypto::rustls::QuicServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
-    path::PathBuf,
+    fs,
+    future::Future,
+    io::Write,
+    net::SocketAddr,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, UnixListener},
-    sync::Semaphore,
-};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-
-trait AsyncSocket: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncSocket for T {}
-type Socket = Box<dyn AsyncSocket>;
+const TERMINAL_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const TERMINAL_CONTROL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const SERVICE_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTROL_STREAM_PRIORITY: i32 = 3;
+// Fixed unauthenticated-protocol admission bounds. These limit task/handshake amplification;
+// they are not a configurable server-wide memory governor.
+const MAX_PENDING_HANDSHAKES: usize = 128;
+const MAX_LIVE_CONNECTIONS: usize = 1_024;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_IDENTITY_BYTES: usize = 64 * 1024;
+const CERTIFICATE_FILE: &str = "certificate.der";
+const PRIVATE_KEY_FILE: &str = "private-key.der";
 
 #[derive(Debug)]
 pub struct ServerState {
     server_instance: u64,
     surface: Arc<Service>,
-    memory: Arc<ServerMemoryBudget>,
-    max_connections: usize,
 }
 
 impl ServerState {
@@ -43,8 +56,6 @@ impl ServerState {
         dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
         catalog_id: u64,
         surface: Arc<Service>,
-        memory: Arc<ServerMemoryBudget>,
-        max_connections: usize,
     ) -> Self {
         let server_instance = dimensions
             .iter()
@@ -56,108 +67,264 @@ impl ServerState {
         Self {
             server_instance,
             surface,
-            memory,
-            max_connections,
         }
     }
 }
 
-pub async fn serve(state: Arc<ServerState>, transport: Transport) -> Result<()> {
-    match transport {
-        Transport::Direct(listen) => serve_direct(state, listen).await,
-        Transport::Minecraft(socket) => serve_minecraft(state, socket).await,
+pub async fn serve(
+    state: Arc<ServerState>,
+    listen: SocketAddr,
+    identity_directory: &Path,
+    shutdown: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    let identity = load_or_create_identity(identity_directory)?;
+    let server_config = make_server_config(&identity)?;
+    let endpoint = Endpoint::server(server_config, listen)
+        .with_context(|| format!("bind Voxy QUIC UDP endpoint {listen}"))?;
+    let actual = endpoint.local_addr()?;
+    eprintln!(
+        "VOXY_READY udp_port={} alpn={} cert_sha256={}",
+        actual.port(),
+        std::str::from_utf8(ALPN).expect("ALPN is static ASCII"),
+        identity.fingerprint
+    );
+
+    let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+    let live_connections = Arc::new(tokio::sync::Semaphore::new(MAX_LIVE_CONNECTIONS));
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    return Ok(());
+                };
+                let Ok(live_permit) = live_connections.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let Ok(handshake_permit) = pending_handshakes.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let peer = incoming.remote_address();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let result = serve_connection(state, incoming, handshake_permit, live_permit).await;
+                    if let Err(error) = result {
+                        eprintln!("Voxy QUIC client {peer} disconnected: {error:#}");
+                    }
+                });
+            }
+            result = &mut shutdown => {
+                result?;
+                state.surface.shutdown("Voxy server shutting down");
+                tokio::time::sleep(SERVICE_SHUTDOWN_GRACE).await;
+                endpoint.close(VarInt::from_u32(0), b"Voxy server shutting down");
+                let _ = tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT, endpoint.wait_idle()).await;
+                return Ok(());
+            }
+        }
     }
 }
 
-async fn serve_direct(state: Arc<ServerState>, listen: std::net::SocketAddr) -> Result<()> {
-    let listener = TcpListener::bind(listen)
+async fn serve_connection(
+    state: Arc<ServerState>,
+    incoming: quinn::Incoming,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
+    live_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
+    let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming)
         .await
-        .with_context(|| format!("bind Voxy socket {listen}"))?;
-    let slots = Arc::new(Semaphore::new(state.max_connections));
-    eprintln!("VOXY_READY transport=direct");
-    eprintln!("Voxy direct transport listening on {listen}");
-    loop {
-        let (socket, peer) = listener.accept().await?;
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            continue;
-        };
-        if let Err(error) = socket.set_nodelay(true) {
-            eprintln!("Voxy client {peer} socket setup failed: {error}");
-            continue;
+        .context("QUIC handshake timeout")??;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await
+        .context("control-stream timeout")??;
+    send.set_priority(CONTROL_STREAM_PRIORITY)
+        .context("set QUIC control-stream priority")?;
+    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        if read_stream_role(&mut recv).await? != Some(STREAM_CONTROL) {
+            bail!("the first bidirectional stream must be the control stream");
         }
-        let state = state.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            if let Err(error) = connection(state, Box::new(socket)).await {
-                eprintln!("Voxy client {peer} disconnected: {error:#}");
-            }
-        });
-    }
-}
-
-async fn serve_minecraft(state: Arc<ServerState>, path: PathBuf) -> Result<()> {
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        if !metadata.file_type().is_socket() {
-            bail!("refusing to replace non-socket path {}", path.display());
+        match read_control(&mut recv).await? {
+            Some(ControlMessage::Hello { dimension }) => Ok(dimension),
+            Some(_) => bail!("HELLO must be the first control message"),
+            None => bail!("control stream ended before HELLO"),
         }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("remove stale bridge socket {}", path.display()))?;
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create bridge socket directory {}", parent.display()))?;
-    }
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("bind Minecraft bridge socket {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("secure Minecraft bridge socket {}", path.display()))?;
-    let slots = Arc::new(Semaphore::new(state.max_connections));
-    eprintln!("VOXY_READY transport=minecraft");
-    eprintln!("Voxy Minecraft transport listening on {}", path.display());
-    loop {
-        let (socket, _) = listener.accept().await?;
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            continue;
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            if let Err(error) = connection(state, Box::new(socket)).await {
-                eprintln!("Voxy Minecraft bridge session disconnected: {error:#}");
-            }
-        });
-    }
-}
-
-async fn connection(state: Arc<ServerState>, mut socket: Socket) -> Result<()> {
-    // Every transport enters the same wire handler with the same global budget. The small
-    // session reservation bounds socket/task overhead before any client-controlled allocation.
-    let _session_memory = state
-        .memory
-        .try_reserve(crate::surface::memory::MemoryClass::Network, 640 * 1024)?;
-    let first = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        Frame::read_client_budgeted(&mut socket, &state.memory),
-    )
-    .await
-    .context("handshake timeout")??
-    .context("connection closed before HELLO")?;
-    let (first, hello_memory) = first.into_parts();
-    if first.kind != C_HELLO {
-        error(1, "HELLO must be the first frame")
-            .write(&mut socket)
-            .await?;
-        bail!("first frame was not HELLO");
-    }
-    let dimension = crate::surface::wire::decode_client_hello(&first.payload)?;
-    drop(first);
-    drop(hello_memory);
-    state
+    })
+    .await;
+    let dimension = match handshake {
+        Ok(Ok(dimension)) => dimension,
+        Ok(Err(error)) => {
+            write_terminal_control(
+                &mut send,
+                &ControlMessage::Error {
+                    code: 1,
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+        Err(_) => {
+            let error = anyhow::anyhow!("control HELLO timeout");
+            write_terminal_control(
+                &mut send,
+                &ControlMessage::Error {
+                    code: 1,
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    drop(handshake_permit);
+    let result = state
         .surface
         .clone()
-        .connection(socket, dimension, state.server_instance)
-        .await
+        .connection(connection, send, recv, dimension, state.server_instance)
+        .await;
+    drop(live_permit);
+    result
+}
+
+async fn write_terminal_control(send: &mut quinn::SendStream, message: &ControlMessage) {
+    let Ok(record) = encode_control_record(message) else {
+        let _ = send.reset(VarInt::from_u32(1));
+        return;
+    };
+    match tokio::time::timeout(TERMINAL_CONTROL_WRITE_TIMEOUT, send.write_all(&record)).await {
+        Ok(Ok(())) => drain_terminal_control(send).await,
+        Ok(Err(_)) | Err(_) => {
+            let _ = send.reset(VarInt::from_u32(1));
+        }
+    }
+}
+
+async fn drain_terminal_control(send: &mut quinn::SendStream) {
+    if send.finish().is_ok() {
+        let _ = tokio::time::timeout(TERMINAL_CONTROL_DRAIN_TIMEOUT, send.stopped()).await;
+    }
+}
+
+struct PersistentIdentity {
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+    fingerprint: String,
+}
+
+fn load_or_create_identity(directory: &Path) -> Result<PersistentIdentity> {
+    fs::create_dir_all(directory)
+        .with_context(|| format!("create QUIC identity directory {}", directory.display()))?;
+    let certificate_path = directory.join(CERTIFICATE_FILE);
+    let private_key_path = directory.join(PRIVATE_KEY_FILE);
+    if certificate_path.exists() && private_key_path.exists() {
+        match PersistentIdentity::read(&certificate_path, &private_key_path) {
+            Ok(identity) if make_server_config(&identity).is_ok() => return Ok(identity),
+            Ok(_) | Err(_) => {
+                quarantine(&certificate_path);
+                quarantine(&private_key_path);
+            }
+        }
+    } else {
+        if certificate_path.exists() {
+            quarantine(&certificate_path);
+        }
+        if private_key_path.exists() {
+            quarantine(&private_key_path);
+        }
+    }
+    let generated = rcgen::generate_simple_self_signed(vec!["voxy.local".to_owned()])?;
+    let certificate = generated.cert.der().to_vec();
+    let private_key = generated.key_pair.serialize_der();
+    let certificate_temp = temporary_path(&certificate_path);
+    let key_temp = temporary_path(&private_key_path);
+    replace_synced(&certificate_path, &certificate_temp, &certificate)?;
+    replace_private_key(&private_key_path, &key_temp, &private_key)?;
+    PersistentIdentity::new(certificate, private_key)
+}
+
+impl PersistentIdentity {
+    fn read(certificate: &Path, private_key: &Path) -> Result<Self> {
+        let certificate = read_bounded(certificate)?;
+        let private_key = read_bounded(private_key)?;
+        Self::new(certificate, private_key)
+    }
+
+    fn new(certificate: Vec<u8>, private_key: Vec<u8>) -> Result<Self> {
+        if certificate.is_empty() || private_key.is_empty() {
+            bail!("QUIC certificate or private key is empty");
+        }
+        let digest = Sha256::digest(&certificate);
+        let mut fingerprint = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write;
+            write!(&mut fingerprint, "{byte:02x}").unwrap();
+        }
+        Ok(Self {
+            certificate,
+            private_key,
+            fingerprint,
+        })
+    }
+}
+
+fn make_server_config(identity: &PersistentIdentity) -> Result<quinn::ServerConfig> {
+    let certificate = CertificateDer::from(identity.certificate.clone());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone()));
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .context("load persistent QUIC certificate and private key")?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.max_early_data_size = 0;
+    let crypto = QuicServerConfig::try_from(tls).context("configure QUIC TLS")?;
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    // One permanent control stream plus at most eight client-opened object streams.
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(9));
+    transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+    transport.stream_receive_window(VarInt::from_u32(32 * 1024));
+    transport.receive_window(VarInt::from_u32(1024 * 1024));
+    transport.send_window(512 * 1024);
+    transport.datagram_receive_buffer_size(None);
+    transport.datagram_send_buffer_size(0);
+    transport.max_idle_timeout(Some(IdleTimeout::try_from(IDLE_TIMEOUT)?));
+    transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+    server.transport_config(Arc::new(transport));
+    Ok(server)
+}
+
+fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_IDENTITY_BYTES as u64 {
+        bail!(
+            "QUIC identity file {} is empty or oversized",
+            path.display()
+        );
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_IDENTITY_BYTES {
+        bail!("QUIC identity file {} grew while reading", path.display());
+    }
+    Ok(bytes)
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+fn replace_private_key(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(temporary)?;
+    fs::set_permissions(temporary, fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, path)?;
+    sync_parent(path)
 }

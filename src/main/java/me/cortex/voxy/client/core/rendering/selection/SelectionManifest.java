@@ -1,133 +1,192 @@
 package me.cortex.voxy.client.core.rendering.selection;
 
-import java.util.BitSet;
-import java.util.HashSet;
-import java.util.List;
+import me.cortex.voxy.client.core.rendering.SectionKey;
+
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Objects;
-import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Immutable renderer snapshot of one manifested Virtual Surface root.
+ * Consumer-owned selection snapshot over immutable structural topology.
  *
- * <p>Object and dependency handles are opaque, non-negative indices owned by the content
- * table.  The renderer never interprets them; it returns the exact handles selected by the GPU
- * cut.  All three final content classes use a fixed 8-cubed layout and are activated together.
+ * <p>Topology is rebuilt only when the manifest handle namespace changes. Frequently changing
+ * residency, compatibility, in-flight, and renderable state lives in pooled primitive arrays.
+ * Every asynchronous holder retains the snapshot and releases it when finished, so storage is
+ * never overwritten while a GPU result or state-thread batch still refers to it.</p>
  */
-public final class SelectionManifest {
+public final class SelectionManifest implements AutoCloseable {
     public static final int MICROTILE_COUNT = 64;
     public static final int NO_HANDLE = -1;
     public static final int MAX_NODES = 262_144;
     public static final int MAX_OBJECT_HANDLES = 262_144;
     public static final int MAX_DEPENDENCIES_PER_CONTENT = 0xffff;
+    private static final int CONTENT_CLASSES = 3;
+    private static final int MASKS_PER_CONTENT = 4;
 
-    private final long generation;
-    private final long snapshotId;
-    private final long cameraVisibilityDomain;
-    private final List<Node> nodes;
-    private final Node[] nodesByIndex;
-    private final int[] nodeIndexByHandle;
-    private final int objectHandleCapacity;
+    public enum ContentClass { EXTERIOR, INTERIOR, COMPLEX }
 
-    public SelectionManifest(long generation, long snapshotId, long cameraVisibilityDomain,
-                             List<Node> nodes) {
-        Objects.requireNonNull(nodes, "nodes");
-        if (nodes.size() > MAX_NODES) {
-            throw new IllegalArgumentException("selection manifest exceeds the node bound");
-        }
-        this.generation = generation;
-        this.snapshotId = snapshotId;
-        this.cameraVisibilityDomain = cameraVisibilityDomain;
-        this.nodes = List.copyOf(nodes);
-        this.nodesByIndex = this.nodes.toArray(Node[]::new);
+    /** Recycles only primitive dynamic state. Immutable topology is shared across snapshots. */
+    public static final class Pool {
+        private final int maximum;
+        private final ArrayDeque<Storage> available = new ArrayDeque<>();
+        private int created;
 
-        int maximumHandle = -1;
-        int maximumObjectHandle = -1;
-        for (Node node : this.nodesByIndex) {
-            Objects.requireNonNull(node, "node");
-            if (node.handle() >= MAX_NODES) {
-                throw new IllegalArgumentException("selection node handle exceeds its bound");
-            }
-            maximumHandle = Math.max(maximumHandle, node.handle());
-            maximumObjectHandle = Math.max(maximumObjectHandle, maximumObjectHandle(node));
+        public Pool(int maximum) {
+            if (maximum < 2) throw new IllegalArgumentException("manifest pool is too small");
+            this.maximum = maximum;
         }
-        this.nodeIndexByHandle = new int[maximumHandle + 1];
-        java.util.Arrays.fill(this.nodeIndexByHandle, NO_HANDLE);
-        for (int index = 0; index < this.nodesByIndex.length; index++) {
-            Node node = this.nodesByIndex[index];
-            if (this.nodeIndexByHandle[node.handle()] != NO_HANDLE) {
-                throw new IllegalArgumentException("duplicate selection node handle "
-                        + node.handle());
+
+        public synchronized SelectionManifest acquire(
+                Topology topology, long generation, long snapshotId, long authorityId,
+                long planRevision, long cameraVisibilityDomain) {
+            Storage storage = this.available.pollFirst();
+            if (storage == null) {
+                if (this.created >= this.maximum) return null;
+                storage = new Storage();
+                this.created++;
             }
-            this.nodeIndexByHandle[node.handle()] = index;
+            storage.ensure(topology.nodes.length * CONTENT_CLASSES * MASKS_PER_CONTENT,
+                    topology.dependencyStates, topology.neighborStates);
+            return new SelectionManifest(this, storage, topology, generation, snapshotId,
+                    authorityId, planRevision, cameraVisibilityDomain);
         }
-        this.objectHandleCapacity = maximumObjectHandle + 1;
-        for (Node node : this.nodesByIndex) {
-            if (node.parentHandle() != NO_HANDLE && indexForHandle(node.parentHandle()) < 0) {
-                throw new IllegalArgumentException("selection node has an unknown parent");
+
+        private synchronized void release(Storage storage) {
+            // The builder overwrites every live range before seal. Retained capacity outside the
+            // next topology is unreachable, so clearing whole historical arrays here only turns
+            // bounded reuse into capacity-proportional memory traffic.
+            this.available.addFirst(storage);
+        }
+    }
+
+    /** Immutable, validated node and content-handle namespace. */
+    public static final class Topology {
+        private final Node[] nodes;
+        private final int[] nodeIndexByHandle;
+        private final int objectHandleCapacity;
+        private final int dependencyStates;
+        private final int neighborStates;
+
+        public Topology(Node[] nodes, int objectHandleCapacity,
+                        int dependencyStates, int neighborStates) {
+            Objects.requireNonNull(nodes, "nodes");
+            if (nodes.length > MAX_NODES || objectHandleCapacity < 0
+                    || objectHandleCapacity > MAX_OBJECT_HANDLES
+                    || dependencyStates < 0 || neighborStates < 0) {
+                throw new IllegalArgumentException("invalid selection topology bounds");
             }
-            for (int child : node.childHandles()) {
-                if (child == NO_HANDLE) continue;
-                Node childNode = nodeForHandle(child);
-                if (childNode == null || childNode.parentHandle() != node.handle()) {
-                    throw new IllegalArgumentException(
-                            "selection child and parent links are inconsistent");
+            this.nodes = nodes;
+            this.objectHandleCapacity = objectHandleCapacity;
+            this.dependencyStates = dependencyStates;
+            this.neighborStates = neighborStates;
+
+            int maximumHandle = -1;
+            for (Node node : nodes) {
+                Objects.requireNonNull(node, "node");
+                if (node.handle < 0 || node.handle >= MAX_NODES) {
+                    throw new IllegalArgumentException("selection node handle exceeds its bound");
                 }
+                maximumHandle = Math.max(maximumHandle, node.handle);
+                validateContent(node.exterior, objectHandleCapacity,
+                        dependencyStates, neighborStates);
+                validateContent(node.interior, objectHandleCapacity,
+                        dependencyStates, neighborStates);
+                validateContent(node.complex, objectHandleCapacity,
+                        dependencyStates, neighborStates);
             }
-            if (node.parentHandle() != NO_HANDLE) {
+            this.nodeIndexByHandle = new int[maximumHandle + 1];
+            Arrays.fill(this.nodeIndexByHandle, NO_HANDLE);
+            for (int index = 0; index < nodes.length; index++) {
+                Node node = nodes[index];
+                if (this.nodeIndexByHandle[node.handle] != NO_HANDLE) {
+                    throw new IllegalArgumentException("duplicate selection node handle");
+                }
+                this.nodeIndexByHandle[node.handle] = index;
+            }
+            for (Node node : nodes) validateLinks(node);
+        }
+
+        private void validateLinks(Node node) {
+            int nodeLod = SectionKey.level(node.sectionKey);
+            if (node.parentHandle != NO_HANDLE) {
+                Node parent = nodeForHandle(node.parentHandle);
+                if (parent == null || SectionKey.level(parent.sectionKey) != nodeLod + 1) {
+                    throw new IllegalArgumentException("selection node has an invalid parent");
+                }
                 boolean linked = false;
-                for (int child : nodeForHandle(node.parentHandle()).childHandlesInternal()) {
-                    linked |= child == node.handle();
+                for (int child : parent.childHandles) linked |= child == node.handle;
+                if (!linked) throw new IllegalArgumentException("selection parent link disagrees");
+            }
+            int linkedMask = 0;
+            for (int childIndex = 0; childIndex < node.childHandles.length; childIndex++) {
+                int handle = node.childHandles[childIndex];
+                if (handle == NO_HANDLE) continue;
+                Node child = nodeForHandle(handle);
+                if (child == null || child.parentHandle != node.handle
+                        || SectionKey.level(child.sectionKey) + 1 != nodeLod
+                        || (node.manifestedChildMask & 1 << childIndex) == 0) {
+                    throw new IllegalArgumentException("selection child link disagrees");
                 }
-                if (!linked) {
-                    throw new IllegalArgumentException(
-                            "selection parent does not list one of its children");
+                linkedMask |= 1 << childIndex;
+            }
+            if ((linkedMask & ~node.manifestedChildMask) != 0) {
+                throw new IllegalArgumentException("linked child is not manifested");
+            }
+        }
+
+        private Node nodeForHandle(int handle) {
+            int index = handle < 0 || handle >= this.nodeIndexByHandle.length
+                    ? NO_HANDLE : this.nodeIndexByHandle[handle];
+            return index == NO_HANDLE ? null : this.nodes[index];
+        }
+
+        private static void validateContent(ContentLayout content, int objectCapacity,
+                                            int dependencyStates, int neighborStates) {
+            Objects.requireNonNull(content, "content");
+            if (content.objectHandles.length != Long.bitCount(content.declaredMask)
+                    || content.dependencyHandles.length > MAX_DEPENDENCIES_PER_CONTENT
+                    || content.neighborDependencyHandles.length > MAX_DEPENDENCIES_PER_CONTENT
+                    || content.neighborDependencyHandles.length
+                    != content.neighborDependencySources.length
+                    || content.dependencyStateOffset < 0
+                    || content.dependencyStateOffset + content.dependencyHandles.length
+                    > dependencyStates
+                    || content.neighborStateOffset < 0
+                    || content.neighborStateOffset + content.neighborDependencyHandles.length
+                    > neighborStates) {
+                throw new IllegalArgumentException("invalid selection content layout");
+            }
+            for (int handle : content.objectHandles) validateObjectHandle(handle, objectCapacity);
+            for (int handle : content.dependencyHandles) validateObjectHandle(handle, objectCapacity);
+            for (int index = 0; index < content.neighborDependencyHandles.length; index++) {
+                validateObjectHandle(content.neighborDependencyHandles[index], objectCapacity);
+                int source = content.neighborDependencySources[index];
+                if (source < 0 || source >= MICROTILE_COUNT
+                        || (content.declaredMask & 1L << source) == 0) {
+                    throw new IllegalArgumentException("invalid neighbor dependency source");
                 }
             }
         }
-        // Parent-chain validation is deliberately bounded.  Besides rejecting cycles, this
-        // bounds the per-invocation ancestor walk in the production compute shader.
-        for (Node node : this.nodesByIndex) {
-            Set<Integer> path = new HashSet<>();
-            Node cursor = node;
-            int depth = 0;
-            while (cursor.parentHandle() != NO_HANDLE) {
-                if (!path.add(cursor.handle())) {
-                    throw new IllegalArgumentException("selection manifest contains a cycle");
-                }
-                if (++depth > 32) {
-                    throw new IllegalArgumentException("selection manifest exceeds depth 32");
-                }
-                cursor = nodeForHandle(cursor.parentHandle());
+
+        private static void validateObjectHandle(int handle, int capacity) {
+            if (handle < 0 || handle >= capacity) {
+                throw new IllegalArgumentException("object handle is outside topology");
             }
+        }
+
+        public int nodeCount() { return this.nodes.length; }
+        public Node nodeAt(int index) { return this.nodes[index]; }
+        public int nodeHandleCapacity() { return this.nodeIndexByHandle.length; }
+        public int objectHandleCapacity() { return this.objectHandleCapacity; }
+
+        public int indexForHandle(int handle) {
+            return handle < 0 || handle >= this.nodeIndexByHandle.length
+                    ? NO_HANDLE : this.nodeIndexByHandle[handle];
         }
     }
 
-    public long generation() { return this.generation; }
-    public long snapshotId() { return this.snapshotId; }
-    public long cameraVisibilityDomain() { return this.cameraVisibilityDomain; }
-    public List<Node> nodes() { return this.nodes; }
-    public Node nodeAt(int index) { return this.nodesByIndex[index]; }
-    public int nodeCount() { return this.nodesByIndex.length; }
-    public int nodeHandleCapacity() { return this.nodeIndexByHandle.length; }
-    public int objectHandleCapacity() { return this.objectHandleCapacity; }
-
-    public int indexForHandle(int handle) {
-        return handle < 0 || handle >= this.nodeIndexByHandle.length
-                ? NO_HANDLE : this.nodeIndexByHandle[handle];
-    }
-
-    public Node nodeForHandle(int handle) {
-        int index = indexForHandle(handle);
-        return index == NO_HANDLE ? null : this.nodesByIndex[index];
-    }
-
-    public enum ContentClass {
-        EXTERIOR,
-        INTERIOR,
-        COMPLEX
-    }
-
-    /** Unsigned, node-relative bounds.  Zero through 65535 span the structural node. */
+    /** Unsigned node-relative bounds; zero through 65535 span the structural node. */
     public record TightBounds(int minX, int minY, int minZ,
                               int maxX, int maxY, int maxZ) {
         public TightBounds {
@@ -140,217 +199,106 @@ public final class SelectionManifest {
         }
     }
 
-    /**
-     * One final 8-cubed content class and its captured object-table state.
-     *
-     * <p>{@code objectHandles} is dense in ascending microtile-bit order.  Dependency bit sets
-     * index their respective handle arrays.  Residency is captured atomically with the manifest
-     * snapshot; the receiver must still recheck it before issuing a request or activation.</p>
-     */
-    public record ContentState(long availableMask, int[] objectHandles,
-                               long residentMask, long renderableMask, long inFlightMask,
-                               int[] dependencyHandles, BitSet residentDependencies,
-                               BitSet inFlightDependencies,
-                               int[] neighborDependencyHandles,
-                               int[] neighborDependencySources,
-                               BitSet residentNeighborDependencies,
-                               BitSet inFlightNeighborDependencies,
-                               int boundaryFaceMask, long estimatedCanonicalBytes,
-                               long estimatedGeometryBytes, long estimatedCompletionMicros) {
-        public ContentState {
-            objectHandles = copyHandles(objectHandles, "object handles", MICROTILE_COUNT, true);
-            dependencyHandles = copyHandles(dependencyHandles, "dependency handles",
-                    MAX_DEPENDENCIES_PER_CONTENT, false);
-            neighborDependencyHandles = copyHandles(neighborDependencyHandles,
-                    "neighbor dependency handles", MAX_DEPENDENCIES_PER_CONTENT, true);
-            neighborDependencySources = Objects.requireNonNull(
-                    neighborDependencySources, "neighbor dependency sources").clone();
-            if (neighborDependencySources.length != neighborDependencyHandles.length) {
-                throw new IllegalArgumentException(
-                        "neighbor dependency handles and source microtiles disagree");
-            }
-            for (int source : neighborDependencySources) {
-                if (source < 0 || source >= MICROTILE_COUNT
-                        || (availableMask & 1L << source) == 0) {
-                    throw new IllegalArgumentException(
-                            "neighbor dependency source is outside content availability");
-                }
-            }
-            residentDependencies = copyBits(residentDependencies, dependencyHandles.length,
-                    "resident dependencies");
-            inFlightDependencies = copyBits(inFlightDependencies, dependencyHandles.length,
-                    "in-flight dependencies");
-            residentNeighborDependencies = copyBits(residentNeighborDependencies,
-                    neighborDependencyHandles.length, "resident neighbor dependencies");
-            inFlightNeighborDependencies = copyBits(inFlightNeighborDependencies,
-                    neighborDependencyHandles.length, "in-flight neighbor dependencies");
-            if (objectHandles.length != Long.bitCount(availableMask)) {
-                throw new IllegalArgumentException(
-                        "8-cubed availability and dense object handles disagree");
-            }
-            if ((residentMask & ~availableMask) != 0
-                    || (renderableMask & ~residentMask) != 0
-                    || (inFlightMask & ~availableMask) != 0) {
-                throw new IllegalArgumentException("invalid content residency masks");
-            }
-            if ((boundaryFaceMask & ~0x3f) != 0) {
-                throw new IllegalArgumentException("boundary face mask is not six bits");
-            }
-            if (estimatedCanonicalBytes < 0 || estimatedGeometryBytes < 0
-                    || estimatedCompletionMicros < 0) {
-                throw new IllegalArgumentException("negative selection content estimate");
+    /** Immutable object/dependency layout for one node content class. */
+    public static final class ContentLayout {
+        private final long declaredMask;
+        private final int[] objectHandles;
+        private final int[] dependencyHandles;
+        private final int[] neighborDependencyHandles;
+        private final int[] neighborDependencySources;
+        private final int dependencyStateOffset;
+        private final int neighborStateOffset;
+        private final int boundaryFaceMask;
+        private final long estimatedCanonicalBytes;
+        private final long estimatedGeometryBytes;
+        private final long estimatedCompletionMicros;
+
+        public ContentLayout(long declaredMask, int[] objectHandles,
+                             int[] dependencyHandles, int[] neighborDependencyHandles,
+                             int[] neighborDependencySources, int dependencyStateOffset,
+                             int neighborStateOffset, int boundaryFaceMask,
+                             long estimatedCanonicalBytes, long estimatedGeometryBytes,
+                             long estimatedCompletionMicros) {
+            this.declaredMask = declaredMask;
+            this.objectHandles = Objects.requireNonNull(objectHandles, "object handles");
+            this.dependencyHandles = Objects.requireNonNull(dependencyHandles,
+                    "dependency handles");
+            this.neighborDependencyHandles = Objects.requireNonNull(neighborDependencyHandles,
+                    "neighbor handles");
+            this.neighborDependencySources = Objects.requireNonNull(neighborDependencySources,
+                    "neighbor sources");
+            this.dependencyStateOffset = dependencyStateOffset;
+            this.neighborStateOffset = neighborStateOffset;
+            this.boundaryFaceMask = boundaryFaceMask;
+            this.estimatedCanonicalBytes = estimatedCanonicalBytes;
+            this.estimatedGeometryBytes = estimatedGeometryBytes;
+            this.estimatedCompletionMicros = estimatedCompletionMicros;
+            if ((boundaryFaceMask & ~0x3f) != 0 || estimatedCanonicalBytes < 0
+                    || estimatedGeometryBytes < 0 || estimatedCompletionMicros < 0) {
+                throw new IllegalArgumentException("invalid content layout metadata");
             }
         }
 
-        @Override
-        public int[] objectHandles() {
-            return this.objectHandles.clone();
-        }
-
-        @Override
-        public int[] dependencyHandles() {
-            return this.dependencyHandles.clone();
-        }
-
-        @Override
-        public BitSet residentDependencies() {
-            return (BitSet) this.residentDependencies.clone();
-        }
-
-        @Override
-        public BitSet inFlightDependencies() {
-            return (BitSet) this.inFlightDependencies.clone();
-        }
-
-        @Override
-        public int[] neighborDependencyHandles() {
-            return this.neighborDependencyHandles.clone();
-        }
-
-        @Override
-        public int[] neighborDependencySources() {
-            return this.neighborDependencySources.clone();
-        }
-
-        @Override
-        public BitSet residentNeighborDependencies() {
-            return (BitSet) this.residentNeighborDependencies.clone();
-        }
-
-        @Override
-        public BitSet inFlightNeighborDependencies() {
-            return (BitSet) this.inFlightNeighborDependencies.clone();
-        }
-
-        public int[] objectHandlesInternal() {
-            return this.objectHandles;
-        }
-
-        public int[] dependencyHandlesInternal() {
-            return this.dependencyHandles;
-        }
-
-        public BitSet residentDependenciesInternal() {
-            return this.residentDependencies;
-        }
-
-        public BitSet inFlightDependenciesInternal() {
-            return this.inFlightDependencies;
-        }
-
-        public int[] neighborDependencyHandlesInternal() {
-            return this.neighborDependencyHandles;
-        }
-
-        public int[] neighborDependencySourcesInternal() {
-            return this.neighborDependencySources;
-        }
-
-        public BitSet residentNeighborDependenciesInternal() {
-            return this.residentNeighborDependencies;
-        }
-
-        public BitSet inFlightNeighborDependenciesInternal() {
-            return this.inFlightNeighborDependencies;
-        }
-
-        private static int[] copyHandles(int[] handles, String name, int maximum,
-                                         boolean allowDuplicates) {
-            Objects.requireNonNull(handles, name);
-            if (handles.length > maximum) {
-                throw new IllegalArgumentException(name + " exceeds its bound");
-            }
-            int[] copy = handles.clone();
-            Set<Integer> unique = new HashSet<>(copy.length);
-            for (int handle : copy) {
-                if (handle < 0 || handle >= MAX_OBJECT_HANDLES
-                        || (!allowDuplicates && !unique.add(handle))) {
-                    throw new IllegalArgumentException(name
-                            + " contains a negative or duplicate handle");
-                }
-            }
-            return copy;
-        }
-
-        private static BitSet copyBits(BitSet bits, int limit, String name) {
-            Objects.requireNonNull(bits, name);
-            BitSet copy = (BitSet) bits.clone();
-            if (copy.length() > limit) {
-                throw new IllegalArgumentException(name + " exceeds its handle array");
-            }
-            return copy;
-        }
+        public long declaredMask() { return this.declaredMask; }
+        public int[] objectHandlesInternal() { return this.objectHandles; }
+        public int[] dependencyHandlesInternal() { return this.dependencyHandles; }
+        public int[] neighborDependencyHandlesInternal() { return this.neighborDependencyHandles; }
+        public int[] neighborDependencySourcesInternal() { return this.neighborDependencySources; }
+        public int dependencyCount() { return this.dependencyHandles.length; }
+        public int neighborDependencyCount() { return this.neighborDependencyHandles.length; }
+        public int boundaryFaceMask() { return this.boundaryFaceMask; }
+        public long estimatedCanonicalBytes() { return this.estimatedCanonicalBytes; }
+        public long estimatedGeometryBytes() { return this.estimatedGeometryBytes; }
+        public long estimatedCompletionMicros() { return this.estimatedCompletionMicros; }
     }
 
-    /** One node in an atomically complete five-level structural manifest. */
-    public record Node(int handle, long sectionKey, int parentHandle,
-                       int manifestedChildMask, int[] childHandles,
-                       TightBounds tightBounds, long geometricErrorQ16, boolean descriptorReady,
-                       ContentState exterior, ContentState interior, ContentState complex) {
-        public Node {
-            if (handle < 0 || parentHandle < NO_HANDLE
-                    || (manifestedChildMask & ~0xff) != 0) {
-                throw new IllegalArgumentException("invalid selection node handle");
+    /** One immutable structural node shared by all state snapshots in its handle namespace. */
+    public static final class Node {
+        private final int handle;
+        private final long sectionKey;
+        private final int parentHandle;
+        private final int manifestedChildMask;
+        private final int[] childHandles;
+        private final TightBounds tightBounds;
+        private final long geometricErrorQ16;
+        private final boolean descriptorReady;
+        private final ContentLayout exterior;
+        private final ContentLayout interior;
+        private final ContentLayout complex;
+
+        public Node(int handle, long sectionKey, int parentHandle, int manifestedChildMask,
+                    int[] childHandles, TightBounds tightBounds, long geometricErrorQ16,
+                    boolean descriptorReady, ContentLayout exterior,
+                    ContentLayout interior, ContentLayout complex) {
+            if (handle < 0 || parentHandle < NO_HANDLE || (manifestedChildMask & ~0xff) != 0
+                    || childHandles == null || childHandles.length != 8
+                    || geometricErrorQ16 < 0 || geometricErrorQ16 > 0xffff_ffffL) {
+                throw new IllegalArgumentException("invalid selection node");
             }
-            Objects.requireNonNull(childHandles, "childHandles");
-            if (childHandles.length != 8) {
-                throw new IllegalArgumentException("selection nodes require eight child slots");
-            }
-            childHandles = childHandles.clone();
-            Set<Integer> uniqueChildren = new HashSet<>();
-            int linkedChildMask = 0;
-            for (int childIndex = 0; childIndex < childHandles.length; childIndex++) {
-                int child = childHandles[childIndex];
-                if (child < NO_HANDLE || child == handle
-                        || child != NO_HANDLE && ((manifestedChildMask & 1 << childIndex) == 0
-                        || !uniqueChildren.add(child))) {
-                    throw new IllegalArgumentException("invalid selection child handle");
-                }
-                if (child != NO_HANDLE) linkedChildMask |= 1 << childIndex;
-            }
-            if (linkedChildMask != manifestedChildMask) {
-                throw new IllegalArgumentException(
-                        "selection node does not contain its complete declared child set");
-            }
-            if (geometricErrorQ16 < 0 || geometricErrorQ16 > 0xffff_ffffL) {
-                throw new IllegalArgumentException("geometric error is not unsigned Q16.16");
-            }
-            exterior = Objects.requireNonNull(exterior, "exterior");
-            interior = Objects.requireNonNull(interior, "interior");
-            complex = Objects.requireNonNull(complex, "complex");
+            this.handle = handle;
+            this.sectionKey = sectionKey;
+            this.parentHandle = parentHandle;
+            this.manifestedChildMask = manifestedChildMask;
+            this.childHandles = childHandles;
+            this.tightBounds = Objects.requireNonNull(tightBounds, "tight bounds");
+            this.geometricErrorQ16 = geometricErrorQ16;
+            this.descriptorReady = descriptorReady;
+            this.exterior = Objects.requireNonNull(exterior, "exterior");
+            this.interior = Objects.requireNonNull(interior, "interior");
+            this.complex = Objects.requireNonNull(complex, "complex");
         }
 
-        @Override
-        public int[] childHandles() {
-            return this.childHandles.clone();
-        }
+        public int handle() { return this.handle; }
+        public long sectionKey() { return this.sectionKey; }
+        public int parentHandle() { return this.parentHandle; }
+        public int manifestedChildMask() { return this.manifestedChildMask; }
+        public int[] childHandlesInternal() { return this.childHandles; }
+        public TightBounds tightBounds() { return this.tightBounds; }
+        public long geometricErrorQ16() { return this.geometricErrorQ16; }
+        public boolean descriptorReady() { return this.descriptorReady; }
 
-        public int[] childHandlesInternal() {
-            return this.childHandles;
-        }
-
-        public ContentState content(ContentClass contentClass) {
-            return switch (Objects.requireNonNull(contentClass, "contentClass")) {
+        public ContentLayout layout(ContentClass contentClass) {
+            return switch (Objects.requireNonNull(contentClass, "content class")) {
                 case EXTERIOR -> this.exterior;
                 case INTERIOR -> this.interior;
                 case COMPLEX -> this.complex;
@@ -358,19 +306,178 @@ public final class SelectionManifest {
         }
     }
 
-    private static int maximumObjectHandle(Node node) {
-        int maximum = -1;
-        for (ContentClass contentClass : ContentClass.values()) {
-            ContentState state = node.content(contentClass);
-            maximum = maximum(maximum, state.objectHandlesInternal());
-            maximum = maximum(maximum, state.dependencyHandlesInternal());
-            maximum = maximum(maximum, state.neighborDependencyHandlesInternal());
+    private static final class Storage {
+        private long[] masks = new long[0];
+        private byte[] dependencies = new byte[0];
+        private byte[] neighbors = new byte[0];
+
+        private void ensure(int maskCount, int dependencyCount, int neighborCount) {
+            if (this.masks.length < maskCount) this.masks = new long[grow(maskCount)];
+            if (this.dependencies.length < dependencyCount) {
+                this.dependencies = new byte[grow(dependencyCount)];
+            }
+            if (this.neighbors.length < neighborCount) {
+                this.neighbors = new byte[grow(neighborCount)];
+            }
         }
-        return maximum;
+
+        private static int grow(int required) {
+            if (required == 0) return 0;
+            int value = Integer.highestOneBit(required - 1) << 1;
+            return value > 0 ? value : required;
+        }
     }
 
-    private static int maximum(int maximum, int[] handles) {
-        for (int handle : handles) maximum = Math.max(maximum, handle);
-        return maximum;
+    private final Pool owner;
+    private final Storage storage;
+    private final Topology topology;
+    private final long generation;
+    private final long snapshotId;
+    private final long authorityId;
+    private final long planRevision;
+    private final long cameraVisibilityDomain;
+    private final AtomicInteger references = new AtomicInteger(1);
+    private boolean sealed;
+
+    private SelectionManifest(Pool owner, Storage storage, Topology topology, long generation,
+                              long snapshotId, long authorityId, long planRevision,
+                              long cameraVisibilityDomain) {
+        this.owner = owner;
+        this.storage = storage;
+        this.topology = topology;
+        this.generation = generation;
+        this.snapshotId = snapshotId;
+        this.authorityId = authorityId;
+        this.planRevision = planRevision;
+        this.cameraVisibilityDomain = cameraVisibilityDomain;
+    }
+
+    public static SelectionManifest empty(long generation, long snapshotId) {
+        Topology topology = new Topology(new Node[0], 0, 0, 0);
+        return new SelectionManifest(null, new Storage(), topology, generation, snapshotId,
+                0, 0, 0).seal();
+    }
+
+    public SelectionManifest retain() {
+        int old = this.references.getAndIncrement();
+        if (old <= 0) {
+            this.references.decrementAndGet();
+            throw new IllegalStateException("selection manifest has been released");
+        }
+        return this;
+    }
+
+    @Override
+    public void close() {
+        int remaining = this.references.decrementAndGet();
+        if (remaining < 0) throw new IllegalStateException("selection manifest released twice");
+        if (remaining == 0 && this.owner != null) this.owner.release(this.storage);
+    }
+
+    public SelectionManifest seal() {
+        this.sealed = true;
+        return this;
+    }
+
+    public void setContentState(int nodeIndex, ContentClass contentClass,
+                                long available, long resident, long renderable, long inFlight) {
+        ensureWritable();
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        if ((available & ~layout.declaredMask) != 0 || (resident & ~available) != 0
+                || (renderable & ~resident) != 0 || (inFlight & ~available) != 0) {
+            throw new IllegalArgumentException("invalid dynamic content masks");
+        }
+        int offset = contentOffset(nodeIndex, contentClass);
+        this.storage.masks[offset] = available;
+        this.storage.masks[offset + 1] = resident;
+        this.storage.masks[offset + 2] = renderable;
+        this.storage.masks[offset + 3] = inFlight;
+    }
+
+    public void setDependencyState(int nodeIndex, ContentClass contentClass, int index,
+                                   boolean resident, boolean inFlight) {
+        ensureWritable();
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        if (index < 0 || index >= layout.dependencyHandles.length) {
+            throw new IndexOutOfBoundsException(index);
+        }
+        this.storage.dependencies[layout.dependencyStateOffset + index] = state(resident, inFlight);
+    }
+
+    public void setNeighborState(int nodeIndex, ContentClass contentClass, int index,
+                                 boolean resident, boolean inFlight) {
+        ensureWritable();
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        if (index < 0 || index >= layout.neighborDependencyHandles.length) {
+            throw new IndexOutOfBoundsException(index);
+        }
+        this.storage.neighbors[layout.neighborStateOffset + index] = state(resident, inFlight);
+    }
+
+    private static byte state(boolean resident, boolean inFlight) {
+        return (byte) ((resident ? 1 : 0) | (inFlight ? 2 : 0));
+    }
+
+    private void ensureWritable() {
+        if (this.sealed) throw new IllegalStateException("selection manifest is sealed");
+    }
+
+    public long generation() { return this.generation; }
+    public long snapshotId() { return this.snapshotId; }
+    public long authorityId() { return this.authorityId; }
+    public long planRevision() { return this.planRevision; }
+    public long cameraVisibilityDomain() { return this.cameraVisibilityDomain; }
+    public int nodeCount() { return this.topology.nodeCount(); }
+    public Node nodeAt(int index) { return this.topology.nodeAt(index); }
+    public int nodeHandleCapacity() { return this.topology.nodeHandleCapacity(); }
+    public int objectHandleCapacity() { return this.topology.objectHandleCapacity(); }
+    public int indexForHandle(int handle) { return this.topology.indexForHandle(handle); }
+    public Node nodeForHandle(int handle) {
+        int index = indexForHandle(handle);
+        return index == NO_HANDLE ? null : nodeAt(index);
+    }
+
+    public ContentLayout contentLayout(int nodeIndex, ContentClass contentClass) {
+        return nodeAt(nodeIndex).layout(contentClass);
+    }
+
+    public long availableMask(int nodeIndex, ContentClass contentClass) {
+        return this.storage.masks[contentOffset(nodeIndex, contentClass)];
+    }
+
+    public long residentMask(int nodeIndex, ContentClass contentClass) {
+        return this.storage.masks[contentOffset(nodeIndex, contentClass) + 1];
+    }
+
+    public long renderableMask(int nodeIndex, ContentClass contentClass) {
+        return this.storage.masks[contentOffset(nodeIndex, contentClass) + 2];
+    }
+
+    public long inFlightMask(int nodeIndex, ContentClass contentClass) {
+        return this.storage.masks[contentOffset(nodeIndex, contentClass) + 3];
+    }
+
+    public boolean dependencyResident(int nodeIndex, ContentClass contentClass, int index) {
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        return (this.storage.dependencies[layout.dependencyStateOffset + index] & 1) != 0;
+    }
+
+    public boolean dependencyInFlight(int nodeIndex, ContentClass contentClass, int index) {
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        return (this.storage.dependencies[layout.dependencyStateOffset + index] & 2) != 0;
+    }
+
+    public boolean neighborResident(int nodeIndex, ContentClass contentClass, int index) {
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        return (this.storage.neighbors[layout.neighborStateOffset + index] & 1) != 0;
+    }
+
+    public boolean neighborInFlight(int nodeIndex, ContentClass contentClass, int index) {
+        ContentLayout layout = contentLayout(nodeIndex, contentClass);
+        return (this.storage.neighbors[layout.neighborStateOffset + index] & 2) != 0;
+    }
+
+    private int contentOffset(int nodeIndex, ContentClass contentClass) {
+        return (nodeIndex * CONTENT_CLASSES + contentClass.ordinal()) * MASKS_PER_CONTENT;
     }
 }

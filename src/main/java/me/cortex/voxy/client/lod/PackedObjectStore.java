@@ -122,19 +122,13 @@ final class PackedObjectStore implements AutoCloseable {
         if (opened.indexRebuilt || opened.tailsScanned || overLimit != 0) checkpoint();
     }
 
-    synchronized boolean put(EncodedObject encoded, CanonicalObject canonical)
-            throws IOException {
+    synchronized boolean put(EncodedObject encoded) throws IOException {
         ensureOpen();
         Objects.requireNonNull(encoded, "encoded");
-        Objects.requireNonNull(canonical, "canonical");
-        if (!encoded.hash().equals(canonical.hash()) || encoded.kind() != canonical.kind()
-                || encoded.canonicalLength() != canonical.canonicalLength()) {
-            throw new IllegalArgumentException("cache envelope and verified canonical object disagree");
-        }
         Entry existing = this.index.get(encoded.hash());
         if (existing != null) {
             try {
-                readValidated(encoded.hash(), existing);
+                readValidated(encoded.hash(), existing).close();
                 return false;
             } catch (CorruptRecordException failure) {
                 discard(encoded.hash(), existing);
@@ -452,15 +446,16 @@ final class PackedObjectStore implements AutoCloseable {
     }
 
     private void appendPut(EncodedObject object) throws IOException {
-        byte[] compressed = object.compressedBytes();
-        long bytes = recordBytes(compressed.length);
+        ByteBuffer compressed = object.compressedBufferInternal();
+        int compressedLength = compressed.remaining();
+        long bytes = recordBytes(compressedLength);
         Pack pack = activeFor(bytes);
         long offset = pack.length;
         byte[] header = encodePutHeader(object);
         writeFully(pack.channel, ByteBuffer.wrap(header), offset);
-        writeFully(pack.channel, ByteBuffer.wrap(compressed), offset + RECORD_HEADER_BYTES);
-        writePadding(pack.channel, offset + RECORD_HEADER_BYTES + compressed.length,
-                padding(compressed.length));
+        writeFully(pack.channel, compressed, offset + RECORD_HEADER_BYTES);
+        writePadding(pack.channel, offset + RECORD_HEADER_BYTES + compressedLength,
+                padding(compressedLength));
         pack.channel.truncate(offset + bytes);
         pack.length = offset + bytes;
         this.uncheckpointedBytes = Math.addExact(this.uncheckpointedBytes, bytes);
@@ -604,12 +599,11 @@ final class PackedObjectStore implements AutoCloseable {
         }
         byte[] compressed = new byte[entry.compressedLength];
         if (!readFully(pack.channel, ByteBuffer.wrap(compressed),
-                entry.recordOffset + RECORD_HEADER_BYTES)
-                || WireMessage.checksum(compressed) != entry.compressedChecksum) {
-            throw new CorruptRecordException("cached object payload checksum mismatch");
+                entry.recordOffset + RECORD_HEADER_BYTES)) {
+            throw new CorruptRecordException("cached object payload is truncated");
         }
         try {
-            return new EncodedObject(expectedHash, entry.kind, entry.dictionaryId,
+            return EncodedObject.takeOwnership(expectedHash, entry.kind, entry.dictionaryId,
                     entry.canonicalLength, entry.compressedChecksum,
                     compressed);
         } catch (IllegalArgumentException failure) {
@@ -717,7 +711,11 @@ final class PackedObjectStore implements AutoCloseable {
                     removeEntry(entry.getKey(), entry.getValue());
                     continue;
                 }
-                appendPut(object);
+                try {
+                    appendPut(object);
+                } finally {
+                    object.close();
+                }
             }
             checkpoint();
         } finally {

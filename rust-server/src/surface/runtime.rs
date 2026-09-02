@@ -17,9 +17,8 @@ use super::{
         bit, descriptor_page_slot_count, descriptor_page_slots, directory_morton_key, level_offset,
         morton3, slots_for_levels,
     },
-    memory::{MemoryClass, MemoryPermit, ServerMemoryBudget},
     object::{CanonicalObject, ObjectHash, ObjectKind},
-    pack::{BudgetedCanonicalObject, PackReader, PackStore, StoredObject},
+    pack::{PackReader, PackStore, StoredObjectSource},
     root::{PublishResult, RootRecord, RootStore},
     visibility::{
         CameraDomainLease, DimensionVisibilityPolicy, RegionChunkSource, RegionalVisibilitySummary,
@@ -64,20 +63,12 @@ const MAX_DIRECTORY_DEPTH: usize = 16;
 const DIRECTORY_PAGE_ENTRIES: usize = 4_096;
 const MAX_ROOT_GRAPH_OBJECTS: usize = 2_200_000;
 const MAX_RETAINED_VISIBILITY_ROOTS: usize = 2;
-const RETAINED_SOURCE_ENTRY_BYTES: usize = 64 + 16 + 64 * 32;
-const RETAINED_REPLACED_KEY_BYTES: usize = 80;
-const GROUP_BUILD_WORKING_BYTES: usize = 128 * 1024 * 1024;
-const PREPARED_STATE_BOUND_BYTES: usize = 32 * 1024;
-const MAX_RETAINED_VISIBILITY_BYTES: usize = 128 * 1024 * 1024;
-/// The first serviceable generation is deliberately tiny: one completed Anvil region is enough
-/// to give clients useful terrain while the rest of an existing world is imported. Later
-/// generations amortize root publication without ever making one changing region invalidate an
-/// entire world-sized transaction.
-// One changed 2x2-chunk group is one publication transaction. This keeps activation latency
-// independent of world size and prevents a busy region from delaying already durable nearby
-// content behind hundreds of unrelated groups.
-const REGION_PUBLICATION_BATCH: usize = 1;
+/// Import a few independent regions together, but retain one 2x2-chunk group as the bounded
+/// source transaction within each region. This makes fresh stores useful in seconds without
+/// retaining an entire region's normalized hierarchy and object index growth in one build.
+const REGION_PUBLICATION_BATCH: usize = 4;
 const GROUP_PUBLICATION_BATCH: usize = 1;
+type RegionOrderKey = (i64, i32, i32);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SourceSnapshot(Vec<(i32, i32, u64)>);
@@ -114,14 +105,12 @@ struct SectionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GroupState {
     manifest: ObjectHash,
-    section_count: usize,
 }
 
 #[derive(Clone, Debug)]
 struct RetainedVisibility {
     token: RootToken,
     index: Arc<VisibilityIndex>,
-    _memory: Arc<MemoryPermit>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -137,19 +126,6 @@ struct PublishedState {
     catalog: Option<Catalog>,
     visibility: Option<Arc<VisibilityIndex>>,
     retained_visibility: Vec<RetainedVisibility>,
-    /// Covers every world-sized allocation reachable from this immutable state. Incremental
-    /// publication reserves the complete successor while this predecessor remains serviceable.
-    _state_memory: Option<Arc<MemoryPermit>>,
-    _visibility_memory: Option<Arc<MemoryPermit>>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RebuildReport {
-    pub sections: usize,
-    pub groups: usize,
-    pub generation: u64,
-    pub published: bool,
-    pub pending: bool,
 }
 
 #[derive(Debug)]
@@ -165,7 +141,9 @@ pub struct DimensionSurface {
     roots: Mutex<RootStore>,
     state: RwLock<PublishedState>,
     build: Mutex<()>,
-    memory: Arc<ServerMemoryBudget>,
+    /// Advances independently of root publication so metadata-only saves and failed source reads
+    /// cannot let one near-origin region monopolize every bounded import transaction.
+    region_publication_cursor: Mutex<Option<RegionOrderKey>>,
 }
 
 impl DimensionSurface {
@@ -175,30 +153,14 @@ impl DimensionSurface {
         source: Arc<AnvilWorld>,
     ) -> Result<Self> {
         let dimension = dimension.into();
-        Self::open_with_budget(
-            data_root,
-            dimension,
-            source,
-            ServerMemoryBudget::default_budget(),
-        )
-    }
-
-    pub fn open_with_budget(
-        data_root: impl AsRef<Path>,
-        dimension: impl Into<String>,
-        source: Arc<AnvilWorld>,
-        memory: Arc<ServerMemoryBudget>,
-    ) -> Result<Self> {
-        let dimension = dimension.into();
         let policy = DimensionVisibilityPolicy::for_dimension(&dimension);
-        Self::open_with_budget_and_policy(data_root, dimension, source, memory, policy)
+        Self::open_with_policy(data_root, dimension, source, policy)
     }
 
-    pub fn open_with_budget_and_policy(
+    pub fn open_with_policy(
         data_root: impl AsRef<Path>,
         dimension: impl Into<String>,
         source: Arc<AnvilWorld>,
-        memory: Arc<ServerMemoryBudget>,
         visibility_policy: DimensionVisibilityPolicy,
     ) -> Result<Self> {
         let dimension = dimension.into();
@@ -213,9 +175,8 @@ impl DimensionSurface {
             .join("surface")
             .join("worlds")
             .join(safe_dimension_name(&dimension));
-        let objects = GcPackStore::open_with_budget(root_path.join("objects"), memory.clone())?;
-        let roots =
-            RootStore::open_verified(root_path.join("roots"), dimension_hash, objects.active())?;
+        let objects = GcPackStore::open(root_path.join("objects"))?;
+        let roots = RootStore::open(root_path.join("roots"), dimension_hash)?;
         let reader = objects.active().reader();
         let surface = Self {
             dimension,
@@ -226,7 +187,7 @@ impl DimensionSurface {
             roots: Mutex::new(roots),
             state: RwLock::new(PublishedState::default()),
             build: Mutex::new(()),
-            memory,
+            region_publication_cursor: Mutex::new(None),
         };
         if let Err(error) = surface.load_published_state() {
             eprintln!(
@@ -261,7 +222,6 @@ impl DimensionSurface {
         block_y: i32,
         block_z: i32,
     ) -> Result<CameraDomainLease> {
-        record.validate()?;
         if record.dimension != ObjectHash::dimension(&self.dimension)? {
             bail!("camera-domain root belongs to a different dimension");
         }
@@ -285,19 +245,10 @@ impl DimensionSurface {
         let index = if let Some(index) = cached {
             index
         } else {
-            let mut memory = self
-                .memory
-                .try_reserve(MemoryClass::Visibility, MAX_RETAINED_VISIBILITY_BYTES)?;
             let index = {
                 let reader = read_lock(&self.reader)?.clone();
                 Arc::new(load_visibility_index(&reader, record.visibility)?)
             };
-            let retained = index.retained_bytes()?;
-            if retained > memory.bytes() {
-                bail!("leased visibility lookup exceeds its bounded memory reservation");
-            }
-            memory.shrink_to(retained);
-            let memory = Arc::new(memory);
             let mut state = write_lock(&self.state)?;
             if !state
                 .retained_visibility
@@ -310,7 +261,6 @@ impl DimensionSurface {
                 state.retained_visibility.push(RetainedVisibility {
                     token,
                     index: index.clone(),
-                    _memory: memory,
                 });
                 if state.retained_visibility.len() > MAX_RETAINED_VISIBILITY_ROOTS {
                     state.retained_visibility.remove(0);
@@ -321,20 +271,34 @@ impl DimensionSurface {
         Ok(index.camera_domain(block_x, block_y, block_z))
     }
 
-    /// Resolves dictionary identity against the exact leased root and returns a canonical proof
-    /// alongside the stored wire form. Dictionary indices are one-based; zero means no dictionary.
-    pub fn read_wire_object(
-        &self,
-        record: RootRecord,
-        hash: ObjectHash,
-        memory: &MemoryPermit,
-    ) -> Result<Option<(StoredObject, u32, CanonicalObject)>> {
-        record.validate()?;
+    /// Resolves the immutable dictionary table once when a connection leases a root.
+    pub fn leased_dictionaries(&self, record: RootRecord) -> Result<Arc<[ObjectHash]>> {
         if record.dimension != ObjectHash::dimension(&self.dimension)? {
             bail!("wire object root belongs to a different dimension");
         }
         let reader = read_lock(&self.reader)?.clone();
-        read_wire_object_from_reader(&reader, record, hash, memory)
+        let set = reader
+            .get(record.dictionary_set)?
+            .context("root dictionary set is missing")?;
+        if set.kind() != ObjectKind::DictionarySet {
+            bail!("root dictionary set has the wrong object type");
+        }
+        Ok(DictionarySet::decode(set.bytes())?.dictionaries.into())
+    }
+
+    /// Opens one immutable compressed extent without decompressing, hashing, or copying it.
+    /// Dictionary indices are one-based; zero means no dictionary.
+    pub fn open_wire_object(
+        &self,
+        record: RootRecord,
+        dictionaries: &[ObjectHash],
+        hash: ObjectHash,
+    ) -> Result<Option<(StoredObjectSource, u32)>> {
+        if record.dimension != ObjectHash::dimension(&self.dimension)? {
+            bail!("wire object root belongs to a different dimension");
+        }
+        let reader = read_lock(&self.reader)?.clone();
+        open_wire_object_from_reader(&reader, dictionaries, hash)
     }
 
     pub fn collect_live(
@@ -362,14 +326,14 @@ impl DimensionSurface {
         Ok(report)
     }
 
-    pub fn refresh(&self, registry: &Arc<RwLock<Registry>>) -> Result<RebuildReport> {
+    pub fn refresh(&self, registry: &Arc<RwLock<Registry>>) -> Result<bool> {
         self.rebuild_incremental(registry, false)
     }
 
     /// Rebuilds the complete immutable graph even when source stamps are unchanged. The object
     /// store replaces only missing/corrupt physical records; canonical hashes and an unchanged
     /// root generation remain stable.
-    pub fn repair(&self, registry: &Arc<RwLock<Registry>>) -> Result<RebuildReport> {
+    pub fn repair(&self, registry: &Arc<RwLock<Registry>>) -> Result<bool> {
         self.rebuild_incremental(registry, true)
     }
 
@@ -377,10 +341,7 @@ impl DimensionSurface {
         &self,
         registry: &Arc<RwLock<Registry>>,
         force_rebuild: bool,
-    ) -> Result<RebuildReport> {
-        let mut hierarchy_memory = self
-            .memory
-            .try_reserve(MemoryClass::Build, 16 * 1024 * 1024)?;
+    ) -> Result<bool> {
         let _build = lock(&self.build)?;
         let (initial_source, headers) = source_headers(&self.source)?;
         let old_state = read_lock(&self.state)?.clone();
@@ -400,7 +361,7 @@ impl DimensionSurface {
                 .as_ref()
                 .is_some_and(|visibility| visibility.is_complete())
         {
-            return Ok(report_for(&old_state, false));
+            return Ok(false);
         }
 
         let mut rebuild_all = force_rebuild
@@ -428,8 +389,39 @@ impl DimensionSurface {
         } else {
             REGION_PUBLICATION_BATCH
         };
-        if changed.len() > batch_limit {
-            changed = nearest_region_batch(changed, batch_limit);
+        let represented_regions = old_source
+            .0
+            .iter()
+            .map(|&(x, z, _)| (x, z))
+            .collect::<BTreeSet<_>>();
+        let current_regions = initial_source
+            .0
+            .iter()
+            .map(|&(x, z, _)| (x, z))
+            .collect::<BTreeSet<_>>();
+        let unrepresented = changed
+            .iter()
+            .copied()
+            .filter(|coordinate| {
+                current_regions.contains(coordinate) && !represented_regions.contains(coordinate)
+            })
+            .collect::<BTreeSet<_>>();
+        let importing_region = batch_limit != usize::MAX && !unrepresented.is_empty();
+        if batch_limit != usize::MAX && !changed.is_empty() {
+            if importing_region {
+                // Finish the most recently saved missing region before ordinary refreshes. This
+                // makes fresh stores useful around active players first while deterministic
+                // near-origin ordering remains the fallback for equal or absent timestamps.
+                changed = recent_region_batch(
+                    unrepresented,
+                    &headers,
+                    &self.source.saved_player_regions()?,
+                    batch_limit,
+                )?;
+            } else {
+                let mut cursor = lock(&self.region_publication_cursor)?;
+                changed = round_robin_region_batch(changed, batch_limit, &mut *cursor);
+            }
         }
         let group_batch_limit = if rebuild_all && old_state.ready {
             usize::MAX
@@ -437,12 +429,8 @@ impl DimensionSurface {
             GROUP_PUBLICATION_BATCH
         };
 
-        let mut previous_changed_memory = None;
         let previous_changed_regions = if !rebuild_all && !changed.is_empty() {
-            let mut permit = self
-                .memory
-                .try_reserve(MemoryClass::Visibility, MAX_RETAINED_VISIBILITY_BYTES)?;
-            let regions = {
+            {
                 let objects = lock(&self.objects)?;
                 load_visibility_regions(
                     objects.active(),
@@ -452,14 +440,8 @@ impl DimensionSurface {
                         .visibility,
                     &changed,
                 )?
-            };
-            let retained = retained_region_bytes(&regions)?;
-            if retained > permit.bytes() {
-                bail!("changed regional source state exceeds its bounded reservation");
+                .1
             }
-            permit.shrink_to(retained);
-            previous_changed_memory = Some(permit);
-            regions
         } else {
             BTreeMap::new()
         };
@@ -473,8 +455,6 @@ impl DimensionSurface {
                 &changed,
                 &previous_changed_regions,
                 objects.active_mut(),
-                &self.memory,
-                &mut hierarchy_memory,
                 group_batch_limit,
                 rebuild_all,
             )?
@@ -500,8 +480,6 @@ impl DimensionSurface {
                     &changed,
                     &BTreeMap::new(),
                     objects.active_mut(),
-                    &self.memory,
-                    &mut hierarchy_memory,
                     usize::MAX,
                     true,
                 )?
@@ -542,34 +520,22 @@ impl DimensionSurface {
                 registry_generation: registry_snapshot.generation,
                 mip_generation: registry_snapshot.mip_generation,
             });
-            return Ok(report_for(&state, false));
+            return Ok(false);
         }
         let catalog = catalog_value.canonical_object()?;
-        drop(previous_changed_memory);
 
-        let mut all_regions_memory = None;
         let mut visibility_regions = if rebuild_all || old_state.root.is_none() {
             BTreeMap::new()
         } else {
-            let mut permit = self.memory.try_reserve(
-                MemoryClass::Visibility,
-                self.memory.bulk_state_reservation_limit(),
-            )?;
-            let regions = {
+            {
                 let objects = lock(&self.objects)?;
                 load_visibility_regions(
                     objects.active(),
                     old_state.root.expect("checked root").visibility,
                     &BTreeSet::new(),
                 )?
-            };
-            let retained = retained_region_bytes(&regions)?;
-            if retained > permit.bytes() {
-                bail!("regional publication state exceeds its bounded working reservation");
+                .1
             }
-            permit.shrink_to(retained);
-            all_regions_memory = Some(permit);
-            regions
         };
         for &coordinate in &changed {
             let Some(hierarchy) = hierarchies.get(&coordinate) else {
@@ -581,14 +547,6 @@ impl DimensionSurface {
         let connectivity_changed = hierarchies
             .values()
             .any(|hierarchy| !hierarchy.affected_groups.is_empty());
-        let visibility_working = if connectivity_changed {
-            VisibilityIndex::conservative_build_memory_bound(&visibility_regions)?
-        } else {
-            VisibilityIndex::exact_build_memory_bound(&visibility_regions)?
-        };
-        let mut visibility_memory = self
-            .memory
-            .try_reserve(MemoryClass::Visibility, visibility_working)?;
         let visibility = Arc::new(if connectivity_changed {
             VisibilityIndex::conservative_from_regions_with_policy(
                 &self.dimension,
@@ -602,14 +560,9 @@ impl DimensionSurface {
                 &visibility_regions,
             )?
         });
-        let visibility_retained = visibility.retained_bytes()?;
-        if visibility_retained > visibility_memory.bytes() {
-            bail!("visibility builder exceeded its conservative memory reservation");
-        }
-        visibility_memory.shrink_to(visibility_retained);
 
         let mut object_sets = lock(&self.objects)?;
-        let (dictionaries, _dictionary_memory) = if let Some(old) = old_state.root {
+        let dictionaries = if let Some(old) = old_state.root {
             load_root_dictionaries(object_sets.active(), old)?
         } else {
             train_dictionaries_from_sources(
@@ -617,7 +570,6 @@ impl DimensionSurface {
                 object_sets.active(),
                 &registry_snapshot,
                 &visibility,
-                &self.memory,
             )?
         };
         let mut dictionary_hashes = dictionaries
@@ -632,40 +584,6 @@ impl DimensionSurface {
         object_sets.active_mut().put(&dictionary_set)?;
 
         let class_dictionaries = class_dictionary_hashes(&dictionaries)?;
-        let hierarchy_key_count = hierarchies.values().try_fold(0usize, |total, hierarchy| {
-            total
-                .checked_add(hierarchy.section_sources.len())
-                .and_then(|value| value.checked_add(hierarchy.replaced_keys.len()))
-                .context("root-planning entry count overflow")
-        })?;
-        let root_planning_entries = old_state
-            .groups
-            .len()
-            .checked_mul(2)
-            .and_then(|value| {
-                old_state
-                    .pending_visibility_roots
-                    .len()
-                    .checked_mul(2)
-                    .and_then(|pending| value.checked_add(pending))
-            })
-            .and_then(|value| {
-                hierarchy_key_count
-                    // Replaced keys can simultaneously appear in the replaced, changed-root,
-                    // adjacent-root, pending-visibility, and final rebuild sets. Twenty nodes
-                    // per input key is a conservative upper bound for those live B-trees.
-                    .checked_mul(20)
-                    .and_then(|hierarchy| value.checked_add(hierarchy))
-            })
-            .and_then(|value| value.checked_add(changed.len()))
-            .context("root-planning entry count overflow")?;
-        let root_planning_bytes = root_planning_entries
-            .checked_mul(RETAINED_REPLACED_KEY_BYTES)
-            .and_then(|value| value.checked_add(4 * 1024 * 1024))
-            .context("root-planning memory overflow")?;
-        let root_planning_memory = self
-            .memory
-            .try_reserve(MemoryClass::Build, root_planning_bytes)?;
         let replaced_keys = hierarchies
             .values()
             .flat_map(|hierarchy| hierarchy.replaced_keys.iter().copied())
@@ -692,18 +610,7 @@ impl DimensionSurface {
         // renderable state once, then reuse it while rebuilding the owning roots and any
         // dependency-facing neighbours. A full repair can span the world, so it deliberately
         // retains only one root-local preparation below.
-        let prepared_change_bound = hierarchy_key_count
-            .checked_mul(PREPARED_STATE_BOUND_BYTES)
-            .and_then(|bytes| bytes.checked_add(16 * 1024 * 1024))
-            .context("prepared change-state memory overflow")?;
-        let _prepared_change_memory = (!rebuild_all
-            && prepared_change_bound <= GROUP_BUILD_WORKING_BYTES)
-            .then(|| {
-                self.memory
-                    .try_reserve(MemoryClass::Build, prepared_change_bound)
-            })
-            .transpose()?;
-        let prepared_changes = if _prepared_change_memory.is_some() {
+        let prepared_changes = if !rebuild_all {
             Some(prepare_section_states_from_sources(
                 &hierarchies,
                 None,
@@ -753,25 +660,12 @@ impl DimensionSurface {
             roots_to_rebuild.extend(pending_visibility_roots.iter().copied());
             pending_visibility_roots.clear();
         }
-        let successor_group_bytes = if rebuild_all {
-            2 * 1024 * 1024
-        } else {
-            retained_group_bytes(&old_state.groups)?
-                .checked_add(2 * 1024 * 1024)
-                .context("successor group-directory memory overflow")?
-        };
-        let mut state_memory = self
-            .memory
-            .try_reserve(MemoryClass::Build, successor_group_bytes)?;
         let mut next_groups = if rebuild_all {
             BTreeMap::new()
         } else {
             (*old_state.groups).clone()
         };
         for root in roots_to_rebuild {
-            let _root_memory = self
-                .memory
-                .try_reserve(MemoryClass::Build, GROUP_BUILD_WORKING_BYTES)?;
             let mut dependency_roots = adjacent_top_roots(root)?
                 .into_iter()
                 .collect::<BTreeSet<_>>();
@@ -802,7 +696,6 @@ impl DimensionSurface {
                             dependency_root,
                             group,
                             &class_dictionaries,
-                            false,
                         )?
                     } else {
                         load_group_sections_matching(
@@ -810,7 +703,6 @@ impl DimensionSurface {
                             dependency_root,
                             group,
                             &class_dictionaries,
-                            false,
                             |key| touches_root_boundary(key, root, dependency_root),
                         )?
                     };
@@ -850,33 +742,8 @@ impl DimensionSurface {
             let manifest = build_manifest_tree(root, &sections, |object| {
                 object_sets.active_mut().put(object).map(|_| ())
             })?;
-            let section_count = sections.len();
-            if !next_groups.contains_key(&root) {
-                let next_group_bytes = retained_group_bytes_for_len(next_groups.len() + 1)?
-                    .checked_add(2 * 1024 * 1024)
-                    .context("successor group-directory memory overflow")?;
-                ensure_retained_state_capacity(&mut state_memory, next_group_bytes)?;
-            }
-            next_groups.insert(
-                root,
-                GroupState {
-                    manifest,
-                    section_count,
-                },
-            );
+            next_groups.insert(root, GroupState { manifest });
         }
-        let group_memory = retained_group_bytes(&next_groups)?;
-        let pending_visibility_memory = pending_visibility_roots
-            .len()
-            .checked_mul(RETAINED_REPLACED_KEY_BYTES)
-            .context("pending visibility-root memory overflow")?;
-        let final_state_memory = group_memory
-            .checked_add(pending_visibility_memory)
-            .and_then(|value| value.checked_add(2 * 1024 * 1024))
-            .context("compact published-state memory overflow")?;
-        let visibility_serialization = self
-            .memory
-            .try_reserve(MemoryClass::Visibility, 64 * 1024 * 1024)?;
         let visibility_directory = visibility
             .canonical_objects_to(&visibility_regions, |object| {
                 object_sets.active_mut().put(object).map(|_| ())
@@ -884,26 +751,9 @@ impl DimensionSurface {
         object_sets.active_mut().put(&visibility_directory)?;
         drop(visibility_regions);
         drop(hierarchies);
-        drop(hierarchy_memory);
         drop(previous_changed_regions);
         drop(changed_roots);
         drop(replaced_keys);
-        drop(all_regions_memory);
-        drop(visibility_serialization);
-        let reserved_state_memory = state_memory.bytes();
-        if final_state_memory > reserved_state_memory {
-            grow_retained_state(
-                &mut state_memory,
-                final_state_memory - reserved_state_memory,
-            )?;
-        } else {
-            state_memory.shrink_to(final_state_memory);
-        }
-        drop(root_planning_memory);
-        let _directory_memory = self.memory.try_reserve(
-            MemoryClass::Build,
-            directory_build_memory_bound(next_groups.len())?,
-        )?;
         let directory = build_directory_to(&next_groups, |object| {
             object_sets.active_mut().put(object).map(|_| ())
         })?;
@@ -943,8 +793,6 @@ impl DimensionSurface {
             registry_generation: registry_snapshot.generation,
             mip_generation: registry_snapshot.mip_generation,
         };
-        let section_count = next_groups.values().map(|group| group.section_count).sum();
-        let group_count = next_groups.len();
         pending_visibility_roots.retain(|root| next_groups.contains_key(root));
         drop(object_sets);
 
@@ -953,16 +801,9 @@ impl DimensionSurface {
             let index = old_state
                 .visibility
                 .context("serviceable predecessor has no visibility index")?;
-            let memory = old_state
-                ._visibility_memory
-                .context("serviceable predecessor visibility is not memory-accounted")?;
             let token = RootToken::from(root);
             retained_visibility.retain(|retained| retained.token != token);
-            retained_visibility.push(RetainedVisibility {
-                token,
-                index,
-                _memory: memory,
-            });
+            retained_visibility.push(RetainedVisibility { token, index });
         }
         let visible_token = RootToken::from(visible);
         retained_visibility.retain(|retained| retained.token != visible_token);
@@ -979,16 +820,8 @@ impl DimensionSurface {
             catalog: Some(catalog_value),
             visibility: Some(visibility),
             retained_visibility,
-            _state_memory: Some(Arc::new(state_memory)),
-            _visibility_memory: Some(Arc::new(visibility_memory)),
         };
-        Ok(RebuildReport {
-            sections: section_count,
-            groups: group_count,
-            generation: visible.generation,
-            published,
-            pending,
-        })
+        Ok(pending)
     }
 
     fn load_published_state(&self) -> Result<()> {
@@ -1015,13 +848,6 @@ impl DimensionSurface {
     }
 
     fn decode_published_state(&self, root: RootRecord) -> Result<PublishedState> {
-        // Recovery decodes an immutable graph while no root from this dimension is announced.
-        // Reserve the complete retained-state ceiling up front so malformed or oversized graphs
-        // fail closed instead of allocating outside the process-wide budget.
-        let mut retained_memory = self.memory.try_reserve(
-            MemoryClass::Build,
-            self.memory.bulk_state_reservation_limit(),
-        )?;
         let objects = lock(&self.objects)?;
         let active = objects.active();
         let catalog_object = active
@@ -1031,27 +857,9 @@ impl DimensionSurface {
             bail!("published catalog has the wrong type");
         }
         let catalog = Catalog::decode(catalog_object.bytes())?;
-        let recovered_visibility = load_visibility_graph(active, root.visibility)?;
-        let persisted_visibility = recovered_visibility.index;
-        let visibility_regions = recovered_visibility.regions;
-        let visibility_working = if persisted_visibility.is_complete() {
-            VisibilityIndex::exact_build_memory_bound(&visibility_regions)?
-        } else {
-            VisibilityIndex::conservative_build_memory_bound(&visibility_regions)?
-        };
-        let recovery_peak = persisted_visibility
-            .retained_bytes()?
-            .checked_add(visibility_working)
-            .context("published visibility recovery memory overflow")?;
-        if recovery_peak > retained_memory.bytes() {
-            bail!("published visibility graph exceeds the bounded recovery reservation");
-        }
-        for region in visibility_regions.values() {
-            for (&key, hashes) in region.source_microtiles() {
-                let _ = load_source_section(active, key, hashes, Some(catalog.catalog_id))?;
-            }
-        }
-        let rebuilt_visibility = if persisted_visibility.is_complete() {
+        let (visibility_complete, visibility_regions) =
+            load_visibility_regions(active, root.visibility, &BTreeSet::new())?;
+        let visibility = if visibility_complete {
             VisibilityIndex::from_regions_with_policy(
                 &self.dimension,
                 self.visibility_policy,
@@ -1064,11 +872,7 @@ impl DimensionSurface {
                 &visibility_regions,
             )?
         };
-        if !persisted_visibility.camera_metadata_matches(&rebuilt_visibility) {
-            bail!("published visibility lookup disagrees with its regional summaries");
-        }
-        drop(persisted_visibility);
-        let visibility = Arc::new(rebuilt_visibility);
+        let visibility = Arc::new(visibility);
         let dictionary_set_hash = root.dictionary_set;
         let set_object = active
             .get(dictionary_set_hash)?
@@ -1089,7 +893,7 @@ impl DimensionSurface {
             class_dictionaries[class.index()] = *dictionary;
         }
         if class_dictionaries.iter().any(|hash| hash.is_zero()) {
-        bail!("root does not publish exactly one dictionary per content class");
+            bail!("root does not publish exactly one dictionary per content class");
         }
         let mut groups = BTreeMap::new();
         let mut visited = HashSet::new();
@@ -1101,7 +905,7 @@ impl DimensionSurface {
             &mut visited,
             &mut groups,
         )?;
-        validate_recovered_groups(active, &mut groups, &class_dictionaries)?;
+        check_recovered_groups(active, &groups, &class_dictionaries)?;
         let source = SourceSnapshot(
             visibility_regions
                 .values()
@@ -1115,30 +919,6 @@ impl DimensionSurface {
         } else {
             groups.keys().copied().collect()
         };
-        let visibility_retained = visibility.retained_bytes()?;
-        let retained = retained_group_bytes(&groups)?
-            .checked_add(visibility_retained)
-            .and_then(|value| {
-                value.checked_add(
-                    pending_visibility_roots
-                        .len()
-                        .checked_mul(RETAINED_REPLACED_KEY_BYTES)?,
-                )
-            })
-            .and_then(|value| {
-                value.checked_add(source.0.capacity().saturating_mul(std::mem::size_of::<(
-                    i32,
-                    i32,
-                    u64,
-                )>()))
-            })
-            .and_then(|value| value.checked_add(1024 * 1024))
-            .context("published retained-state memory overflow")?;
-        if retained > retained_memory.bytes() {
-            bail!("published retained state exceeds its bounded memory reservation");
-        }
-        retained_memory.shrink_to(retained);
-        let retained_memory = Arc::new(retained_memory);
         Ok(PublishedState {
             groups: Arc::new(groups),
             pending_visibility_roots: Arc::new(pending_visibility_roots),
@@ -1152,76 +932,43 @@ impl DimensionSurface {
             catalog: Some(catalog),
             visibility: Some(visibility),
             retained_visibility: Vec::new(),
-            _state_memory: Some(retained_memory.clone()),
-            _visibility_memory: Some(retained_memory),
         })
     }
 }
 
-fn read_wire_object_from_reader(
+fn open_wire_object_from_reader(
     reader: &PackReader,
-    record: RootRecord,
+    dictionaries: &[ObjectHash],
     hash: ObjectHash,
-    memory: &MemoryPermit,
-) -> Result<Option<(StoredObject, u32, CanonicalObject)>> {
-    let Some(stored) = reader.read_stored_scoped(hash, memory)? else {
+) -> Result<Option<(StoredObjectSource, u32)>> {
+    let Some(stored) = reader.open_stored_source(hash)? else {
         return Ok(None);
     };
-    let (dictionary_id, canonical) = if stored.dictionary.is_zero() {
-        (0, stored.decode()?)
+    let dictionary_id = if stored.dictionary().is_zero() {
+        0
     } else {
-        let set_hash = record.dictionary_set;
-        let set_object = reader
-            .get_scoped(set_hash, memory)?
-            .context("root dictionary set is missing")?;
-        let set = DictionarySet::decode(set_object.bytes())?;
-        let position = set
-            .dictionaries
-            .binary_search(&stored.dictionary)
+        let position = dictionaries
+            .binary_search(&stored.dictionary())
             .map_err(|_| LeasedDictionaryMismatch)?;
-        let dictionary = reader
-            .get_scoped(stored.dictionary, memory)?
-            .context("compression dictionary is missing")?;
-        if dictionary.kind() != ObjectKind::CompressionDictionary {
-            bail!("announced compression dictionary has the wrong type");
-        }
-        let dictionary_bytes = decode_dictionary(dictionary.bytes())?.zstd;
-        (
-            u32::try_from(position + 1).context("dictionary index overflow")?,
-            stored.decode_with_dictionary(Some(dictionary_bytes))?,
-        )
+        u32::try_from(position + 1).context("dictionary index overflow")?
     };
-    Ok(Some((stored, dictionary_id, canonical)))
+    Ok(Some((stored, dictionary_id)))
 }
 
 trait CanonicalObjectReader {
-    fn canonical(&self, hash: ObjectHash) -> Result<Option<BudgetedCanonicalObject>>;
+    fn canonical(&self, hash: ObjectHash) -> Result<Option<CanonicalObject>>;
 }
 
 impl CanonicalObjectReader for PackStore {
-    fn canonical(&self, hash: ObjectHash) -> Result<Option<BudgetedCanonicalObject>> {
+    fn canonical(&self, hash: ObjectHash) -> Result<Option<CanonicalObject>> {
         self.get(hash)
     }
 }
 
 impl CanonicalObjectReader for PackReader {
-    fn canonical(&self, hash: ObjectHash) -> Result<Option<BudgetedCanonicalObject>> {
+    fn canonical(&self, hash: ObjectHash) -> Result<Option<CanonicalObject>> {
         self.get(hash)
     }
-}
-
-fn load_visibility_graph(
-    store: &impl CanonicalObjectReader,
-    directory_hash: ObjectHash,
-) -> Result<super::visibility::RecoveredVisibility> {
-    let directory = store
-        .canonical(directory_hash)?
-        .context("published visibility directory is missing")?;
-    VisibilityIndex::from_canonical_graph(directory.as_object(), |hash| {
-        store
-            .canonical(hash)?
-            .with_context(|| format!("published visibility graph object {hash} is missing"))
-    })
 }
 
 fn load_visibility_index(
@@ -1231,7 +978,7 @@ fn load_visibility_index(
     let directory = store
         .canonical(directory_hash)?
         .context("published visibility directory is missing")?;
-    VisibilityIndex::from_canonical_index(directory.as_object(), |hash| {
+    VisibilityIndex::from_canonical_index(&directory, |hash| {
         store
             .canonical(hash)?
             .with_context(|| format!("published visibility page {hash} is missing"))
@@ -1242,25 +989,15 @@ fn load_visibility_regions(
     store: &impl CanonicalObjectReader,
     directory_hash: ObjectHash,
     wanted: &BTreeSet<(i32, i32)>,
-) -> Result<BTreeMap<(i32, i32), RegionalVisibilitySummary>> {
+) -> Result<(bool, BTreeMap<(i32, i32), RegionalVisibilitySummary>)> {
     let directory = store
         .canonical(directory_hash)?
         .context("published visibility directory is missing")?;
-    VisibilityIndex::regions_from_canonical_graph(directory.as_object(), wanted, |hash| {
+    VisibilityIndex::regions_from_canonical_graph(&directory, wanted, |hash| {
         store
             .canonical(hash)?
             .with_context(|| format!("published visibility summary page {hash} is missing"))
     })
-}
-
-fn report_for(state: &PublishedState, published: bool) -> RebuildReport {
-    RebuildReport {
-        sections: state.groups.values().map(|group| group.section_count).sum(),
-        groups: state.groups.len(),
-        generation: state.root.map_or(0, |root| root.generation),
-        published,
-        pending: false,
-    }
 }
 
 fn source_headers(
@@ -1340,23 +1077,113 @@ fn apply_source_changes(
     )
 }
 
-fn nearest_region_batch(changed: BTreeSet<(i32, i32)>, limit: usize) -> BTreeSet<(i32, i32)> {
+fn region_order_key((x, z): (i32, i32)) -> RegionOrderKey {
+    (
+        i64::from(x)
+            .saturating_mul(i64::from(x))
+            .saturating_add(i64::from(z).saturating_mul(i64::from(z))),
+        x,
+        z,
+    )
+}
+
+/// Selects represented regional work in deterministic near-to-far order, resumes strictly after
+/// the last attempted coordinate, and wraps at the end. The cursor advances before source I/O,
+/// so one persistently changing or unreadable region cannot starve the rest.
+fn round_robin_region_batch(
+    changed: BTreeSet<(i32, i32)>,
+    limit: usize,
+    cursor: &mut Option<RegionOrderKey>,
+) -> BTreeSet<(i32, i32)> {
+    if changed.is_empty() || limit == 0 {
+        return BTreeSet::new();
+    }
     let mut regions = changed.into_iter().collect::<Vec<_>>();
-    regions.sort_unstable_by_key(|&(x, z)| {
+    regions.sort_unstable_by_key(|&coordinate| region_order_key(coordinate));
+    let start = (*cursor).map_or(0, |previous| {
+        regions.partition_point(|&coordinate| region_order_key(coordinate) <= previous)
+    });
+    let selected = (0..limit.min(regions.len()))
+        .map(|offset| regions[(start + offset) % regions.len()])
+        .collect::<Vec<_>>();
+    *cursor = selected.last().copied().map(region_order_key);
+    selected.into_iter().collect()
+}
+
+fn recent_region_batch(
+    changed: BTreeSet<(i32, i32)>,
+    headers: &BTreeMap<(i32, i32), RegionHeader>,
+    saved_player_regions: &BTreeMap<(i32, i32), u64>,
+    limit: usize,
+) -> Result<BTreeSet<(i32, i32)>> {
+    let mut regions = changed
+        .into_iter()
+        .map(|coordinate| {
+            let header = headers.get(&coordinate).with_context(|| {
+                format!(
+                    "unrepresented region ({},{}) lacks its captured header",
+                    coordinate.0, coordinate.1
+                )
+            })?;
+            let timestamp = header
+                .entries
+                .iter()
+                .filter(|entry| entry.location >> 8 != 0 && entry.location & 0xff != 0)
+                .map(|entry| entry.timestamp)
+                .max()
+                .unwrap_or(0);
+            Ok((
+                coordinate,
+                saved_player_regions.get(&coordinate).copied(),
+                timestamp,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    regions.sort_unstable_by_key(|&(coordinate, saved, timestamp)| {
         (
-            i64::from(x)
-                .saturating_mul(i64::from(x))
-                .saturating_add(i64::from(z).saturating_mul(i64::from(z))),
-            x,
-            z,
+            saved.is_none(),
+            std::cmp::Reverse(saved.unwrap_or(0)),
+            std::cmp::Reverse(timestamp),
+            region_order_key(coordinate),
         )
     });
     regions.truncate(limit);
-    regions.into_iter().collect()
+    Ok(regions
+        .into_iter()
+        .map(|(coordinate, _, _)| coordinate)
+        .collect())
 }
 
-fn nearest_group_batch(changed: BTreeSet<(i32, i32)>, limit: usize) -> BTreeSet<(i32, i32)> {
-    nearest_region_batch(changed, limit)
+fn recent_group_batch(
+    changed: BTreeSet<(i32, i32)>,
+    header: &RegionHeader,
+    limit: usize,
+) -> BTreeSet<(i32, i32)> {
+    let mut groups = changed
+        .into_iter()
+        .map(|coordinate| {
+            let local_group_x = coordinate.0.rem_euclid(16) as usize;
+            let local_group_z = coordinate.1.rem_euclid(16) as usize;
+            let base_x = local_group_x * 2;
+            let base_z = local_group_z * 2;
+            let timestamp = (0..2usize)
+                .flat_map(|z| (0..2usize).map(move |x| (base_x + x) | ((base_z + z) << 5)))
+                .filter_map(|slot| header.entries.get(slot))
+                .filter(|entry| entry.location >> 8 != 0 && entry.location & 0xff != 0)
+                .map(|entry| entry.timestamp)
+                .max()
+                .unwrap_or(0);
+            (coordinate, timestamp)
+        })
+        .collect::<Vec<_>>();
+    groups.sort_unstable_by_key(|&(coordinate, timestamp)| {
+        (std::cmp::Reverse(timestamp), region_order_key(coordinate))
+    });
+    groups.truncate(limit);
+    groups
+        .into_iter()
+        .map(|(coordinate, _)| coordinate)
+        .collect()
 }
 
 fn is_metadata_only_refresh(
@@ -1470,8 +1297,6 @@ fn load_changed_hierarchies(
     changed: &BTreeSet<(i32, i32)>,
     previous_regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
     store: &mut PackStore,
-    memory: &Arc<ServerMemoryBudget>,
-    state_memory: &mut MemoryPermit,
     group_batch_limit: usize,
     force: bool,
 ) -> Result<BTreeMap<(i32, i32), LoadedHierarchy>> {
@@ -1497,7 +1322,7 @@ fn load_changed_hierarchies(
             force || previous.is_none(),
         )?;
         if affected_groups.len() > group_batch_limit {
-            affected_groups = nearest_group_batch(affected_groups, group_batch_limit);
+            affected_groups = recent_group_batch(affected_groups, &header, group_batch_limit);
         }
         let had_candidate_groups = !affected_groups.is_empty();
         let mut summary = previous.cloned();
@@ -1505,11 +1330,9 @@ fn load_changed_hierarchies(
         let mut section_sources = BTreeMap::new();
         let mut replaced_keys = BTreeSet::new();
         let mut completed_groups = BTreeSet::new();
-        let mut accounted_retained = 0usize;
         let mut last_error = None;
         for group in affected_groups {
             let empty = BTreeMap::new();
-            let mut temporary_memory = memory.try_reserve(MemoryClass::Build, 0)?;
             let result = load_region_hierarchy(
                 source,
                 registry,
@@ -1525,8 +1348,6 @@ fn load_changed_hierarchies(
                     .unwrap_or(&empty),
                 summary.as_ref(),
                 store,
-                memory,
-                &mut temporary_memory,
                 force || previous.is_none(),
             );
             match result {
@@ -1536,28 +1357,6 @@ fn load_changed_hierarchies(
                     section_sources.extend(hierarchy.section_sources);
                     replaced_keys.extend(hierarchy.replaced_keys);
                     completed_groups.extend(hierarchy.affected_groups);
-                    let retained = summary
-                        .as_ref()
-                        .expect("successful group has a summary")
-                        .retained_bytes()?
-                        .checked_add(
-                            section_sources
-                                .len()
-                                .checked_mul(RETAINED_SOURCE_ENTRY_BYTES)
-                                .context("retained source-state memory overflow")?,
-                        )
-                        .and_then(|value| {
-                            value.checked_add(
-                                replaced_keys
-                                    .len()
-                                    .checked_mul(RETAINED_REPLACED_KEY_BYTES)?,
-                            )
-                        })
-                        .context("retained hierarchy memory overflow")?;
-                    if retained > accounted_retained {
-                        grow_retained_state(state_memory, retained - accounted_retained)?;
-                        accounted_retained = retained;
-                    }
                 }
                 Err(error) => {
                     last_error = Some(format!("{error:#}"));
@@ -1612,9 +1411,7 @@ fn train_dictionaries_from_sources(
     store: &PackStore,
     registry: &RegistrySnapshot,
     visibility: &VisibilityIndex,
-    memory: &Arc<ServerMemoryBudget>,
-) -> Result<(Vec<CanonicalObject>, Vec<MemoryPermit>)> {
-    let mut working = memory.try_reserve(MemoryClass::Build, 64 * 1024 * 1024)?;
+) -> Result<Vec<CanonicalObject>> {
     let mut corpora: [Vec<CanonicalObject>; super::manifest::CONTENT_CLASS_COUNT] =
         std::array::from_fn(|_| Vec::new());
     let mut corpus_bytes = [0usize; super::manifest::CONTENT_CLASS_COUNT];
@@ -1651,16 +1448,7 @@ fn train_dictionaries_from_sources(
         .map(|class| train_dictionary(class, std::mem::take(&mut corpora[class.index()])))
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
-    let retained = dictionaries.iter().try_fold(0usize, |total, object| {
-        total
-            .checked_add(object.byte_capacity())
-            .context("dictionary retained-memory overflow")
-    })?;
-    if retained > working.bytes() {
-        bail!("trained dictionaries exceed their bounded memory reservation");
-    }
-    working.shrink_to(retained);
-    Ok((dictionaries, vec![working]))
+    Ok(dictionaries)
 }
 
 fn prepare_section_states_from_sources(
@@ -1769,8 +1557,6 @@ fn load_region_hierarchy(
     previous_source_microtiles: &BTreeMap<SectionKey, [ObjectHash; 64]>,
     previous_summary: Option<&RegionalVisibilitySummary>,
     store: &mut PackStore,
-    memory: &Arc<ServerMemoryBudget>,
-    state_memory: &mut MemoryPermit,
     force: bool,
 ) -> Result<LoadedHierarchy> {
     if header.entries.len() != 1024 || expected_sources.len() != 1024 {
@@ -1798,12 +1584,7 @@ fn load_region_hierarchy(
     let mut section_sources = BTreeMap::<SectionKey, [ObjectHash; 64]>::new();
     let mut replaced_keys = BTreeSet::<SectionKey>::new();
     let mut affected_groups = BTreeSet::new();
-    let mut accounted_retained = 0usize;
     for (x, z) in group_ids {
-        // Owns the bounded Anvil/NBT input, normalized chunks, one hierarchy level, sibling
-        // reconstruction cache, and source encoding. The pack reserves its compression buffers
-        // separately; pressure therefore delays this group without withdrawing the active root.
-        let _group_memory = memory.try_reserve(MemoryClass::Build, GROUP_BUILD_WORKING_BYTES)?;
         let group = source.load_level_zero_group(x, z, registry)?;
         let coverage = group
             .chunks
@@ -1910,26 +1691,6 @@ fn load_region_hierarchy(
             current = next;
             changed_children = parents;
         }
-        let retained = summary
-            .retained_bytes()?
-            .checked_add(
-                section_sources
-                    .len()
-                    .checked_mul(RETAINED_SOURCE_ENTRY_BYTES)
-                    .context("retained source-state memory overflow")?,
-            )
-            .and_then(|value| {
-                value.checked_add(
-                    replaced_keys
-                        .len()
-                        .checked_mul(RETAINED_REPLACED_KEY_BYTES)?,
-                )
-            })
-            .context("retained hierarchy memory overflow")?;
-        if retained > accounted_retained {
-            grow_retained_state(state_memory, retained - accounted_retained)?;
-            accounted_retained = retained;
-        }
     }
     let visibility_summary = summary.finish_refresh(header.file_marker, expected_sources)?;
     Ok(LoadedHierarchy {
@@ -1938,47 +1699,6 @@ fn load_region_hierarchy(
         affected_groups,
         replaced_keys,
     })
-}
-
-fn grow_retained_state(permit: &mut MemoryPermit, additional: usize) -> Result<()> {
-    permit.try_grow(additional)?;
-    Ok(())
-}
-
-fn ensure_retained_state_capacity(permit: &mut MemoryPermit, required: usize) -> Result<()> {
-    if required > permit.bytes() {
-        permit.try_grow(required - permit.bytes())?;
-    }
-    Ok(())
-}
-
-fn retained_group_bytes(groups: &BTreeMap<SectionKey, GroupState>) -> Result<usize> {
-    retained_group_bytes_for_len(groups.len())
-}
-
-fn retained_group_bytes_for_len(entries: usize) -> Result<usize> {
-    entries
-        .checked_mul(128 + std::mem::size_of::<SectionKey>() + std::mem::size_of::<GroupState>())
-        .context("retained compact group-directory memory overflow")
-}
-
-fn directory_build_memory_bound(entries: usize) -> Result<usize> {
-    entries
-        .checked_mul(std::mem::size_of::<RootDirectoryEntry>() + 16)
-        .and_then(|bytes| bytes.checked_add(4 * 1024 * 1024))
-        .context("root-directory build memory overflow")
-}
-
-fn retained_region_bytes(
-    regions: &BTreeMap<(i32, i32), RegionalVisibilitySummary>,
-) -> Result<usize> {
-    regions
-        .values()
-        .try_fold(regions.len().saturating_mul(96), |total, region| {
-            total
-                .checked_add(region.retained_bytes()?)
-                .context("retained regional state memory overflow")
-        })
 }
 
 fn persist_source_sections(
@@ -2149,38 +1869,29 @@ fn registry_snapshot(registry: &RwLock<Registry>) -> Result<RegistrySnapshot> {
     Ok(read_lock(registry)?.snapshot())
 }
 
-fn load_root_dictionaries(
-    store: &PackStore,
-    root: RootRecord,
-) -> Result<(Vec<CanonicalObject>, Vec<MemoryPermit>)> {
+fn load_root_dictionaries(store: &PackStore, root: RootRecord) -> Result<Vec<CanonicalObject>> {
     let set_hash = root.dictionary_set;
     let set = store
         .get(set_hash)?
         .context("root dictionary set is missing")?;
     let set = DictionarySet::decode(set.bytes())?;
-    let mut by_class: [Option<(CanonicalObject, MemoryPermit)>;
-        super::manifest::CONTENT_CLASS_COUNT] = std::array::from_fn(|_| None);
+    let mut by_class: [Option<CanonicalObject>; super::manifest::CONTENT_CLASS_COUNT] =
+        std::array::from_fn(|_| None);
     for hash in set.dictionaries {
         let dictionary = store
             .get(hash)?
             .context("root compression dictionary is missing")?;
         let class = decode_dictionary(dictionary.bytes())?.class;
-        if by_class[class.index()]
-            .replace(dictionary.into_parts())
-            .is_some()
-        {
+        if by_class[class.index()].replace(dictionary).is_some() {
             bail!("root has duplicate class compression dictionaries");
         }
     }
     let mut dictionaries = Vec::with_capacity(super::manifest::CONTENT_CLASS_COUNT);
-    let mut memory = Vec::with_capacity(super::manifest::CONTENT_CLASS_COUNT);
     for (class, dictionary) in by_class.into_iter().enumerate() {
-        let (dictionary, permit) = dictionary
-            .with_context(|| format!("root has no dictionary for class {class}"))?;
-        dictionaries.push(dictionary);
-        memory.push(permit);
+        dictionaries
+            .push(dictionary.with_context(|| format!("root has no dictionary for class {class}"))?);
     }
-    Ok((dictionaries, memory))
+    Ok(dictionaries)
 }
 
 fn class_dictionary_hashes(
@@ -2208,16 +1919,8 @@ fn load_group_sections(
     root: SectionKey,
     group: &GroupState,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
-    verify_content_bytes: bool,
 ) -> Result<BTreeMap<SectionKey, SectionState>> {
-    load_group_sections_matching(
-        objects,
-        root,
-        group,
-        class_dictionaries,
-        verify_content_bytes,
-        |_| true,
-    )
+    load_group_sections_matching(objects, root, group, class_dictionaries, |_| true)
 }
 
 fn load_group_sections_matching(
@@ -2225,7 +1928,6 @@ fn load_group_sections_matching(
     root: SectionKey,
     group: &GroupState,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
-    verify_content_bytes: bool,
     include: impl Fn(SectionKey) -> bool,
 ) -> Result<BTreeMap<SectionKey, SectionState>> {
     let mut sections = BTreeMap::new();
@@ -2235,7 +1937,6 @@ fn load_group_sections_matching(
         group.manifest,
         spatial(root),
         class_dictionaries,
-        verify_content_bytes,
         &include,
         &mut visited,
         &mut sections,
@@ -2243,14 +1944,13 @@ fn load_group_sections_matching(
     Ok(sections)
 }
 
-fn validate_recovered_groups(
+fn check_recovered_groups(
     objects: &PackStore,
-    groups: &mut BTreeMap<SectionKey, GroupState>,
+    groups: &BTreeMap<SectionKey, GroupState>,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
 ) -> Result<()> {
-    for (&group_root, group) in groups {
-        group.section_count =
-            load_group_sections(objects, group_root, group, class_dictionaries, true)?.len();
+    for (&root, group) in groups {
+        load_group_sections(objects, root, group, class_dictionaries)?;
     }
     Ok(())
 }
@@ -2694,7 +2394,6 @@ fn load_directory(
                         root,
                         GroupState {
                             manifest: entry.hash,
-                            section_count: 0,
                         },
                     )
                     .is_some()
@@ -2712,7 +2411,6 @@ fn load_manifest_tree(
     hash: ObjectHash,
     expected_root: SpatialNode,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
-    verify_content_bytes: bool,
     include: &impl Fn(SectionKey) -> bool,
     visited: &mut HashSet<ObjectHash>,
     sections: &mut BTreeMap<SectionKey, SectionState>,
@@ -2772,14 +2470,9 @@ fn load_manifest_tree(
             bail!("manifest contains a duplicate descriptor page");
         }
     }
-    for (key, state) in sections_from_manifest(
-        &manifest,
-        &pages,
-        objects,
-        class_dictionaries,
-        verify_content_bytes,
-        include,
-    )? {
+    for (key, state) in
+        sections_from_manifest(&manifest, &pages, objects, class_dictionaries, include)?
+    {
         if sections.insert(key, state).is_some() {
             bail!("manifest graph contains a duplicate structural node");
         }
@@ -2792,7 +2485,6 @@ fn sections_from_manifest(
     pages: &BTreeMap<usize, ManifestDescriptorPage>,
     objects: &PackStore,
     class_dictionaries: &[ObjectHash; super::manifest::CONTENT_CLASS_COUNT],
-    verify_content_bytes: bool,
     include: &impl Fn(SectionKey) -> bool,
 ) -> Result<BTreeMap<SectionKey, SectionState>> {
     let mut result = BTreeMap::new();
@@ -2842,7 +2534,6 @@ fn sections_from_manifest(
                         expected_kind,
                         class_dictionaries[class.index()],
                         "content microtile",
-                        verify_content_bytes,
                     )?;
                 }
                 for dependency in &content.dependencies {
@@ -2852,7 +2543,6 @@ fn sections_from_manifest(
                         expected_kind,
                         class_dictionaries[class.index()],
                         "content dependency",
-                        verify_content_bytes,
                     )?;
                 }
                 for dependencies in &content.neighbor_dependencies {
@@ -2863,7 +2553,6 @@ fn sections_from_manifest(
                             ObjectKind::ComplexMicrotile,
                             class_dictionaries[ContentClass::Complex.index()],
                             "neighbor dependency",
-                            verify_content_bytes,
                         )?;
                     }
                 }
@@ -2889,21 +2578,12 @@ fn validate_content_object(
     expected_kind: ObjectKind,
     expected_dictionary: ObjectHash,
     label: &str,
-    verify_canonical: bool,
 ) -> Result<()> {
     let location = objects
         .location(hash)
         .with_context(|| format!("{label} has no pack location"))?;
     if location.kind != expected_kind || location.dictionary != expected_dictionary {
         bail!("{label} has the wrong type or dictionary");
-    }
-    if verify_canonical {
-        let canonical = objects
-            .get(hash)?
-            .with_context(|| format!("{label} disappeared while validating its root closure"))?;
-        if canonical.kind() != expected_kind {
-            bail!("{label} canonical data disagrees with its pack metadata");
-        }
     }
     Ok(())
 }
@@ -2974,4 +2654,46 @@ fn descendant_depth(root: SectionKey, key: SectionKey) -> Option<u8> {
         current = current.parent()?;
     }
     (current == root).then_some(depth)
+}
+
+fn key_from_morton(root: SpatialNode, depth: u8, morton: usize) -> Result<SectionKey> {
+    let mut x = root.x;
+    let mut y = root.y;
+    let mut z = root.z;
+    for step in (0..depth).rev() {
+        let octant = (morton >> (usize::from(step) * 3)) & 7;
+        x = x
+            .checked_mul(2)
+            .and_then(|value| value.checked_add((octant & 1) as i32))
+            .context("manifest x overflow")?;
+        y = y
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(((octant >> 1) & 1) as i32))
+            .context("manifest y overflow")?;
+        z = z
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(((octant >> 2) & 1) as i32))
+            .context("manifest z overflow")?;
+    }
+    SectionKey::new(root.lod - depth, x, y, z)
+}
+
+fn top_root(mut key: SectionKey) -> SectionKey {
+    while let Some(parent) = key.parent() {
+        key = parent;
+    }
+    key
+}
+
+fn spatial(key: SectionKey) -> SpatialNode {
+    SpatialNode {
+        lod: key.level,
+        x: key.x,
+        y: key.y,
+        z: key.z,
+    }
+}
+
+fn key(node: SpatialNode) -> Result<SectionKey> {
+    SectionKey::new(node.lod, node.x, node.y, node.z)
 }

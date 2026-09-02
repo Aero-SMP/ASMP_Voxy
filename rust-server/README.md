@@ -13,9 +13,9 @@ incoming, and grace-period roots while compacting reachable objects.
 
 ## Running
 
-The normal and debug server/controller JARs both contain the Linux x86-64 release executable. The
-controller extracts it, starts it with `voxy-rust.toml`, forwards its log output, restarts it after
-an unexpected exit, and stops it with Minecraft. The host must provide `libzstd.so.1`.
+The server-controller JAR contains the Linux x86-64 release executable. The controller extracts
+it, starts it with `voxy-rust.toml`, forwards its log output, restarts it after an unexpected exit,
+and stops it with Minecraft. The host must provide `libzstd.so.1`.
 
 The backend can also be run directly:
 
@@ -24,9 +24,9 @@ cargo build --release --locked --bin voxy-rust-server
 target/release/voxy-rust-server --config voxy-rust.toml
 ```
 
-`--once` refreshes the configured worlds and exits without opening a listener. Configuration is
-file-only; there are no environment-variable overrides. See
-`examples/voxy-rust-direct.toml` and `examples/voxy-rust-minecraft.toml`.
+`--once` refreshes the configured worlds and exits without opening a QUIC endpoint. Configuration
+is file-only; there are no environment-variable overrides. See
+`examples/voxy-rust-quic.toml`.
 
 The save root automatically discovers:
 
@@ -37,10 +37,10 @@ The save root automatically discovers:
 
 `poll_ms` controls how often Anvil changes are coalesced into a new transactional root.
 `rayon_threads = 0` uses Rayon's default worker count.
-`memory.managed_mib` is the single process-wide managed allocation budget (2 GiB by default),
-and `memory.max_connections` bounds live sessions. Reaching the budget delays lower-priority
-publication or maintenance without deleting the current root; an impossible request fails with a
-typed pressure error rather than deadlocking.
+Streaming uses finite active request streams, bounded response records, positional packfile reads,
+and QUIC stream and connection flow control. Publication normalizes one changed 2-by-2 chunk group
+at a time, compression writes one object at a time, and large indexes remain file-backed. There is
+no aggregate memory governor.
 
 Visibility defaults to sky-exterior inference only for `minecraft:overworld`, portal connectivity
 for `minecraft:the_nether`, and conservative visibility for the End and unknown dimensions. A
@@ -53,20 +53,28 @@ safe per-dimension override can select `portal_only` or `conservative`:
 
 `sky_exterior` is rejected for every dimension except `minecraft:overworld`.
 
-## Transports
+## Network
 
-`transport = "direct"` opens `direct.listen`. The authenticated Minecraft controller advertises
-`direct.advertise_host` and `direct.advertise_port`; an empty host reuses the Minecraft server
-hostname, while port zero reuses the listener port. Terrain traffic then travels directly between
-the Java client and Rust.
+`quic.listen` binds the UDP terrain endpoint. The authenticated Minecraft server mod advertises
+`quic.advertise_host` and `quic.advertise_port`; an empty host reuses the authenticated Minecraft
+peer address, while port zero uses the port Rust actually bound. A nonzero advertised port supports
+NAT or proxy remapping. Minecraft TCP and Voxy UDP may use the same numeric port.
 
-Direct Voxy traffic has no second account challenge or encryption. Firewall, proxy, or private
-network controls are required when the endpoint must not be publicly usable.
+Rust creates or reloads a persistent QUIC certificate and private key below the configured
+`data/quic` directory. QUIC traffic is encrypted, and the controller authenticates the exact
+certificate to the client through Minecraft by forwarding Rust's ALPN and SHA-256 fingerprint.
+Rust has no second account challenge, so firewall or private-network controls remain appropriate
+when arbitrary protocol clients must not reach the endpoint.
 
-`transport = "minecraft"` opens the mode-0600 Unix socket configured by `minecraft.socket`. The
-controller relays opaque terrain frames over the existing Minecraft connection, so Rust opens
-no additional public port.
+After binding and loading that identity, Rust emits exactly one controller readiness record:
 
-Both transports carry the same bounded frames: root announcements, subtree requests,
-manifest data, exact object requests, object bundles, root-ready acknowledgements, camera-domain
-updates, byte credit, ping, and errors.
+```text
+VOXY_READY udp_port=<1..65535> alpn=<ASCII token> cert_sha256=<64 lowercase hex>
+```
+
+Each connection owns one long-lived bidirectional control stream for hello, root announcements,
+leases, activation, camera-domain messages, and bounded errors. Terrain, manifests, catalogs, and
+dictionaries use short-lived client-initiated bidirectional request streams. Each request names
+one root token, one priority lane, and a bounded same-lane list of canonical object hashes. QUIC
+provides liveness and flow control; there is no application ping, byte-credit frame, TCP listener,
+or Minecraft terrain relay.

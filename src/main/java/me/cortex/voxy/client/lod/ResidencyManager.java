@@ -20,9 +20,7 @@ import java.util.function.Consumer;
 
 /** Bounded residency for authenticated objects and their parsed production forms. */
 public final class ResidencyManager implements AutoCloseable {
-    private static final long OBJECT_RECORD_BYTES = 128;
     private static final int MAX_PINNED_ROOTS = 3;
-    private static final long PIN_ENTRY_BYTES = 96;
 
     public record Limits(int maxObjects, int maxManifestObjects) {
         public Limits {
@@ -36,6 +34,11 @@ public final class ResidencyManager implements AutoCloseable {
     public record ObjectStatus(boolean compressed, boolean decoded, boolean meshing,
                                boolean renderable) {}
 
+    /** Compact owner-thread snapshot used only when a debug client requests a report. */
+    public record Diagnostics(int objects, int decodedObjects, int preparedMicrotiles,
+                              int manifestObjects, int pinnedRoots, int pinnedObjects,
+                              int objectLimit, int manifestLimit) {}
+
     /** Result of an atomic root-pin update. Missing residency is recoverable demand. */
     public enum PinResult {
         MISSING,
@@ -43,42 +46,28 @@ public final class ResidencyManager implements AutoCloseable {
         CHANGED
     }
 
-    private final MemoryBudget memory;
     private final Limits limits;
     private final Map<Hash256, ResidentObject> objects = new LinkedHashMap<>(16, 0.75f, true);
     private final Map<Hash256, ManifestRecord> manifests = new LinkedHashMap<>(16, 0.75f, true);
     private final Map<RootToken, Set<Hash256>> rootPins = new HashMap<>();
-    private final MemoryBudget.Reservation pinTableMemory;
     private boolean closed;
 
-    public ResidencyManager(String dimension, MemoryBudget memory,
-                              Limits limits) {
+    public ResidencyManager(String dimension, Limits limits) {
         Objects.requireNonNull(dimension, "dimension");
         if (dimension.isEmpty()) throw new IllegalArgumentException("dimension is empty");
-        this.memory = Objects.requireNonNull(memory, "memory");
         this.limits = Objects.requireNonNull(limits, "limits");
-        long pinBytes = Math.multiplyExact((long) limits.maxObjects(),
-                Math.multiplyExact(PIN_ENTRY_BYTES, MAX_PINNED_ROOTS + 2L));
-        this.pinTableMemory = memory.tryReserve(MemoryBudget.Allocation.of(
-                MemoryBudget.Pool.OBJECT_TABLE, pinBytes)).orElseThrow(() ->
-                new IllegalStateException(
-                        "Virtual Surface memory budget cannot admit bounded root-pin tables"));
     }
 
     /** Atomically admits the compressed envelope and verified canonical representation. */
     public synchronized boolean admitVerifiedObject(EncodedObject encoded,
-                                                     CanonicalObject canonical) {
+                                                     DecodedObject decoded) {
         ensureOpen();
         Objects.requireNonNull(encoded, "encoded");
-        Objects.requireNonNull(canonical, "canonical");
-        if (!encoded.hash().equals(canonical.hash()) || encoded.kind() != canonical.kind()
-                || encoded.canonicalLength() != canonical.canonicalLength()) {
-            throw new IllegalArgumentException("encoded and canonical object metadata disagree");
-        }
+        Objects.requireNonNull(decoded, "decoded");
         ResidentObject existing = this.objects.get(encoded.hash());
         if (existing != null) {
-            if (existing.canonical != null && !existing.canonical.equals(canonical)) {
-                throw new IllegalStateException("conflicting canonical content for one hash");
+            if (existing.decoded != null && !existing.decoded.equals(decoded)) {
+                throw new IllegalStateException("conflicting decoded content for one hash");
             }
             // Compression is deliberately outside canonical object identity. A later root may
             // encode the same authenticated object with a newly trained dictionary or different
@@ -87,54 +76,28 @@ public final class ResidencyManager implements AutoCloseable {
             return true;
         }
         if (!makeObjectRoom()) return false;
-        MemoryBudget.Allocation allocation = new MemoryBudget.Allocation(
-                0, OBJECT_RECORD_BYTES, encoded.compressedLength(), canonical.canonicalLength(),
-                0, 0, 0, 0);
-        Optional<MemoryBudget.Reservation> reservation = this.memory.tryReserve(allocation);
-        if (reservation.isEmpty()) {
-            reclaimUnreferencedLocked();
-            reservation = this.memory.tryReserve(allocation);
-            if (reservation.isEmpty()) return false;
-        }
-        this.objects.put(encoded.hash(), new ResidentObject(encoded, canonical,
-                reservation.orElseThrow()));
+        this.objects.put(encoded.hash(), new ResidentObject(decoded));
         return true;
     }
 
-    /** Parses and retains one authenticated root-directory or manifest-subtree object. */
-    public synchronized boolean installManifestObject(CanonicalObject canonical)
-            throws ManifestCodec.DecodeException {
+    /** Retains the decoded form of one authenticated manifest object. */
+    public synchronized boolean installManifestObject(DecodedObject decoded) {
         ensureOpen();
-        Objects.requireNonNull(canonical, "canonical");
-        if (this.manifests.containsKey(canonical.hash())) return false;
-        ResidentObject resident = requireCanonical(canonical);
-        if (canonical.kind() != ObjectKind.ROOT_DIRECTORY
-                && canonical.kind() != ObjectKind.MANIFEST_SUBTREE
-                && canonical.kind() != ObjectKind.MANIFEST_DESCRIPTOR_PAGE) {
-            throw new IllegalArgumentException("object is not production manifest metadata");
-        }
+        Objects.requireNonNull(decoded, "decoded");
+        if (this.manifests.containsKey(decoded.hash())) return false;
+        ResidentObject resident = requireDecoded(decoded);
         if (this.manifests.size() >= this.limits.maxManifestObjects()) {
-            reclaimUnreferencedLocked(Set.of(canonical.hash()));
+            reclaimUnreferencedLocked(Set.of(decoded.hash()));
             if (this.manifests.size() >= this.limits.maxManifestObjects()) return false;
         }
-        Object parsed = switch (canonical.kind()) {
-            case ROOT_DIRECTORY -> ManifestCodec.decodeRootDirectory(canonical.bytesInternal());
-            case MANIFEST_SUBTREE -> ManifestCodec.decodeManifestSubtree(canonical.bytesInternal());
-            case MANIFEST_DESCRIPTOR_PAGE ->
-                    ManifestCodec.decodeDescriptorPage(canonical.bytesInternal());
+        Object parsed = switch (decoded.kind()) {
+            case ROOT_DIRECTORY -> decoded.rootDirectory();
+            case MANIFEST_SUBTREE -> decoded.manifestSubtree();
+            case MANIFEST_DESCRIPTOR_PAGE -> decoded.descriptorPage();
             default -> throw new IllegalArgumentException("object is not manifest metadata");
         };
-        long retainedBytes = manifestRetainedBytes(canonical.canonicalLength(), parsed);
-        Optional<MemoryBudget.Reservation> retained = this.memory.tryReserve(
-                MemoryBudget.Allocation.of(MemoryBudget.Pool.MANIFEST, retainedBytes));
-        if (retained.isEmpty()) {
-            reclaimUnreferencedLocked(Set.of(canonical.hash()));
-            retained = this.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.MANIFEST, retainedBytes));
-            if (retained.isEmpty()) return false;
-        }
-        this.manifests.put(canonical.hash(), new ManifestRecord(parsed, retained.orElseThrow()));
-        resident.discardCanonical();
+        this.manifests.put(decoded.hash(), new ManifestRecord(parsed));
+        resident.discardDecoded();
         return true;
     }
 
@@ -159,40 +122,23 @@ public final class ResidencyManager implements AutoCloseable {
                 ? Optional.of(page) : Optional.empty();
     }
 
-    /** Translates and retains one fixed-8-cubed object under the decoded-content budget. */
-    public synchronized boolean installMicrotile(CanonicalObject canonical,
+    /** Translates and retains one fixed-8-cubed object. */
+    public synchronized boolean installMicrotile(DecodedObject decoded,
                                                  long expectedCatalogId,
                                                  int[] blockTranslations,
                                                  int[] biomeTranslations)
             throws MicrotileCodec.DecodeException {
         ensureOpen();
-        Objects.requireNonNull(canonical, "canonical");
-        ResidentObject resident = requireCanonical(canonical);
-        if (!isMicrotile(canonical.kind())) {
+        Objects.requireNonNull(decoded, "decoded");
+        ResidentObject resident = requireDecoded(decoded);
+        if (!isMicrotile(decoded.kind())) {
             throw new IllegalArgumentException("object is not a production microtile");
         }
         if (resident.preparedMicrotile != null) return false;
-        long retainedBytes = Math.addExact(OBJECT_RECORD_BYTES,
-                (long) MicrotileCodec.CELL_COUNT * Long.BYTES);
-        Optional<MemoryBudget.Reservation> preparedMemory = this.memory.tryReserve(
-                MemoryBudget.Allocation.of(MemoryBudget.Pool.DECODED, retainedBytes));
-        if (preparedMemory.isEmpty()) {
-            reclaimUnreferencedLocked(Set.of(canonical.hash()));
-            preparedMemory = this.memory.tryReserve(
-                    MemoryBudget.Allocation.of(MemoryBudget.Pool.DECODED, retainedBytes));
-            if (preparedMemory.isEmpty()) return false;
-        }
-        MicrotileCodec.Prepared prepared;
-        try {
-            prepared = MicrotileCodec.decode(canonical.bytesInternal(), canonical.kind(),
-                    expectedCatalogId, blockTranslations, biomeTranslations, true);
-        } catch (MicrotileCodec.DecodeException | RuntimeException failure) {
-            preparedMemory.orElseThrow().close();
-            throw failure;
-        }
+        MicrotileCodec.Prepared prepared = MicrotileCodec.prepare(decoded.microtile(),
+                expectedCatalogId, blockTranslations, biomeTranslations, true);
         resident.preparedMicrotile = prepared;
-        resident.preparedMemory = preparedMemory.orElseThrow();
-        resident.discardCanonical();
+        resident.discardDecoded();
         return true;
     }
 
@@ -202,11 +148,18 @@ public final class ResidencyManager implements AutoCloseable {
         return object == null ? Optional.empty() : Optional.ofNullable(object.preparedMicrotile);
     }
 
-    /** Returns canonical data retained for catalog, dictionary, or not-yet-installed content. */
-    public synchronized Optional<CanonicalObject> verifiedCanonical(Hash256 hash) {
+    /** Allocation-free prepared-content probe for hot selector snapshot publication. */
+    public synchronized boolean hasPreparedMicrotile(Hash256 hash) {
         ensureOpen();
         ResidentObject object = this.objects.get(Objects.requireNonNull(hash, "hash"));
-        return object == null ? Optional.empty() : Optional.ofNullable(object.canonical);
+        return object != null && object.preparedMicrotile != null;
+    }
+
+    /** Returns an authenticated object whose decoded payload has not yet been installed. */
+    public synchronized Optional<DecodedObject> decodedObject(Hash256 hash) {
+        ensureOpen();
+        ResidentObject object = this.objects.get(Objects.requireNonNull(hash, "hash"));
+        return object == null ? Optional.empty() : Optional.ofNullable(object.decoded);
     }
 
     /** Pins one reachable object to an immutable root until that root is released. */
@@ -262,7 +215,7 @@ public final class ResidencyManager implements AutoCloseable {
         return PinResult.CHANGED;
     }
 
-    /** Visits retained-root hashes without materializing another budget-sized set. */
+    /** Visits retained-root hashes without materializing another set. */
     public synchronized void forEachProtectedHash(Consumer<Hash256> visitor) {
         ensureOpen();
         Objects.requireNonNull(visitor, "visitor");
@@ -279,7 +232,7 @@ public final class ResidencyManager implements AutoCloseable {
         ResidentObject object = this.objects.get(Objects.requireNonNull(hash, "hash"));
         if (object == null) return Optional.empty();
         boolean parsed = this.manifests.containsKey(hash);
-        boolean decoded = object.canonical != null || object.preparedMicrotile != null || parsed;
+        boolean decoded = object.decoded != null || object.preparedMicrotile != null || parsed;
         return Optional.of(new ObjectStatus(true, decoded, false,
                 object.preparedMicrotile != null));
     }
@@ -289,23 +242,35 @@ public final class ResidencyManager implements AutoCloseable {
         return this.objects.containsKey(Objects.requireNonNull(hash, "hash"));
     }
 
+    public synchronized Diagnostics diagnostics() {
+        ensureOpen();
+        int decoded = 0;
+        int prepared = 0;
+        for (ResidentObject object : this.objects.values()) {
+            if (object.decoded != null) decoded++;
+            if (object.preparedMicrotile != null) prepared++;
+        }
+        int pins = 0;
+        for (Set<Hash256> root : this.rootPins.values()) pins += root.size();
+        return new Diagnostics(this.objects.size(), decoded, prepared, this.manifests.size(),
+                this.rootPins.size(), pins, this.limits.maxObjects(),
+                this.limits.maxManifestObjects());
+    }
+
     @Override
     public synchronized void close() {
         if (this.closed) return;
         this.closed = true;
-        for (ManifestRecord manifest : this.manifests.values()) manifest.close();
-        for (ResidentObject object : this.objects.values()) object.close();
         this.manifests.clear();
         this.objects.clear();
         this.rootPins.clear();
-        this.pinTableMemory.close();
     }
 
-    private ResidentObject requireCanonical(CanonicalObject canonical) {
-        ResidentObject object = this.objects.get(canonical.hash());
-        if (object == null || object.canonical == null || !object.canonical.equals(canonical)) {
+    private ResidentObject requireDecoded(DecodedObject decoded) {
+        ResidentObject object = this.objects.get(decoded.hash());
+        if (object == null || object.decoded == null || !object.decoded.equals(decoded)) {
             throw new IllegalArgumentException(
-                    "object was not admitted as verified canonical data");
+                    "object was not admitted as authenticated decoded data");
         }
         return object;
     }
@@ -326,9 +291,7 @@ public final class ResidencyManager implements AutoCloseable {
         while (iterator.hasNext()) {
             Map.Entry<Hash256, ResidentObject> entry = iterator.next();
             if (isProtected(entry.getKey(), additionallyProtected)) continue;
-            ManifestRecord manifest = this.manifests.remove(entry.getKey());
-            if (manifest != null) manifest.close();
-            entry.getValue().close();
+            this.manifests.remove(entry.getKey());
             iterator.remove();
             reclaimed++;
         }
@@ -360,66 +323,27 @@ public final class ResidencyManager implements AutoCloseable {
                 || kind == ObjectKind.COMPLEX_MICROTILE;
     }
 
-    private static long manifestRetainedBytes(int canonicalLength, Object parsed) {
-        long supplemental;
-        if (parsed instanceof ManifestSubtree subtree) {
-            supplemental = Math.addExact(
-                    Math.multiplyExact((long) subtree.structuralSlots(), Integer.BYTES),
-                    Math.addExact(
-                            Math.multiplyExact((long) subtree.descriptorPageSlots(), Integer.BYTES),
-                            Math.multiplyExact((long) subtree.availableNodeCount(), 64L)));
-        } else if (parsed instanceof DescriptorPage page) {
-            supplemental = Math.multiplyExact((long) page.slotCount(), 192L);
-        } else {
-            supplemental = Math.multiplyExact((long) ((RootDirectory) parsed).entries().size(),
-                    160L);
-        }
-        return Math.addExact(Math.multiplyExact((long) canonicalLength, 2L), supplemental);
-    }
-
     private void ensureOpen() {
         if (this.closed) throw new IllegalStateException("residency is closed");
     }
 
-    private static final class ResidentObject implements AutoCloseable {
-        private final EncodedObject encoded;
-        private final MemoryBudget.Reservation memory;
-        private CanonicalObject canonical;
+    private static final class ResidentObject {
+        private DecodedObject decoded;
         private MicrotileCodec.Prepared preparedMicrotile;
-        private MemoryBudget.Reservation preparedMemory;
 
-        private ResidentObject(EncodedObject encoded, CanonicalObject canonical,
-                               MemoryBudget.Reservation memory) {
-            this.encoded = encoded;
-            this.canonical = canonical;
-            this.memory = memory;
+        private ResidentObject(DecodedObject decoded) {
+            this.decoded = decoded;
         }
 
-        private void discardCanonical() {
-            if (this.canonical == null) return;
-            this.memory.reduceTo(new MemoryBudget.Allocation(
-                    0, OBJECT_RECORD_BYTES, this.encoded.compressedLength(), 0,
-                    0, 0, 0, 0));
-            this.canonical = null;
+        private void discardDecoded() {
+            this.decoded = null;
         }
 
-        @Override
-        public void close() {
-            if (this.preparedMemory != null) this.preparedMemory.close();
-            this.memory.close();
-        }
     }
 
-    private record ManifestRecord(Object value, MemoryBudget.Reservation memory)
-            implements AutoCloseable {
+    private record ManifestRecord(Object value) {
         private ManifestRecord {
             Objects.requireNonNull(value, "value");
-            Objects.requireNonNull(memory, "memory");
-        }
-
-        @Override
-        public void close() {
-            this.memory.close();
         }
     }
 }

@@ -353,7 +353,7 @@ float screenSpaceError(uint node, bool predicted) {
     return errorBlocks * projectionScale / closestDistance;
 }
 
-bool shouldDescend(uint node, bool predicted) {
+bool wantsDescend(uint node, bool predicted) {
     if (childMask(node) == 0u) return false;
     // Structural metadata is complete before bounded descriptor pages. Until this node's page
     // arrives, select its hierarchy level from SSE alone and return the node key to the CPU.
@@ -364,6 +364,18 @@ bool shouldDescend(uint node, bool predicted) {
     // eligible descendants, independently of its own error value.
     if (selectedClasses(node) == 0u) return true;
     return screenSpaceError(node, predicted) > sseThresholdPixels;
+}
+
+bool childStructureReady(uint node) {
+    uint required = childMask(node);
+    for (uint child = 0u; child < 8u; child++) {
+        if ((required & (1u << child)) != 0u && childAt(node, child) == NO_NODE) return false;
+    }
+    return true;
+}
+
+bool shouldDescend(uint node, bool predicted) {
+    return wantsDescend(node, predicted) && childStructureReady(node);
 }
 
 bool selectedInCut(uint node, bool predicted) {
@@ -392,7 +404,8 @@ float selectionScore(uint node, bool predicted) {
     return predicted ? score * 0.125f : score + 1048576.0f;
 }
 
-void appendEntry(uint queue, uint node, uvec2 masks[3], float score) {
+void appendEntry(uint queue, uint node, uvec2 masks[3], float score,
+                 bool structureBlocked) {
     uint index;
     uint overflowBit;
     if (queue == 0u) {
@@ -417,7 +430,7 @@ void appendEntry(uint queue, uint node, uvec2 masks[3], float score) {
     outputWords[base + 7u] = masks[1].y;
     outputWords[base + 8u] = masks[2].x;
     outputWords[base + 9u] = masks[2].y;
-    outputWords[base + 10u] = 0u;
+    outputWords[base + 10u] = structureBlocked ? 1u : 0u;
     outputWords[base + 11u] = 0u;
 }
 
@@ -431,9 +444,13 @@ void main() {
     currentMasks[2] = uvec2(0u);
     bool current = selectedInCut(node, false);
     if (current) selectedContentMasks(node, false, currentMasks);
-    if (current && (!descriptorReady(node) || classesForMasks(currentMasks) != 0u)) {
+    bool currentStructureBlocked = current && wantsDescend(node, false)
+            && !childStructureReady(node);
+    if (current && (!descriptorReady(node) || classesForMasks(currentMasks) != 0u
+            || currentStructureBlocked)) {
         float score = selectionScore(node, false);
-        appendEntry(0u, node, currentMasks, score);
+        appendEntry(0u, node, currentMasks, score,
+                currentStructureBlocked);
     }
 
     bool predicted = selectedInCut(node, true);
@@ -447,6 +464,6 @@ void main() {
     }
     if (classesForMasks(predictedMasks) != 0u) {
         float score = selectionScore(node, true);
-        appendEntry(1u, node, predictedMasks, score);
+        appendEntry(1u, node, predictedMasks, score, false);
     }
 }

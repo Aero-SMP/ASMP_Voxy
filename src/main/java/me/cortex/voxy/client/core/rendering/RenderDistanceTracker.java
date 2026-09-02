@@ -6,11 +6,15 @@ import java.util.function.LongConsumer;
 
 public class RenderDistanceTracker {
     private static final int CHECK_DISTANCE_BLOCKS = 128;
+    private static final int MAX_OPERATIONS_PER_UPDATE = 512;
+    private static final long PROCESS_BUDGET_NANOS = 1_000_000L;
     private final LongConsumer addTopLevelNode;
     private final LongConsumer removeTopLevelNode;
-    private final int processRate;
     private final int minSec;
     private final int maxSec;
+    private final long[] candidateKeys = new long[MAX_OPERATIONS_PER_UPDATE];
+    private final long[] candidateDistances = new long[MAX_OPERATIONS_PER_UPDATE];
+    private final byte[] candidateOperations = new byte[MAX_OPERATIONS_PER_UPDATE];
     private Long2ByteOpenHashMap operations = new Long2ByteOpenHashMap(1<<13);
     private int[] boundDist;
     private int radius;
@@ -19,13 +23,13 @@ public class RenderDistanceTracker {
     private int renderDistance;
     private double posX;
     private double posZ;
-    public RenderDistanceTracker(int rate, int minSec, int maxSec, LongConsumer addTopLevelNode, LongConsumer removeTopLevelNode) {
+    public RenderDistanceTracker(int minSec, int maxSec, LongConsumer addTopLevelNode,
+                                 LongConsumer removeTopLevelNode) {
         this.addTopLevelNode = addTopLevelNode;
         this.removeTopLevelNode = removeTopLevelNode;
         this.radius = this.renderDistance = 2;
         this.boundDist = generateBoundingHalfCircleDistance(this.radius);
         this.fillRing(true);
-        this.processRate = rate;
         this.minSec = minSec;
         this.maxSec = maxSec;
     }
@@ -55,8 +59,7 @@ public class RenderDistanceTracker {
             this.moveCenter(((int)x)>>9, ((int)z)>>9);
         }
 
-        //TODO: make process rate in terms of updatesPerSecond not updates per frame
-        return this.process(this.processRate)!=0;
+        return this.process()!=0;
     }
 
     private void add(int x, int z) {
@@ -172,25 +175,59 @@ public class RenderDistanceTracker {
         }
     }
 
-    private int process(int count) {
+    private int process() {
         if (this.operations.isEmpty()) {
             return 0;
         }
+        int candidates = 0;
         var iter = this.operations.long2ByteEntrySet().fastIterator();
-        int processed = 0;
-        while (iter.hasNext() && count--!=0) {
+        while (iter.hasNext()) {
             var entry = iter.next();
             if (entry.getByteValue()==0) {
                 iter.remove();
-                count++;
                 continue;
             }
-            processed++;
             byte op = entry.getByteValue();
             if (op != 1 && op != -1) {
                 throw new IllegalStateException();
             }
-            long pos = entry.getLongKey();
+            long key = entry.getLongKey();
+            int x = (int) key;
+            int z = (int) (key >>> 32);
+            long dx = (long) x - this.centerX;
+            long dz = (long) z - this.centerZ;
+            long distance = dx * dx + dz * dz;
+            int insertion = candidates;
+            if (insertion == MAX_OPERATIONS_PER_UPDATE
+                    && compare(op, distance, key,
+                    this.candidateOperations[insertion - 1],
+                    this.candidateDistances[insertion - 1],
+                    this.candidateKeys[insertion - 1]) >= 0) continue;
+            if (insertion == MAX_OPERATIONS_PER_UPDATE) insertion--;
+            while (insertion > 0 && compare(op, distance, key,
+                    this.candidateOperations[insertion - 1],
+                    this.candidateDistances[insertion - 1],
+                    this.candidateKeys[insertion - 1]) < 0) {
+                if (insertion < MAX_OPERATIONS_PER_UPDATE) {
+                    this.candidateOperations[insertion] = this.candidateOperations[insertion - 1];
+                    this.candidateDistances[insertion] = this.candidateDistances[insertion - 1];
+                    this.candidateKeys[insertion] = this.candidateKeys[insertion - 1];
+                }
+                insertion--;
+            }
+            this.candidateOperations[insertion] = op;
+            this.candidateDistances[insertion] = distance;
+            this.candidateKeys[insertion] = key;
+            if (candidates < MAX_OPERATIONS_PER_UPDATE) candidates++;
+        }
+
+        long deadline = System.nanoTime() + PROCESS_BUDGET_NANOS;
+        int processed = 0;
+        for (int index = 0; index < candidates; index++) {
+            if (processed != 0 && System.nanoTime() - deadline >= 0) break;
+            long pos = this.candidateKeys[index];
+            byte op = this.operations.remove(pos);
+            if (op == 0) continue;
             int x = (int) (pos&0xFFFFFFFFL);
             int z = (int) ((pos>>>32)&0xFFFFFFFFL);
             if (op == 1) {
@@ -198,9 +235,19 @@ public class RenderDistanceTracker {
             } else {
                 this.rem(x, z);
             }
-            iter.remove();
+            processed++;
         }
         return processed;
+    }
+
+    /** Additions nearest the camera precede removals; obsolete removals run farthest-first. */
+    private static int compare(byte leftOperation, long leftDistance, long leftKey,
+                               byte rightOperation, long rightDistance, long rightKey) {
+        if (leftOperation != rightOperation) return leftOperation == 1 ? -1 : 1;
+        int distance = leftOperation == 1
+                ? Long.compare(leftDistance, rightDistance)
+                : Long.compare(rightDistance, leftDistance);
+        return distance != 0 ? distance : Long.compareUnsigned(leftKey, rightKey);
     }
 
     private static int[] generateBoundingHalfCircleDistance(int radius) {

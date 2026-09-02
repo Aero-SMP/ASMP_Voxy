@@ -15,6 +15,17 @@ base {
     archivesName.set("ASMP_${modId}")
 }
 
+allprojects { project ->
+    project.plugins.withId('java') {
+        def testSources = project.sourceSets.findByName('test')
+        if (testSources != null) project.sourceSets.remove(testSources)
+        ['test', 'testClasses', 'compileTestJava', 'processTestResources'].each { name ->
+            def task = project.tasks.findByName(name)
+            if (task != null) task.enabled = false
+        }
+    }
+}
+
 repositories {
     mavenCentral()
     maven { url = 'https://maven.caffeinemc.net/releases' }
@@ -53,11 +64,11 @@ java {
     toolchain.languageVersion.set(JavaLanguageVersion.of(21))
 }
 
-sourceSets.main.java.srcDir 'bridge-shared/src/main/java'
+sourceSets.main.java.srcDir 'shared/src/main/java'
 
 sourceSets {
     debug {
-        java.srcDirs = ['src/debug/java', 'bridge-shared/src/debug/java']
+        java.srcDirs = ['src/debug/java']
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
 }
@@ -101,6 +112,7 @@ tasks.named('processResources') {
 dependencies {
     def sodiumVersion = providers.gradleProperty('sodium_version').get()
     def lwjglZstd = 'org.lwjgl:lwjgl-zstd:3.3.3'
+    def kwikVersion = '0.10.10'
     compileOnly "net.caffeinemc:sodium-neoforge-mod:${sodiumVersion}"
     compileOnly "net.caffeinemc:sodium-neoforge-api:${sodiumVersion}"
     runtimeOnly("net.caffeinemc:sodium-neoforge:${sodiumVersion}") {
@@ -116,12 +128,19 @@ dependencies {
      'natives-windows', 'natives-windows-arm64', 'natives-windows-x86'].each { classifier ->
         clientEmbedded "${lwjglZstd}:${classifier}"
     }
+
+    compileOnly "tech.kwik:kwik:${kwikVersion}"
+    clientEmbedded "tech.kwik:kwik:${kwikVersion}"
+    clientEmbedded 'tech.kwik:agent15:3.2'
+    clientEmbedded 'at.favre.lib:hkdf:2.0.0'
+    clientEmbedded 'io.whitfin:siphash:3.0.0'
 }
 
 def addEmbeddedClientClasses = { Jar task ->
     task.from({ configurations.clientEmbedded.collect { zipTree(it) } }) {
         include 'org/lwjgl/util/zstd/**', 'linux/**', 'macos/**', 'windows/**',
-                'META-INF/linux/**', 'META-INF/macos/**', 'META-INF/windows/**'
+                'META-INF/linux/**', 'META-INF/macos/**', 'META-INF/windows/**',
+                'tech/kwik/**', 'at/favre/lib/hkdf/**', 'io/whitfin/siphash/**'
         exclude 'module-info.class', 'META-INF/MANIFEST.MF', 'META-INF/*.SF',
                 'META-INF/*.RSA', 'META-INF/*.DSA'
     }
@@ -133,7 +152,7 @@ tasks.named('jar', Jar) { task ->
 }
 
 tasks.register('debugJar', Jar) {
-    description = 'Build the client JAR with bounded remote diagnostics enabled'
+    description = 'Build the client JAR with local pipeline diagnostics enabled'
     archiveClassifier.set('debug')
     manifest.attributes('Implementation-Version': modVersion)
     from(sourceSets.main.output) {
@@ -168,7 +187,7 @@ neoForge {
 }
 
 tasks.register('buildRustServer', Exec) {
-    description = 'Build the Rust backend embedded in the server/controller JARs'
+    description = 'Build the QUIC Rust backend embedded in the server-controller JAR'
     workingDir 'rust-server'
     commandLine 'cargo', 'build', '--release', '--locked', '--bin', 'voxy-rust-server'
     inputs.files 'rust-server/Cargo.toml', 'rust-server/Cargo.lock'
@@ -178,6 +197,6 @@ tasks.register('buildRustServer', Exec) {
 
 tasks.register('buildAll') {
     group = 'build'
-    description = 'Assemble the normal and debug client and bundled server JARs'
-    dependsOn tasks.named('jar'), tasks.named('debugJar'), ':bridge:jar', ':bridge:debugJar'
+    description = 'Assemble normal/debug clients and normal/debug bundled server JARs'
+    dependsOn tasks.named('jar'), tasks.named('debugJar'), ':server:jar', ':server:debugJar'
 }

@@ -1,234 +1,264 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
-import me.cortex.voxy.client.lod.ContentPipeline.PreparedMicrotile;
+import me.cortex.voxy.client.core.rendering.selection.SelectionManifest.ContentLayout;
+import me.cortex.voxy.client.core.rendering.selection.SelectionManifest.Node;
 import me.cortex.voxy.client.lod.ContentPipeline.CompatibilityState;
+import me.cortex.voxy.client.lod.ContentPipeline.PreparedMicrotile;
 import me.cortex.voxy.client.lod.ManifestCodec.ContentClass;
-import me.cortex.voxy.client.lod.ManifestCodec.ContentDescriptor;
 import me.cortex.voxy.client.lod.ManifestCodec.ManifestNode;
 import me.cortex.voxy.client.lod.ManifestCodec.NeighborDependency;
 import me.cortex.voxy.client.lod.ManifestCodec.QuantizedBounds;
 import me.cortex.voxy.client.lod.ManifestCodec.SpatialNode;
-import me.cortex.voxy.client.lod.RootDemandPlan.ManifestView;
-import me.cortex.voxy.client.lod.RootDemandPlan.NodeView;
-import me.cortex.voxy.client.lod.RootDemandPlan.ObjectView;
+import me.cortex.voxy.client.lod.ManifestCodec.VisibilityMembership;
+import me.cortex.voxy.client.lod.RootDemandPlan.Binding;
+import me.cortex.voxy.client.lod.RootDemandPlan.ContentLayer;
+import me.cortex.voxy.client.lod.RootDemandPlan.ContentObject;
 import me.cortex.voxy.client.lod.WireMessage.Hash256;
 
-import java.util.ArrayList;
-import java.util.BitSet;
-import java.util.HashMap;
-import java.util.List;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
 
-/** Builds the immutable GPU selection snapshot directly from authenticated manifests. */
+/** Publishes pooled primitive state over a topology shared until the plan namespace changes. */
 public final class SelectionManifestBuilder {
     private static final long CANONICAL_BYTES_PER_MICROTILE = 8L << 10;
     private static final long GEOMETRY_BYTES_PER_MICROTILE = 24L << 10;
+    private static final int POOL_SIZE = 4;
+    private static final ContentLayout EMPTY_CONTENT = new ContentLayout(0, new int[0],
+            new int[0], new int[0], new int[0], 0, 0, 0, 0, 0, 0);
 
-    private SelectionManifestBuilder() {}
+    private final SelectionManifest.Pool pool = new SelectionManifest.Pool(POOL_SIZE);
+    private final long[] renderableScratch = new long[3];
+    private RootDemandPlan topologyPlan;
+    private long topologyRevision = Long.MIN_VALUE;
+    private SelectionManifest.Topology topology;
+    private ContentLayer[] sources = new ContentLayer[0];
+    private SpatialNode[] spatials = new SpatialNode[0];
 
-    public static SelectionManifest build(ManifestView view,
-                                          ResidencyManager residency,
-                                          MicrotileActivationManager activations,
-                                          long snapshotId,
-                                          long cameraVisibilityDomain,
-                                          Map<SpatialNode, CompatibilityState> compatibility) {
-        Objects.requireNonNull(view, "view");
+    /** Returns null only while every bounded snapshot slot is still owned asynchronously. */
+    public SelectionManifest build(RootDemandPlan plan,
+                                   ResidencyManager residency,
+                                   MicrotileActivationManager activations,
+                                   long snapshotId, long authorityId, long planRevision,
+                                   long selectionTopologyRevision,
+                                   long cameraVisibilityDomain,
+                                   Map<SpatialNode, CompatibilityState> compatibility) {
+        Objects.requireNonNull(plan, "plan");
         Objects.requireNonNull(residency, "residency");
         Objects.requireNonNull(activations, "activations");
         Objects.requireNonNull(compatibility, "compatibility");
-        Map<SpatialNode, Integer> nodeHandles = new HashMap<>(view.nodes().size());
-        Map<Hash256, ObjectView> objects = new HashMap<>(view.objects().size());
-        for (NodeView node : view.nodes()) nodeHandles.put(node.spatial(), node.handle());
-        for (ObjectView object : view.objects()) objects.put(object.hash(), object);
+        if (this.topologyPlan != plan
+                || this.topologyRevision != selectionTopologyRevision) {
+            rebuildTopology(plan, selectionTopologyRevision);
+        }
+        SelectionManifest manifest = this.pool.acquire(this.topology,
+                plan.root().root().generation(), snapshotId, authorityId, planRevision,
+                cameraVisibilityDomain);
+        if (manifest == null) return null;
+        try {
+            for (int nodeIndex = 0; nodeIndex < this.spatials.length; nodeIndex++) {
+                SpatialNode spatial = this.spatials[nodeIndex];
+                Arrays.fill(this.renderableScratch, 0L);
+                activations.active(spatial).ifPresent(active -> {
+                    if (!active.publication().activationFencePassed()) return;
+                    for (PreparedMicrotile tile : active.content().microtiles()) {
+                        int content = switch (tile.object().contentClass()) {
+                            case EXTERIOR -> 0;
+                            case INTERIOR -> 1;
+                            case COMPLEX -> 2;
+                        };
+                        this.renderableScratch[content] |= 1L << tile.object().microtileIndex();
+                    }
+                });
+                CompatibilityState modelState = compatibility.get(spatial);
+                long exteriorRaw = sourceMask(nodeIndex, 0);
+                long interiorRaw = sourceMask(nodeIndex, 1);
+                long complexRaw = sourceMask(nodeIndex, 2);
+                long ordinaryRaw = exteriorRaw | interiorRaw;
+                for (int content = 0; content < 3; content++) {
+                    ContentLayer source = this.sources[nodeIndex * 3 + content];
+                    var contentClass = selectionClass(content);
+                    if (source == null) {
+                        manifest.setContentState(nodeIndex, contentClass, 0, 0, 0, 0);
+                        continue;
+                    }
+                    long available = switch (content) {
+                        case 0 -> modelState == null
+                                ? exteriorRaw : modelState.exteriorAvailableMask();
+                        case 1 -> modelState == null
+                                ? interiorRaw : modelState.interiorAvailableMask();
+                        case 2 -> modelState == null
+                                ? complexRaw & ~ordinaryRaw : modelState.complexAvailableMask();
+                        default -> throw new AssertionError();
+                    };
+                    available &= eligibleMask(source, cameraVisibilityDomain);
+                    long resident = 0;
+                    long inFlight = 0;
+                    for (ContentObject object : source.objects()) {
+                        long bit = 1L << object.microtileIndex();
+                        if ((available & bit) == 0) continue;
+                        if (residency.hasPreparedMicrotile(object.hash())) resident |= bit;
+                        if (plan.selectionObjectInFlight(object.hash())) inFlight |= bit;
+                    }
+                    long renderable = this.renderableScratch[content] & resident & available;
+                    resident &= available;
+                    inFlight &= available;
+                    manifest.setContentState(nodeIndex, contentClass, available, resident,
+                            renderable, inFlight);
+                    for (int index = 0; index < source.dependencies().size(); index++) {
+                        Hash256 hash = source.dependencies().get(index);
+                        manifest.setDependencyState(nodeIndex, contentClass, index,
+                                residency.hasPreparedMicrotile(hash),
+                                plan.selectionObjectInFlight(hash));
+                    }
+                    for (int index = 0; index < source.neighborDependencies().size(); index++) {
+                        Hash256 hash = source.neighborDependencies().get(index).hash();
+                        manifest.setNeighborState(nodeIndex, contentClass, index,
+                                residency.hasPreparedMicrotile(hash),
+                                plan.selectionObjectInFlight(hash));
+                    }
+                }
+            }
+            return manifest.seal();
+        } catch (RuntimeException | Error failure) {
+            manifest.close();
+            throw failure;
+        }
+    }
 
-        ArrayList<SelectionManifest.Node> nodes = new ArrayList<>(view.nodes().size());
-        for (NodeView node : view.nodes()) {
-            SpatialNode spatial = node.spatial();
-            ManifestNode manifest = node.manifestNode();
-            int parent = parentHandle(spatial, nodeHandles);
-            int[] children = childHandles(spatial, manifest.childMask(), nodeHandles);
-            SelectionManifest.TightBounds bounds = manifest.bounds()
+    private void rebuildTopology(RootDemandPlan plan, long planRevision) {
+        int nodeCount = plan.selectionNodeCount();
+        Node[] nodes = new Node[nodeCount];
+        ContentLayer[] nextSources = new ContentLayer[Math.multiplyExact(nodeCount, 3)];
+        SpatialNode[] nextSpatials = new SpatialNode[nodeCount];
+        int dependencyOffset = 0;
+        int neighborOffset = 0;
+        for (int handle = 0; handle < nodeCount; handle++) {
+            SpatialNode spatial = plan.selectionSpatial(handle);
+            ManifestNode structural = plan.selectionStructuralNode(handle);
+            Binding binding = plan.selectionBinding(handle);
+            nextSpatials[handle] = spatial;
+            int parent = parentHandle(plan, spatial);
+            int[] children = childHandles(plan, spatial, structural.childMask());
+            SelectionManifest.TightBounds bounds = structural.bounds()
                     .map(SelectionManifestBuilder::bounds)
                     .orElseGet(() -> new SelectionManifest.TightBounds(
                             0, 0, 0, 0xffff, 0xffff, 0xffff));
-            Map<ContentClass, Long> rendered = renderableMasks(spatial, activations);
-            long ordinary = mask(manifest, ContentClass.EXTERIOR)
-                    | mask(manifest, ContentClass.INTERIOR);
-            CompatibilityState modelState = compatibility.get(spatial);
-            long exteriorAvailable = modelState == null
-                    ? mask(manifest, ContentClass.EXTERIOR)
-                    : modelState.exteriorAvailableMask();
-            long interiorAvailable = modelState == null
-                    ? mask(manifest, ContentClass.INTERIOR)
-                    : modelState.interiorAvailableMask();
-            long complexAvailable = modelState == null
-                    ? mask(manifest, ContentClass.COMPLEX) & ~ordinary
-                    : modelState.complexAvailableMask();
-            exteriorAvailable &= eligibleMask(manifest, ContentClass.EXTERIOR,
-                    cameraVisibilityDomain);
-            interiorAvailable &= eligibleMask(manifest, ContentClass.INTERIOR,
-                    cameraVisibilityDomain);
-            complexAvailable &= eligibleMask(manifest, ContentClass.COMPLEX,
-                    cameraVisibilityDomain);
-            nodes.add(new SelectionManifest.Node(node.handle(),
-                    RootDemandPlan.sectionKey(spatial), parent, manifest.childMask(), children, bounds,
-                    manifest.geometricErrorQ16(), !manifest.contents().isEmpty(),
-                    content(manifest.contents().get(ContentClass.EXTERIOR),
-                            ContentClass.EXTERIOR, view, residency, objects, rendered,
-                            exteriorAvailable),
-                    content(manifest.contents().get(ContentClass.INTERIOR),
-                            ContentClass.INTERIOR, view, residency, objects, rendered,
-                            interiorAvailable),
-                    content(manifest.contents().get(ContentClass.COMPLEX),
-                            ContentClass.COMPLEX, view, residency, objects, rendered,
-                            complexAvailable)));
-        }
-        return new SelectionManifest(view.root().generation(), snapshotId,
-                cameraVisibilityDomain, nodes);
-    }
-
-    private static SelectionManifest.ContentState content(
-            ContentDescriptor descriptor, ContentClass contentClass, ManifestView view,
-            ResidencyManager residency,
-            Map<Hash256, ObjectView> objects, Map<ContentClass, Long> rendered,
-            long availableMask) {
-        if (descriptor == null || availableMask == 0) return emptyContent();
-        int[] objectHandles = new int[Long.bitCount(availableMask)];
-        long resident = 0;
-        long inFlight = 0;
-        int sourceDense = 0;
-        int outputDense = 0;
-        for (int microtile = 0; microtile < Long.SIZE; microtile++) {
-            long bit = 1L << microtile;
-            if ((descriptor.microtileMask() & bit) == 0) continue;
-            Hash256 hash = descriptor.objects().get(sourceDense++);
-            if ((availableMask & bit) == 0) continue;
-            objectHandles[outputDense++] = requireHandle(view, hash);
-            ObjectView object = objects.get(hash);
-            if (residency.decodedMicrotile(hash).isPresent()) resident |= bit;
-            if (object != null && object.inFlight()) inFlight |= bit;
-        }
-        long renderable = rendered.getOrDefault(contentClass, 0L);
-        resident &= availableMask;
-        inFlight &= availableMask;
-        renderable &= resident & availableMask;
-
-        int[] dependencies = handles(view, descriptor.dependencies());
-        List<NeighborDependency> selectedSourceNeighbors = descriptor.neighborDependencies()
-                .stream()
-                .filter(dependency -> (availableMask
-                        & 1L << dependency.sourceMicrotileIndex()) != 0)
-                .toList();
-        List<Hash256> neighborHashes = selectedSourceNeighbors.stream()
-                .map(NeighborDependency::hash)
-                .toList();
-        int[] neighborDependencies = handles(view, neighborHashes);
-        int[] neighborSources = selectedSourceNeighbors.stream()
-                .mapToInt(NeighborDependency::sourceMicrotileIndex)
-                .toArray();
-        BitSet residentDependencies = residentStates(descriptor.dependencies(), residency);
-        BitSet inFlightDependencies = inFlightStates(descriptor.dependencies(), objects);
-        BitSet residentNeighbors = residentStates(neighborHashes, residency);
-        BitSet inFlightNeighbors = inFlightStates(neighborHashes, objects);
-        long count = Long.bitCount(availableMask);
-        return new SelectionManifest.ContentState(availableMask, objectHandles,
-                resident, renderable, inFlight, dependencies, residentDependencies,
-                inFlightDependencies, neighborDependencies, neighborSources, residentNeighbors,
-                inFlightNeighbors, descriptor.boundarySummary().faceMask(),
-                count * CANONICAL_BYTES_PER_MICROTILE,
-                count * GEOMETRY_BYTES_PER_MICROTILE, 2_000);
-    }
-
-    private static long mask(ManifestNode node, ContentClass contentClass) {
-        ContentDescriptor descriptor = node.contents().get(contentClass);
-        return descriptor == null ? 0 : descriptor.microtileMask();
-    }
-
-    private static long eligibleMask(ManifestNode node, ContentClass contentClass,
-                                     long cameraVisibilityDomain) {
-        ContentDescriptor descriptor = node.contents().get(contentClass);
-        return descriptor == null ? 0 : descriptor.eligibleMask(cameraVisibilityDomain);
-    }
-
-    private static SelectionManifest.ContentState emptyContent() {
-        return new SelectionManifest.ContentState(0, new int[0], 0, 0, 0,
-                new int[0], new BitSet(), new BitSet(), new int[0], new int[0], new BitSet(),
-                new BitSet(), 0, 0, 0, 0);
-    }
-
-    private static Map<ContentClass, Long> renderableMasks(
-            SpatialNode node, MicrotileActivationManager activations) {
-        Map<ContentClass, Long> masks = new java.util.EnumMap<>(ContentClass.class);
-        activations.active(node).ifPresent(active -> {
-            if (!active.publication().activationFencePassed()) return;
-            for (PreparedMicrotile tile : active.content().microtiles()) {
-                masks.merge(tile.object().contentClass(),
-                        1L << tile.object().microtileIndex(), (left, right) -> left | right);
+            ContentLayout[] layouts = new ContentLayout[3];
+            for (int content = 0; content < 3; content++) {
+                ContentLayer source = layer(binding, manifestClass(content));
+                nextSources[handle * 3 + content] = source;
+                if (source == null) {
+                    layouts[content] = EMPTY_CONTENT;
+                    continue;
+                }
+                int[] objects = new int[source.objects().size()];
+                for (int index = 0; index < objects.length; index++) {
+                    objects[index] = plan.selectionObjectHandle(source.objects().get(index).hash());
+                }
+                int[] dependencies = handles(plan, source.dependencies());
+                int[] neighbors = new int[source.neighborDependencies().size()];
+                int[] neighborSources = new int[neighbors.length];
+                for (int index = 0; index < neighbors.length; index++) {
+                    NeighborDependency dependency = source.neighborDependencies().get(index);
+                    neighbors[index] = plan.selectionObjectHandle(dependency.hash());
+                    neighborSources[index] = dependency.sourceMicrotileIndex();
+                }
+                long count = Long.bitCount(source.microtileMask());
+                layouts[content] = new ContentLayout(source.microtileMask(), objects,
+                        dependencies, neighbors, neighborSources, dependencyOffset,
+                        neighborOffset, source.boundarySummary().faceMask(),
+                        count * CANONICAL_BYTES_PER_MICROTILE,
+                        count * GEOMETRY_BYTES_PER_MICROTILE, 2_000);
+                dependencyOffset = Math.addExact(dependencyOffset, dependencies.length);
+                neighborOffset = Math.addExact(neighborOffset, neighbors.length);
             }
-        });
-        return masks;
+            nodes[handle] = new Node(handle, RootDemandPlan.sectionKey(spatial), parent,
+                    structural.childMask(), children, bounds, structural.geometricErrorQ16(),
+                    binding != null, layouts[0], layouts[1], layouts[2]);
+        }
+        this.topology = new SelectionManifest.Topology(nodes, plan.objectHandleCount(),
+                dependencyOffset, neighborOffset);
+        this.sources = nextSources;
+        this.spatials = nextSpatials;
+        this.topologyPlan = plan;
+        this.topologyRevision = planRevision;
     }
 
-    private static int parentHandle(SpatialNode node, Map<SpatialNode, Integer> handles) {
+    private long sourceMask(int nodeIndex, int content) {
+        ContentLayer source = this.sources[nodeIndex * 3 + content];
+        return source == null ? 0 : source.microtileMask();
+    }
+
+    private static ContentLayer layer(Binding binding, ContentClass contentClass) {
+        if (binding == null) return null;
+        for (ContentLayer layer : binding.layers()) {
+            if (layer.contentClass() == contentClass) return layer;
+        }
+        return null;
+    }
+
+    private static long eligibleMask(ContentLayer layer, long cameraDomain) {
+        if (cameraDomain == 0) return layer.microtileMask();
+        long eligible = layer.exteriorVisibilityMask() | layer.unknownVisibilityMask();
+        for (VisibilityMembership membership : layer.visibilityMemberships()) {
+            if (membership.domain() == cameraDomain) {
+                eligible |= membership.microtileMask();
+                break;
+            }
+        }
+        return eligible;
+    }
+
+    private static int parentHandle(RootDemandPlan plan, SpatialNode node) {
         if (node.lod() == ManifestCodec.MAX_LOD) return SelectionManifest.NO_HANDLE;
-        return handles.getOrDefault(new SpatialNode(node.lod() + 1,
-                        Math.floorDiv(node.x(), 2), Math.floorDiv(node.y(), 2),
-                        Math.floorDiv(node.z(), 2)), SelectionManifest.NO_HANDLE);
+        return plan.selectionHandle(new SpatialNode(node.lod() + 1,
+                Math.floorDiv(node.x(), 2), Math.floorDiv(node.y(), 2),
+                Math.floorDiv(node.z(), 2)));
     }
 
-    private static int[] childHandles(SpatialNode node, int childMask,
-                                      Map<SpatialNode, Integer> handles) {
+    private static int[] childHandles(RootDemandPlan plan, SpatialNode node, int childMask) {
         int[] result = new int[8];
-        java.util.Arrays.fill(result, SelectionManifest.NO_HANDLE);
+        Arrays.fill(result, SelectionManifest.NO_HANDLE);
         if (node.lod() == 0) return result;
         for (int child = 0; child < 8; child++) {
             if ((childMask & 1 << child) == 0) continue;
-            SpatialNode spatial = new SpatialNode(node.lod() - 1,
+            result[child] = plan.selectionHandle(new SpatialNode(node.lod() - 1,
                     node.x() * 2 + (child & 1), node.y() * 2 + (child >>> 1 & 1),
-                    node.z() * 2 + (child >>> 2 & 1));
-            result[child] = handles.getOrDefault(spatial, SelectionManifest.NO_HANDLE);
+                    node.z() * 2 + (child >>> 2 & 1)));
         }
         return result;
     }
 
-    private static int[] handles(ManifestView view, List<Hash256> hashes) {
+    private static int[] handles(RootDemandPlan plan, java.util.List<Hash256> hashes) {
         int[] result = new int[hashes.size()];
         for (int index = 0; index < result.length; index++) {
-            result[index] = requireHandle(view, hashes.get(index));
+            result[index] = plan.selectionObjectHandle(hashes.get(index));
         }
         return result;
     }
 
-    private static BitSet residentStates(List<Hash256> hashes,
-                                         ResidencyManager residency) {
-        BitSet result = new BitSet(hashes.size());
-        for (int index = 0; index < hashes.size(); index++) {
-            if (residency.decodedMicrotile(hashes.get(index)).isPresent()) result.set(index);
-        }
-        return result;
+    private static ContentClass manifestClass(int ordinal) {
+        return switch (ordinal) {
+            case 0 -> ContentClass.EXTERIOR;
+            case 1 -> ContentClass.INTERIOR;
+            case 2 -> ContentClass.COMPLEX;
+            default -> throw new IllegalArgumentException("invalid content class");
+        };
     }
 
-    private static BitSet inFlightStates(List<Hash256> hashes,
-                                         Map<Hash256, ObjectView> objects) {
-        BitSet result = new BitSet(hashes.size());
-        for (int index = 0; index < hashes.size(); index++) {
-            ObjectView object = objects.get(hashes.get(index));
-            if (object != null && object.inFlight()) result.set(index);
-        }
-        return result;
-    }
-
-    private static int requireHandle(ManifestView view, Hash256 hash) {
-        Integer handle = view.objectHandles().get(hash);
-        if (handle == null) throw new IllegalStateException("manifest object lacks a handle");
-        return handle;
+    private static SelectionManifest.ContentClass selectionClass(int ordinal) {
+        return switch (ordinal) {
+            case 0 -> SelectionManifest.ContentClass.EXTERIOR;
+            case 1 -> SelectionManifest.ContentClass.INTERIOR;
+            case 2 -> SelectionManifest.ContentClass.COMPLEX;
+            default -> throw new IllegalArgumentException("invalid content class");
+        };
     }
 
     private static SelectionManifest.TightBounds bounds(QuantizedBounds bounds) {
         return new SelectionManifest.TightBounds(bounds.minX(), bounds.minY(), bounds.minZ(),
                 bounds.maxX(), bounds.maxY(), bounds.maxZ());
     }
-
 }

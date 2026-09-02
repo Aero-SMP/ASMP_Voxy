@@ -60,8 +60,6 @@ public class RenderResourceReuse {
             glGetError();//Clear any errors
             if (!(Capabilities.INSTANCE.isNvidia && Capabilities.INSTANCE.isWindows && Capabilities.INSTANCE.sparseBuffer)) {//This hack makes it so it doesnt crash on renderdoc
                 buffer = new GlBuffer(capacity, false);//Only do this if we are not on nvidia
-                //TODO: FIXME: TEST, see if the issue is that we are trying to zero the entire buffer, try only zeroing increments
-                // or dont zero it at all
             } else {
                 Logger.info("Running on nvidia, using workaround sparse buffer allocation");
             }
@@ -105,6 +103,15 @@ public class RenderResourceReuse {
         }
 
         geometryCapacity = Math.max(512*1024*1024, geometryCapacity);//min of 512 mb
+
+        // Sparse buffers reserve virtual address space and commit pages on demand. A non-sparse
+        // buffer is physical VRAM immediately, so reserving the same 4 GiB would waste memory and
+        // can terminate the client before Voxy has uploaded meaningful geometry.
+        boolean allocateSparseInitially = Capabilities.INSTANCE.isNvidia
+                && Capabilities.INSTANCE.isWindows && Capabilities.INSTANCE.sparseBuffer;
+        if (!allocateSparseInitially) {
+            geometryCapacity = Math.min(geometryCapacity, 512L*1024L*1024L);
+        }
 
         //Limit to available dedicated memory if possible
         if (Capabilities.INSTANCE.canQueryGpuMemory) {

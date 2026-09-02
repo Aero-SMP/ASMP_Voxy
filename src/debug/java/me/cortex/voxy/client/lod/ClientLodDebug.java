@@ -1,321 +1,269 @@
 package me.cortex.voxy.client.lod;
 
-import me.cortex.voxy.network.DebugPayload;
-import net.minecraft.client.Minecraft;
-import net.neoforged.neoforge.network.registration.PayloadRegistrar;
+import me.cortex.voxy.client.VoxyClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.lwjgl.system.MemoryStack;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.StringJoiner;
+import java.nio.IntBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReference;
 
-/** Diagnostics compiled only into the debug client JAR. */
-final class ClientLodDebug {
+import static org.lwjgl.opengl.GL42C.GL_COMMAND_BARRIER_BIT;
+import static org.lwjgl.opengl.GL42C.glMemoryBarrier;
+import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BARRIER_BIT;
+import static org.lwjgl.opengl.GL45C.glGetNamedBufferSubData;
+
+/** Pipeline diagnostics compiled only into the debug client JAR. */
+public final class ClientLodDebug {
     private static final Logger LOGGER = LoggerFactory.getLogger("Voxy Client Debug");
-    private static final String VERSION =
-            ClientLodDebug.class.getPackage().getImplementationVersion();
+    private static final String VERSION = VoxyClient.MOD_VERSION;
     private static final Path LOG = Path.of("logs", "voxy-client-debug.log").toAbsolutePath();
     private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(
             Thread.ofPlatform().daemon().name("Voxy client debug log writer").factory());
-    private static final int MAX_OBJECT_KIND = 16;
-    private static final AtomicInteger SEQUENCE = new AtomicInteger();
-    private static final AtomicLong FRAMES = new AtomicLong();
-    private static final AtomicLong FRAME_BYTES = new AtomicLong();
-    private static final AtomicLong BRIDGE_IN_PACKETS = new AtomicLong();
-    private static final AtomicLong BRIDGE_IN_BYTES = new AtomicLong();
-    private static final AtomicLong BRIDGE_OUT_PACKETS = new AtomicLong();
-    private static final AtomicLong BRIDGE_OUT_BYTES = new AtomicLong();
-    private static final AtomicLong OBJECTS = new AtomicLong();
-    private static final AtomicLong OBJECT_BYTES = new AtomicLong();
-    private static final AtomicLong CACHE_HITS = new AtomicLong();
-    private static final AtomicLongArray OBJECT_KINDS =
-            new AtomicLongArray(MAX_OBJECT_KIND);
-    private static final AtomicLong CREDIT_BYTES = new AtomicLong();
-    private static final AtomicLong SELECTIONS = new AtomicLong();
-    private static final AtomicLong FRONTIER_NODES = new AtomicLong();
-    private static final AtomicLong REQUEST_NODES = new AtomicLong();
-    private static final AtomicLong COMPLETE_SELECTIONS = new AtomicLong();
-    private static final AtomicLong ACTIVATION_CANDIDATES = new AtomicLong();
-    private static final AtomicLong ACTIVATION_NO_BINDING = new AtomicLong();
-    private static final AtomicLong ACTIVATION_EMPTY_CUT = new AtomicLong();
-    private static final AtomicLong ACTIVATION_MISSING = new AtomicLong();
-    private static final AtomicLong ACTIVATION_MISSING_NEIGHBORS = new AtomicLong();
-    private static final AtomicLong ACTIVATION_PRESSURE = new AtomicLong();
-    private static final AtomicLong COMPILED = new AtomicLong();
-    private static final AtomicLong QUEUED = new AtomicLong();
-    private static final AtomicLong VISIBLE = new AtomicLong();
-    private static final AtomicLong RETIRED = new AtomicLong();
-    private static final AtomicLong CAMERA_DOMAIN_RESPONSES = new AtomicLong();
+    private static final long SAMPLE_INTERVAL_NANOS = 1_000_000_000L;
+    private static final AtomicReference<String> SNAPSHOT = new AtomicReference<>(
+            "blocker=CONNECTING snapshot=not-ready");
+    private static final AtomicLong SNAPSHOT_NANOS = new AtomicLong();
 
-    private static long lastSample;
-    private static final AtomicBoolean ANNOUNCED = new AtomicBoolean();
-    private static volatile String transport = "closed";
+    private static long nextSampleNanos;
+    private static int candidates;
+    private static int busy;
+    private static int missingBinding;
+    private static int noCompatibleContent;
+    private static int missingContent;
+    private static int missingNeighbors;
+    private static int modelsPending;
+    private static int pendingModelId = -1;
+    private static int stageBlocked;
+    private static int pinBlocked;
+    private static int workerSaturated;
+    private static int alreadyActive;
+    private static int submitted;
+    private static ManifestCodec.SpatialNode sampleNode;
+    private static WireMessage.Hash256 sampleHash;
+    private static final long RENDER_SAMPLE_INTERVAL_NANOS = 1_000_000_000L;
+    private static int sampledRenderFrame = Integer.MIN_VALUE;
+    private static int sampledRenderPasses;
+    private static long nextRenderSampleNanos;
+    private static volatile int renderFrame = Integer.MIN_VALUE;
+    private static volatile int geometrySections;
+    private static volatile int conservativeSelected;
+    private static volatile int refinedSelected;
+    private static volatile int conservativeOpaque;
+    private static volatile int conservativeTranslucent;
+    private static volatile int conservativeTemporal;
+    private static volatile int refinedOpaque;
+    private static volatile int refinedTranslucent;
+    private static volatile int refinedTemporal;
 
     static {
-        WRITER.execute(() -> {
-            try {
-                Files.createDirectories(LOG.getParent());
-                Files.writeString(LOG, "Voxy version " + VERSION + System.lineSeparator(),
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            } catch (IOException exception) {
-                LOGGER.error("Could not initialize Voxy client debug log", exception);
-            }
-        });
+        String version = "Voxy version " + VERSION;
+        LOGGER.info(version);
+        WRITER.execute(() -> initializeLog(version));
+        ClientAutoUpdater.start();
     }
 
     private ClientLodDebug() {}
 
-    static void register(PayloadRegistrar registrar) {
-        registrar.playToServer(DebugPayload.TYPE, DebugPayload.CODEC,
-                (payload, context) -> {});
-    }
+    static boolean diagnosticsEnabled() { return true; }
 
     static void tick() {
+        ClientAutoUpdater.tick();
         long now = System.nanoTime();
-        if (lastSample != 0 && now - lastSample < 1_000_000_000L) return;
-        lastSample = now;
-        var connection = Minecraft.getInstance().getConnection();
-        if (connection == null || !connection.hasChannel(DebugPayload.TYPE)) return;
-        send("sample"
-                + " transport=" + transport
-                + " bridgeInPackets=" + BRIDGE_IN_PACKETS.getAndSet(0)
-                + " bridgeInKiB=" + kib(BRIDGE_IN_BYTES.getAndSet(0))
-                + " bridgeOutPackets=" + BRIDGE_OUT_PACKETS.getAndSet(0)
-                + " bridgeOutKiB=" + kib(BRIDGE_OUT_BYTES.getAndSet(0))
-                + " frames=" + FRAMES.getAndSet(0)
-                + " frameKiB=" + kib(FRAME_BYTES.getAndSet(0))
-                + " objects=" + OBJECTS.getAndSet(0)
-                + " objectKiB=" + kib(OBJECT_BYTES.getAndSet(0))
-                + " cacheHits=" + CACHE_HITS.getAndSet(0)
-                + " objectKinds=" + objectKinds()
-                + " creditKiB=" + kib(CREDIT_BYTES.getAndSet(0))
-                + " selections=" + SELECTIONS.getAndSet(0)
-                + " frontierNodes=" + FRONTIER_NODES.getAndSet(0)
-                + " requestNodes=" + REQUEST_NODES.getAndSet(0)
-                + " completeSelections=" + COMPLETE_SELECTIONS.getAndSet(0)
-                + " activationCandidates=" + ACTIVATION_CANDIDATES.getAndSet(0)
-                + " activationNoBinding=" + ACTIVATION_NO_BINDING.getAndSet(0)
-                + " activationEmptyCut=" + ACTIVATION_EMPTY_CUT.getAndSet(0)
-                + " activationMissing=" + ACTIVATION_MISSING.getAndSet(0)
-                + " activationMissingNeighbors="
-                + ACTIVATION_MISSING_NEIGHBORS.getAndSet(0)
-                + " activationPressure=" + ACTIVATION_PRESSURE.getAndSet(0)
-                + " memoryUsedMiB=" + ClientSession.debugMemoryUsedMiB()
-                + " memoryAvailableMiB=" + ClientSession.debugMemoryAvailableMiB()
-                + " compiled=" + COMPILED.getAndSet(0)
-                + " queued=" + QUEUED.getAndSet(0)
-                + " visible=" + VISIBLE.getAndSet(0)
-                + " retired=" + RETIRED.getAndSet(0)
-                + " cameraDomainResponses="
-                + CAMERA_DOMAIN_RESPONSES.getAndSet(0));
-    }
-
-    static long timer() {
-        return System.nanoTime();
-    }
-
-    static void transportResponse(long startedNanos, byte mode) {
-        event("transport-response elapsedMs=" + millis(System.nanoTime() - startedNanos)
-                + " mode=" + mode);
-    }
-
-    static void bridgeInputOverflow(int queued) {
-        event("transport-overflow queued=" + queued);
-    }
-
-    static void bridgeIn(int bytes) {
-        BRIDGE_IN_PACKETS.incrementAndGet();
-        BRIDGE_IN_BYTES.addAndGet(bytes);
-    }
-
-    static void bridgeOut(int bytes) {
-        BRIDGE_OUT_PACKETS.incrementAndGet();
-        BRIDGE_OUT_BYTES.addAndGet(bytes);
+        if (now < nextSampleNanos) return;
+        nextSampleNanos = now + SAMPLE_INTERVAL_NANOS;
+        try {
+            emit("VOXY_PIPELINE " + ClientSession.debugSnapshot());
+        } catch (RuntimeException failure) {
+            emit("VOXY_PIPELINE state=DEBUG_SNAPSHOT_FAILED type="
+                    + failure.getClass().getSimpleName() + " message="
+                    + oneLine(failure.getMessage()));
+        }
     }
 
     static void sessionStarted(long session, String dimension) {
-        ANNOUNCED.set(false);
-        lastSample = 0;
-        transport = "connecting";
-        resetCounters();
-        event("session-start session=" + session + " dimension=" + dimension);
+        nextSampleNanos = 0;
+        emit("VOXY_SESSION state=START session=" + session
+                + " dimension=" + oneLine(dimension));
     }
 
     static void sessionFailed(Throwable failure) {
-        transport = "closed";
-        event("session-failure type=" + failure.getClass().getSimpleName()
-                + " message=" + String.valueOf(failure.getMessage()));
+        emit("VOXY_SESSION state=FAILED type=" + failure.getClass().getSimpleName()
+                + " message=" + oneLine(failure.getMessage()));
     }
 
-    static void transportOpened(boolean direct, String description) {
-        resetCounters();
-        transport = direct ? "direct" : "minecraft";
-        event("transport-open direct=" + direct + " description=" + description);
+    static String latestSnapshot() {
+        long captured = SNAPSHOT_NANOS.get();
+        long ageMillis = captured == 0 ? -1
+                : TimeUnit.NANOSECONDS.toMillis(Math.max(0, System.nanoTime() - captured));
+        return "sampleAgeMs=" + ageMillis + ' ' + SNAPSHOT.get();
     }
 
-    static void frame(int type, int bytes) {
-        FRAMES.incrementAndGet();
-        FRAME_BYTES.addAndGet(bytes);
-        if (type == FrameCodec.S_CAMERA_DOMAIN) {
-            CAMERA_DOMAIN_RESPONSES.incrementAndGet();
+    static void snapshotCaptured(String snapshot) {
+        SNAPSHOT.set(snapshot);
+        SNAPSHOT_NANOS.set(System.nanoTime());
+    }
+
+    static void activationPass(int candidateCount, int busyCount, int missingBindingCount,
+                               int noCompatibleContentCount, int missingContentCount,
+                               int missingNeighborCount, int modelsPendingCount,
+                               int modelId, int stageBlockedCount, int pinBlockedCount,
+                               int workerSaturatedCount, int alreadyActiveCount,
+                               int submittedCount, ManifestCodec.SpatialNode node,
+                               WireMessage.Hash256 hash) {
+        candidates = candidateCount;
+        busy = busyCount;
+        missingBinding = missingBindingCount;
+        noCompatibleContent = noCompatibleContentCount;
+        missingContent = missingContentCount;
+        missingNeighbors = missingNeighborCount;
+        modelsPending = modelsPendingCount;
+        pendingModelId = modelId;
+        stageBlocked = stageBlockedCount;
+        pinBlocked = pinBlockedCount;
+        workerSaturated = workerSaturatedCount;
+        alreadyActive = alreadyActiveCount;
+        submitted = submittedCount;
+        sampleNode = node;
+        sampleHash = hash;
+    }
+
+    static String activationSummary() {
+        return "candidates=" + candidates
+                + ",busy=" + busy
+                + ",missingBinding=" + missingBinding
+                + ",noCompatibleContent=" + noCompatibleContent
+                + ",missingContent=" + missingContent
+                + ",missingNeighbors=" + missingNeighbors
+                + ",modelsPending=" + modelsPending
+                + ",pendingModelId=" + pendingModelId
+                + ",stageBlocked=" + stageBlocked
+                + ",pinBlocked=" + pinBlocked
+                + ",workerSaturated=" + workerSaturated
+                + ",alreadyActive=" + alreadyActive
+                + ",submitted=" + submitted
+                + ",sampleNode=" + String.valueOf(sampleNode)
+                + ",sampleHash=" + String.valueOf(sampleHash);
+    }
+
+    static String activationBlocker() {
+        if (missingBinding > 0) return "MISSING_NODE_DESCRIPTOR";
+        if (noCompatibleContent > 0) return "NO_COMPATIBLE_SELECTED_CONTENT";
+        if (missingContent > 0) return "WAITING_FOR_CONTENT_OBJECTS";
+        if (missingNeighbors > 0) return "WAITING_FOR_NEIGHBOR_DEPENDENCIES";
+        if (modelsPending > 0) return "WAITING_FOR_BLOCK_MODELS";
+        if (pinBlocked > 0) return "RESIDENCY_PIN_FAILED";
+        if (stageBlocked > 0) return "ACTIVATION_STAGE_BLOCKED";
+        if (workerSaturated > 0) return "MESH_WORKER_BUSY";
+        if (busy > 0) return "ACTIVATION_BUSY";
+        return null;
+    }
+
+    /** Samples existing renderer counters at most once per second, twice for the two HZB passes. */
+    public static void captureRender(int frameId, int sectionCount,
+                                     int renderListBuffer, int drawCountBuffer) {
+        long now = System.nanoTime();
+        if (frameId != sampledRenderFrame) {
+            if (now < nextRenderSampleNanos) return;
+            sampledRenderFrame = frameId;
+            sampledRenderPasses = 0;
+            nextRenderSampleNanos = now + RENDER_SAMPLE_INTERVAL_NANOS;
+        }
+        if (frameId != sampledRenderFrame || sampledRenderPasses >= 2) return;
+        int pass = sampledRenderPasses++;
+        int selected = 0;
+        int opaque = 0;
+        int translucent = 0;
+        int temporal = 0;
+        if (sectionCount > 0) {
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                IntBuffer renderList = stack.mallocInt(1);
+                IntBuffer counts = stack.mallocInt(6);
+                glGetNamedBufferSubData(renderListBuffer, 0, renderList);
+                glGetNamedBufferSubData(drawCountBuffer, 0, counts);
+                selected = renderList.get(0);
+                opaque = counts.get(3);
+                translucent = counts.get(4);
+                temporal = counts.get(5);
+            }
+        }
+        renderFrame = frameId;
+        geometrySections = sectionCount;
+        if (pass == 0) {
+            conservativeSelected = selected;
+            conservativeOpaque = opaque;
+            conservativeTranslucent = translucent;
+            conservativeTemporal = temporal;
+        } else {
+            refinedSelected = selected;
+            refinedOpaque = opaque;
+            refinedTranslucent = translucent;
+            refinedTemporal = temporal;
         }
     }
 
-    static void hello(long serverInstance) {
-        event("hello serverInstance=" + serverInstance);
+    static String renderSummary() {
+        return "frame=" + renderFrame
+                + ",geometrySections=" + geometrySections
+                + ",conservativeSelected=" + conservativeSelected
+                + ",refinedSelected=" + refinedSelected
+                + ",conservativeDraws=" + conservativeOpaque + '/'
+                + conservativeTranslucent + '/' + conservativeTemporal
+                + ",refinedDraws=" + refinedOpaque + '/'
+                + refinedTranslucent + '/' + refinedTemporal;
     }
 
-    static void credit(long bytes) {
-        CREDIT_BYTES.addAndGet(bytes);
-    }
-
-    static void rootAnnounced(long generation) {
-        event("root-announced generation=" + generation);
-    }
-
-    static void objectDecoded(int kind, int compressedBytes, boolean cacheHit) {
-        OBJECTS.incrementAndGet();
-        OBJECT_BYTES.addAndGet(compressedBytes);
-        if (cacheHit) CACHE_HITS.incrementAndGet();
-        if (kind >= 0 && kind < MAX_OBJECT_KIND) OBJECT_KINDS.incrementAndGet(kind);
-    }
-
-    static void selection(long generation, long snapshot, int frontier, int requests,
-                          boolean complete) {
-        SELECTIONS.incrementAndGet();
-        FRONTIER_NODES.addAndGet(frontier);
-        REQUEST_NODES.addAndGet(requests);
-        if (complete) COMPLETE_SELECTIONS.incrementAndGet();
-    }
-
-    static void activationPass(int candidates) {
-        ACTIVATION_CANDIDATES.addAndGet(candidates);
-    }
-
-    static void activationNoBinding() {
-        ACTIVATION_NO_BINDING.incrementAndGet();
-    }
-
-    static void activationEmptyCut() {
-        ACTIVATION_EMPTY_CUT.incrementAndGet();
-    }
-
-    static void activationMissing(int requestable, int neighbors) {
-        ACTIVATION_MISSING.addAndGet(requestable);
-        ACTIVATION_MISSING_NEIGHBORS.addAndGet(neighbors);
-    }
-
-    static void activationPressure() {
-        ACTIVATION_PRESSURE.incrementAndGet();
-    }
-
-    static void activationCompiled(long key, long generation) {
-        COMPILED.incrementAndGet();
-    }
-
-    static void activationQueued(long key, long generation) {
-        QUEUED.incrementAndGet();
-    }
-
-    static void activationVisible(long key, long generation) {
-        VISIBLE.incrementAndGet();
-    }
-
-    static void activationRetired(long key, long generation) {
-        RETIRED.incrementAndGet();
-    }
-
-    static void rootActivated(long generation) {
-        event("root-activated generation=" + generation);
-    }
-
-    static void failure(String reason) {
-        event("failure reason=" + String.valueOf(reason));
-    }
-
-    private static String objectKinds() {
-        StringJoiner kinds = new StringJoiner(",", "[", "]");
-        for (int kind = 0; kind < MAX_OBJECT_KIND; kind++) {
-            long count = OBJECT_KINDS.getAndSet(kind, 0);
-            if (count != 0) kinds.add(kind + ":" + count);
+    static String renderBlocker(int activePublications) {
+        if (activePublications == 0) return null;
+        if (renderFrame == Integer.MIN_VALUE) return "WAITING_FOR_RENDER_COUNTER_SAMPLE";
+        if (geometrySections == 0) return "ACTIVE_PUBLICATION_HAS_NO_GEOMETRY_ALLOCATION";
+        if (conservativeSelected == 0 && refinedSelected == 0) {
+            return "GPU_SELECTED_ZERO_ACTIVE_SECTIONS";
         }
-        return kinds.toString();
+        if (conservativeOpaque + conservativeTranslucent + conservativeTemporal
+                + refinedOpaque + refinedTranslucent + refinedTemporal == 0) {
+            return "GPU_GENERATED_ZERO_DRAW_COMMANDS";
+        }
+        return null;
     }
 
-    private static void resetCounters() {
-        FRAMES.set(0);
-        FRAME_BYTES.set(0);
-        BRIDGE_IN_PACKETS.set(0);
-        BRIDGE_IN_BYTES.set(0);
-        BRIDGE_OUT_PACKETS.set(0);
-        BRIDGE_OUT_BYTES.set(0);
-        OBJECTS.set(0);
-        OBJECT_BYTES.set(0);
-        CACHE_HITS.set(0);
-        for (int kind = 0; kind < MAX_OBJECT_KIND; kind++) OBJECT_KINDS.set(kind, 0);
-        CREDIT_BYTES.set(0);
-        SELECTIONS.set(0);
-        FRONTIER_NODES.set(0);
-        REQUEST_NODES.set(0);
-        COMPLETE_SELECTIONS.set(0);
-        ACTIVATION_CANDIDATES.set(0);
-        ACTIVATION_NO_BINDING.set(0);
-        ACTIVATION_EMPTY_CUT.set(0);
-        ACTIVATION_MISSING.set(0);
-        ACTIVATION_MISSING_NEIGHBORS.set(0);
-        ACTIVATION_PRESSURE.set(0);
-        COMPILED.set(0);
-        QUEUED.set(0);
-        VISIBLE.set(0);
-        RETIRED.set(0);
-        CAMERA_DOMAIN_RESPONSES.set(0);
+    private static void initializeLog(String version) {
+        try {
+            Files.createDirectories(LOG.getParent());
+            Files.writeString(LOG, version + System.lineSeparator(),
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException failure) {
+            LOGGER.error("Could not initialize Voxy client debug log", failure);
+        }
     }
 
-    private static void event(String message) {
-        send("event " + message);
-    }
-
-    private static void send(String message) {
+    private static void emit(String message) {
+        LOGGER.info(message);
         WRITER.execute(() -> {
             try {
                 Files.writeString(LOG, Instant.now() + " " + message + System.lineSeparator(),
                         StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-            } catch (IOException exception) {
-                LOGGER.error("Could not write Voxy client debug log", exception);
+            } catch (IOException failure) {
+                LOGGER.error("Could not write Voxy client debug log", failure);
             }
         });
-        var connection = Minecraft.getInstance().getConnection();
-        if (connection == null || !connection.hasChannel(DebugPayload.TYPE)) return;
-        if (ANNOUNCED.compareAndSet(false, true)) {
-            sendRaw(connection, "Voxy version " + VERSION);
-        }
-        sendRaw(connection, message);
     }
 
-    private static void sendRaw(net.minecraft.client.multiplayer.ClientPacketListener connection,
-                                String message) {
-        String safe = message.replace('\n', ' ').replace('\r', ' ');
-        if (safe.length() > DebugPayload.MAX_MESSAGE_LENGTH) {
-            safe = safe.substring(0, DebugPayload.MAX_MESSAGE_LENGTH);
-        }
-        connection.send(new DebugPayload(SEQUENCE.incrementAndGet(), safe));
+    static void updaterEvent(String message) {
+        emit("VOXY_UPDATER " + message);
     }
 
-    private static long millis(long nanos) {
-        return (nanos + 500_000L) / 1_000_000L;
-    }
-
-    private static long kib(long bytes) {
-        return (bytes + 512L) / 1024L;
+    private static String oneLine(String value) {
+        return String.valueOf(value).replace('\n', ' ').replace('\r', ' ');
     }
 }

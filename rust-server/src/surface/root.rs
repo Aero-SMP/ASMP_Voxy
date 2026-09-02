@@ -1,5 +1,4 @@
 use super::{
-    memory::MemoryPressure,
     object::{ObjectHash, ObjectKind},
     pack::PackStore,
 };
@@ -94,17 +93,6 @@ impl RootRecord {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RootRecovery {
-    pub damaged_current: bool,
-    pub damaged_previous: bool,
-    pub conflicting_roots: bool,
-    pub restored_previous: bool,
-    pub discarded_candidate: bool,
-    pub referenced_object_loss: bool,
-    pub needs_regeneration: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublishResult {
     Published,
@@ -122,7 +110,6 @@ pub struct RootStore {
     dimension: ObjectHash,
     current: Option<RootRecord>,
     previous: Option<RootRecord>,
-    recovery: RootRecovery,
 }
 
 impl RootStore {
@@ -135,67 +122,51 @@ impl RootStore {
         let current_path = root.join("root.current");
         let previous_path = root.join("root.previous");
         let candidate_path = root.join("root.next");
-        let mut recovery = RootRecovery::default();
-        let current = read_slot(&current_path, dimension, &mut recovery.damaged_current)?;
-        let previous = read_slot(&previous_path, dimension, &mut recovery.damaged_previous)?;
+        let current = read_slot(&current_path, dimension)?;
+        let previous = read_slot(&previous_path, dimension)?;
+        let mut restored_previous = false;
 
         let chosen = match (current, previous) {
             (Some(current), Some(previous_record))
                 if current.generation == previous_record.generation
                     && current != previous_record =>
             {
-                recovery.conflicting_roots = true;
                 quarantine(&previous_path);
                 Some(current)
             }
             (Some(current), Some(previous_record))
                 if previous_record.generation > current.generation =>
             {
-                recovery.restored_previous = true;
+                restored_previous = true;
                 Some(previous_record)
             }
             (Some(current), _) => Some(current),
             (None, Some(previous_record)) => {
-                recovery.restored_previous = true;
+                restored_previous = true;
                 Some(previous_record)
             }
             (None, None) => None,
         };
 
-        if recovery.restored_previous {
+        if restored_previous {
             let bytes = chosen.expect("restored root exists").encode()?;
             replace_synced(&current_path, &root.join("root.restore"), &bytes)?;
         }
         if candidate_path.exists() {
             fs::remove_file(&candidate_path)?;
             sync_parent(&candidate_path)?;
-            recovery.discarded_candidate = true;
         }
         // Retain a distinct older complete generation for client fallback and conservative GC
         // pinning. If recovery promoted the previous slot, it is now the current root and must
         // not be reported twice.
-        let mut previous_damaged = false;
-        let retained_previous = read_slot(&previous_path, dimension, &mut previous_damaged)?
-            .filter(|record| Some(*record) != chosen);
-        recovery.damaged_previous |= previous_damaged;
-        recovery.needs_regeneration = chosen.is_none();
+        let retained_previous =
+            read_slot(&previous_path, dimension)?.filter(|record| Some(*record) != chosen);
         Ok(Self {
             root,
             dimension,
             current: chosen,
             previous: retained_previous,
-            recovery,
         })
-    }
-
-    pub fn open_verified(
-        root: impl AsRef<Path>,
-        dimension: ObjectHash,
-        objects: &PackStore,
-    ) -> Result<Self> {
-        let mut store = Self::open(root, dimension)?;
-        store.recover_references(objects)?;
-        Ok(store)
     }
 
     pub fn current(&self) -> Option<RootRecord> {
@@ -220,9 +191,6 @@ impl RootStore {
         )?;
         self.current = Some(record);
         self.previous = None;
-        self.recovery.referenced_object_loss = true;
-        self.recovery.restored_previous = true;
-        self.recovery.needs_regeneration = false;
         Ok(())
     }
 
@@ -247,74 +215,6 @@ impl RootStore {
         sync_parent(&self.root.join("root.current"))?;
         self.current = None;
         self.previous = None;
-        self.recovery.referenced_object_loss = true;
-        self.recovery.needs_regeneration = true;
-        Ok(())
-    }
-
-    pub fn recovery(&self) -> &RootRecovery {
-        &self.recovery
-    }
-
-    /// Verifies that the active root's required immutable objects still exist and match their
-    /// hashes. If not, the previous complete root is restored; if neither generation is
-    /// complete, callers receive an explicit regeneration state.
-    pub fn recover_references(&mut self, objects: &PackStore) -> Result<()> {
-        let Some(current) = self.current else {
-            self.recovery.needs_regeneration = true;
-            return Ok(());
-        };
-        match verify_root_references(objects, current) {
-            Ok(()) => {
-                if let Some(previous) = self.previous {
-                    match verify_root_references(objects, previous) {
-                        Ok(()) => {}
-                        Err(error) if is_memory_pressure(&error) => return Err(error),
-                        Err(_) => {
-                            let previous_path = self.root.join("root.previous");
-                            quarantine(&previous_path);
-                            self.previous = None;
-                            self.recovery.referenced_object_loss = true;
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            Err(error) if is_memory_pressure(&error) => return Err(error),
-            Err(_) => {}
-        }
-        self.recovery.referenced_object_loss = true;
-        let current_path = self.root.join("root.current");
-        quarantine(&current_path);
-
-        let previous_path = self.root.join("root.previous");
-        let mut damaged_previous = false;
-        let previous = read_slot(&previous_path, self.dimension, &mut damaged_previous)?;
-        self.recovery.damaged_previous |= damaged_previous;
-        if let Some(previous) = previous {
-            match verify_root_references(objects, previous) {
-                Ok(()) => {
-                    replace_synced(
-                        &current_path,
-                        &self.root.join("root.restore"),
-                        &previous.encode()?,
-                    )?;
-                    self.current = Some(previous);
-                    self.previous = None;
-                    self.recovery.restored_previous = true;
-                    self.recovery.needs_regeneration = false;
-                    return Ok(());
-                }
-                Err(error) if is_memory_pressure(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-        if previous_path.exists() {
-            quarantine(&previous_path);
-        }
-        self.current = None;
-        self.previous = None;
-        self.recovery.needs_regeneration = true;
         Ok(())
     }
 
@@ -360,15 +260,9 @@ impl RootStore {
         fs::rename(&candidate_path, &current_path)?;
         self.current = Some(record);
         self.previous = retained_previous;
-        self.recovery.needs_regeneration = false;
         sync_parent(&current_path)?;
-        self.recovery.needs_regeneration = false;
         Ok(PublishResult::Published)
     }
-}
-
-fn is_memory_pressure(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<MemoryPressure>())
 }
 
 fn verify_root_references(objects: &PackStore, record: RootRecord) -> Result<()> {
@@ -414,12 +308,11 @@ fn verify_reference(
     Ok(())
 }
 
-fn read_slot(path: &Path, dimension: ObjectHash, damaged: &mut bool) -> Result<Option<RootRecord>> {
+fn read_slot(path: &Path, dimension: ObjectHash) -> Result<Option<RootRecord>> {
     let bytes = match read_file_bounded(path, ROOT_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            *damaged = true;
             quarantine(path);
             eprintln!(
                 "discarding damaged surface root {}: {error}",
@@ -431,12 +324,10 @@ fn read_slot(path: &Path, dimension: ObjectHash, damaged: &mut bool) -> Result<O
     match RootRecord::decode(&bytes) {
         Ok(record) if record.dimension == dimension => Ok(Some(record)),
         Ok(_) => {
-            *damaged = true;
             quarantine(path);
             Ok(None)
         }
         Err(error) => {
-            *damaged = true;
             quarantine(path);
             eprintln!(
                 "discarding damaged surface root {}: {error:#}",

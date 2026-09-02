@@ -9,7 +9,6 @@ import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.lod.ContentPipeline.MeshingPath;
 import me.cortex.voxy.client.lod.RootDemandPlan;
-import me.cortex.voxy.client.lod.MemoryBudget;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.client.core.model.CatalogMapper;
 import org.lwjgl.system.MemoryUtil;
@@ -39,26 +38,18 @@ public final class GpuMicrotileMesher
             + (long) FACE_COUNT * MAX_QUADS_PER_FACE * Long.BYTES;
 
     private final ModelFactory models;
-    private final MemoryBudget memory;
     private final Thread ownerThread = Thread.currentThread();
     private final Executor ownerExecutor;
     private final Shader shader;
     private final GlBuffer input;
     private final GlBuffer output;
-    private final MemoryBudget.Reservation buffersMemory;
     private CompletableFuture<BuiltSection> pending;
     private boolean closeRequested;
     private boolean closed;
 
-    public GpuMicrotileMesher(ModelFactory models, Executor ownerExecutor,
-                                MemoryBudget memory) {
+    public GpuMicrotileMesher(ModelFactory models, Executor ownerExecutor) {
         this.models = Objects.requireNonNull(models, "models");
         this.ownerExecutor = Objects.requireNonNull(ownerExecutor, "ownerExecutor");
-        this.memory = Objects.requireNonNull(memory, "memory");
-        this.buffersMemory = memory.tryReserve(MemoryBudget.Allocation.of(
-                MemoryBudget.Pool.MESHING, Math.addExact(INPUT_BYTES, OUTPUT_BYTES)))
-                .orElseThrow(() -> new IllegalStateException(
-                        "Virtual Surface memory budget cannot admit GPU meshing buffers"));
         Shader createdShader = null;
         GlBuffer createdInput = null;
         GlBuffer createdOutput = null;
@@ -72,7 +63,6 @@ public final class GpuMicrotileMesher
             if (createdOutput != null) createdOutput.free();
             if (createdInput != null) createdInput.free();
             if (createdShader != null) createdShader.free();
-            this.buffersMemory.close();
             throw failure;
         }
         this.shader = createdShader;
@@ -179,13 +169,7 @@ public final class GpuMicrotileMesher
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
         // The copy and its fence are queued on the render thread, but parsing happens only after
         // the fence signals on a later frame. No glGet* call stalls Minecraft's render loop.
-        MemoryBudget.Reservation readbackMemory = this.memory.tryReserve(
-                MemoryBudget.Allocation.of(MemoryBudget.Pool.IN_FLIGHT,
-                        Math.addExact(OUTPUT_BYTES, 64L))).orElseThrow(() ->
-                new IllegalStateException(
-                        "Virtual Surface memory budget cannot admit GPU meshing readback"));
-        try {
-            DownloadStream.INSTANCE.download(this.output, 0, OUTPUT_BYTES, (download, size) -> {
+        DownloadStream.INSTANCE.download(this.output, 0, OUTPUT_BYTES, (download, size) -> {
             try {
                 if (this.closed) throw new IllegalStateException("GPU mesher closed in flight");
                 BuiltSection geometry = readResult(request, grid, download, size);
@@ -193,15 +177,10 @@ public final class GpuMicrotileMesher
             } catch (Throwable failure) {
                 result.completeExceptionally(failure);
             } finally {
-                readbackMemory.close();
                 if (this.pending == result) this.pending = null;
                 finishDeferredClose();
             }
-            });
-        } catch (RuntimeException | Error failure) {
-            readbackMemory.close();
-            throw failure;
-        }
+        });
     }
 
     private BuiltSection readResult(HybridMeshingDispatcher.FragmentRequest request,
@@ -302,7 +281,6 @@ public final class GpuMicrotileMesher
         this.shader.free();
         this.input.free();
         this.output.free();
-        this.buffersMemory.close();
     }
 
     private void ensureOwner() {

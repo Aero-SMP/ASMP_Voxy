@@ -232,22 +232,38 @@ public class AsyncNodeManager {
             hierarchyAdvanced = work != 0;
         }
 
-        while (true) {
+        int rendererTransactions = this.rendererTransactionQueue.size();
+        boolean topologyDeferred = false;
+        while (rendererTransactions-- > 0) {
             RendererTransaction transaction = this.rendererTransactionQueue.poll();
             if (transaction == null) break;
-            workDone++;
-            hierarchyAdvanced = true;
             try {
-                switch (transaction.operation) {
-                    case COMMIT -> this.manager.commitStagedRoot(
-                            transaction.sourceRevision, transaction.positions);
-                    case ROLLBACK -> this.manager.rollbackStagedRoot(transaction.sourceRevision);
-                    case COMPLETE_ROLLBACK -> this.manager.completeRollback(
-                            transaction.sourceRevision);
+                boolean completed = switch (transaction.operation) {
+                    case COMMIT -> {
+                        this.manager.commitStagedRoot(
+                                transaction.sourceRevision, transaction.positions);
+                        yield true;
+                    }
+                    case ROLLBACK -> {
+                        this.manager.rollbackStagedRoot(transaction.sourceRevision);
+                        yield true;
+                    }
+                    case COMPLETE_ROLLBACK -> {
+                        this.manager.completeRollback(transaction.sourceRevision);
+                        yield true;
+                    }
                     case FINALIZE -> this.manager.finalizeStagedRoot(transaction.sourceRevision);
+                };
+                if (!completed) {
+                    this.rendererTransactionQueue.add(transaction);
+                    topologyDeferred = true;
+                    continue;
                 }
+                workDone++;
+                hierarchyAdvanced = true;
                 this.completedRendererTransactions.add(transaction);
             } catch (Throwable failure) {
+                workDone++;
                 transaction.failure.accept(failure);
             }
         }
@@ -299,6 +315,7 @@ public class AsyncNodeManager {
 
         if (workDone == 0) {//Nothing happened, which is odd, but just return
             //Should probably log that nothing happened, at least once
+            if (topologyDeferred) LockSupport.parkNanos(10_000_000L);
             return;
         }
         if (this.needsWaitForSync) {
@@ -455,7 +472,9 @@ public class AsyncNodeManager {
         boolean transferred = false;
         try {
             if (publication.previousRevision() >= 0) {
-                this.manager.finalizeStagedRoot(publication.previousRevision());
+                if (!this.manager.finalizeStagedRoot(publication.previousRevision())) {
+                    return false;
+                }
             }
             NodeManager.RendererFence staged = this.manager.stageGeometryResult(geometry);
             if (staged == null && this.manager.ensureHierarchyOwner(geometry.position)) {
@@ -668,7 +687,6 @@ public class AsyncNodeManager {
     //==================================================================================================================
     //Incoming events
 
-    //TODO: add atomic counters for each event type probably
     private final ConcurrentLinkedDeque<MemoryBuffer> requestBatchQueue = new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<VirtualSurfacePublication> virtualSurfaceQueue =
             new ConcurrentLinkedDeque<>();
