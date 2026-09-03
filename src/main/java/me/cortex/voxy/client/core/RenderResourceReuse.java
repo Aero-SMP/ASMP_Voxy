@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core;
 
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
@@ -46,12 +47,17 @@ public class RenderResourceReuse {
     }
 
     static GlBuffer getOrCreateGeometryBuffer() {
+        long capacity = getGeometryBufferSize();
         GlBuffer buffer = null;
-        if (!GEOMETRY_BUFFER_CACHE.isEmpty()) {
-            buffer = GEOMETRY_BUFFER_CACHE.removeFirst();
-            //Reuse buffer, todo: probably check the geometry size and try upsize if possible
-        } else {
-            long capacity = getGeometryBufferSize();
+        while (!GEOMETRY_BUFFER_CACHE.isEmpty()) {
+            GlBuffer candidate = GEOMETRY_BUFFER_CACHE.removeFirst();
+            if (candidate.size() == capacity) {
+                buffer = candidate;
+                break;
+            }
+            candidate.free();
+        }
+        if (buffer == null) {
             long driverMemory = -1;
             if (Capabilities.INSTANCE.canQueryGpuMemory) {
                 driverMemory = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
@@ -94,6 +100,25 @@ public class RenderResourceReuse {
     }
 
     private static long getGeometryBufferSize() {
+        int requestedMib = VoxyConfig.CONFIG.geometryMemoryMib;
+        if (requestedMib > 0) {
+            long requested = requestedMib * 1024L * 1024L;
+            long limit = Math.min(Capabilities.INSTANCE.ssboMaxSize, (1L << 32) - 1024);
+            if (Capabilities.INSTANCE.canQueryGpuMemory) {
+                long free = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
+                long safeAvailable = free - (1536L * 1024L * 1024L);
+                if (safeAvailable <= 0) safeAvailable = Math.max(64L * 1024L * 1024L, free / 2);
+                limit = Math.min(limit, safeAvailable);
+            }
+            long alignment = Math.max(1024, Capabilities.INSTANCE.ssboBindingAlignment);
+            long capacity = Math.max(alignment, Math.min(requested, limit));
+            capacity -= capacity % alignment;
+            if (capacity != requested) {
+                Logger.warn("Clamped requested geometry buffer from " + requested + " to " + capacity + " bytes");
+            }
+            return capacity;
+        }
+
         long geometryCapacity = Math.min((1L<<(64-Long.numberOfLeadingZeros(Capabilities.INSTANCE.ssboMaxSize-1)))<<1, 1L<<32)-1024/*(1L<<32)-1024*/;
         if (Capabilities.INSTANCE.isIntel) {
             geometryCapacity = Math.max(geometryCapacity, 1L<<30);//intel moment, force min 1gb
@@ -121,10 +146,6 @@ public class RenderResourceReuse {
             limit = Math.max(512*1024*1024, limit);
 
             geometryCapacity = Math.min(geometryCapacity, limit);
-        }
-        var override = System.getProperty("voxy.geometryBufferSizeOverrideMB", "");
-        if (!override.isEmpty()) {
-            geometryCapacity = Long.parseLong(override)*1024L*1024L;
         }
         return geometryCapacity;
     }

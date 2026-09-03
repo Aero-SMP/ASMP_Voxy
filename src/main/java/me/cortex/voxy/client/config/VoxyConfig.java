@@ -25,6 +25,7 @@ public class VoxyConfig {
 
     public boolean enabled = true;
     public boolean enableRendering = true;
+    public int geometryMemoryMib = 0;
     public float sectionRenderDistance = 16;
     public float subDivisionSize = 64;
     public int skyFogDistance = 96;

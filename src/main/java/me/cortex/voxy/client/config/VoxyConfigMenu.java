@@ -29,6 +29,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
     private static final ResourceLocation ENABLED = id("enabled");
     private static final ResourceLocation IRIS_RELOAD = id("iris_reload");
     private static final ResourceLocation RENDERING = id("rendering");
+    private static final ResourceLocation GEOMETRY_MEMORY = id("geometry_memory");
     private static final ResourceLocation RENDER_DISTANCE = id("render_distance");
     private static final ResourceLocation RENDER_RELOAD = OptionFlag.REQUIRES_RENDERER_RELOAD.getId();
 
@@ -70,6 +71,14 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setRange(new Range(10, 64 * 16, 1))
                 .setValueFormatter(value -> Component.literal(Integer.toString(value * 2)))
                 .setImpact(OptionImpact.MEDIUM)
+                .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
+
+        var geometryMemory = option(builder.createIntegerOption(GEOMETRY_MEMORY),
+                "voxy.config.general.geometry_memory", () -> geometryMemoryIndex(CFG.geometryMemoryMib),
+                value -> CFG.geometryMemoryMib = GEOMETRY_MEMORY_MIB[value], RENDER_RELOAD)
+                .setRange(new Range(0, GEOMETRY_MEMORY_MIB.length - 1, 1))
+                .setValueFormatter(VoxyConfigMenu::geometryMemoryLabel)
+                .setImpact(OptionImpact.HIGH)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
         var environmentalFog = option(builder.createBooleanOption(id("eviromental_fog")),
@@ -122,7 +131,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
-                .addOptionGroup(group(builder, subdivisionSize, renderDistance))
+                .addOptionGroup(group(builder, subdivisionSize, renderDistance, geometryMemory))
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
                 .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));
@@ -210,5 +219,27 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
 
     private static int subDiv2ln(float value) {
         return (int) ((Math.log((double) value / SUBDIV_MIN) / Math.log(2) / SUBDIV_CONST) * SUBDIV_IN_MAX);
+    }
+
+    private static final int[] GEOMETRY_MEMORY_MIB = {0, 256, 512, 768, 1024, 1536, 2048, 3072, 4096};
+
+    private static int geometryMemoryIndex(int configuredMib) {
+        int nearest = 0;
+        int nearestDistance = Math.abs(configuredMib - GEOMETRY_MEMORY_MIB[0]);
+        for (int i = 1; i < GEOMETRY_MEMORY_MIB.length; i++) {
+            int distance = Math.abs(configuredMib - GEOMETRY_MEMORY_MIB[i]);
+            if (distance < nearestDistance) {
+                nearest = i;
+                nearestDistance = distance;
+            }
+        }
+        return nearest;
+    }
+
+    private static Component geometryMemoryLabel(int value) {
+        int mib = GEOMETRY_MEMORY_MIB[value];
+        if (mib == 0) return Component.translatable("voxy.config.general.geometry_memory.auto");
+        if (mib % 1024 == 0) return Component.literal((mib / 1024) + " GiB");
+        return Component.literal(mib + " MiB");
     }
 }

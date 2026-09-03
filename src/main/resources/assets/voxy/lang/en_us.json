@@ -14,6 +14,10 @@
   "voxy.config.general.renderDistance": "Render distance",
   "voxy.config.general.renderDistance.tooltip": "Render distance of voxy in chunks",
 
+  "voxy.config.general.geometry_memory": "Geometry memory",
+  "voxy.config.general.geometry_memory.tooltip": "Geometry arena capacity. Auto selects a safe size for the GPU; fixed sizes are still limited by hardware and available dedicated memory.",
+  "voxy.config.general.geometry_memory.auto": "Auto",
+
   "voxy.config.general.environmental_fog": "Enable environmental fog",
   "voxy.config.general.environmental_fog.tooltip": "Enables or disables voxy rendering environmental fog",
 
