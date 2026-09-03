@@ -39,20 +39,18 @@ impl Section {
                 cells.len()
             );
         }
-        let non_empty_children = if cells.iter().any(|cell| !cell.is_air()) {
-            0xff
-        } else {
-            0
-        };
+        if key.level != 0 {
+            bail!("source cells may only construct a level-zero section");
+        }
         Ok(Self {
             key,
-            non_empty_children,
+            non_empty_children: 0,
             cells,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.non_empty_children == 0 || self.cells.iter().all(|cell| cell.is_air())
+        self.cells.iter().all(|cell| cell.is_air())
     }
 }
 
@@ -97,6 +95,16 @@ pub fn build_parent(
     children: &[Option<Section>; 8],
     opacity: &[u8],
 ) -> Result<Section> {
+    build_parent_from_refs(key, &children.each_ref().map(Option::as_ref), opacity)
+}
+
+/// Allocation-free parent builder for regional streaming. Regional rebuilds retain one level and
+/// borrow it while producing the next.
+pub fn build_parent_from_refs(
+    key: SectionKey,
+    children: &[Option<&Section>; 8],
+    opacity: &[u8],
+) -> Result<Section> {
     if key.level == 0 {
         bail!("a level-zero section has no Voxy child sections");
     }
@@ -122,7 +130,7 @@ pub fn build_parent(
                                 gy / SECTION_EDGE,
                                 gz / SECTION_EDGE,
                             );
-                            if let Some(child) = &children[child_slot] {
+                            if let Some(child) = children[child_slot] {
                                 input[child_index(dx, dy, dz)] = child.cells[cell_index(
                                     gx % SECTION_EDGE,
                                     gy % SECTION_EDGE,
@@ -149,4 +157,26 @@ pub const fn cell_index(x: usize, y: usize, z: usize) -> usize {
 
 pub const fn child_index(x: usize, y: usize, z: usize) -> usize {
     (x & 1) | ((z & 1) << 1) | ((y & 1) << 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_zero_content_is_not_confused_with_child_presence() {
+        let key = SectionKey::new(0, 0, -2, 0).unwrap();
+        let mut cells = vec![Cell::AIR; SECTION_VOLUME];
+        cells[0].block = 1;
+        let section = Section::from_cells(key, cells).unwrap();
+        assert!(!section.is_empty());
+        assert_eq!(section.non_empty_children, 0);
+        assert!(
+            Section::from_cells(
+                SectionKey::new(1, 0, -1, 0).unwrap(),
+                vec![Cell::AIR; SECTION_VOLUME]
+            )
+            .is_err()
+        );
+    }
 }

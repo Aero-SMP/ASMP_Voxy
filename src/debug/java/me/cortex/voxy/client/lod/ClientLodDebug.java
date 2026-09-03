@@ -1,58 +1,42 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.VoxyClient;
+import net.minecraft.client.Minecraft;
+import net.neoforged.neoforge.client.event.RenderFrameEvent;
+import net.neoforged.neoforge.common.NeoForge;
+import org.lwjgl.system.MemoryStack;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.lwjgl.system.MemoryStack;
 
 import java.io.IOException;
+import java.nio.IntBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.nio.IntBuffer;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.lwjgl.opengl.GL42C.GL_COMMAND_BARRIER_BIT;
 import static org.lwjgl.opengl.GL42C.glMemoryBarrier;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BARRIER_BIT;
 import static org.lwjgl.opengl.GL45C.glGetNamedBufferSubData;
 
-/** Pipeline diagnostics compiled only into the debug client JAR. */
+/** Regional-pipeline diagnostics compiled only into debug client JARs. */
 public final class ClientLodDebug {
     private static final Logger LOGGER = LoggerFactory.getLogger("Voxy Client Debug");
-    private static final String VERSION = VoxyClient.MOD_VERSION;
     private static final Path LOG = Path.of("logs", "voxy-client-debug.log").toAbsolutePath();
     private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(
             Thread.ofPlatform().daemon().name("Voxy client debug log writer").factory());
-    private static final long SAMPLE_INTERVAL_NANOS = 1_000_000_000L;
-    private static final AtomicReference<String> SNAPSHOT = new AtomicReference<>(
-            "blocker=CONNECTING snapshot=not-ready");
-    private static final AtomicLong SNAPSHOT_NANOS = new AtomicLong();
+    private static final long SAMPLE_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+    private static final int UNLIMITED_FRAMERATE = 260;
 
+    private static boolean initialized;
+    private static boolean dynamicFpsHandled;
     private static long nextSampleNanos;
-    private static int candidates;
-    private static int busy;
-    private static int missingBinding;
-    private static int noCompatibleContent;
-    private static int missingContent;
-    private static int missingNeighbors;
-    private static int modelsPending;
-    private static int pendingModelId = -1;
-    private static int stageBlocked;
-    private static int pinBlocked;
-    private static int workerSaturated;
-    private static int alreadyActive;
-    private static int submitted;
-    private static ManifestCodec.SpatialNode sampleNode;
-    private static WireMessage.Hash256 sampleHash;
-    private static final long RENDER_SAMPLE_INTERVAL_NANOS = 1_000_000_000L;
     private static int sampledRenderFrame = Integer.MIN_VALUE;
     private static int sampledRenderPasses;
     private static long nextRenderSampleNanos;
@@ -60,15 +44,11 @@ public final class ClientLodDebug {
     private static volatile int geometrySections;
     private static volatile int conservativeSelected;
     private static volatile int refinedSelected;
-    private static volatile int conservativeOpaque;
-    private static volatile int conservativeTranslucent;
-    private static volatile int conservativeTemporal;
-    private static volatile int refinedOpaque;
-    private static volatile int refinedTranslucent;
-    private static volatile int refinedTemporal;
+    private static volatile int conservativeDraws;
+    private static volatile int refinedDraws;
 
     static {
-        String version = "Voxy version " + VERSION;
+        String version = "Voxy version " + VoxyClient.MOD_VERSION;
         LOGGER.info(version);
         WRITER.execute(() -> initializeLog(version));
         ClientAutoUpdater.start();
@@ -76,101 +56,51 @@ public final class ClientLodDebug {
 
     private ClientLodDebug() {}
 
-    static boolean diagnosticsEnabled() { return true; }
+    static void init() {
+        if (initialized) return;
+        initialized = true;
+        NeoForge.EVENT_BUS.addListener(ClientLodDebug::forceFullSpeed);
+    }
+
+    private static void forceFullSpeed(RenderFrameEvent.Pre event) {
+        disableDynamicFps();
+        Minecraft minecraft = Minecraft.getInstance();
+        minecraft.options.pauseOnLostFocus = false;
+        if (minecraft.options.framerateLimit().get() != UNLIMITED_FRAMERATE) {
+            minecraft.options.framerateLimit().set(UNLIMITED_FRAMERATE);
+        }
+        if (minecraft.options.enableVsync().get()) minecraft.options.enableVsync().set(false);
+        minecraft.getWindow().setFramerateLimit(UNLIMITED_FRAMERATE);
+    }
+
+    private static void disableDynamicFps() {
+        if (dynamicFpsHandled) return;
+        dynamicFpsHandled = true;
+        try {
+            Class<?> configClass = Class.forName("dynamic_fps.impl.config.DynamicFPSConfig");
+            Object config = configClass.getField("INSTANCE").get(null);
+            configClass.getMethod("setEnabled", boolean.class).invoke(config, false);
+            Class<?> modClass = Class.forName("dynamic_fps.impl.DynamicFPSMod");
+            modClass.getMethod("onStatusChanged", boolean.class).invoke(null, true);
+            emit("VOXY_DEBUG state=FULL_SPEED dynamicFps=DISABLED");
+        } catch (ClassNotFoundException ignored) {
+            emit("VOXY_DEBUG state=FULL_SPEED dynamicFps=ABSENT");
+        } catch (ReflectiveOperationException | RuntimeException failure) {
+            emit("VOXY_DEBUG state=FULL_SPEED dynamicFps=FAILED type="
+                    + failure.getClass().getSimpleName() + " message="
+                    + oneLine(failure.getMessage()));
+        }
+    }
 
     static void tick() {
         ClientAutoUpdater.tick();
         long now = System.nanoTime();
         if (now < nextSampleNanos) return;
         nextSampleNanos = now + SAMPLE_INTERVAL_NANOS;
-        try {
-            emit("VOXY_PIPELINE " + ClientSession.debugSnapshot());
-        } catch (RuntimeException failure) {
-            emit("VOXY_PIPELINE state=DEBUG_SNAPSHOT_FAILED type="
-                    + failure.getClass().getSimpleName() + " message="
-                    + oneLine(failure.getMessage()));
-        }
+        emit("VOXY_PIPELINE " + ClientSession.debugSnapshot() + ' ' + renderSnapshot());
     }
 
-    static void sessionStarted(long session, String dimension) {
-        nextSampleNanos = 0;
-        emit("VOXY_SESSION state=START session=" + session
-                + " dimension=" + oneLine(dimension));
-    }
-
-    static void sessionFailed(Throwable failure) {
-        emit("VOXY_SESSION state=FAILED type=" + failure.getClass().getSimpleName()
-                + " message=" + oneLine(failure.getMessage()));
-    }
-
-    static String latestSnapshot() {
-        long captured = SNAPSHOT_NANOS.get();
-        long ageMillis = captured == 0 ? -1
-                : TimeUnit.NANOSECONDS.toMillis(Math.max(0, System.nanoTime() - captured));
-        return "sampleAgeMs=" + ageMillis + ' ' + SNAPSHOT.get();
-    }
-
-    static void snapshotCaptured(String snapshot) {
-        SNAPSHOT.set(snapshot);
-        SNAPSHOT_NANOS.set(System.nanoTime());
-    }
-
-    static void activationPass(int candidateCount, int busyCount, int missingBindingCount,
-                               int noCompatibleContentCount, int missingContentCount,
-                               int missingNeighborCount, int modelsPendingCount,
-                               int modelId, int stageBlockedCount, int pinBlockedCount,
-                               int workerSaturatedCount, int alreadyActiveCount,
-                               int submittedCount, ManifestCodec.SpatialNode node,
-                               WireMessage.Hash256 hash) {
-        candidates = candidateCount;
-        busy = busyCount;
-        missingBinding = missingBindingCount;
-        noCompatibleContent = noCompatibleContentCount;
-        missingContent = missingContentCount;
-        missingNeighbors = missingNeighborCount;
-        modelsPending = modelsPendingCount;
-        pendingModelId = modelId;
-        stageBlocked = stageBlockedCount;
-        pinBlocked = pinBlockedCount;
-        workerSaturated = workerSaturatedCount;
-        alreadyActive = alreadyActiveCount;
-        submitted = submittedCount;
-        sampleNode = node;
-        sampleHash = hash;
-    }
-
-    static String activationSummary() {
-        return "candidates=" + candidates
-                + ",busy=" + busy
-                + ",missingBinding=" + missingBinding
-                + ",noCompatibleContent=" + noCompatibleContent
-                + ",missingContent=" + missingContent
-                + ",missingNeighbors=" + missingNeighbors
-                + ",modelsPending=" + modelsPending
-                + ",pendingModelId=" + pendingModelId
-                + ",stageBlocked=" + stageBlocked
-                + ",pinBlocked=" + pinBlocked
-                + ",workerSaturated=" + workerSaturated
-                + ",alreadyActive=" + alreadyActive
-                + ",submitted=" + submitted
-                + ",sampleNode=" + String.valueOf(sampleNode)
-                + ",sampleHash=" + String.valueOf(sampleHash);
-    }
-
-    static String activationBlocker() {
-        if (missingBinding > 0) return "MISSING_NODE_DESCRIPTOR";
-        if (noCompatibleContent > 0) return "NO_COMPATIBLE_SELECTED_CONTENT";
-        if (missingContent > 0) return "WAITING_FOR_CONTENT_OBJECTS";
-        if (missingNeighbors > 0) return "WAITING_FOR_NEIGHBOR_DEPENDENCIES";
-        if (modelsPending > 0) return "WAITING_FOR_BLOCK_MODELS";
-        if (pinBlocked > 0) return "RESIDENCY_PIN_FAILED";
-        if (stageBlocked > 0) return "ACTIVATION_STAGE_BLOCKED";
-        if (workerSaturated > 0) return "MESH_WORKER_BUSY";
-        if (busy > 0) return "ACTIVATION_BUSY";
-        return null;
-    }
-
-    /** Samples existing renderer counters at most once per second, twice for the two HZB passes. */
+    /** Samples existing renderer counters once per second for both HZB passes. */
     public static void captureRender(int frameId, int sectionCount,
                                      int renderListBuffer, int drawCountBuffer) {
         long now = System.nanoTime();
@@ -178,14 +108,12 @@ public final class ClientLodDebug {
             if (now < nextRenderSampleNanos) return;
             sampledRenderFrame = frameId;
             sampledRenderPasses = 0;
-            nextRenderSampleNanos = now + RENDER_SAMPLE_INTERVAL_NANOS;
+            nextRenderSampleNanos = now + SAMPLE_INTERVAL_NANOS;
         }
-        if (frameId != sampledRenderFrame || sampledRenderPasses >= 2) return;
+        if (sampledRenderPasses >= 2) return;
         int pass = sampledRenderPasses++;
         int selected = 0;
-        int opaque = 0;
-        int translucent = 0;
-        int temporal = 0;
+        int draws = 0;
         if (sectionCount > 0) {
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
             try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -194,49 +122,24 @@ public final class ClientLodDebug {
                 glGetNamedBufferSubData(renderListBuffer, 0, renderList);
                 glGetNamedBufferSubData(drawCountBuffer, 0, counts);
                 selected = renderList.get(0);
-                opaque = counts.get(3);
-                translucent = counts.get(4);
-                temporal = counts.get(5);
+                draws = counts.get(3) + counts.get(4) + counts.get(5);
             }
         }
         renderFrame = frameId;
         geometrySections = sectionCount;
         if (pass == 0) {
             conservativeSelected = selected;
-            conservativeOpaque = opaque;
-            conservativeTranslucent = translucent;
-            conservativeTemporal = temporal;
+            conservativeDraws = draws;
         } else {
             refinedSelected = selected;
-            refinedOpaque = opaque;
-            refinedTranslucent = translucent;
-            refinedTemporal = temporal;
+            refinedDraws = draws;
         }
     }
 
-    static String renderSummary() {
-        return "frame=" + renderFrame
-                + ",geometrySections=" + geometrySections
-                + ",conservativeSelected=" + conservativeSelected
-                + ",refinedSelected=" + refinedSelected
-                + ",conservativeDraws=" + conservativeOpaque + '/'
-                + conservativeTranslucent + '/' + conservativeTemporal
-                + ",refinedDraws=" + refinedOpaque + '/'
-                + refinedTranslucent + '/' + refinedTemporal;
-    }
-
-    static String renderBlocker(int activePublications) {
-        if (activePublications == 0) return null;
-        if (renderFrame == Integer.MIN_VALUE) return "WAITING_FOR_RENDER_COUNTER_SAMPLE";
-        if (geometrySections == 0) return "ACTIVE_PUBLICATION_HAS_NO_GEOMETRY_ALLOCATION";
-        if (conservativeSelected == 0 && refinedSelected == 0) {
-            return "GPU_SELECTED_ZERO_ACTIVE_SECTIONS";
-        }
-        if (conservativeOpaque + conservativeTranslucent + conservativeTemporal
-                + refinedOpaque + refinedTranslucent + refinedTemporal == 0) {
-            return "GPU_GENERATED_ZERO_DRAW_COMMANDS";
-        }
-        return null;
+    private static String renderSnapshot() {
+        return "renderFrame=" + renderFrame + " geometrySections=" + geometrySections
+                + " selected=" + conservativeSelected + '/' + refinedSelected
+                + " draws=" + conservativeDraws + '/' + refinedDraws;
     }
 
     private static void initializeLog(String version) {
@@ -261,11 +164,8 @@ public final class ClientLodDebug {
         });
     }
 
-    static void updaterEvent(String message) {
-        emit("VOXY_UPDATER " + message);
-    }
+    static void updaterEvent(String message) { emit("VOXY_UPDATER " + message); }
 
-    /** Copies a coherent log snapshot on the same executor that owns every append. */
     static boolean snapshotLog(Path destination) throws IOException, InterruptedException {
         try {
             return WRITER.submit(() -> {

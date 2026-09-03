@@ -8,7 +8,7 @@ import static org.lwjgl.opengl.GL15C.GL_ARRAY_BUFFER;
 import static org.lwjgl.opengl.GL15C.glBindBuffer;
 
 public class BasicSectionGeometryData {
-    public static final int SECTION_METADATA_SIZE = 32;
+    public static final int SECTION_METADATA_SIZE = 48;
     private final GlBuffer sectionMetadataBuffer;
     private final GlBuffer geometryBuffer;
 

@@ -4,23 +4,8 @@ package me.cortex.voxy.client.lod;
 public final class ClientLodDebug {
     private ClientLodDebug() {}
 
-    static boolean diagnosticsEnabled() { return false; }
+    static void init() {}
     static void tick() {}
-    static void sessionStarted(long session, String dimension) {}
-    static void sessionFailed(Throwable failure) {}
-    static String latestSnapshot() { return "blocker=DEBUG_DISABLED"; }
-    static void snapshotCaptured(String snapshot) {}
-    static void activationPass(int candidates, int busy, int missingBinding,
-                               int noCompatibleContent, int missingContent,
-                               int missingNeighbors, int modelsPending,
-                               int pendingModelId, int stageBlocked, int pinBlocked,
-                               int workerSaturated, int alreadyActive, int submitted,
-                               ManifestCodec.SpatialNode sampleNode,
-                               WireMessage.Hash256 sampleHash) {}
-    static String activationSummary() { return "disabled"; }
-    static String activationBlocker() { return null; }
     public static void captureRender(int frameId, int geometrySections,
                                      int renderListBuffer, int drawCountBuffer) {}
-    static String renderSummary() { return "disabled"; }
-    static String renderBlocker(int activePublications) { return null; }
 }

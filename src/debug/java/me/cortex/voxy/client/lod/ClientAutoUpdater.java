@@ -2,6 +2,7 @@ package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.Screenshot;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
@@ -42,6 +43,7 @@ final class ClientAutoUpdater {
     private static final String REMOTE_DIAGNOSTICS =
             "/home/printer/Desktop/Creative/logs/client-upload";
     private static final long POLL_SECONDS = 20;
+    private static final long SCREENSHOT_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
     private static final Pattern DEBUG_JAR = Pattern.compile(
             "^ASMP_voxy-([0-9A-Za-z][0-9A-Za-z.-]*)\\+([0-9.]+)-neoforge-debug\\.jar$");
     private static final Pattern VERSION_TOKEN = Pattern.compile("[0-9]+|[A-Za-z]+");
@@ -50,6 +52,10 @@ final class ClientAutoUpdater {
     private static volatile boolean restartPending;
     private static boolean restartDisconnectRequested;
     private static long nextConnectNanos;
+    private static long nextScreenshotNanos;
+    private static final AtomicBoolean SCREENSHOT_IN_FLIGHT = new AtomicBoolean();
+    private static final Object SCREENSHOT_LOCK = new Object();
+    private static volatile Path latestScreenshot;
 
     private ClientAutoUpdater() {}
 
@@ -99,6 +105,7 @@ final class ClientAutoUpdater {
             minecraft.stop();
             return;
         }
+        captureScreenshot(minecraft);
         if (!readyToConnect) return;
         if (!minecraft.isGameLoadFinished() || minecraft.getConnection() != null
                 || minecraft.level != null || minecraft.screen == null
@@ -111,6 +118,52 @@ final class ClientAutoUpdater {
                 ServerData.Type.OTHER);
         ConnectScreen.startConnecting(minecraft.screen, minecraft,
                 ServerAddress.parseString(MINECRAFT_SERVER), server, false, null);
+    }
+
+    private static void captureScreenshot(Minecraft minecraft) {
+        if (!minecraft.isGameLoadFinished() || minecraft.level == null) return;
+        long now = System.nanoTime();
+        if (now < nextScreenshotNanos) return;
+        nextScreenshotNanos = now + SCREENSHOT_INTERVAL_NANOS;
+        if (!SCREENSHOT_IN_FLIGHT.compareAndSet(false, true)) return;
+
+        Path gameDirectory = minecraft.gameDirectory.toPath().toAbsolutePath();
+        String filename = "voxy-debug-auto-" + System.currentTimeMillis() + ".png";
+        Path captured = gameDirectory.resolve("screenshots").resolve(filename);
+        try {
+            Screenshot.grab(gameDirectory.toFile(), filename, minecraft.getMainRenderTarget(),
+                    result -> {
+                        try {
+                            if (!Files.isRegularFile(captured)) {
+                                ClientLodDebug.updaterEvent("state=SCREENSHOT_FAILED message="
+                                        + oneLine(result.getString()));
+                                return;
+                            }
+                            synchronized (SCREENSHOT_LOCK) {
+                                Path previous = latestScreenshot;
+                                latestScreenshot = captured;
+                                if (previous != null && !previous.equals(captured)) {
+                                    try {
+                                        Files.deleteIfExists(previous);
+                                    } catch (IOException failure) {
+                                        ClientLodDebug.updaterEvent(
+                                                "state=SCREENSHOT_CLEANUP_FAILED message="
+                                                        + oneLine(failure.getMessage()));
+                                    }
+                                }
+                            }
+                            ClientLodDebug.updaterEvent("state=SCREENSHOT_CAPTURED file="
+                                    + captured.getFileName());
+                        } finally {
+                            SCREENSHOT_IN_FLIGHT.set(false);
+                        }
+                    });
+        } catch (RuntimeException | Error failure) {
+            SCREENSHOT_IN_FLIGHT.set(false);
+            ClientLodDebug.updaterEvent("state=SCREENSHOT_FAILED type="
+                    + failure.getClass().getSimpleName() + " message="
+                    + oneLine(failure.getMessage()));
+        }
     }
 
     private static boolean checkAndInstall() throws Exception {
@@ -211,11 +264,17 @@ final class ClientAutoUpdater {
         snapshot(gameDirectory.resolve(".voxy-updater").resolve("relaunched-java.log"),
                 staging.resolve("relaunched-java.log"), sources, snapshotStatus);
         try {
-            Path screenshot = newestFile(gameDirectory.resolve("screenshots"));
-            if (screenshot != null) {
-                snapshot(screenshot, staging.resolve("latest-screenshot"
-                        + extension(screenshot.getFileName().toString())), sources,
-                        snapshotStatus);
+            synchronized (SCREENSHOT_LOCK) {
+                Path screenshot = latestScreenshot;
+                if (screenshot == null || !Files.isRegularFile(screenshot)) {
+                    screenshot = SCREENSHOT_IN_FLIGHT.get() ? null
+                            : newestFile(gameDirectory.resolve("screenshots"));
+                }
+                if (screenshot != null) {
+                    snapshot(screenshot, staging.resolve("latest-screenshot"
+                            + extension(screenshot.getFileName().toString())), sources,
+                            snapshotStatus);
+                }
             }
         } catch (IOException failure) {
             snapshotStatus.append("screenshots=FAILED:")

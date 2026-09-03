@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.core.rendering;
 
-/** Packed spatial keys shared by the renderer and manifest hierarchy. */
+/** Packed spatial keys shared by the renderer and regional hierarchy. */
 public final class SectionKey {
     public static final int MAX_LOD_LAYER = 4;
 

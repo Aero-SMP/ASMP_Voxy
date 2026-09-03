@@ -1,17 +1,14 @@
 pub mod anvil;
+pub mod catalog;
 pub mod config;
 pub mod crc;
 pub mod key;
 pub mod lod;
+pub mod regional;
 pub mod registry;
 pub mod server;
-pub mod surface;
 
 pub const MAX_LOD: u8 = 4;
-
-pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> anyhow::Result<std::sync::MutexGuard<'_, T>> {
-    mutex.lock().map_err(|_| anyhow::anyhow!("mutex poisoned"))
-}
 
 pub fn read_lock<T>(
     lock: &std::sync::RwLock<T>,

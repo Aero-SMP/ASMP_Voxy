@@ -1,9 +1,6 @@
-use crate::surface::visibility::DimensionVisibilityPolicy;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, time::Duration};
-
-const MAX_VISIBILITY_POLICY_OVERRIDES: usize = 256;
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -13,7 +10,6 @@ pub struct Config {
     pub dimension: String,
     pub poll_interval: Duration,
     pub rayon_threads: usize,
-    pub visibility_policies: BTreeMap<String, DimensionVisibilityPolicy>,
     pub once: bool,
 }
 
@@ -28,8 +24,6 @@ struct FileConfig {
     poll_ms: u64,
     #[serde(default)]
     rayon_threads: usize,
-    #[serde(default)]
-    visibility: BTreeMap<String, DimensionVisibilityPolicy>,
     #[serde(default)]
     once: bool,
     #[serde(default)]
@@ -89,11 +83,10 @@ impl Config {
             bail!("rayon_threads must be between 1 and 256, or 0 for the Rayon default");
         }
         if file.dimension.is_empty()
-            || file.dimension.len() > crate::surface::wire::MAX_DIMENSION_BYTES
+            || file.dimension.len() > crate::regional::wire::MAX_DIMENSION_BYTES
         {
             bail!("dimension is outside the length limit");
         }
-        validate_visibility_policies(&file.visibility)?;
         Ok(Self {
             world: file.world,
             data: file.data,
@@ -101,7 +94,6 @@ impl Config {
             dimension: file.dimension,
             poll_interval: Duration::from_millis(file.poll_ms),
             rayon_threads: file.rayon_threads,
-            visibility_policies: file.visibility,
             once: once || file.once,
         })
     }
@@ -109,23 +101,6 @@ impl Config {
     pub fn usage() -> &'static str {
         "voxy-rust-server [--config voxy-rust.toml] [--once]"
     }
-}
-
-fn validate_visibility_policies(
-    policies: &BTreeMap<String, DimensionVisibilityPolicy>,
-) -> Result<()> {
-    if policies.len() > MAX_VISIBILITY_POLICY_OVERRIDES {
-        bail!(
-            "visibility policy overrides exceed the {MAX_VISIBILITY_POLICY_OVERRIDES}-dimension limit"
-        );
-    }
-    for (dimension, &policy) in policies {
-        if dimension.is_empty() || dimension.len() > crate::surface::wire::MAX_DIMENSION_BYTES {
-            bail!("visibility override dimension is outside the length limit");
-        }
-        DimensionVisibilityPolicy::configured(dimension, Some(policy))?;
-    }
-    Ok(())
 }
 
 fn default_dimension() -> String {

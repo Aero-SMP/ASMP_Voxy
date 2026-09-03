@@ -45,7 +45,7 @@ final class QuicEndpointDiscovery {
                 (payload, context) -> receiveEndpoint(payload));
     }
 
-    static QuicClient connect() throws IOException {
+    static RegionalQuicClient connect() throws IOException {
         ClientPacketListener listener = Minecraft.getInstance().getConnection();
         if (listener == null || !listener.hasChannel(QuicEndpointPayload.TYPE)) {
             throw new IOException("Minecraft server does not advertise Voxy QUIC");
@@ -74,7 +74,7 @@ final class QuicEndpointDiscovery {
         InetAddress[] addresses = endpoint.host().isEmpty()
                 ? new InetAddress[]{remoteAddress(listener.getConnection().getRemoteAddress())}
                 : resolve(endpoint.host());
-        return QuicClient.connect(addresses, endpoint.udpPort(), endpoint.alpn(),
+        return RegionalQuicClient.connect(addresses, endpoint.udpPort(), endpoint.alpn(),
                 endpoint.certificateSha256());
     }
 

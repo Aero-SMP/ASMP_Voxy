@@ -23,7 +23,6 @@ const REGION_HEADER_BYTES: usize = 8192;
 const MAX_COMPRESSED_CHUNK: usize = 255 * 4096;
 const MAX_EXTERNAL_CHUNK: usize = 128 * 1024 * 1024;
 const MAX_DECOMPRESSED_CHUNK: u64 = 128 * 1024 * 1024;
-const MAX_PLAYER_DATA_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DimensionSpec {
@@ -95,7 +94,6 @@ pub struct LevelZeroGroup {
 pub struct AnvilWorld {
     pub dimension: String,
     pub root: PathBuf,
-    world_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,14 +106,6 @@ struct ChunkNbt {
     status: String,
     #[serde(default)]
     sections: Vec<SectionNbt>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PlayerNbt {
-    #[serde(rename = "Dimension")]
-    dimension: String,
-    #[serde(rename = "Pos")]
-    position: Vec<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,73 +145,8 @@ struct BiomesNbt {
 }
 
 impl AnvilWorld {
-    pub fn new(dimension: String, root: PathBuf, world_root: PathBuf) -> Self {
-        Self {
-            dimension,
-            root,
-            world_root,
-        }
-    }
-
-    /// Last saved player positions are the strongest bootstrap hint available before the first
-    /// client can lease a published root. Reading them changes only import order; it never loads
-    /// or generates a Minecraft chunk.
-    pub fn saved_player_regions(&self) -> Result<BTreeMap<(i32, i32), u64>> {
-        let directory = self.world_root.join("playerdata");
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("read {}", directory.display()));
-            }
-        };
-        let mut regions: BTreeMap<(i32, i32), u64> = BTreeMap::new();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_none_or(|extension| extension != "dat") {
-                continue;
-            }
-            let Ok(file) = File::open(&path) else {
-                continue;
-            };
-            let Ok(player) = fastnbt::from_reader::<_, PlayerNbt>(
-                GzDecoder::new(file).take(MAX_PLAYER_DATA_BYTES),
-            ) else {
-                continue;
-            };
-            if player.dimension != self.dimension || player.position.len() < 3 {
-                continue;
-            }
-            let x = player.position[0];
-            let z = player.position[2];
-            if !x.is_finite()
-                || !z.is_finite()
-                || x < i32::MIN as f64
-                || x > i32::MAX as f64
-                || z < i32::MIN as f64
-                || z > i32::MAX as f64
-            {
-                continue;
-            }
-            let coordinate = (
-                (x.floor() as i32).div_euclid(512),
-                (z.floor() as i32).div_euclid(512),
-            );
-            let saved = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs());
-            regions
-                .entry(coordinate)
-                .and_modify(|current| *current = (*current).max(saved))
-                .or_insert(saved);
-        }
-        Ok(regions)
+    pub fn new(dimension: String, root: PathBuf) -> Self {
+        Self { dimension, root }
     }
 
     pub fn region_dir(&self) -> PathBuf {
@@ -416,7 +341,7 @@ impl AnvilWorld {
     }
 
     /// Reads every canonical compressed-chunk fingerprint from one already-snapshotted region
-    /// through a single file handle. Incremental surface publication uses this compact source table
+    /// through a single file handle. Regional publication uses this compact source table
     /// to distinguish the actually changed 2×2 chunk groups from unrelated region rewrites.
     pub fn region_fingerprints(&self, header: &RegionHeader) -> Result<Vec<Option<u64>>> {
         if header.entries.len() != 1024 {

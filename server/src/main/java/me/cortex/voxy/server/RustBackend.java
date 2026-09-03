@@ -80,9 +80,13 @@ final class RustBackend {
         while (running) {
             Process child = null;
             try {
-                child = new ProcessBuilder(binary.toString(), "--config", CONFIG.toString())
-                        .redirectErrorStream(true)
-                        .start();
+                var builder = new ProcessBuilder(binary.toString(), "--config", CONFIG.toString())
+                        .redirectErrorStream(true);
+                // glibc otherwise creates an allocator arena for each busy Rayon/Tokio thread.
+                // Large temporary generation batches then leave many mostly empty 64–128 MiB
+                // arenas resident even after Rust drops every object they contained.
+                builder.environment().put("MALLOC_ARENA_MAX", "2");
+                child = builder.start();
                 synchronized (RustBackend.class) {
                     if (!running) {
                         terminateChild(child);

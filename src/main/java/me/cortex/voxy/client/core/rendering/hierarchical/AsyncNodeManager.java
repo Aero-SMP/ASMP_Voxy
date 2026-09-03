@@ -12,7 +12,6 @@ import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.section.BasicAsyncGeometryManager;
 import me.cortex.voxy.client.core.rendering.section.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.client.lod.MicrotileActivationManager.PublicationCancelledException;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.AllocationArena;
 import me.cortex.voxy.common.util.MemoryBuffer;
@@ -69,9 +68,9 @@ public class AsyncNodeManager {
 
     private final AtomicInteger workCounter = new AtomicInteger();
     private final ArrayList<RendererTransaction> completedRendererTransactions = new ArrayList<>();
-    private final ArrayList<VirtualSurfacePublication> completedVirtualSurfacePublications =
+    private final ArrayList<RegionalSectionPublication> completedRegionalSectionPublications =
             new ArrayList<>();
-    private final ArrayDeque<VirtualSurfacePublication> deferredVirtualSurfacePublications =
+    private final ArrayDeque<RegionalSectionPublication> deferredRegionalSectionPublications =
             new ArrayDeque<>();
     /**
      * Render-thread-owned completion queue. A result becoming visible to OpenGL is not the same
@@ -290,13 +289,13 @@ public class AsyncNodeManager {
 
         // Resolve topology work first. A directly selected descendant may arrive before its
         // request owner, so retain its complete geometry and retry only after hierarchy progress.
-        if (hierarchyAdvanced) this.retryDeferredVirtualSurfacePublications();
+        if (hierarchyAdvanced) this.retryDeferredRegionalSectionPublications();
         while (hasGeometryCapacity()) {
-            VirtualSurfacePublication publication = this.virtualSurfaceQueue.poll();
+            RegionalSectionPublication publication = this.regionalSectionQueue.poll();
             if (publication == null) break;
             workDone++;
-            if (!this.processVirtualSurfacePublication(publication)) {
-                this.deferredVirtualSurfacePublications.addLast(publication);
+            if (!this.processRegionalSectionPublication(publication)) {
+                this.deferredRegionalSectionPublications.addLast(publication);
             }
         }
 
@@ -403,14 +402,15 @@ public class AsyncNodeManager {
                 var iter = ids.intIterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
-                    int scatterAddr = (val<<1)|(1<<31);//Since we write to the second buffer
+                    int scatterAddr = (val*3)|(1<<31);//Since we write to the second buffer
 
-                    //Geometry buffer is index of 1, so mutate to put it in that location, it is also 32 bytes, so needs to be split into 2 separate scatter writes
-                    long ptrA = results.getScatterWritePtr(scatterAddr+0, 1);
+                    // Three aligned writes retain full u32 bucket counts for dense sections.
+                    long ptrA = results.getScatterWritePtr(scatterAddr+0, 2);
                     long ptrB = results.getScatterWritePtr(scatterAddr+1, 0);
+                    long ptrC = results.getScatterWritePtr(scatterAddr+2, 0);
 
                     //Write update data
-                    this.geometryManager.writeMetadataSplit(val, ptrA, ptrB);
+                    this.geometryManager.writeMetadataSplit(val, ptrA, ptrB, ptrC);
                 }
                 ids.clear();
             }
@@ -432,8 +432,8 @@ public class AsyncNodeManager {
 
         results.rendererTransactions.addAll(this.completedRendererTransactions);
         this.completedRendererTransactions.clear();
-        results.virtualSurfacePublications.addAll(this.completedVirtualSurfacePublications);
-        this.completedVirtualSurfacePublications.clear();
+        results.regionalSectionPublications.addAll(this.completedRegionalSectionPublications);
+        this.completedRegionalSectionPublications.clear();
 
         results.geometrySectionCount = this.geometryManager.getSectionCount();
         results.usedGeometry = this.geometryManager.getGeometryUsedBytes();
@@ -455,19 +455,19 @@ public class AsyncNodeManager {
                 > 50_000_000L;
     }
 
-    private void retryDeferredVirtualSurfacePublications() {
-        int remaining = this.deferredVirtualSurfacePublications.size();
+    private void retryDeferredRegionalSectionPublications() {
+        int remaining = this.deferredRegionalSectionPublications.size();
         while (remaining-- > 0 && hasGeometryCapacity()) {
-            VirtualSurfacePublication publication =
-                    this.deferredVirtualSurfacePublications.removeFirst();
-            if (!this.processVirtualSurfacePublication(publication)) {
-                this.deferredVirtualSurfacePublications.addLast(publication);
+            RegionalSectionPublication publication =
+                    this.deferredRegionalSectionPublications.removeFirst();
+            if (!this.processRegionalSectionPublication(publication)) {
+                this.deferredRegionalSectionPublications.addLast(publication);
             }
         }
     }
 
-    /** Uploads one complete node, or retains it until its manifested parent path exists. */
-    private boolean processVirtualSurfacePublication(VirtualSurfacePublication publication) {
+    /** Uploads one complete node, or retains it until its indexed parent path exists. */
+    private boolean processRegionalSectionPublication(RegionalSectionPublication publication) {
         BuiltSection geometry = publication.geometry();
         boolean transferred = false;
         try {
@@ -482,12 +482,12 @@ public class AsyncNodeManager {
             }
             if (staged == null) {
                 if (this.manager.hasTopLevelAncestor(geometry.position)) return false;
-                throw new PublicationCancelledException(
-                        "Virtual Surface hierarchy root is no longer active");
+                throw new IllegalStateException(
+                        "regional section hierarchy root is no longer active");
             }
             transferred = true;
             this.manager.commitStagedRoot(geometry.sourceRevision, Set.of(geometry.position));
-            this.completedVirtualSurfacePublications.add(publication);
+            this.completedRegionalSectionPublications.add(publication);
         } catch (Throwable failure) {
             if (!transferred) geometry.free();
             try {
@@ -585,11 +585,11 @@ public class AsyncNodeManager {
         this.usedGeometryAmount = results.usedGeometry;
 
         if (!results.rendererTransactions.isEmpty()
-                || !results.virtualSurfacePublications.isEmpty()) {
+                || !results.regionalSectionPublications.isEmpty()) {
             // glFenceSync is ordered after every upload, metadata scatter and top-level pointer
             // command emitted above. Polling happens on later render frames and never waits.
             this.queueGpuCompletion(new ArrayList<>(results.rendererTransactions),
-                    new ArrayList<>(results.virtualSurfacePublications));
+                    new ArrayList<>(results.regionalSectionPublications));
         }
 
         //Insert the result set into the cache
@@ -624,8 +624,8 @@ public class AsyncNodeManager {
                     Logger.error("Voxy renderer transaction completion failed", failure);
                 }
             }
-            for (VirtualSurfacePublication publication
-                    : completion.virtualSurfacePublications) {
+            for (RegionalSectionPublication publication
+                    : completion.regionalSectionPublications) {
                 try {
                     publication.success().run();
                 } catch (RuntimeException failure) {
@@ -636,7 +636,7 @@ public class AsyncNodeManager {
     }
 
     private void queueGpuCompletion(ArrayList<RendererTransaction> transactions,
-                                    ArrayList<VirtualSurfacePublication> publications) {
+                                    ArrayList<RegionalSectionPublication> publications) {
         try {
             this.gpuCompletions.addLast(new GpuCompletion(new GlFence(), transactions,
                     publications));
@@ -648,11 +648,11 @@ public class AsyncNodeManager {
 
     private void failGpuCompletion(GpuCompletion completion, Throwable failure) {
         this.failGpuCompletion(completion.rendererTransactions,
-                completion.virtualSurfacePublications, failure);
+                completion.regionalSectionPublications, failure);
     }
 
     private void failGpuCompletion(ArrayList<RendererTransaction> transactions,
-                                   ArrayList<VirtualSurfacePublication> publications,
+                                   ArrayList<RegionalSectionPublication> publications,
                                    Throwable failure) {
         for (RendererTransaction transaction : transactions) {
             try {
@@ -662,7 +662,7 @@ public class AsyncNodeManager {
                         callbackFailure);
             }
         }
-        for (VirtualSurfacePublication publication : publications) {
+        for (RegionalSectionPublication publication : publications) {
             try {
                 publication.failure().accept(failure);
             } catch (RuntimeException callbackFailure) {
@@ -688,12 +688,12 @@ public class AsyncNodeManager {
     //Incoming events
 
     private final ConcurrentLinkedDeque<MemoryBuffer> requestBatchQueue = new ConcurrentLinkedDeque<>();
-    private final ConcurrentLinkedDeque<VirtualSurfacePublication> virtualSurfaceQueue =
+    private final ConcurrentLinkedDeque<RegionalSectionPublication> regionalSectionQueue =
             new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RendererTransaction> rendererTransactionQueue =
             new ConcurrentLinkedDeque<>();
 
-    private record VirtualSurfacePublication(BuiltSection geometry, long previousRevision,
+    private record RegionalSectionPublication(BuiltSection geometry, long previousRevision,
                                              Runnable success,
                                              Consumer<Throwable> failure) {}
 
@@ -703,7 +703,7 @@ public class AsyncNodeManager {
                                        Runnable success, Consumer<Throwable> failure) {}
     private record GpuCompletion(GlFence fence,
                                  ArrayList<RendererTransaction> rendererTransactions,
-                                 ArrayList<VirtualSurfacePublication> virtualSurfacePublications) {}
+                                 ArrayList<RegionalSectionPublication> regionalSectionPublications) {}
 
     public void commitStagedRoot(long sourceRevision, Set<Long> positions, Runnable success,
                                  Consumer<Throwable> failure) {
@@ -757,10 +757,10 @@ public class AsyncNodeManager {
     }
 
     /**
-     * Queues a complete Virtual Surface node for one indivisible upload and hierarchy swap.
+     * Queues a complete regional section node for one indivisible upload and hierarchy swap.
      * Ownership of {@code geometry} transfers immediately to this manager.
      */
-    public void publishVirtualSurface(BuiltSection geometry, long previousRevision,
+    public void publishRegionalSection(BuiltSection geometry, long previousRevision,
                                       Runnable success,
                                       Consumer<Throwable> failure) {
         Objects.requireNonNull(geometry, "geometry");
@@ -771,7 +771,7 @@ public class AsyncNodeManager {
             failure.accept(new IllegalStateException("Voxy renderer is not running"));
             return;
         }
-        this.virtualSurfaceQueue.add(new VirtualSurfacePublication(geometry, previousRevision,
+        this.regionalSectionQueue.add(new RegionalSectionPublication(geometry, previousRevision,
                 success, failure));
         this.addWork();
     }
@@ -838,19 +838,19 @@ public class AsyncNodeManager {
         }
 
         while (true) {
-            VirtualSurfacePublication publication = this.virtualSurfaceQueue.poll();
+            RegionalSectionPublication publication = this.regionalSectionQueue.poll();
             if (publication == null) break;
             publication.geometry().free();
             publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
         }
-        while (!this.deferredVirtualSurfacePublications.isEmpty()) {
-            VirtualSurfacePublication publication =
-                    this.deferredVirtualSurfacePublications.removeFirst();
+        while (!this.deferredRegionalSectionPublications.isEmpty()) {
+            RegionalSectionPublication publication =
+                    this.deferredRegionalSectionPublications.removeFirst();
             publication.geometry().free();
             publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
         }
-        while (!this.completedVirtualSurfacePublications.isEmpty()) {
-            this.completedVirtualSurfacePublications.removeLast().failure().accept(
+        while (!this.completedRegionalSectionPublications.isEmpty()) {
+            this.completedRegionalSectionPublications.removeLast().failure().accept(
                     new IllegalStateException("Voxy renderer stopped before its GPU fence"));
         }
 
@@ -878,11 +878,11 @@ public class AsyncNodeManager {
                         "Voxy renderer stopped before its GPU fence"));
             }
             result.rendererTransactions.clear();
-            for (VirtualSurfacePublication publication : result.virtualSurfacePublications) {
+            for (RegionalSectionPublication publication : result.regionalSectionPublications) {
                 publication.failure().accept(new IllegalStateException(
                         "Voxy renderer stopped before its GPU fence"));
             }
-            result.virtualSurfacePublications.clear();
+            result.regionalSectionPublications.clear();
             result.geometryUpload.free();
             result.scatterWriteBuffer.free();
         }
@@ -934,7 +934,7 @@ public class AsyncNodeManager {
         //Cleaner operations
         private final IntOpenHashSet cleanerOperations = new IntOpenHashSet();
         private final ArrayList<RendererTransaction> rendererTransactions = new ArrayList<>();
-        private final ArrayList<VirtualSurfacePublication> virtualSurfacePublications =
+        private final ArrayList<RegionalSectionPublication> regionalSectionPublications =
                 new ArrayList<>();
 
         public void reset() {
@@ -946,7 +946,7 @@ public class AsyncNodeManager {
             this.usedGeometry = 0;
             this.geometryUpload.reset();
             this.rendererTransactions.clear();
-            this.virtualSurfacePublications.clear();
+            this.regionalSectionPublications.clear();
         }
 
         //Get or create a scatter write address for the given location

@@ -9,7 +9,7 @@ autotests = false
 autobenches = false
 
 [lib]
-test = false
+test = true
 bench = false
 doctest = false
 

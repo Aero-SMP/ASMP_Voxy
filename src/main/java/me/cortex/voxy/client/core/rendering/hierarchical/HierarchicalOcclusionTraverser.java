@@ -9,10 +9,6 @@ import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.Viewport;
-import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
-import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
-import me.cortex.voxy.client.core.rendering.selection.PredictionTiming;
-import me.cortex.voxy.client.core.rendering.selection.VirtualSurfaceSelector;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
@@ -20,6 +16,9 @@ import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import org.lwjgl.system.MemoryUtil;
+
+import java.util.Objects;
+import java.util.function.LongConsumer;
 
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL12.GL_UNPACK_IMAGE_HEIGHT;
@@ -41,7 +40,7 @@ public class HierarchicalOcclusionTraverser {
 
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
-    private final VirtualSurfaceSelector virtualSurfaceSelector = new VirtualSurfaceSelector();
+    private LongConsumer refinementListener = ignored -> {};
 
     private final GlBuffer requestBuffer;
 
@@ -204,8 +203,7 @@ public class HierarchicalOcclusionTraverser {
         //VisibilityId
         MemoryUtil.memPutInt(ptr, this.nodeCleaner.visibilityId); ptr += 4;
 
-        // These requests reserve hierarchy owners only. Exact manifest/object selection and
-        // bounded residency decide whether terrain is fetched and published.
+        // These requests reserve hierarchy owners and directly request regional child sections.
         MemoryUtil.memPutInt(ptr, MAX_REQUEST_QUEUE_SIZE); ptr += 4;
 
         //Put the render distance here so that it can generate a correct circle, TODO: make it not top level section sized
@@ -224,14 +222,14 @@ public class HierarchicalOcclusionTraverser {
     }
 
     public void doTraversal(Viewport viewport) {
-        this.doTraversal(viewport, viewport.hiZBuffer, SelectionBatch.Pass.CONSERVATIVE);
+        this.doTraversal(viewport, viewport.hiZBuffer);
     }
 
     public void doSecondPass(Viewport viewport) {
-        this.doTraversal(viewport, viewport.refinedHiZBuffer, SelectionBatch.Pass.REFINED);
+        this.doTraversal(viewport, viewport.refinedHiZBuffer);
     }
 
-    private void doTraversal(Viewport viewport, HiZBuffer hiZBuffer, SelectionBatch.Pass pass) {
+    private void doTraversal(Viewport viewport, HiZBuffer hiZBuffer) {
         this.uploadUniform(viewport, hiZBuffer);
 
         this.traversal.bind();
@@ -248,31 +246,13 @@ public class HierarchicalOcclusionTraverser {
 
         this.downloadResetRequestQueue();
 
-        this.virtualSurfaceSelector.select(viewport, hiZBuffer, pass);
-
         //Bind the hiz buffer
         glBindSampler(0, 0);
         glBindTextureUnit(0, 0);
     }
 
-    public void publishSelectionManifest(SelectionManifest manifest) {
-        this.virtualSurfaceSelector.publish(manifest);
-    }
-
-    public void clearSelectionManifest(long generation, long snapshotId) {
-        this.virtualSurfaceSelector.clear(generation, snapshotId);
-    }
-
-    public void updatePredictionTiming(PredictionTiming timing) {
-        this.virtualSurfaceSelector.updatePredictionTiming(timing);
-    }
-
-    public SelectionBatch pollSelectionBatch() {
-        return this.virtualSurfaceSelector.poll();
-    }
-
-    public void resetVirtualSurfaceSelection() {
-        this.virtualSurfaceSelector.resetSession();
+    public void setRefinementListener(LongConsumer listener) {
+        this.refinementListener = Objects.requireNonNull(listener, "listener");
     }
 
     private void traverseInternal() {
@@ -357,6 +337,12 @@ public class HierarchicalOcclusionTraverser {
             MemoryUtil.memPutInt(ptr-8, count);
         }
         if (count != 0) {
+            for (int index = 0; index < count; index++) {
+                long address = ptr + (long) index * 8;
+                long position = (long) MemoryUtil.memGetInt(address) << 32
+                        | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
+                this.refinementListener.accept(position);
+            }
             this.nodeManager.submitRequestBatch(new MemoryBuffer(count*8L+8).cpyFrom(ptr-8));// the -8 is because we incremented it by 8
         }
     }
@@ -374,7 +360,6 @@ public class HierarchicalOcclusionTraverser {
         this.topNodeIds.free();
         this.scratchQueueA.free();
         this.scratchQueueB.free();
-        this.virtualSurfaceSelector.free();
         glDeleteSamplers(this.hizSampler);
     }
 

@@ -1,6 +1,5 @@
-//! Canonical block/biome catalog referenced by every published surface root.
+//! Canonical block/biome catalog referenced by regional section files.
 
-use super::object::{CanonicalObject, ObjectKind};
 use crate::{
     registry::{MAX_BIOMES, MAX_BLOCKS, RegistrySnapshot, production_full_cube_opacity},
     take, take_u16, take_u32, take_u64,
@@ -170,10 +169,6 @@ impl Catalog {
         };
         catalog.validate()?;
         Ok(catalog)
-    }
-
-    pub fn canonical_object(&self) -> Result<CanonicalObject> {
-        CanonicalObject::new(ObjectKind::Catalog, self.encode()?)
     }
 }
 

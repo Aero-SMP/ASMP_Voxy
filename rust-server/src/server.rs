@@ -3,22 +3,23 @@
 use crate::{
     anvil::AnvilWorld,
     crc::crc32c,
-    quarantine, replace_synced,
-    surface::{
-        service::Service,
+    quarantine,
+    regional::{
+        RegionalAnnouncement, RegionalResponder, RegionalService,
         wire::{
-            ALPN, ControlMessage, STREAM_CONTROL, encode_control_record, read_control,
-            read_stream_role,
+            ALPN, ControlMessage, STREAM_CONTROL, STREAM_SECTION_LANE, encode_control_record,
+            read_control, read_lane, read_request_batch, read_stream_role, write_control,
+            write_reply_batch,
         },
     },
-    sync_parent,
+    replace_synced, sync_parent,
 };
 use anyhow::{Context, Result, bail};
 use quinn::{Endpoint, IdleTimeout, VarInt, crypto::rustls::QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     future::Future,
     io::Write,
@@ -35,10 +36,13 @@ const TERMINAL_CONTROL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const CONTROL_STREAM_PRIORITY: i32 = 3;
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const SECTION_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 // Fixed unauthenticated-protocol admission bounds. These limit task/handshake amplification;
 // they are not a configurable server-wide memory governor.
 const MAX_PENDING_HANDSHAKES: usize = 128;
 const MAX_LIVE_CONNECTIONS: usize = 1_024;
+const MAX_SUBSCRIBED_REGIONS: usize = 16_384;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_IDENTITY_BYTES: usize = 64 * 1024;
@@ -48,14 +52,14 @@ const PRIVATE_KEY_FILE: &str = "private-key.der";
 #[derive(Debug)]
 pub struct ServerState {
     server_instance: u64,
-    surface: Arc<Service>,
+    regional: Arc<RegionalService>,
 }
 
 impl ServerState {
     pub fn new(
         dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
         catalog_id: u64,
-        surface: Arc<Service>,
+        regional: Arc<RegionalService>,
     ) -> Self {
         let server_instance = dimensions
             .iter()
@@ -66,7 +70,7 @@ impl ServerState {
             });
         Self {
             server_instance,
-            surface,
+            regional,
         }
     }
 }
@@ -117,7 +121,7 @@ pub async fn serve(
             }
             result = &mut shutdown => {
                 result?;
-                state.surface.shutdown("Voxy server shutting down");
+                state.regional.shutdown("Voxy server shutting down");
                 tokio::time::sleep(SERVICE_SHUTDOWN_GRACE).await;
                 endpoint.close(VarInt::from_u32(0), b"Voxy server shutting down");
                 let _ = tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT, endpoint.wait_idle()).await;
@@ -179,13 +183,158 @@ async fn serve_connection(
         }
     };
     drop(handshake_permit);
-    let result = state
-        .surface
-        .clone()
-        .connection(connection, send, recv, dimension, state.server_instance)
-        .await;
+    let responder = state
+        .regional
+        .responder(&dimension, state.server_instance)?;
+    let result = serve_regional_connection(
+        state.regional.clone(),
+        responder,
+        connection,
+        send,
+        recv,
+        dimension,
+    )
+    .await;
     drop(live_permit);
     result
+}
+
+async fn serve_regional_connection(
+    service: Arc<RegionalService>,
+    responder: RegionalResponder,
+    connection: quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    dimension: String,
+) -> Result<()> {
+    write_control_timeout(&mut send, &responder.hello()?).await?;
+    let mut announcements = service.subscribe();
+    let mut subscribed_regions = HashSet::new();
+    let result = async {
+        loop {
+            tokio::select! {
+            incoming = connection.accept_bi() => {
+                let (section_send, section_recv) = incoming.context("accept regional section lane")?;
+                let lane_responder = responder.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_section_lane(lane_responder, section_send, section_recv).await {
+                        eprintln!("regional section lane ended: {error:#}");
+                    }
+                });
+            }
+            control = read_control(&mut recv) => {
+                let Some(control) = control? else {
+                    return Ok(());
+                };
+                let response = match control {
+                    ControlMessage::RegionRequest { region_x, region_z } => {
+                        if !subscribed_regions.contains(&(region_x, region_z))
+                                && subscribed_regions.len() == MAX_SUBSCRIBED_REGIONS {
+                            bail!("regional subscription set exceeded its safety bound");
+                        }
+                        if subscribed_regions.insert((region_x, region_z)) {
+                            responder.subscribe_region(region_x, region_z)?;
+                        }
+                        Some(responder.region(region_x, region_z)?)
+                    }
+                    ControlMessage::RegionRelease { region_x, region_z } => {
+                        if subscribed_regions.remove(&(region_x, region_z)) {
+                            responder.unsubscribe_region(region_x, region_z)?;
+                        }
+                        None
+                    }
+                    ControlMessage::CatalogRequest => Some(responder.catalog_response()?),
+                    _ => bail!("client sent a server-only or duplicate regional control record"),
+                };
+                if let Some(response) = response {
+                    write_control_timeout(&mut send, &response).await?;
+                }
+            }
+            announcement = announcements.recv() => {
+                let announcement = match announcement {
+                    Ok(value) => value,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        bail!("regional client missed {skipped} current-state announcements");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+                let message = match announcement {
+                    RegionalAnnouncement::Changed {
+                        dimension: changed, region_x, region_z, generation,
+                    } if changed == dimension
+                            && subscribed_regions.contains(&(region_x, region_z)) => Some(ControlMessage::RegionChanged {
+                        region_x, region_z, generation,
+                    }),
+                    RegionalAnnouncement::Shutdown(message) => {
+                        write_control_timeout(&mut send, &ControlMessage::Shutdown { message }).await?;
+                        return Ok(());
+                    }
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    write_control_timeout(&mut send, &message).await?;
+                }
+            }
+            }
+        }
+    }.await;
+    for (region_x, region_z) in subscribed_regions {
+        if let Err(error) = responder.unsubscribe_region(region_x, region_z) {
+            eprintln!(
+                "cannot release disconnected regional subscription ({region_x},{region_z}): {error:#}"
+            );
+        }
+    }
+    result
+}
+
+async fn serve_section_lane(
+    responder: RegionalResponder,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    let role = tokio::time::timeout(SECTION_HEADER_TIMEOUT, read_stream_role(&mut recv))
+        .await
+        .context("regional section-lane role timeout")??;
+    if role != Some(STREAM_SECTION_LANE) {
+        bail!("non-section role on a regional section lane");
+    }
+    let lane = tokio::time::timeout(SECTION_HEADER_TIMEOUT, read_lane(&mut recv))
+        .await
+        .context("regional section-lane priority timeout")??;
+    send.set_priority(match lane {
+        crate::regional::wire::PriorityLane::Coverage => 2,
+        crate::regional::wire::PriorityLane::Refinement => 1,
+    })?;
+    while let Some(request) = read_request_batch(&mut recv).await? {
+        let responder = responder.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let response_worker = tokio::task::spawn_blocking(move || {
+            responder.sections(&request, |response| {
+                sender
+                    .blocking_send(response)
+                    .map_err(|_| anyhow::anyhow!("regional section lane closed"))
+            })
+        });
+        while let Some(response) = receiver.recv().await {
+            write_reply_batch(&mut send, &response).await?;
+        }
+        response_worker
+            .await
+            .context("regional section response task failed")??;
+    }
+    send.finish()?;
+    Ok(())
+}
+
+async fn write_control_timeout(
+    send: &mut quinn::SendStream,
+    message: &ControlMessage,
+) -> Result<()> {
+    tokio::time::timeout(CONTROL_WRITE_TIMEOUT, write_control(send, message))
+        .await
+        .context("regional control write timeout")??;
+    Ok(())
 }
 
 async fn write_terminal_control(send: &mut quinn::SendStream, message: &ControlMessage) {
@@ -281,7 +430,7 @@ fn make_server_config(identity: &PersistentIdentity) -> Result<quinn::ServerConf
     let crypto = QuicServerConfig::try_from(tls).context("configure QUIC TLS")?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport = quinn::TransportConfig::default();
-    // One permanent control stream plus at most eight client-opened object streams.
+    // One permanent control stream plus eight persistent client-opened section lanes.
     transport.max_concurrent_bidi_streams(VarInt::from_u32(9));
     transport.max_concurrent_uni_streams(VarInt::from_u32(0));
     transport.stream_receive_window(VarInt::from_u32(32 * 1024));

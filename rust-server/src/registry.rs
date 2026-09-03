@@ -64,7 +64,7 @@ impl Registry {
                 b_path.display()
             );
         }
-        // save() publishes one generation to both peers before any surface root may reference its
+        // save() publishes one generation to both peers before any regional shard may reference its
         // IDs. Therefore either valid peer is a safe high-water snapshot after a
         // single-file fault. A higher lone generation can only be an interrupted, unpublished
         // first copy; retaining its append-only IDs is also safe and prevents later aliasing.
@@ -199,6 +199,10 @@ impl Registry {
 
     pub fn catalog_id(&self) -> u64 {
         self.catalog_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn save(&mut self) -> Result<()> {

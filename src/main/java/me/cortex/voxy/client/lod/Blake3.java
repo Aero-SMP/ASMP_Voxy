@@ -5,7 +5,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
-/** Compact unkeyed BLAKE3-256 implementation used to authenticate canonical objects. */
+/** Compact unkeyed BLAKE3-256 implementation used to authenticate canonical records. */
 public final class Blake3 {
     private static final int BLOCK_BYTES = 64;
     private static final int CHUNK_BYTES = 1024;

@@ -1,80 +1,58 @@
 # Voxy Rust server
 
-This crate is Voxy's native backend. Minecraft Anvil saves remain authoritative.
-The server converts changed terrain into independently addressed 8³ exterior, interior, and
-complex microtiles, publishes bounded Morton manifest subtrees, and serves exact immutable object
-requests from the Java client.
+This crate is the native regional storage and QUIC backend. Saved Minecraft Anvil chunks remain
+authoritative.
 
-Canonical objects use BLAKE3-256 identities. Dictionary-compressed Zstd objects are stored in
-indexed append-only packfiles, so physical packing does not change object identity. A dimension's
-monotonic root generation and Merkle root define freshness. Publication writes objects and
-manifests before atomically replacing the advertised root; garbage collection retains current,
-incoming, and grace-period roots while compacting reachable objects.
+For each Anvil region and dimension, the backend maintains:
+
+- a fixed source table containing Anvil save markers and semantic terrain fingerprints;
+- one checksummed regional LOD file with a direct spatial section directory;
+- compressed 32-cubed section payloads containing block, biome, and light cells exactly once.
+
+Changed files are written, synced, validated by construction, and atomically renamed. Existing
+request readers retain their already-open file generation. There are no append-only object packs,
+global roots, reachability scans, format bridges, or stored normalized source blocks.
 
 ## Running
 
-The server-controller JAR contains the Linux x86-64 release executable. The controller extracts
-it, starts it with `voxy-rust.toml`, forwards its log output, restarts it after an unexpected exit,
-and stops it with Minecraft. The host must provide `libzstd.so.1`.
-
-The backend can also be run directly:
+The server-controller JAR embeds the Linux x86-64 release executable and runs it with
+`voxy-rust.toml`. The host must provide `libzstd.so.1`. The backend can also run directly:
 
 ```sh
 cargo build --release --locked --bin voxy-rust-server
 target/release/voxy-rust-server --config voxy-rust.toml
 ```
 
-`--once` refreshes the configured worlds and exits without opening a QUIC endpoint. Configuration
-is file-only; there are no environment-variable overrides. See
-`examples/voxy-rust-quic.toml`.
+`--once` imports every currently saved region and exits without opening QUIC. The save root
+discovers the Overworld, Nether, End, and namespaced dimension region directories automatically.
+`poll_ms` controls saved-Anvil polling. `rayon_threads = 0` uses Rayon's default worker count.
 
-The save root automatically discovers:
-
-- `region` as `minecraft:overworld`
-- `DIM-1/region` as `minecraft:the_nether`
-- `DIM1/region` as `minecraft:the_end`
-- `dimensions/<namespace>/<path>/region` as `<namespace>:<path>`
-
-`poll_ms` controls how often Anvil changes are coalesced into a new transactional root.
-`rayon_threads = 0` uses Rayon's default worker count.
-Streaming uses finite active request streams, bounded response records, positional packfile reads,
-and QUIC stream and connection flow control. Publication normalizes one changed 2-by-2 chunk group
-at a time, compression writes one object at a time, and large indexes remain file-backed. There is
-no aggregate memory governor.
-
-Visibility defaults to sky-exterior inference only for `minecraft:overworld`, portal connectivity
-for `minecraft:the_nether`, and conservative visibility for the End and unknown dimensions. A
-safe per-dimension override can select `portal_only` or `conservative`:
+The configuration shape is:
 
 ```toml
-[visibility]
-"minecraft:the_end" = "portal_only"
-```
+world = "/path/to/minecraft/world"
+data = "/path/to/voxy-data"
+dimension = "minecraft:overworld"
+poll_ms = 2000
+rayon_threads = 16
 
-`sky_exterior` is rejected for every dimension except `minecraft:overworld`.
+[quic]
+listen = "0.0.0.0:25587"
+advertise_host = ""
+advertise_port = 0
+```
 
 ## Network
 
-`quic.listen` binds the UDP terrain endpoint. The authenticated Minecraft server mod advertises
-`quic.advertise_host` and `quic.advertise_port`; an empty host reuses the authenticated Minecraft
-peer address, while port zero uses the port Rust actually bound. A nonzero advertised port supports
-NAT or proxy remapping. Minecraft TCP and Voxy UDP may use the same numeric port.
-
-Rust creates or reloads a persistent QUIC certificate and private key below the configured
-`data/quic` directory. QUIC traffic is encrypted, and the controller authenticates the exact
-certificate to the client through Minecraft by forwarding Rust's ALPN and SHA-256 fingerprint.
-Rust has no second account challenge, so firewall or private-network controls remain appropriate
-when arbitrary protocol clients must not reach the endpoint.
-
-After binding and loading that identity, Rust emits exactly one controller readiness record:
+Rust creates a persistent certificate below `data/quic` and emits one readiness record after the
+UDP endpoint is live:
 
 ```text
-VOXY_READY udp_port=<1..65535> alpn=<ASCII token> cert_sha256=<64 lowercase hex>
+VOXY_READY udp_port=<1..65535> alpn=voxy-region cert_sha256=<64 lowercase hex>
 ```
 
-Each connection owns one long-lived bidirectional control stream for hello, root announcements,
-leases, activation, camera-domain messages, and bounded errors. Terrain, manifests, catalogs, and
-dictionaries use short-lived client-initiated bidirectional request streams. Each request names
-one root token, one priority lane, and a bounded same-lane list of canonical object hashes. QUIC
-provides liveness and flow control; there is no application ping, byte-credit frame, TCP listener,
-or Minecraft terrain relay.
+Each connection has one control stream plus persistent section lanes for coverage, current detail,
+and prediction. Control records expose the current catalog and spatially paged region directory.
+Section requests contain only a generation and exact section coordinate; replies are emitted in
+bounded batches while regional files are read. Protocol bounds, finite lane queues, QUIC flow
+control, CRC32C, BLAKE3 fingerprints, and pinned TLS protect the current data path.

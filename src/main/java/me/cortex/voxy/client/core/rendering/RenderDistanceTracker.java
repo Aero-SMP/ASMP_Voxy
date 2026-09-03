@@ -23,13 +23,13 @@ public class RenderDistanceTracker {
     private int renderDistance;
     private double posX;
     private double posZ;
+    private boolean initialized;
     public RenderDistanceTracker(int minSec, int maxSec, LongConsumer addTopLevelNode,
                                  LongConsumer removeTopLevelNode) {
         this.addTopLevelNode = addTopLevelNode;
         this.removeTopLevelNode = removeTopLevelNode;
         this.radius = this.renderDistance = 2;
         this.boundDist = generateBoundingHalfCircleDistance(this.radius);
-        this.fillRing(true);
         this.minSec = minSec;
         this.maxSec = maxSec;
     }
@@ -38,25 +38,34 @@ public class RenderDistanceTracker {
         if (renderDistance == this.renderDistance) {
             return;
         }
-        this.fillRing(false);
+        if (this.initialized) this.fillRing(false);
         var previousOperations = this.operations;
         this.operations = new Long2ByteOpenHashMap(1<<13);
         this.radius = this.renderDistance = renderDistance;
-        this.centerX = ((int)this.posX)>>9;
-        this.centerZ = ((int)this.posZ)>>9;
+        this.centerX = (int) Math.floor(this.posX / 512.0);
+        this.centerZ = (int) Math.floor(this.posZ / 512.0);
         this.boundDist = generateBoundingHalfCircleDistance(this.radius);
         this.operations.putAll(previousOperations);
         previousOperations.clear();
-        this.fillRing(true);
+        if (this.initialized) this.fillRing(true);
     }
 
     public boolean setCenterAndProcess(double x, double z) {
+        if (!this.initialized) {
+            this.posX = x;
+            this.posZ = z;
+            this.centerX = (int) Math.floor(x / 512.0);
+            this.centerZ = (int) Math.floor(z / 512.0);
+            this.initialized = true;
+            this.fillRing(true);
+            return this.process() != 0;
+        }
         double dx = this.posX-x;
         double dz = this.posZ-z;
         if (CHECK_DISTANCE_BLOCKS*CHECK_DISTANCE_BLOCKS<dx*dx+dz*dz) {
             this.posX = x;
             this.posZ = z;
-            this.moveCenter(((int)x)>>9, ((int)z)>>9);
+            this.moveCenter((int) Math.floor(x / 512.0), (int) Math.floor(z / 512.0));
         }
 
         return this.process()!=0;

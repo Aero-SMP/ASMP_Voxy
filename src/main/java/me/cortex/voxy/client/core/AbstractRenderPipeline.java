@@ -91,7 +91,7 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
         // The conservative pass above guarantees a complete current-view cut.  Newly drawn
         // temporal occluders are now present in this frame's Voxy depth target, so rebuild HZB
-        // and refine both the render cut and manifested object frontier authoritatively.
+        // and refine the projected-size section cut authoritatively.
         this.innerRefinementWork(viewport, this.fb.getDepthTex().id);
         rs.buildDrawCalls(viewport);
 

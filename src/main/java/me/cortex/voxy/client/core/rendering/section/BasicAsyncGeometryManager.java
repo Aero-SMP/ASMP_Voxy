@@ -10,7 +10,7 @@ import me.cortex.voxy.common.util.MemoryBuffer;
 import org.lwjgl.system.MemoryUtil;
 /** Stages geometry allocation changes before applying them to the backing GPU data store. */
 public class BasicAsyncGeometryManager {
-    public static final int SECTION_METADATA_SIZE = 32;
+    public static final int SECTION_METADATA_SIZE = 48;
 
     private static final long GEOMETRY_ELEMENT_SIZE = 8;
     private final HierarchicalBitSet allocationSet;
@@ -157,36 +157,38 @@ public class BasicAsyncGeometryManager {
         }
     }
 
-    public void writeMetadataSplit(int sectionId, long ptrA, long ptrB) {
-        if (SECTION_METADATA_SIZE != 32) {//This system only works with 32 byte metadata
-            throw new IllegalStateException();
-        }
+    public void writeMetadataSplit(int sectionId, long ptrA, long ptrB, long ptrC) {
         var sec = this.sectionMetadata.get(sectionId);
         if (sec == null) {
             //Write nothing
             MemoryUtil.memSet(ptrA, 0, 16);
             MemoryUtil.memSet(ptrB, 0, 16);
+            MemoryUtil.memSet(ptrC, 0, 16);
         } else {
-            sec.writeMetadataSplitParts(ptrA, ptrB);
+            sec.writeMetadataSplitParts(ptrA, ptrB, ptrC);
         }
     }
 
     private record SectionMeta(long position, int aabb, int geometryPtr, int itemCount, int[] offsets, byte childExistence) {
         public void writeMetadata(long ptr) {
-            this.writeMetadataSplitParts(ptr, ptr+16);
+            this.writeMetadataSplitParts(ptr, ptr+16, ptr+32);
         }
 
-        public void writeMetadataSplitParts(long ptrA, long ptrB) {//First 16 bytes are put into ptrA the remaining 16 bytes are put into ptrB
+        public void writeMetadataSplitParts(long ptrA, long ptrB, long ptrC) {
             //Split the long into 2 ints to solve endian issues
             MemoryUtil.memPutInt(ptrA, (int) (this.position>>32)); ptrA += 4;
             MemoryUtil.memPutInt(ptrA, (int) this.position); ptrA += 4;
             MemoryUtil.memPutInt(ptrA, (int) this.aabb); ptrA += 4;
             MemoryUtil.memPutInt(ptrA, this.geometryPtr + this.offsets[0]); ptrA += 4;
 
-            MemoryUtil.memPutInt(ptrB, (this.offsets[1]-this.offsets[0])|((this.offsets[2]-this.offsets[1])<<16)); ptrB += 4;
-            MemoryUtil.memPutInt(ptrB, (this.offsets[3]-this.offsets[2])|((this.offsets[4]-this.offsets[3])<<16)); ptrB += 4;
-            MemoryUtil.memPutInt(ptrB, (this.offsets[5]-this.offsets[4])|((this.offsets[6]-this.offsets[5])<<16)); ptrB += 4;
-            MemoryUtil.memPutInt(ptrB, (this.offsets[7]-this.offsets[6])|((this.itemCount -this.offsets[7])<<16)); ptrB += 4;
+            MemoryUtil.memPutInt(ptrB, this.offsets[1]-this.offsets[0]); ptrB += 4;
+            MemoryUtil.memPutInt(ptrB, this.offsets[2]-this.offsets[1]); ptrB += 4;
+            MemoryUtil.memPutInt(ptrB, this.offsets[3]-this.offsets[2]); ptrB += 4;
+            MemoryUtil.memPutInt(ptrB, this.offsets[4]-this.offsets[3]);
+            MemoryUtil.memPutInt(ptrC, this.offsets[5]-this.offsets[4]); ptrC += 4;
+            MemoryUtil.memPutInt(ptrC, this.offsets[6]-this.offsets[5]); ptrC += 4;
+            MemoryUtil.memPutInt(ptrC, this.offsets[7]-this.offsets[6]); ptrC += 4;
+            MemoryUtil.memPutInt(ptrC, this.itemCount-this.offsets[7]);
         }
     }
 }

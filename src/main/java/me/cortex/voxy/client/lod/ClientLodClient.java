@@ -6,11 +6,12 @@ import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.bus.api.SubscribeEvent;
 
-/** Client facade for renderer demand and immutable-object residency. */
+/** Client facade for renderer-driven regional section demand. */
 public final class ClientLodClient {
     private ClientLodClient() {}
 
     public static void init(IEventBus modBus) {
+        ClientLodDebug.init();
         QuicEndpointDiscovery.register(modBus);
         NeoForge.EVENT_BUS.register(ClientLodClient.class);
     }
@@ -30,13 +31,18 @@ public final class ClientLodClient {
         ClientSession.disconnect();
     }
 
-    /** Supplies only the bounded LOD4 metadata window; terrain requests still come from the GPU. */
-    public static void metadataRootEntered(long key) {
-        ClientSession.metadataRootEntered(key);
+    /** Supplies the bounded LOD4 coverage window; finer demand still comes from the GPU. */
+    public static void sectionEntered(long key) {
+        ClientSession.sectionEntered(key);
     }
 
-    public static void metadataRootLeft(long key) {
-        ClientSession.metadataRootLeft(key);
+    public static void sectionLeft(long key) {
+        ClientSession.sectionLeft(key);
+    }
+
+    /** Accepts projected-size refinement requests from the renderer's normal hierarchy. */
+    public static void refinementRequested(long parent) {
+        ClientSession.refinementRequested(parent);
     }
 
     public static void resetDemand() {

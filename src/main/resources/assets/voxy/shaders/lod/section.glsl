@@ -2,6 +2,7 @@
 struct SectionMeta {
     uvec4 a;
     uvec4 b;
+    uvec4 c;
 };
 
 uvec2 extractRawPos(SectionMeta section) {

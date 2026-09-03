@@ -6,32 +6,19 @@ import com.mojang.blaze3d.systems.RenderSystem;
 
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
-import me.cortex.voxy.client.core.model.CatalogModelCompatibility;
 import me.cortex.voxy.client.core.rendering.ChunkBoundRenderer;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
-import me.cortex.voxy.client.core.rendering.building.CpuMicrotileMesher;
-import me.cortex.voxy.client.core.rendering.building.GeometryMerger;
-import me.cortex.voxy.client.core.rendering.building.GpuMicrotileMesher;
-import me.cortex.voxy.client.core.rendering.building.HybridMeshingDispatcher;
+import me.cortex.voxy.client.core.rendering.building.SectionMesher;
 import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierarchical.NodeCleaner;
-import me.cortex.voxy.client.core.rendering.selection.SelectionBatch;
-import me.cortex.voxy.client.core.rendering.selection.SelectionManifest;
-import me.cortex.voxy.client.core.rendering.selection.PredictionTiming;
 import me.cortex.voxy.client.core.rendering.section.MDICSectionRenderer;
 import me.cortex.voxy.client.core.rendering.section.BasicSectionGeometryData;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.iris.IrisUtil;
-import me.cortex.voxy.client.lod.MicrotileActivationManager;
-import me.cortex.voxy.client.lod.CatalogCodec;
-import me.cortex.voxy.client.lod.CompiledGeometryCache;
-import me.cortex.voxy.client.lod.ContentPipeline;
-import me.cortex.voxy.client.lod.ManifestCodec.SpatialNode;
-import me.cortex.voxy.client.lod.RootDemandPlan;
 import me.cortex.voxy.client.lod.ClientLodClient;
 import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
 import me.cortex.voxy.common.Logger;
@@ -63,136 +50,59 @@ import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
 
 public class VoxyRenderSystem {
-    private static final int VIRTUAL_SURFACE_CACHE_ENTRIES = 4096;
-
     private final CatalogMapper mapper;
     private ModelBakerySubsystem modelService;
     private BasicSectionGeometryData geometryData;
     private AsyncNodeManager nodeManager;
-    private final AtomicLong virtualSurfaceRevision = new AtomicLong(1);
+    private final AtomicLong regionalSectionRevision = new AtomicLong(1);
 
     /** The renderer-local translation table populated exclusively from the catalog. */
     public CatalogMapper getMapper() {
         return this.mapper;
     }
 
-    /** Publishes one immutable manifest/residency snapshot to the render-thread GPU cut. */
-    public void publishSelectionManifest(SelectionManifest manifest) {
-        this.traversal.publishSelectionManifest(manifest);
+    public interface SectionPublication extends AutoCloseable {
+        boolean activationFencePassed();
+        Optional<Throwable> activationFailure();
+        boolean retirementFencePassed();
+        @Override void close();
     }
 
-    public void clearSelectionManifest(long generation, long snapshotId) {
-        this.traversal.clearSelectionManifest(generation, snapshotId);
+    public interface SectionPublisher {
+        SectionPublication publish(long position, BuiltSection geometry,
+                                   Optional<SectionPublication> previous);
     }
 
-    public void updatePredictionTiming(PredictionTiming timing) {
-        this.traversal.updatePredictionTiming(timing);
+    public SectionPublisher regionalSectionPublisher() {
+        return this::publishRegionalSection;
     }
 
-    public SelectionBatch pollSelectionBatch() {
-        return this.traversal.pollSelectionBatch();
+    public SectionMesher regionalSectionMesher() {
+        return new SectionMesher(this.modelService);
     }
 
-    /** Direct publication adapter for final microtile geometry. */
-    public MicrotileActivationManager.Renderer virtualSurfaceRenderer() {
-        return new MicrotileActivationManager.Renderer() {
-            @Override
-            public MicrotileActivationManager.Publication publishAtomically(
-                    SpatialNode node, BuiltSection geometry,
-                    Optional<MicrotileActivationManager.Publication> previous) {
-                return publishVirtualSurface(node, geometry, previous);
-            }
-
-            @Override
-            public MicrotileActivationManager.Publication removeAtomically(
-                    SpatialNode node, MicrotileActivationManager.Publication previous) {
-                return removeVirtualSurface(node, previous);
-            }
-        };
-    }
-
-    /** Creates the connection-lifetime activation owner; callers must retain it across roots. */
-    public MicrotileActivationManager createVirtualSurfaceActivationManager() {
-        if (!RenderSystem.isOnRenderThread()) {
-            throw new IllegalStateException(
-                    "Virtual Surface GPU resources must be created on the render thread");
-        }
-        CompiledGeometryCache cache = new CompiledGeometryCache(VIRTUAL_SURFACE_CACHE_ENTRIES);
-        try {
-            HybridMeshingDispatcher dispatcher = new HybridMeshingDispatcher(
-                    new GpuMicrotileMesher(this.modelService.factory,
-                            Minecraft.getInstance()::execute),
-                    new CpuMicrotileMesher(this.modelService.factory),
-                    new GeometryMerger(), cache);
-            return new MicrotileActivationManager(dispatcher, virtualSurfaceRenderer());
-        } catch (RuntimeException | Error failure) {
-            cache.close();
-            throw failure;
-        }
-    }
-
-    public void resetVirtualSurfaceSelection() {
-        this.traversal.resetVirtualSurfaceSelection();
-    }
-
-    /** Captures catalog authority and this renderer session's model-resource namespace. */
-    public CatalogModelCompatibility createVirtualSurfaceModelCompatibility(
-            CatalogCodec.Catalog catalog,
-            ContentPipeline.CatalogMappings mappings) {
-        Objects.requireNonNull(catalog, "catalog");
-        Objects.requireNonNull(mappings, "mappings");
-        if (catalog.catalogId() != mappings.catalogId()) {
-            throw new IllegalArgumentException("catalog mappings belong to another catalog");
-        }
-        return CatalogModelCompatibility.create(catalog, mappings.blocks(), mappings.biomes(),
-                this.modelService.factory);
-    }
-
-    /** Requests every local model named by a catalog without classifying an unfinished bake. */
-    public void requestVirtualSurfaceModelBakes(int[] localBlockIds) {
-        Objects.requireNonNull(localBlockIds, "localBlockIds");
-        for (int block : localBlockIds) {
-            if (block > 0 && !this.modelService.factory.hasModelForBlockId(block)) {
-                this.modelService.requestBlockBake(block);
-            }
-        }
-    }
-
-    private MicrotileActivationManager.Publication publishVirtualSurface(
-            SpatialNode node, BuiltSection geometry,
-            Optional<MicrotileActivationManager.Publication> previous) {
-        long position = RootDemandPlan.sectionKey(node);
+    private SectionPublication publishRegionalSection(
+            long position, BuiltSection geometry, Optional<SectionPublication> previous) {
         if (geometry.position != position) {
-            throw new IllegalArgumentException("microtile geometry is bound to the wrong node");
+            throw new IllegalArgumentException("regional geometry is bound to the wrong section");
         }
-        VirtualSurfacePublication previousPublication = previous
-                .map(value -> requireVirtualSurfacePublication(position, value))
+        RegionalSectionPublication previousPublication = previous
+                .map(value -> requireRegionalSectionPublication(position, value))
                 .orElse(null);
-        return queueVirtualSurface(position, geometry, previousPublication, false);
+        return queueRegionalSection(position, geometry, previousPublication, false);
     }
 
-    private MicrotileActivationManager.Publication removeVirtualSurface(
-            SpatialNode node, MicrotileActivationManager.Publication previous) {
-        Objects.requireNonNull(node, "node");
-        long position = RootDemandPlan.sectionKey(node);
-        VirtualSurfacePublication publication = requireVirtualSurfacePublication(
-                position, previous);
-        BuiltSection empty = BuiltSection.emptyWithChildren(position,
-                publication.children);
-        return queueVirtualSurface(position, empty, publication, true);
-    }
-
-    private VirtualSurfacePublication queueVirtualSurface(
-            long position, BuiltSection geometry, VirtualSurfacePublication previous,
+    private RegionalSectionPublication queueRegionalSection(
+            long position, BuiltSection geometry, RegionalSectionPublication previous,
             boolean removal) {
-        long revision = this.virtualSurfaceRevision.getAndIncrement();
-        if (revision <= 0) throw new IllegalStateException("virtual-surface revision exhausted");
+        long revision = this.regionalSectionRevision.getAndIncrement();
+        if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
                 geometry.aabb, geometry.geometryBuffer, geometry.offsets);
-        VirtualSurfacePublication publication = new VirtualSurfacePublication(
-                this.nodeManager, position, revision, geometry.childExistence, removal);
+        RegionalSectionPublication publication = new RegionalSectionPublication(
+                this.nodeManager, position, revision, removal);
         long previousRevision = previous == null ? -1 : previous.revision;
-        this.nodeManager.publishVirtualSurface(queued, previousRevision, () ->
+        this.nodeManager.publishRegionalSection(queued, previousRevision, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
                     publication.activated.set(true);
                     if (previous != null) previous.markSafeToRelease();
@@ -202,10 +112,10 @@ public class VoxyRenderSystem {
         return publication;
     }
 
-    private VirtualSurfacePublication requireVirtualSurfacePublication(
-            long position, MicrotileActivationManager.Publication value) {
+    private RegionalSectionPublication requireRegionalSectionPublication(
+            long position, SectionPublication value) {
         if (!(Objects.requireNonNull(value, "previous")
-                instanceof VirtualSurfacePublication publication)
+                instanceof RegionalSectionPublication publication)
                 || publication.position != position) {
             throw new IllegalArgumentException(
                     "replacement publication belongs to another renderer");
@@ -216,12 +126,11 @@ public class VoxyRenderSystem {
         return publication;
     }
 
-    private final class VirtualSurfacePublication
-            implements MicrotileActivationManager.Publication {
+    private final class RegionalSectionPublication
+            implements SectionPublication {
         private final AsyncNodeManager renderer;
         private final long position;
         private final long revision;
-        private final byte children;
         private final boolean removal;
         private final AtomicBoolean activated = new AtomicBoolean();
         private final AtomicBoolean retired = new AtomicBoolean();
@@ -230,12 +139,11 @@ public class VoxyRenderSystem {
         private final AtomicBoolean failureRecoveryQueued = new AtomicBoolean();
         private volatile Throwable failure;
 
-        private VirtualSurfacePublication(AsyncNodeManager renderer, long position,
-                                          long revision, byte children, boolean removal) {
+        private RegionalSectionPublication(AsyncNodeManager renderer, long position,
+                                           long revision, boolean removal) {
             this.renderer = renderer;
             this.position = position;
             this.revision = revision;
-            this.children = children;
             this.removal = removal;
         }
 
@@ -264,8 +172,10 @@ public class VoxyRenderSystem {
             if (!this.closeRequested.get() || this.failure != null || !this.activated.get()
                     || this.retired.get() || this.removal
                     || !this.removalQueued.compareAndSet(false, true)) return;
-            BuiltSection empty = BuiltSection.emptyWithChildren(this.position, this.children);
-            queueVirtualSurface(this.position, empty, this, true);
+            // Retirement removes this complete subtree. The old geometry remains active until
+            // the zero-child replacement and every descendant retirement cross their fences.
+            BuiltSection empty = BuiltSection.emptyWithChildren(this.position, (byte) 0);
+            queueRegionalSection(this.position, empty, this, true);
         }
 
         /**
@@ -347,6 +257,7 @@ public class VoxyRenderSystem {
                 this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData);
                 this.nodeCleaner = new NodeCleaner(this.nodeManager);
                 this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner);
+                this.traversal.setRefinementListener(ClientLodClient::refinementRequested);
 
                 Arrays.stream(this.mapper.getBiomeEntries()).forEach(this.modelService::addBiome);
                 this.mapper.setBiomeCallback(this.modelService::addBiome);
@@ -389,10 +300,10 @@ public class VoxyRenderSystem {
                         maxSec,
                         position -> {
                             this.nodeManager.addTopLevel(position);
-                            ClientLodClient.metadataRootEntered(position);
+                            ClientLodClient.sectionEntered(position);
                         },
                         position -> {
-                            ClientLodClient.metadataRootLeft(position);
+                            ClientLodClient.sectionLeft(position);
                             this.nodeManager.removeTopLevel(position);
                         });
 

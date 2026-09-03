@@ -245,7 +245,7 @@ public class NodeManager {
     }
 
     /**
-     * Attaches already-uploaded candidates and manifested child topology without freeing active
+     * Attaches already-uploaded candidates and indexed child topology without freeing active
      * geometry until every key passes preflight. Request-to-node publication waits for finalize.
      */
     public void commitStagedRoot(long sourceRevision, Set<Long> positions) {
@@ -304,7 +304,7 @@ public class NodeManager {
                 previousChildExistenceKnown = true;
                 this.nodeData.setNodeGeometry(node, target.candidate.geometryId);
                 // Existing child topology remains authoritative through the geometry fence.
-                // Finalization reconciles the old allocation with the new manifested mask.
+                // Finalization reconciles the old allocation with the new indexed mask.
                 this.invalidateNode(node);
             }
             this.stagedGeometry.remove(target.key);
@@ -522,7 +522,7 @@ public class NodeManager {
     }
 
     /**
-     * A manifested topology replacement may remove only renderer-empty branches. Their activation
+     * An indexed topology replacement may remove only renderer-empty branches. Their activation
      * owners retire them first; a committed or nonempty descendant keeps the parent replacement
      * pending instead of becoming unreachable.
      */
@@ -1060,10 +1060,8 @@ public class NodeManager {
         int x = SectionKey.x(pos);
         int y = SectionKey.y(pos);
         int z = SectionKey.z(pos);
-        // Manifests use canonical Morton octants: X is bit 0, Y is bit 1,
-        // and Z is bit 2. Keep the renderer hierarchy in that same order so a manifest
-        // child-existence bit always names the section that Rust published for it.
-        return (x & 1) | ((y & 1) << 1) | ((z & 1) << 2);
+        // Regional octants match the cell layout: X is bit 0, Z is bit 1, Y is bit 2.
+        return (x & 1) | ((z & 1) << 1) | ((y & 1) << 2);
     }
 
     private static long makeChildPos(long basePos, int addin) {
@@ -1073,8 +1071,8 @@ public class NodeManager {
         }
         return SectionKey.pack(lvl-1,
                 (SectionKey.x(basePos)<<1)|(addin&1),
-                (SectionKey.y(basePos)<<1)|((addin>>1)&1),
-                (SectionKey.z(basePos)<<1)|((addin>>2)&1));
+                (SectionKey.y(basePos)<<1)|((addin>>2)&1),
+                (SectionKey.z(basePos)<<1)|((addin>>1)&1));
     }
 
     private static long makeParentPos(long pos) {

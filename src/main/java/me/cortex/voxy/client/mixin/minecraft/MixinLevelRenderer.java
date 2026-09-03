@@ -50,9 +50,8 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
     @Override
     public void voxy$shutdownRenderer() {
         if (this.renderer != null) {
-            // Stop object decoding, hybrid meshing, activation candidates and their GPU fences
-            // while every renderer/model resource they own is still valid.  Shutting the
-            // renderer first can free ModelFactory and GL objects underneath an in-flight             // candidate.
+            // Stop regional decode, meshing, publication, and GPU fences while every renderer
+            // and model resource they own is still valid.
             ClientLodClient.rendererLifecycleChanged();
             VoxyRenderSystem closing = this.renderer;
             this.renderer = null;
@@ -83,7 +82,7 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
         try {
             // Clear demand owned by the previous renderer before the new tracker publishes its
             // initial window. Clearing it after construction discards that new window and leaves
-            // the QUIC session with no manifest roots, so it never requests terrain.
+            // the QUIC session with no coverage roots, so it never requests terrain.
             ClientLodClient.rendererLifecycleChanged();
             VoxyRenderSystem created = new VoxyRenderSystem(mapper);
             this.renderer = created;
