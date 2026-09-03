@@ -328,7 +328,7 @@ public final class RootDemandPlan {
     }
 
     public RootAnnounce root() { return this.root; }
-    /** Monotonic epoch for structural topology or object-handle table mutations. */
+    /** Monotonic epoch for structural node topology and descriptor-binding mutations. */
     public long manifestRevision() { return this.manifestRevision; }
     public long selectionTopologyRevision() { return this.selectionTopologyRevision; }
 
@@ -1500,11 +1500,9 @@ public final class RootDemandPlan {
         this.expectedObjects.put(hash, expected);
         this.objectHandles.put(hash, this.objectHandles.size());
         this.objectsByHandle.add(hash);
-        this.manifestRevision++;
-        // The immutable selector topology records the exact capability namespace bound to this
-        // plan revision. A newly granted handle must therefore invalidate the cached topology;
-        // the protocol ceiling remains enforced by requireObjectCapacity above.
-        this.selectionTopologyRevision++;
+        // Object handles never enter GPU selection topology. They are owner-thread-local
+        // capabilities expanded from authenticated selected node masks, so granting one must not
+        // invalidate the very selector frontier that will later retire it.
         if (enqueue) enqueueExpectedObject(hash);
     }
 
@@ -1626,7 +1624,6 @@ public final class RootDemandPlan {
 
     /** Drops historical metadata while preserving exact outstanding response capabilities. */
     private void pruneIrrelevantMetadata(boolean topologyWasComplete) {
-        Map<Hash256, Integer> previousObjectHandles = Map.copyOf(this.objectHandles);
         Map<SpatialNode, Integer> previousNodeHandles = Map.copyOf(this.nodeHandles);
         Set<Hash256> previousManifests = Set.copyOf(this.manifests.keySet());
         Set<Hash256> previousDescriptorPages = Set.copyOf(this.descriptorPages.keySet());
@@ -1660,8 +1657,7 @@ public final class RootDemandPlan {
                 !relevant(entry.getValue().root())
                         && !this.subtreeInFlight.contains(entry.getKey()));
         rebuildReachableRegistries();
-        boolean handleNamespaceChanged = !previousNodeHandles.equals(this.nodeHandles)
-                || !previousObjectHandles.equals(this.objectHandles);
+        boolean handleNamespaceChanged = !previousNodeHandles.equals(this.nodeHandles);
         if (topologyWasComplete != discoveryComplete()
                 || !previousManifests.equals(this.manifests.keySet())
                 || !previousDescriptorPages.equals(this.descriptorPages.keySet())

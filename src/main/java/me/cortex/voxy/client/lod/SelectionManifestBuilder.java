@@ -178,8 +178,8 @@ public final class SelectionManifestBuilder {
                     structural.childMask(), children, bounds, structural.geometricErrorQ16(),
                     binding != null, layouts[0], layouts[1], layouts[2]);
         }
-        this.topology = new SelectionManifest.Topology(nodes, plan.objectHandleCount(),
-                dependencyOffset, neighborOffset);
+        this.topology = new SelectionManifest.Topology(
+                nodes, dependencyOffset, neighborOffset);
         this.sources = nextSources;
         this.spatials = nextSpatials;
         this.topologyPlan = plan;

@@ -19,7 +19,6 @@ public final class SelectionManifest implements AutoCloseable {
     public static final int MICROTILE_COUNT = 64;
     public static final int NO_HANDLE = -1;
     public static final int MAX_NODES = 262_144;
-    public static final int MAX_OBJECT_HANDLES = 262_144;
     public static final int MAX_DEPENDENCIES_PER_CONTENT = 0xffff;
     private static final int CONTENT_CLASSES = 3;
     private static final int MASKS_PER_CONTENT = 6;
@@ -60,24 +59,19 @@ public final class SelectionManifest implements AutoCloseable {
         }
     }
 
-    /** Immutable, validated node and content-handle namespace. */
+    /** Immutable, validated node topology and content-state layout. */
     public static final class Topology {
         private final Node[] nodes;
         private final int[] nodeIndexByHandle;
-        private final int objectHandleCapacity;
         private final int dependencyStates;
         private final int neighborStates;
 
-        public Topology(Node[] nodes, int objectHandleCapacity,
-                        int dependencyStates, int neighborStates) {
+        public Topology(Node[] nodes, int dependencyStates, int neighborStates) {
             Objects.requireNonNull(nodes, "nodes");
-            if (nodes.length > MAX_NODES || objectHandleCapacity < 0
-                    || objectHandleCapacity > MAX_OBJECT_HANDLES
-                    || dependencyStates < 0 || neighborStates < 0) {
+            if (nodes.length > MAX_NODES || dependencyStates < 0 || neighborStates < 0) {
                 throw new IllegalArgumentException("invalid selection topology bounds");
             }
             this.nodes = nodes;
-            this.objectHandleCapacity = objectHandleCapacity;
             this.dependencyStates = dependencyStates;
             this.neighborStates = neighborStates;
 
@@ -163,7 +157,6 @@ public final class SelectionManifest implements AutoCloseable {
         public int nodeCount() { return this.nodes.length; }
         public Node nodeAt(int index) { return this.nodes[index]; }
         public int nodeHandleCapacity() { return this.nodeIndexByHandle.length; }
-        public int objectHandleCapacity() { return this.objectHandleCapacity; }
         public int indexForHandle(int handle) {
             return handle < 0 || handle >= this.nodeIndexByHandle.length
                     ? NO_HANDLE : this.nodeIndexByHandle[handle];
@@ -331,7 +324,7 @@ public final class SelectionManifest implements AutoCloseable {
     }
 
     public static SelectionManifest empty(long generation, long snapshotId) {
-        Topology topology = new Topology(new Node[0], 0, 0, 0);
+        Topology topology = new Topology(new Node[0], 0, 0);
         return new SelectionManifest(null, new Storage(), topology, generation, snapshotId,
                 0, 0, 0).seal();
     }
@@ -414,7 +407,6 @@ public final class SelectionManifest implements AutoCloseable {
     public int nodeCount() { return this.topology.nodeCount(); }
     public Node nodeAt(int index) { return this.topology.nodeAt(index); }
     public int nodeHandleCapacity() { return this.topology.nodeHandleCapacity(); }
-    public int objectHandleCapacity() { return this.topology.objectHandleCapacity(); }
     public int indexForHandle(int handle) { return this.topology.indexForHandle(handle); }
     public Node nodeForHandle(int handle) {
         int index = indexForHandle(handle);

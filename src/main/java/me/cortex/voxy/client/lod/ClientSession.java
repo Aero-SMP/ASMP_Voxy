@@ -1698,9 +1698,9 @@ final class ClientSession {
                     || selection.generation() != this.plan.root().root().generation()
                     || source.authorityId() != this.selectionAuthority) return;
             long manifestRevision = this.plan.manifestRevision();
-            // Object and node handles belong to the exact plan revision captured by their
-            // immutable renderer manifest. Metadata pruning may compact both tables without
-            // changing the published root generation.
+            // Node handles and descriptor bindings belong to the exact structural plan revision
+            // captured by the immutable renderer manifest. Content capabilities are deliberately
+            // separate: the CPU grants them from this authenticated row after GPU selection.
             if (source.planRevision() != manifestRevision) {
                 if (this.completeFrontier) invalidateSelectionAuthority();
                 this.manifestDirty = true;
@@ -1744,10 +1744,6 @@ final class ClientSession {
                             selection.nodeHandle(desiredSegment, row), key);
                 }
                 mergeCut(this.desiredCuts, selection, desiredSegment, row);
-                collectHandles(selectedContent, this.plan,
-                        selection, desiredSegment, row, false);
-                collectSelectedNeighborHandles(selectedNeighbors, this.plan,
-                        selection, desiredSegment, row);
             }
             SelectionBatch.Segment renderableSegment = SelectionBatch.Segment.RENDERABLE;
             for (int row = 0; row < selection.count(renderableSegment); row++) {
