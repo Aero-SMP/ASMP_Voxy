@@ -18,6 +18,8 @@ layout(binding = SCENE_UNIFORM_BINDING, std140) uniform SceneUniform {
     uint frameId;
     uint requestQueueSize;
     float renderDistance;
+    uint finalPass;
+    uint coarsenGraceFrames;
 };
 
 #import <voxy:lod/hierarchical/queue.glsl>
@@ -26,7 +28,8 @@ layout(binding = SCENE_UNIFORM_BINDING, std140) uniform SceneUniform {
 
 layout(binding = REQUEST_QUEUE_BINDING, std430) restrict buffer requestQueueStruct {
     uvec2 requestQueueIndex;
-    uvec2[] requestQueue;
+    uvec2 refinementQueue[MAX_REQUEST_QUEUE_SIZE];
+    uvec2 coarseningQueue[MAX_COARSEN_QUEUE_SIZE];
 };
 
 layout(binding = RENDER_QUEUE_BINDING, std430) restrict buffer renderQueueStruct {
@@ -34,7 +37,7 @@ layout(binding = RENDER_QUEUE_BINDING, std430) restrict buffer renderQueueStruct
     uint[] renderQueue;
 };
 
-layout(binding = RENDER_TRACKER_BINDING, std430) restrict writeonly buffer renderTrackerArray {
+layout(binding = RENDER_TRACKER_BINDING, std430) restrict buffer renderTrackerArray {
     uint[] lastRenderFrame;
 };
 
@@ -49,10 +52,17 @@ void addRequest(inout UnpackedNode node) {
             uint atomRes = atomicAdd(requestQueueIndex.x, 1);
             if (atomRes < MAX_REQUEST_QUEUE_SIZE) {//Hard limit
                 //Mark node as having a request submitted to prevent duplicate submissions
-                requestQueue[atomRes] = getRawPos(node);
+                refinementQueue[atomRes] = getRawPos(node);
                 markRequested(node);
             }
         }
+    }
+}
+
+void addCoarsening(in UnpackedNode node) {
+    uint slot = atomicAdd(requestQueueIndex.y, 1);
+    if (slot < MAX_COARSEN_QUEUE_SIZE) {
+        coarseningQueue[slot] = getRawPos(node);
     }
 }
 
@@ -71,7 +81,6 @@ void enqueueChildren(in UnpackedNode node) {
 
 void enqueueSelfForRender(in UnpackedNode node) {
     if (renderQueueIndex < renderQueueMaxSize) {
-        lastRenderFrame[getId(node)] = frameId;
         if (!isEmptyMesh(node)) {
             uint renderIndex = atomicAdd(renderQueueIndex, 1);
             if (renderIndex < renderQueueMaxSize) {
@@ -100,11 +109,23 @@ void traverse(in UnpackedNode node) {
     //Compute screenspace
     setupScreenspace(node);
 
-    if (!(outsideFrustum() || isCulledByHiz())) {
+    bool visible = !(outsideFrustum() || isCulledByHiz());
+    bool refinementRequired = visible && node.lodLevel != 0 && !isTerminal(node)
+            && shouldDecend();
+    if (finalPass != 0u) {
+        if (refinementRequired) {
+            lastRenderFrame[getId(node)] = frameId;
+        } else if (hasChildren(node) && !childListIsEmpty(node)
+                && frameId - lastRenderFrame[getId(node)] >= coarsenGraceFrames) {
+            addCoarsening(node);
+        }
+    }
+
+    if (visible) {
         //It is visible, TODO: maybe do a more detailed hiz test? (or make it so that )
 
         //Only decend if not a root node
-        if (node.lodLevel!=0 && !isTerminal(node) && shouldDecend()) {
+        if (refinementRequired) {
             if (hasChildren(node)) {
                 enqueueChildren(node);
             } else {
@@ -144,6 +165,9 @@ void main() {
         //Check if were inside the render distastance before traversince
         if (isWithinRenderDistance(node)) {
             traverse(node);
+        } else if (finalPass != 0u && hasChildren(node) && !childListIsEmpty(node)
+                && frameId - lastRenderFrame[getId(node)] >= coarsenGraceFrames) {
+            addCoarsening(node);
         }
     }
 }

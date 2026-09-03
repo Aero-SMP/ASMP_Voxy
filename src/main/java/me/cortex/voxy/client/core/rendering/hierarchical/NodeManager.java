@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.rendering.hierarchical;
 
 import it.unimi.dsi.fastutil.ints.IntConsumer;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -56,10 +57,13 @@ public class NodeManager {
     private final Map<Long, StagedGeometryKey> committedPositions = new HashMap<>();
     /** Candidate allocations detached by rollback but retained until its GPU pointer fence. */
     private final Map<StagedGeometryKey, Integer> rolledBackGeometry = new HashMap<>();
+    /** Detached subtree geometry retained until the parent-leaf update crosses a GPU fence. */
+    private final Map<Long, CoarsenedGeometry> coarsenedGeometry = new HashMap<>();
 
     public record RendererFence(long position, long sourceRevision, long geometryBytes) {}
     private record StagedGeometryKey(long sourceRevision, long position) {}
     private record StagedGeometry(int geometryId, byte childExistence, long geometryBytes) {}
+    private record CoarsenedGeometry(long parent, IntArrayList geometryIds) {}
 
     private static final class RequestPool {
         private final HierarchicalBitSet allocated = new HierarchicalBitSet(NodeStore.REQUEST_ID_MSK);
@@ -469,6 +473,58 @@ public class NodeManager {
         }
     }
 
+    /**
+     * Detaches every loaded descendant while retaining the coarse parent and its indexed child
+     * mask. Geometry allocations are deliberately retained for a second, post-fence phase.
+     */
+    boolean coarsenSubtree(long revision, long parent) {
+        assertPosValid(parent);
+        if (this.coarsenedGeometry.containsKey(revision)) {
+            throw new IllegalStateException("duplicate subtree coarsening revision");
+        }
+        if (this.hasPendingGeometry(parent)) return false;
+        for (CoarsenedGeometry pending : this.coarsenedGeometry.values()) {
+            if (contains(pending.parent, parent) || contains(parent, pending.parent)) return false;
+        }
+
+        IntArrayList retired = new IntArrayList();
+        int state = this.activeSectionMap.get(parent);
+        int type = state & NODE_TYPE_MSK;
+        if (state != -1 && type == NODE_TYPE_INNER) {
+            int nodeId = state & NODE_ID_MSK;
+            this._recurseRemoveNode(parent, true, retired);
+            this.transition(parent, state, NODE_TYPE_LEAF | nodeId);
+            this.refreshParentLeafState(parent);
+            this.invalidateNode(nodeId);
+        } else if (state != -1 && type != NODE_TYPE_LEAF && type != NODE_TYPE_REQUEST) {
+            throw new IllegalStateException("invalid coarsening owner for "
+                    + SectionKey.describe(parent));
+        }
+        this.coarsenedGeometry.put(revision, new CoarsenedGeometry(parent, retired));
+        return true;
+    }
+
+    private boolean hasPendingGeometry(long parent) {
+        for (StagedGeometryKey key : this.stagedGeometry.keySet()) {
+            if (contains(parent, key.position)) return true;
+        }
+        for (StagedGeometryKey key : this.committedPositions.values()) {
+            if (contains(parent, key.position)) return true;
+        }
+        return false;
+    }
+
+    /** Releases detached geometry only after the topology fence completed. */
+    void releaseCoarsened(long revision) {
+        CoarsenedGeometry retired = this.coarsenedGeometry.remove(revision);
+        if (retired == null) {
+            throw new IllegalStateException("missing fenced subtree coarsening revision");
+        }
+        for (int index = 0; index < retired.geometryIds.size(); index++) {
+            this.removeGeometryIfAllocated(retired.geometryIds.getInt(index));
+        }
+    }
+
     private void removeGeometryIfAllocated(int geometryId) {
         if (geometryId != NULL_GEOMETRY_ID && geometryId != EMPTY_GEOMETRY_ID) {
             this.geometryManager.removeSection(geometryId);
@@ -480,7 +536,7 @@ public class NodeManager {
     }
 
     private void recurseRemoveNode(long pos) {
-        this._recurseRemoveNode(pos, false);
+        this._recurseRemoveNode(pos, false, null);
     }
 
     private NodeRequest request(int state) {
@@ -761,13 +817,19 @@ public class NodeManager {
         this.nodeData.unmarkRequestInFlight(parentNodeId);
     }
 
-    private void _removeRequest(int reqId, NodeRequest req) {
-        this.setRequestedChildren(reqId, req, 0);
+    private void _removeRequest(int reqId, NodeRequest req, IntArrayList retiredGeometry) {
+        int required = req.requiredMask();
+        for (int child = 0; child < 8; child++) {
+            if ((required & 1 << child) == 0) continue;
+            int meshId = this.removeRequestedChild(reqId, req, child);
+            this.retireGeometry(meshId, retiredGeometry);
+        }
         this.childRequests.release(reqId);
     }
 
     //Recursivly fully removes all nodes and children
-    private void _recurseRemoveNode(long pos, boolean onlyRemoveChildren) {
+    private void _recurseRemoveNode(long pos, boolean onlyRemoveChildren,
+                                    IntArrayList retiredGeometry) {
         //NOTE: this also removes from the section map
         int nodeId;
         if (onlyRemoveChildren) {
@@ -792,7 +854,7 @@ public class NodeManager {
                 int reqId = this.nodeData.getNodeRequest(nodeId);
                 var req = this.childRequests.get(reqId);
                 childExistence ^= req.requiredMask();
-                this._removeRequest(reqId, req);
+                this._removeRequest(reqId, req, retiredGeometry);
 
                 if (onlyRemoveChildren) {
                     this.nodeData.unmarkRequestInFlight(nodeId);
@@ -811,7 +873,7 @@ public class NodeManager {
                     if ((childExistence & (1 << i)) == 0) continue;
 
                     long childPos = makeChildPos(pos, i);
-                    this.recurseRemoveNode(childPos);
+                    this._recurseRemoveNode(childPos, false, retiredGeometry);
                 }
 
                 if (onlyRemoveChildren) {
@@ -822,8 +884,7 @@ public class NodeManager {
             if (!onlyRemoveChildren) {
                 //Free geometry and related memory for this node
                 int meshId = this.nodeData.getNodeGeometry(nodeId);
-                if (meshId != EMPTY_GEOMETRY_ID && meshId != NULL_GEOMETRY_ID)
-                    this.removeGeometry(meshId);
+                this.retireGeometry(meshId, retiredGeometry);
 
                 this.nodeData.free(nodeId);
                 this.clearFreeId(nodeId);
@@ -848,8 +909,7 @@ public class NodeManager {
 
                 this.topLevelRequests.release(nodeId);
                 int meshId = req.mesh(0);
-                if (meshId != EMPTY_GEOMETRY_ID && meshId != NULL_GEOMETRY_ID)
-                    this.removeGeometry(meshId);
+                this.retireGeometry(meshId, retiredGeometry);
 
             } else {
                 throw new IllegalStateException("Cannot recursively remove one child from an active request");
@@ -857,6 +917,12 @@ public class NodeManager {
         } else {
             throw new IllegalStateException();
         }
+    }
+
+    private void retireGeometry(int geometryId, IntArrayList retiredGeometry) {
+        if (geometryId == EMPTY_GEOMETRY_ID || geometryId == NULL_GEOMETRY_ID) return;
+        if (retiredGeometry == null) this.removeGeometry(geometryId);
+        else retiredGeometry.add(geometryId);
     }
 
     //==================================================================================================================

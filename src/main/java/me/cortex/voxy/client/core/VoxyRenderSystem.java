@@ -35,6 +35,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import static org.lwjgl.opengl.GL11.GL_VIEWPORT;
 import static org.lwjgl.opengl.GL11.glEnable;
@@ -70,11 +72,25 @@ public class VoxyRenderSystem {
 
     public interface SectionPublisher {
         SectionPublication publish(long position, BuiltSection geometry,
-                                   Optional<SectionPublication> previous);
+                                   Optional<SectionPublication> previous,
+                                   BooleanSupplier current);
+        void coarsen(long parent, Runnable success, Consumer<Throwable> failure);
     }
 
     public SectionPublisher regionalSectionPublisher() {
-        return this::publishRegionalSection;
+        return new SectionPublisher() {
+            @Override
+            public SectionPublication publish(long position, BuiltSection geometry,
+                                              Optional<SectionPublication> previous,
+                                              BooleanSupplier current) {
+                return publishRegionalSection(position, geometry, previous, current);
+            }
+
+            @Override
+            public void coarsen(long parent, Runnable success, Consumer<Throwable> failure) {
+                coarsenRegionalSubtree(parent, success, failure);
+            }
+        };
     }
 
     public SectionMesher regionalSectionMesher() {
@@ -82,19 +98,21 @@ public class VoxyRenderSystem {
     }
 
     private SectionPublication publishRegionalSection(
-            long position, BuiltSection geometry, Optional<SectionPublication> previous) {
+            long position, BuiltSection geometry, Optional<SectionPublication> previous,
+            BooleanSupplier current) {
         if (geometry.position != position) {
             throw new IllegalArgumentException("regional geometry is bound to the wrong section");
         }
         RegionalSectionPublication previousPublication = previous
                 .map(value -> requireRegionalSectionPublication(position, value))
                 .orElse(null);
-        return queueRegionalSection(position, geometry, previousPublication, false);
+        return queueRegionalSection(position, geometry, previousPublication, false,
+                Objects.requireNonNull(current, "current"));
     }
 
     private RegionalSectionPublication queueRegionalSection(
             long position, BuiltSection geometry, RegionalSectionPublication previous,
-            boolean removal) {
+            boolean removal, BooleanSupplier current) {
         long revision = this.regionalSectionRevision.getAndIncrement();
         if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
@@ -102,14 +120,24 @@ public class VoxyRenderSystem {
         RegionalSectionPublication publication = new RegionalSectionPublication(
                 this.nodeManager, position, revision, removal);
         long previousRevision = previous == null ? -1 : previous.revision;
-        this.nodeManager.publishRegionalSection(queued, previousRevision, () ->
+        this.nodeManager.publishRegionalSection(queued, previousRevision, current, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
                     publication.activated.set(true);
                     if (previous != null) previous.markSafeToRelease();
                     if (removal) publication.markSafeToRelease();
                     publication.finishCloseIfRequested();
-                }, publication::failAndRollback), publication::failAndRollback);
+                }, publication::failAndRollback), publication::cancelBeforeStaging,
+                publication::failAndRollback);
         return publication;
+    }
+
+    private void coarsenRegionalSubtree(long parent, Runnable success,
+                                        Consumer<Throwable> failure) {
+        Objects.requireNonNull(success, "success");
+        Objects.requireNonNull(failure, "failure");
+        long revision = this.regionalSectionRevision.getAndIncrement();
+        if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
+        this.nodeManager.coarsenSubtree(revision, parent, success, failure);
     }
 
     private RegionalSectionPublication requireRegionalSectionPublication(
@@ -175,7 +203,12 @@ public class VoxyRenderSystem {
             // Retirement removes this complete subtree. The old geometry remains active until
             // the zero-child replacement and every descendant retirement cross their fences.
             BuiltSection empty = BuiltSection.emptyWithChildren(this.position, (byte) 0);
-            queueRegionalSection(this.position, empty, this, true);
+            queueRegionalSection(this.position, empty, this, true, () -> true);
+        }
+
+        private void cancelBeforeStaging() {
+            this.activated.set(true);
+            this.retired.set(true);
         }
 
         /**
@@ -258,6 +291,7 @@ public class VoxyRenderSystem {
                 this.nodeCleaner = new NodeCleaner(this.nodeManager);
                 this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner);
                 this.traversal.setRefinementListener(ClientLodClient::refinementRequested);
+                this.traversal.setCoarseningListener(ClientLodClient::coarseningRequested);
 
                 Arrays.stream(this.mapper.getBiomeEntries()).forEach(this.modelService::addBiome);
                 this.mapper.setBiomeCallback(this.modelService::addBiome);

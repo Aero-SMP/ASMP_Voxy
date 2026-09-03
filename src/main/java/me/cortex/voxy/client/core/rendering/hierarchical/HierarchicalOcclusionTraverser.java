@@ -32,15 +32,18 @@ import static org.lwjgl.opengl.GL45.*;
 // TODO: swap to persistent gpu threads instead of dispatching MAX_ITERATIONS of compute layers
 public class HierarchicalOcclusionTraverser {
     public static final int MAX_REQUEST_QUEUE_SIZE = 50;
+    public static final int MAX_COARSEN_QUEUE_SIZE = 64;
     public static final int MAX_QUEUE_SIZE = 200_000;
 
 
     private static final int MAX_ITERATIONS = SectionKey.MAX_LOD_LAYER+1;
     private static final int LOCAL_WORK_SIZE_BITS = 5;
+    private static final double COARSEN_GRACE_NANOS = 2_000_000_000.0;
 
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
     private LongConsumer refinementListener = ignored -> {};
+    private LongConsumer coarseningListener = ignored -> {};
 
     private final GlBuffer requestBuffer;
 
@@ -72,11 +75,15 @@ public class HierarchicalOcclusionTraverser {
     private AutoBindingShader traversal;
 
     private AbstractRenderPipeline pipeline;//Used to bind shader taa uniforms
+    private long previousFrameNanos;
+    private double averageFrameNanos = 16_666_667.0;
+    private int coarsenGraceFrames = 120;
 
     public HierarchicalOcclusionTraverser(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner) {
         this.nodeCleaner = nodeCleaner;
         this.nodeManager = nodeManager;
-        this.requestBuffer = new GlBuffer(MAX_REQUEST_QUEUE_SIZE*8L+8).zero();
+        this.requestBuffer = new GlBuffer(
+                (MAX_REQUEST_QUEUE_SIZE + MAX_COARSEN_QUEUE_SIZE) * 8L + 8).zero();
         this.nodeBuffer = new GlBuffer(nodeManager.maxNodeCount*16L).fill(-1);
 
 
@@ -101,6 +108,7 @@ public class HierarchicalOcclusionTraverser {
             .define("MAX_ITERATIONS", MAX_ITERATIONS)
             .define("LOCAL_SIZE_BITS", LOCAL_WORK_SIZE_BITS)
             .define("MAX_REQUEST_QUEUE_SIZE", MAX_REQUEST_QUEUE_SIZE)
+            .define("MAX_COARSEN_QUEUE_SIZE", MAX_COARSEN_QUEUE_SIZE)
 
             .define("HIZ_BINDING", 0)
 
@@ -180,7 +188,7 @@ public class HierarchicalOcclusionTraverser {
         }
     }
 
-    private void uploadUniform(Viewport viewport, HiZBuffer hiZBuffer) {
+    private void uploadUniform(Viewport viewport, HiZBuffer hiZBuffer, boolean finalPass) {
         long ptr = UploadStream.INSTANCE.upload(this.uniformBuffer, 0, 1024);
 
         viewport.MVP.getToAddress(ptr); ptr += 4*4*4;
@@ -209,6 +217,10 @@ public class HierarchicalOcclusionTraverser {
         //Put the render distance here so that it can generate a correct circle, TODO: make it not top level section sized
         MemoryUtil.memPutFloat(ptr, (float) Math.pow(VoxyConfig.CONFIG.sectionRenderDistance*16*32,2));ptr += 4;
 
+        MemoryUtil.memPutInt(ptr, finalPass ? 1 : 0);
+        ptr += 4;
+        MemoryUtil.memPutInt(ptr, this.coarsenGraceFrames);
+
 
     }
 
@@ -222,15 +234,25 @@ public class HierarchicalOcclusionTraverser {
     }
 
     public void doTraversal(Viewport viewport) {
-        this.doTraversal(viewport, viewport.hiZBuffer);
+        long now = System.nanoTime();
+        if (this.previousFrameNanos != 0) {
+            long elapsed = now - this.previousFrameNanos;
+            if (elapsed > 0 && elapsed < 250_000_000L) {
+                this.averageFrameNanos += (elapsed - this.averageFrameNanos) * 0.05;
+                this.coarsenGraceFrames = Math.max(30, Math.min(600,
+                        (int) Math.ceil(COARSEN_GRACE_NANOS / this.averageFrameNanos)));
+            }
+        }
+        this.previousFrameNanos = now;
+        this.doTraversal(viewport, viewport.hiZBuffer, false);
     }
 
     public void doSecondPass(Viewport viewport) {
-        this.doTraversal(viewport, viewport.refinedHiZBuffer);
+        this.doTraversal(viewport, viewport.refinedHiZBuffer, true);
     }
 
-    private void doTraversal(Viewport viewport, HiZBuffer hiZBuffer) {
-        this.uploadUniform(viewport, hiZBuffer);
+    private void doTraversal(Viewport viewport, HiZBuffer hiZBuffer, boolean finalPass) {
+        this.uploadUniform(viewport, hiZBuffer, finalPass);
 
         this.traversal.bind();
         this.bindings(viewport, hiZBuffer);
@@ -253,6 +275,10 @@ public class HierarchicalOcclusionTraverser {
 
     public void setRefinementListener(LongConsumer listener) {
         this.refinementListener = Objects.requireNonNull(listener, "listener");
+    }
+
+    public void setCoarseningListener(LongConsumer listener) {
+        this.coarseningListener = Objects.requireNonNull(listener, "listener");
     }
 
     private void traverseInternal() {
@@ -317,33 +343,33 @@ public class HierarchicalOcclusionTraverser {
     private void downloadResetRequestQueue() {
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         DownloadStream.INSTANCE.download(this.requestBuffer, this::forwardDownloadResult);
-        nglClearNamedBufferSubData(this.requestBuffer.id, GL_R32UI, 0, 4, GL_RED_INTEGER, GL_UNSIGNED_INT, 0);
+        nglClearNamedBufferSubData(this.requestBuffer.id, GL_R32UI, 0, 8,
+                GL_RED_INTEGER, GL_UNSIGNED_INT, 0);
     }
 
     private void forwardDownloadResult(long ptr, long size) {
-        int count = MemoryUtil.memGetInt(ptr);ptr += 8;//its 8 since we need to skip the second value (which is empty)
-        if (count < 0 || count > 50000) {
-            Logger.error(new IllegalStateException("Count unexpected extreme value: " + count + " things may get weird"));
-            return;
-        }
-        if (count > (this.requestBuffer.size()>>3)-1) {
-            //This should not break the synchonization between gpu and cpu as in the traversal shader is
-            // `if (atomRes < REQUEST_QUEUE_SIZE) {` which forcefully clamps to the request size
-
-
-            count = (int) ((this.requestBuffer.size()>>3)-1);
-
-            //Write back the clamped count
-            MemoryUtil.memPutInt(ptr-8, count);
-        }
-        if (count != 0) {
-            for (int index = 0; index < count; index++) {
-                long address = ptr + (long) index * 8;
+        int refinementCount = (int) Math.min(
+                Integer.toUnsignedLong(MemoryUtil.memGetInt(ptr)), MAX_REQUEST_QUEUE_SIZE);
+        int coarseningCount = (int) Math.min(
+                Integer.toUnsignedLong(MemoryUtil.memGetInt(ptr + 4)), MAX_COARSEN_QUEUE_SIZE);
+        long refinementPtr = ptr + 8;
+        if (refinementCount != 0) {
+            for (int index = 0; index < refinementCount; index++) {
+                long address = refinementPtr + (long) index * 8;
                 long position = (long) MemoryUtil.memGetInt(address) << 32
                         | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
                 this.refinementListener.accept(position);
             }
-            this.nodeManager.submitRequestBatch(new MemoryBuffer(count*8L+8).cpyFrom(ptr-8));// the -8 is because we incremented it by 8
+            MemoryUtil.memPutInt(ptr, refinementCount);
+            this.nodeManager.submitRequestBatch(new MemoryBuffer(refinementCount * 8L + 8)
+                    .cpyFrom(ptr));
+        }
+        long coarseningPtr = refinementPtr + MAX_REQUEST_QUEUE_SIZE * 8L;
+        for (int index = 0; index < coarseningCount; index++) {
+            long address = coarseningPtr + (long) index * 8;
+            long position = (long) MemoryUtil.memGetInt(address) << 32
+                    | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
+            this.coarseningListener.accept(position);
         }
     }
 

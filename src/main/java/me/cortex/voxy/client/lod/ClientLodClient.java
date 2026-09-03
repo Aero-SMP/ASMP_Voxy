@@ -45,6 +45,11 @@ public final class ClientLodClient {
         ClientSession.refinementRequested(parent);
     }
 
+    /** Collapses renderer-selected detail after the final HZB pass grace period. */
+    public static void coarseningRequested(long parent) {
+        ClientSession.coarseningRequested(parent);
+    }
+
     public static void resetDemand() {
         ClientSession.resetDemand();
     }

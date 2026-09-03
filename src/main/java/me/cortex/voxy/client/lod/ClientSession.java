@@ -92,6 +92,11 @@ final class ClientSession {
         if (current != null) current.enqueueRefinement(parent);
     }
 
+    static void coarseningRequested(long parent) {
+        Session current = active;
+        if (current != null) current.enqueueCoarsening(parent);
+    }
+
     static void resetDemand() {
         synchronized (TOP_LEVEL) { TOP_LEVEL.clear(); }
         Session current = active;
@@ -198,8 +203,8 @@ final class ClientSession {
     private static final class Demand {
         final long key;
         final boolean coverage;
-        int token;
-        Phase phase = Phase.NEW;
+        volatile int token;
+        volatile Phase phase = Phase.NEW;
         RegionalProtocol.RegionIndex index;
         int ordinal = -1;
         RegionalSectionCodec.SectionData decoded;
@@ -227,6 +232,8 @@ final class ClientSession {
         final ConcurrentLinkedQueue<DemandEvent> demandEvents = new ConcurrentLinkedQueue<>();
         final ConcurrentLinkedQueue<Long> refinementEvents = new ConcurrentLinkedQueue<>();
         final Set<Long> queuedRefinements = ConcurrentHashMap.newKeySet();
+        final ConcurrentLinkedQueue<Long> coarseningEvents = new ConcurrentLinkedQueue<>();
+        final Set<Long> queuedCoarsenings = ConcurrentHashMap.newKeySet();
         final ArrayBlockingQueue<Event> events = new ArrayBlockingQueue<>(MAX_EVENTS);
         final Semaphore wakeup = new Semaphore(0);
         final Semaphore sectionTaskSlots = new Semaphore(MAX_SECTION_TASKS);
@@ -242,6 +249,8 @@ final class ClientSession {
         final Map<Long, LinkedHashSet<Long>> demandsByRegion = new HashMap<>();
         final Map<Long, LinkedHashSet<Long>> demandsByTop = new HashMap<>();
         final Set<Long> deferredRefinements = new LinkedHashSet<>();
+        final Set<Long> coarseningRoots = new HashSet<>();
+        final Object publicationLock = new Object();
         final ArrayDeque<Long> refinementAdmissionQueue = new ArrayDeque<>();
         final Set<Long> refinementAdmissionSet = new HashSet<>();
         final ArrayDeque<Long> coverageBindQueue = new ArrayDeque<>();
@@ -448,6 +457,11 @@ final class ClientSession {
                     case DecodedResult result -> this.acceptDecoded(result);
                     case MeshedResult result -> this.acceptMeshed(result);
                     case PublicationQueued result -> this.acceptPublication(result);
+                    case Coarsened result -> this.finishCoarsening(result.parent);
+                    case CoarsenFailed failed -> {
+                        this.finishCoarsening(failed.parent);
+                        throw new IOException("regional subtree coarsening failed", failed.failure);
+                    }
                     case BatchComplete complete -> {
                         this.inFlightBatches = Math.max(0, this.inFlightBatches - 1);
                         this.inFlightBytes = Math.max(0,
@@ -480,10 +494,20 @@ final class ClientSession {
                     this.deferredRefinements.removeIf(parent -> topAncestor(parent) == top);
                 }
             }
+            Long coarsening;
+            while ((coarsening = this.coarseningEvents.poll()) != null) {
+                if (!hasTop(topAncestor(coarsening)) || !this.demands.containsKey(coarsening)
+                        || this.overlapsCoarsening(coarsening)) {
+                    this.queuedCoarsenings.remove(coarsening);
+                    continue;
+                }
+                this.coarsen(coarsening);
+            }
             Long parent;
             while ((parent = this.refinementEvents.poll()) != null) {
                 this.queuedRefinements.remove(parent);
                 if (!hasTop(topAncestor(parent))) continue;
+                if (this.isCoarsening(parent)) continue;
                 if (this.deferredRefinements.contains(parent)
                         || this.refinementAdmissionSet.contains(parent)) continue;
                 if (this.indexFor(parent) == null) this.deferredRefinements.add(parent);
@@ -495,6 +519,76 @@ final class ClientSession {
             if (this.queuedRefinements.add(parent)) {
                 this.refinementEvents.add(parent);
             }
+        }
+
+        void enqueueCoarsening(long parent) {
+            if (this.queuedCoarsenings.add(parent)) {
+                this.coarseningEvents.add(parent);
+                this.signal();
+            }
+        }
+
+        void coarsen(long parent) {
+            this.coarseningRoots.add(parent);
+            synchronized (this.publicationLock) {
+                Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
+                if (owned != null) {
+                    for (long key : List.copyOf(owned)) {
+                        if (key != parent && contains(parent, key)) {
+                            this.retireDetailDemand(key);
+                        }
+                    }
+                }
+                this.removeRefinementsBelow(parent);
+                this.publisher.coarsen(parent,
+                        () -> this.putEvent(new Coarsened(parent)),
+                        failure -> this.putEvent(new CoarsenFailed(parent, failure)));
+            }
+        }
+
+        void retireDetailDemand(long key) {
+            Demand demand = this.demands.remove(key);
+            if (demand == null || demand.coverage) return;
+            demand.token++;
+            demand.received = null;
+            demand.decoded = null;
+            demand.pendingIndex = null;
+            demand.pendingOrdinal = -1;
+            if (demand.phase == Phase.ACTIVE) this.activeCount--;
+            // One fenced renderer operation owns the whole subtree; do not close each child.
+            demand.publication = null;
+            long region = regionFor(key);
+            removeOwned(this.demandsByRegion, region, key);
+            removeOwned(this.demandsByTop, topAncestor(key), key);
+            this.pendingBindSet.remove(key);
+            if (!this.demandsByRegion.containsKey(region)) this.releaseRegion(region);
+        }
+
+        void removeRefinementsBelow(long parent) {
+            this.deferredRefinements.removeIf(key -> contains(parent, key));
+            this.refinementAdmissionQueue.removeIf(key -> contains(parent, key));
+            this.refinementAdmissionSet.removeIf(key -> contains(parent, key));
+            this.refinementEvents.removeIf(key -> contains(parent, key));
+            this.queuedRefinements.removeIf(key -> contains(parent, key));
+        }
+
+        boolean isCoarsening(long key) {
+            for (long root : this.coarseningRoots) {
+                if (contains(root, key)) return true;
+            }
+            return false;
+        }
+
+        boolean overlapsCoarsening(long key) {
+            for (long root : this.coarseningRoots) {
+                if (contains(root, key) || contains(key, root)) return true;
+            }
+            return false;
+        }
+
+        void finishCoarsening(long parent) {
+            this.coarseningRoots.remove(parent);
+            this.queuedCoarsenings.remove(parent);
         }
 
         void addDemand(long key) {
@@ -1005,7 +1099,7 @@ final class ClientSession {
                 return;
             }
             demand.phase = Phase.PUBLISHING;
-            enqueueMain(new PublishTask(this, demand.key, result.token, result.geometry,
+            enqueueMain(new PublishTask(this, demand, result.token, result.geometry,
                     demand.publication));
         }
 
@@ -1014,7 +1108,7 @@ final class ClientSession {
             BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.token + 1L,
                     (byte) demand.index.childMask(demand.ordinal));
             try {
-                enqueueMain(new PublishTask(this, demand.key, demand.token, empty,
+                enqueueMain(new PublishTask(this, demand, demand.token, empty,
                         demand.publication));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -1026,7 +1120,7 @@ final class ClientSession {
         void acceptPublication(PublicationQueued result) throws IOException {
             Demand demand = this.demands.get(result.key);
             if (!current(demand, result.token, Phase.PUBLISHING)) {
-                result.publication.close();
+                if (!this.isCoarsening(result.key)) result.publication.close();
                 return;
             }
             demand.publication = result.publication;
@@ -1114,6 +1208,7 @@ final class ClientSession {
         String snapshot() {
             return "regional=ACTIVE dimension=" + this.dimension + " desired=" + this.demands.size()
                     + " active=" + this.activeCount + " regions=" + this.indexes.size()
+                    + " coarsening=" + this.coarseningRoots.size()
                     + " batches=" + this.inFlightBatches + " inFlightBytes=" + this.inFlightBytes
                     + " received=" + this.receivedBytes
                     + " failure=" + String.valueOf(this.failure);
@@ -1142,6 +1237,9 @@ final class ClientSession {
             this.subscribedRegions.clear();
             this.refinementEvents.clear();
             this.queuedRefinements.clear();
+            this.coarseningEvents.clear();
+            this.queuedCoarsenings.clear();
+            this.coarseningRoots.clear();
             this.deferredRefinements.clear();
             this.clearStageQueues();
         }
@@ -1151,8 +1249,8 @@ final class ClientSession {
     private record StageRef(long key, int token) {}
 
     private sealed interface Event permits CatalogReady, IndexReady, CacheResult, CacheCorrupt,
-            SectionResult, DecodedResult, MeshedResult, PublicationQueued, BatchComplete,
-            WorkerFailed {}
+            SectionResult, DecodedResult, MeshedResult, PublicationQueued, Coarsened,
+            CoarsenFailed, BatchComplete, WorkerFailed {}
     private record CatalogReady(RegionalProtocol.Hash32 fingerprint,
                                 RegionalSectionCodec.Mappings mappings) implements Event {}
     private record IndexReady(RegionalProtocol.RegionMessage message,
@@ -1166,6 +1264,8 @@ final class ClientSession {
     private record PublicationQueued(long key, int token,
                                      VoxyRenderSystem.SectionPublication publication)
             implements Event {}
+    private record Coarsened(long parent) implements Event {}
+    private record CoarsenFailed(long parent, Throwable failure) implements Event {}
     private record BatchComplete(long reservedBytes) implements Event {}
     private record WorkerFailed(Throwable failure) implements Event {}
 
@@ -1194,12 +1294,21 @@ final class ClientSession {
         }
     }
 
-    private record PublishTask(Session owner, long key, int token, BuiltSection geometry,
+    private record PublishTask(Session owner, Demand demand, int token, BuiltSection geometry,
                                VoxyRenderSystem.SectionPublication previous) implements MainTask {
         @Override public void run(VoxyRenderSystem renderer) {
-            VoxyRenderSystem.SectionPublication publication = this.owner.publisher.publish(
-                    this.key, this.geometry, Optional.ofNullable(this.previous));
-            this.owner.putEvent(new PublicationQueued(this.key, this.token, publication));
+            VoxyRenderSystem.SectionPublication publication;
+            synchronized (this.owner.publicationLock) {
+                if (this.demand.token != this.token
+                        || this.demand.phase != Phase.PUBLISHING) {
+                    this.geometry.free();
+                    return;
+                }
+                publication = this.owner.publisher.publish(this.demand.key, this.geometry,
+                        Optional.ofNullable(this.previous), () -> this.demand.token == this.token
+                                && this.demand.phase == Phase.PUBLISHING);
+            }
+            this.owner.putEvent(new PublicationQueued(this.demand.key, this.token, publication));
         }
         @Override public void cancel() { this.geometry.free(); }
     }
@@ -1238,6 +1347,14 @@ final class ClientSession {
         return SectionKey.pack(level, SectionKey.x(parent) * 2 + (child & 1),
                 SectionKey.y(parent) * 2 + (child >>> 2 & 1),
                 SectionKey.z(parent) * 2 + (child >>> 1 & 1));
+    }
+
+    private static boolean contains(long ancestor, long descendant) {
+        int shift = SectionKey.level(ancestor) - SectionKey.level(descendant);
+        return shift >= 0
+                && SectionKey.x(ancestor) == SectionKey.x(descendant) >> shift
+                && SectionKey.y(ancestor) == SectionKey.y(descendant) >> shift
+                && SectionKey.z(ancestor) == SectionKey.z(descendant) >> shift;
     }
 
     private static int regionX(long key) {

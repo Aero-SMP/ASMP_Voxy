@@ -26,6 +26,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
@@ -256,6 +257,12 @@ public class AsyncNodeManager {
                         yield true;
                     }
                     case FINALIZE -> this.manager.finalizeStagedRoot(transaction.sourceRevision);
+                    case RELEASE_COARSEN -> {
+                        this.manager.releaseCoarsened(transaction.sourceRevision);
+                        yield true;
+                    }
+                    case COARSEN -> throw new IllegalStateException(
+                            "coarsening must retain regional publication order");
                 };
                 if (!completed) {
                     this.rendererTransactionQueue.add(transaction);
@@ -295,16 +302,23 @@ public class AsyncNodeManager {
         // request owner, so retain its complete geometry and retry only after hierarchy progress.
         boolean deferredAdvanced = false;
         boolean regionalBatchLimited = false;
-        if (hierarchyAdvanced || this.retryDeferredAfterSync) {
+        if (hierarchyAdvanced || this.retryDeferredAfterSync || !this.coarsenQueue.isEmpty()) {
             this.retryDeferredAfterSync = false;
             DeferredRetry retry = this.retryDeferredRegionalSectionPublications();
             deferredAdvanced = retry.advanced();
             regionalBatchLimited = retry.batchLimited();
             this.retryDeferredAfterSync = retry.batchLimited();
         }
-        while (!regionalBatchLimited && hasGeometryCapacity()) {
+        while (!regionalBatchLimited) {
             RegionalSectionPublication publication = this.regionalSectionQueue.peek();
             if (publication == null) break;
+            if (!publication.current.getAsBoolean()) {
+                this.regionalSectionQueue.poll();
+                workDone++;
+                this.cancelRegionalSectionPublication(publication);
+                continue;
+            }
+            if (!hasGeometryCapacity()) break;
             if (!this.regionalSyncBatchHasRoom(publication)) {
                 regionalBatchLimited = true;
                 break;
@@ -314,6 +328,29 @@ public class AsyncNodeManager {
             workDone++;
             if (!this.processRegionalSectionPublication(publication)) {
                 this.deferredRegionalSectionPublications.addLast(publication);
+            }
+        }
+
+        {
+            int coarsenings = this.coarsenQueue.size();
+            while (coarsenings-- > 0) {
+                RendererTransaction transaction = this.coarsenQueue.peek();
+                if (transaction == null) break;
+                try {
+                    long parent = transaction.positions.iterator().next();
+                    if (!this.manager.coarsenSubtree(transaction.sourceRevision, parent)) {
+                        topologyDeferred = true;
+                        break;
+                    }
+                    this.coarsenQueue.poll();
+                    workDone++;
+                    hierarchyAdvanced = true;
+                    this.completedRendererTransactions.add(transaction);
+                } catch (Throwable failure) {
+                    this.coarsenQueue.poll();
+                    workDone++;
+                    transaction.failure.accept(failure);
+                }
             }
         }
 
@@ -479,9 +516,16 @@ public class AsyncNodeManager {
     private DeferredRetry retryDeferredRegionalSectionPublications() {
         int remaining = this.deferredRegionalSectionPublications.size();
         boolean advanced = false;
-        while (remaining-- > 0 && hasGeometryCapacity()) {
+        while (remaining-- > 0) {
             RegionalSectionPublication publication =
                     this.deferredRegionalSectionPublications.peekFirst();
+            if (!publication.current.getAsBoolean()) {
+                this.deferredRegionalSectionPublications.removeFirst();
+                this.cancelRegionalSectionPublication(publication);
+                advanced = true;
+                continue;
+            }
+            if (!hasGeometryCapacity()) break;
             if (!this.regionalSyncBatchHasRoom(publication)) {
                 return new DeferredRetry(advanced, true);
             }
@@ -512,6 +556,10 @@ public class AsyncNodeManager {
         BuiltSection geometry = publication.geometry();
         boolean transferred = false;
         try {
+            if (!publication.current.getAsBoolean()) {
+                this.cancelRegionalSectionPublication(publication);
+                return true;
+            }
             long geometryBytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
             long stagedBytes = UploadStream.alignUp(geometryBytes,
                     UploadStream.BASE_ALLOCATION_ALIGNEMENT)
@@ -547,6 +595,11 @@ public class AsyncNodeManager {
             publication.failure().accept(failure);
         }
         return true;
+    }
+
+    private void cancelRegionalSectionPublication(RegionalSectionPublication publication) {
+        publication.geometry().free();
+        publication.canceled().run();
     }
 
     private IntConsumer tlnAddCallback; private IntConsumer tlnRemoveCallback;
@@ -741,12 +794,17 @@ public class AsyncNodeManager {
             new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RendererTransaction> rendererTransactionQueue =
             new ConcurrentLinkedDeque<>();
+    private final ConcurrentLinkedDeque<RendererTransaction> coarsenQueue =
+            new ConcurrentLinkedDeque<>();
 
     private record RegionalSectionPublication(BuiltSection geometry, long previousRevision,
-                                             Runnable success,
+                                             BooleanSupplier current, Runnable success,
+                                             Runnable canceled,
                                              Consumer<Throwable> failure) {}
 
-    private enum RendererOperation { COMMIT, ROLLBACK, COMPLETE_ROLLBACK, FINALIZE }
+    private enum RendererOperation {
+        COMMIT, ROLLBACK, COMPLETE_ROLLBACK, FINALIZE, COARSEN, RELEASE_COARSEN
+    }
     private record RendererTransaction(long sourceRevision, Set<Long> positions,
                                        RendererOperation operation,
                                        Runnable success, Consumer<Throwable> failure) {}
@@ -773,6 +831,23 @@ public class AsyncNodeManager {
                                    Consumer<Throwable> failure) {
         this.submitRendererTransaction(new RendererTransaction(sourceRevision,
                 Set.of(), RendererOperation.FINALIZE, success, failure));
+    }
+
+    public void coarsenSubtree(long revision, long parent, Runnable success,
+                               Consumer<Throwable> failure) {
+        Objects.requireNonNull(success, "success");
+        Objects.requireNonNull(failure, "failure");
+        RendererTransaction transaction = new RendererTransaction(revision, Set.of(parent),
+                RendererOperation.COARSEN,
+                () -> this.submitRendererTransaction(new RendererTransaction(revision,
+                        Set.of(), RendererOperation.RELEASE_COARSEN, success, failure)),
+                failure);
+        if (!this.running) {
+            failure.accept(new IllegalStateException("Voxy renderer is not running"));
+            return;
+        }
+        this.coarsenQueue.add(transaction);
+        this.addWork();
     }
 
     private void submitRendererTransaction(RendererTransaction transaction) {
@@ -810,10 +885,13 @@ public class AsyncNodeManager {
      * Ownership of {@code geometry} transfers immediately to this manager.
      */
     public void publishRegionalSection(BuiltSection geometry, long previousRevision,
-                                      Runnable success,
+                                      BooleanSupplier current, Runnable success,
+                                      Runnable canceled,
                                       Consumer<Throwable> failure) {
         Objects.requireNonNull(geometry, "geometry");
+        Objects.requireNonNull(current, "current");
         Objects.requireNonNull(success, "success");
+        Objects.requireNonNull(canceled, "canceled");
         Objects.requireNonNull(failure, "failure");
         if (!this.running) {
             geometry.free();
@@ -821,7 +899,7 @@ public class AsyncNodeManager {
             return;
         }
         this.regionalSectionQueue.add(new RegionalSectionPublication(geometry, previousRevision,
-                success, failure));
+                current, success, canceled, failure));
         this.addWork();
     }
 
@@ -905,6 +983,11 @@ public class AsyncNodeManager {
 
         while (true) {
             RendererTransaction transaction = this.rendererTransactionQueue.poll();
+            if (transaction == null) break;
+            transaction.failure.accept(new IllegalStateException("Voxy renderer stopped"));
+        }
+        while (true) {
+            RendererTransaction transaction = this.coarsenQueue.poll();
             if (transaction == null) break;
             transaction.failure.accept(new IllegalStateException("Voxy renderer stopped"));
         }
