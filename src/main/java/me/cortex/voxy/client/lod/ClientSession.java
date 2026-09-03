@@ -596,9 +596,14 @@ final class ClientSession {
         private final NodeKeys nodeKeyScratch = new NodeKeys();
         private final Map<SpatialNode, Long> lastRelevantSelectionEpoch = new HashMap<>();
         private final Set<SpatialNode> compiling = new HashSet<>();
-        private final Map<SpatialNode, RootToken> awaitingFence = new HashMap<>();
+        /** Owner writes while the render thread polls; each completed fence is enqueued once. */
+        private final Map<SpatialNode, RootToken> awaitingFence = new ConcurrentHashMap<>();
+        private final Set<SpatialNode> enqueuedFences = ConcurrentHashMap.newKeySet();
         private final Set<SpatialNode> retiring = new HashSet<>();
         private final ContentPipeline content = new ContentPipeline();
+        /** Exact completed objects awaiting catalog translation; never a capability-table scan. */
+        private final LinkedHashSet<Hash256> pendingMicrotileInstalls =
+                new LinkedHashSet<>();
         private volatile boolean open = true;
         private volatile boolean metadataResync;
         private volatile long publishedSnapshot;
@@ -1033,6 +1038,7 @@ final class ClientSession {
             this.dictionaryIds.clear();
             this.objectStreamFailures.clear();
             this.delayedObjectRetries.clear();
+            this.pendingMicrotileInstalls.clear();
             this.compatibility.clear();
             this.desiredCuts.clear();
             this.renderableCuts.clear();
@@ -1637,7 +1643,11 @@ final class ClientSession {
             }
             current.acceptObject(decoded.hash(), decoded.kind());
             this.pinInputsRevision++;
-            if (decoded.kind() == ObjectKind.CATALOG) {
+            if (isMicrotile(decoded.kind())) {
+                // The exact completion may outlive its last section binding after cancellation,
+                // but remains useful physical residency and requires no global table scan.
+                this.pendingMicrotileInstalls.add(decoded.hash());
+            } else if (decoded.kind() == ObjectKind.CATALOG) {
                 putMain(new CatalogTask(this, root, decoded.catalog()));
             } else if (decoded.kind() == ObjectKind.DICTIONARY_SET) {
                 List<Hash256> hashes = decoded.dictionarySet().hashes();
@@ -1659,26 +1669,23 @@ final class ClientSession {
 
         private void installMicrotiles() throws Exception {
             if (this.plan == null || this.mappings == null) return;
-            for (int handle = 0; handle < this.plan.objectHandleCount(); handle++) {
-                RootDemandPlan.ObjectView object = this.plan.objectView(handle);
-                if (!object.processed() || !isMicrotile(object.expected().kind())
-                        || this.resources.residency.decodedMicrotile(object.hash()).isPresent()) {
-                    continue;
-                }
+            var iterator = this.pendingMicrotileInstalls.iterator();
+            while (iterator.hasNext()) {
+                Hash256 hash = iterator.next();
                 Optional<DecodedObject> decoded =
-                        this.resources.residency.decodedObject(object.hash());
+                        this.resources.residency.decodedObject(hash);
                 if (decoded.isEmpty()) {
-                    if (this.plan.retryMissingResidentObject(object.hash())) {
+                    if (this.plan.retryMissingResidentObject(hash)) {
                         this.manifestDirty = true;
                     }
+                    iterator.remove();
                     continue;
                 }
-                if (!this.resources.residency.installMicrotile(decoded.orElseThrow(),
-                        this.mappings.catalogId(), this.mappings.blocks(),
-                        this.mappings.biomes())) {
-                    break;
-                }
-                this.manifestDirty = true;
+                boolean installed = this.resources.residency.installMicrotile(
+                        decoded.orElseThrow(), this.mappings.catalogId(),
+                        this.mappings.blocks(), this.mappings.biomes());
+                iterator.remove();
+                if (installed) this.manifestDirty = true;
             }
         }
 
@@ -1893,12 +1900,14 @@ final class ClientSession {
                     ContentPriority priority = this.coverageCuts.containsNode(node)
                             ? ContentPriority.COVERAGE : ContentPriority.CURRENT_VIEW;
                     if (!missing.requestable().isEmpty()) {
-                        this.plan.requestObjectsByHash(missing.requestable(), priority);
+                        this.plan.requestObjectsByHash(RootDemandPlan.sectionKey(node),
+                                missing.requestable(), priority);
                     }
                     // These are exact dependencies of the selected source slots, not a
                     // widening to unrelated content in the structural node.
                     if (!missing.neighborDependencies().isEmpty()) {
                         this.plan.requestObjectsByHash(
+                                RootDemandPlan.sectionKey(node),
                                 missing.neighborDependencies(), priority);
                     }
                     continue;
@@ -1938,7 +1947,7 @@ final class ClientSession {
                         if (!this.resources.residency.contains(hash)) missing.add(hash);
                     }
                     if (!missing.isEmpty()) {
-                        this.plan.requestObjectsByHash(missing,
+                        this.plan.requestObjectsByHash(RootDemandPlan.sectionKey(node), missing,
                                 this.coverageCuts.containsNode(node)
                                         ? ContentPriority.COVERAGE
                                         : ContentPriority.CURRENT_VIEW);
@@ -2251,20 +2260,25 @@ final class ClientSession {
         }
 
         private void pollActivationFences() {
-            for (Map.Entry<SpatialNode, RootToken> entry
-                    : List.copyOf(this.awaitingFence.entrySet())) {
+            for (Map.Entry<SpatialNode, RootToken> entry : this.awaitingFence.entrySet()) {
                 SpatialNode node = entry.getKey();
+                FenceEvent event = null;
                 Optional<Throwable> failure = this.resources.activations.activationFailure(node);
                 if (failure.isPresent()) {
-                    offer(new FenceEvent(entry.getValue(), node, failure.orElseThrow()));
+                    event = new FenceEvent(entry.getValue(), node, failure.orElseThrow());
                 } else if (this.resources.activations.activationFencePassed(node)) {
-                    offer(new FenceEvent(entry.getValue(), node, null));
+                    event = new FenceEvent(entry.getValue(), node, null);
+                }
+                if (event != null && this.enqueuedFences.add(node) && !offer(event)) {
+                    this.enqueuedFences.remove(node);
                 }
             }
         }
 
         private void acceptFence(FenceEvent fence) {
-            if (!this.awaitingFence.remove(fence.node, fence.root)) return;
+            boolean awaited = this.awaitingFence.remove(fence.node, fence.root);
+            this.enqueuedFences.remove(fence.node);
+            if (!awaited) return;
             if (fence.failure != null) {
                 this.resources.activations.discardFailedPublication(fence.node);
                 if (fence.failure

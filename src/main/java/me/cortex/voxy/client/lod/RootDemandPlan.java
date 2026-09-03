@@ -551,20 +551,21 @@ public final class RootDemandPlan {
         }
     }
 
-    /** Adds exact content/dependency hashes, including a complex companion discovered locally. */
-    public void requestObjectsByHash(Collection<Hash256> hashes, ContentPriority priority) {
+    /** Adds exact descriptor-bound hashes, including a complex companion discovered locally. */
+    public void requestObjectsByHash(long sectionKey, Collection<Hash256> hashes,
+                                     ContentPriority priority) {
         Objects.requireNonNull(hashes, "hashes");
         Objects.requireNonNull(priority, "priority");
-        ArrayList<Hash256> validated = new ArrayList<>(hashes.size());
-        for (Hash256 hash : hashes) {
-            Hash256 value = Objects.requireNonNull(hash, "content request hash");
-            ExpectedObject expected = this.expectedObjects.get(value);
-            if (expected == null || !isMicrotile(expected.kind())) {
-                throw new IllegalArgumentException("object is not reachable microtile content");
-            }
-            validated.add(value);
-        }
-        for (Hash256 hash : validated) {
+        Binding binding = binding(sectionKey).orElseThrow(() ->
+                new IllegalArgumentException("content request belongs to an unresolved node"));
+        LinkedHashMap<Hash256, ObjectKind> validated =
+                bindingObjectKinds(binding, hashes);
+        for (Map.Entry<Hash256, ObjectKind> entry : validated.entrySet()) {
+            Hash256 hash = entry.getKey();
+            // A selected capability may have been compacted after asynchronous GPU readback.
+            // Re-register only this descriptor-authenticated hash; the hard table limit remains
+            // enforced by registerExpectedObject().
+            registerSelectedObject(sectionKey, hash, entry.getValue());
             // An explicit selector request means disposable residency no longer has this object,
             // even if the same immutable hash completed an earlier transfer.
             this.processedObjects.remove(hash);
@@ -574,6 +575,44 @@ public final class RootDemandPlan {
             }
             refreshContentPriority(hash);
         }
+    }
+
+    private static LinkedHashMap<Hash256, ObjectKind> bindingObjectKinds(
+            Binding binding, Collection<Hash256> hashes) {
+        LinkedHashMap<Hash256, ObjectKind> result = new LinkedHashMap<>();
+        for (Hash256 hash : hashes) {
+            result.put(Objects.requireNonNull(hash, "content request hash"), null);
+        }
+        for (ContentLayer layer : binding.layers()) {
+            ObjectKind layerKind = MicrotileCodec.objectKind(layer.contentClass());
+            for (ContentObject object : layer.objects()) {
+                mergeBoundKind(result, object.hash(), object.kind());
+            }
+            for (Hash256 dependency : layer.dependencies()) {
+                mergeBoundKind(result, dependency, layerKind);
+            }
+            for (NeighborDependency dependency : layer.neighborDependencies()) {
+                mergeBoundKind(result, dependency.hash(), ObjectKind.COMPLEX_MICROTILE);
+            }
+        }
+        for (ObjectKind kind : result.values()) {
+            if (kind == null) throw new IllegalArgumentException(
+                    "object is not bound to the requesting section");
+        }
+        return result;
+    }
+
+    private static void mergeBoundKind(Map<Hash256, ObjectKind> requested,
+                                       Hash256 hash, ObjectKind candidate) {
+        if (!requested.containsKey(hash)) return;
+        requested.put(hash, mergeObjectKind(requested.get(hash), candidate));
+    }
+
+    private static ObjectKind mergeObjectKind(ObjectKind present, ObjectKind candidate) {
+        if (present != null && present != candidate) {
+            throw new IllegalArgumentException("descriptor hash changes object kind");
+        }
+        return candidate;
     }
 
     /**
@@ -1029,15 +1068,15 @@ public final class RootDemandPlan {
         this.bindingsByObject.computeIfAbsent(hash, ignored -> new LinkedHashSet<>()).add(key);
     }
 
-    /** Returns only the section keys made installable by this object, avoiding O(N) rescans. */
-    public List<Long> acceptObject(Hash256 hash, ObjectKind kind) {
+    /** Accepts one exact completion without materializing or scanning the capability table. */
+    public int acceptObject(Hash256 hash, ObjectKind kind) {
         ExpectedObject expected = this.expectedObjects.get(Objects.requireNonNull(hash, "hash"));
         if (expected == null || expected.kind() != kind || !consumeObject(hash)) {
             throw new IllegalArgumentException("unsolicited or wrong-type object");
         }
         this.processedObjects.add(hash);
         LinkedHashSet<Long> keys = this.bindingsByObject.get(hash);
-        return keys == null ? List.of() : List.copyOf(keys);
+        return keys == null ? 0 : keys.size();
     }
 
     /** Adds the three verified kind-7 objects named by the root's dictionary-set object. */
