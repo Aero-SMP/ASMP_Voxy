@@ -11,7 +11,7 @@ mod source;
 mod store;
 pub mod wire;
 
-pub use builder::{RegionalBuildStats, rebuild_region};
+pub use builder::{RegionalBuildStats, rebuild_region, rebuild_region_incremental};
 pub use index::RegionIndex;
 pub use runtime::{RegionalRefresh, RegionalRuntime};
 pub use section::SectionFrame;

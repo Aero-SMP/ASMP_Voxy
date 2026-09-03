@@ -3,8 +3,7 @@
 //! The ALPN and message set intentionally have no legacy branch or negotiated version. Changing
 //! this format means changing its magic/ALPN and deploying the matching client and server.
 
-use super::SectionCoordinate;
-use crate::{key::SectionKey, take, take_i32, take_u8, take_u16, take_u32, take_u64};
+use crate::{take, take_i32, take_u8, take_u16, take_u32, take_u64};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -328,35 +327,36 @@ fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> {
     Ok(message)
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SectionRequest {
-    pub generation: u64,
-    pub coordinate: SectionCoordinate,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SectionRequestBatch {
     pub epoch: u64,
-    pub requests: Vec<SectionRequest>,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub generation: u64,
+    pub ordinals: Vec<u32>,
 }
 
 impl SectionRequestBatch {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.epoch == 0 || self.requests.is_empty() || self.requests.len() > MAX_SECTION_REQUESTS
+        if self.epoch == 0
+            || self.generation == 0
+            || self.ordinals.is_empty()
+            || self.ordinals.len() > MAX_SECTION_REQUESTS
         {
             bail!("invalid regional section request batch bounds");
         }
-        let mut output = Vec::with_capacity(10 + self.requests.len() * 21);
+        let mut output = Vec::with_capacity(26 + self.ordinals.len() * 4);
         output.extend_from_slice(&self.epoch.to_le_bytes());
-        output.extend_from_slice(&(self.requests.len() as u16).to_le_bytes());
-        let mut unique = HashSet::with_capacity(self.requests.len());
-        for request in &self.requests {
-            validate_request(request)?;
-            if !unique.insert(request.coordinate) {
+        output.extend_from_slice(&self.region_x.to_le_bytes());
+        output.extend_from_slice(&self.region_z.to_le_bytes());
+        output.extend_from_slice(&self.generation.to_le_bytes());
+        output.extend_from_slice(&(self.ordinals.len() as u16).to_le_bytes());
+        let mut unique = HashSet::with_capacity(self.ordinals.len());
+        for ordinal in &self.ordinals {
+            if !unique.insert(*ordinal) {
                 bail!("duplicate section in one regional request batch");
             }
-            output.extend_from_slice(&request.generation.to_le_bytes());
-            put_coordinate(&mut output, request.coordinate)?;
+            output.extend_from_slice(&ordinal.to_le_bytes());
         }
         Ok(output)
     }
@@ -364,20 +364,29 @@ impl SectionRequestBatch {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut input = bytes;
         let epoch = take_u64(&mut input)?;
+        let region_x = take_i32(&mut input)?;
+        let region_z = take_i32(&mut input)?;
+        let generation = take_u64(&mut input)?;
         let count = take_u16(&mut input)? as usize;
-        if epoch == 0 || count == 0 || count > MAX_SECTION_REQUESTS || input.len() != count * 21 {
+        if epoch == 0
+            || generation == 0
+            || count == 0
+            || count > MAX_SECTION_REQUESTS
+            || input.len() != count * 4
+        {
             bail!("invalid regional section request batch bounds");
         }
-        let mut requests = Vec::with_capacity(count);
+        let mut ordinals = Vec::with_capacity(count);
         for _ in 0..count {
-            let request = SectionRequest {
-                generation: take_u64(&mut input)?,
-                coordinate: take_coordinate(&mut input)?,
-            };
-            validate_request(&request)?;
-            requests.push(request);
+            ordinals.push(take_u32(&mut input)?);
         }
-        let batch = Self { epoch, requests };
+        let batch = Self {
+            epoch,
+            region_x,
+            region_z,
+            generation,
+            ordinals,
+        };
         batch.encode()?;
         Ok(batch)
     }
@@ -408,24 +417,18 @@ impl TryFrom<u8> for SectionReplyStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SectionReply {
-    pub generation: u64,
-    pub coordinate: SectionCoordinate,
     pub status: SectionReplyStatus,
-    pub canonical_length: u32,
-    pub compressed_crc: u32,
-    pub fingerprint: [u8; 16],
     pub compressed: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SectionReplyBatch {
     pub epoch: u64,
+    pub start: u16,
     pub replies: Vec<SectionReply>,
 }
 
 impl SectionReplyBatch {
-    const REPLY_HEADER_BYTES: usize = 50;
-
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.epoch == 0 || self.replies.is_empty() || self.replies.len() > MAX_SECTION_REQUESTS {
             bail!("invalid regional section reply batch bounds");
@@ -436,8 +439,11 @@ impl SectionReplyBatch {
                 .checked_add(reply.compressed.len())
                 .context("regional section reply body size overflow")
         })?;
-        let length = 10usize
-            .checked_add(self.replies.len() * Self::REPLY_HEADER_BYTES)
+        if usize::from(self.start) + self.replies.len() > MAX_SECTION_REQUESTS {
+            bail!("regional section reply range exceeds its request");
+        }
+        let length = 12usize
+            .checked_add(self.replies.len())
             .and_then(|length| length.checked_add(body_bytes))
             .context("regional section reply frame size overflow")?;
         if length > MAX_SECTION_BATCH_BYTES {
@@ -445,15 +451,10 @@ impl SectionReplyBatch {
         }
         let mut output = Vec::with_capacity(length);
         output.extend_from_slice(&self.epoch.to_le_bytes());
+        output.extend_from_slice(&self.start.to_le_bytes());
         output.extend_from_slice(&(self.replies.len() as u16).to_le_bytes());
         for reply in &self.replies {
             output.push(reply.status as u8);
-            output.extend_from_slice(&reply.generation.to_le_bytes());
-            put_coordinate(&mut output, reply.coordinate)?;
-            output.extend_from_slice(&reply.canonical_length.to_le_bytes());
-            output.extend_from_slice(&(reply.compressed.len() as u32).to_le_bytes());
-            output.extend_from_slice(&reply.compressed_crc.to_le_bytes());
-            output.extend_from_slice(&reply.fingerprint);
         }
         for reply in &self.replies {
             output.extend_from_slice(&reply.compressed);
@@ -462,96 +463,73 @@ impl SectionReplyBatch {
         Ok(output)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8], compressed_lengths: &[u32]) -> Result<Self> {
         if bytes.len() > MAX_SECTION_BATCH_BYTES {
             bail!("regional section reply frame exceeds its safety bound");
         }
         let mut input = bytes;
         let epoch = take_u64(&mut input)?;
+        let start = take_u16(&mut input)?;
         let count = take_u16(&mut input)? as usize;
         if epoch == 0
             || count == 0
             || count > MAX_SECTION_REQUESTS
-            || input.len() < count * Self::REPLY_HEADER_BYTES
+            || usize::from(start) + count > MAX_SECTION_REQUESTS
+            || compressed_lengths.len() != count
+            || input.len() < count
         {
             bail!("invalid regional section reply batch bounds");
         }
-        let mut replies = Vec::with_capacity(count);
+        let mut statuses = Vec::with_capacity(count);
         for _ in 0..count {
             let status = SectionReplyStatus::try_from(take_u8(&mut input)?)?;
-            let generation = take_u64(&mut input)?;
-            let coordinate = take_coordinate(&mut input)?;
-            let canonical_length = take_u32(&mut input)?;
-            let compressed_length = take_u32(&mut input)? as usize;
-            let compressed_crc = take_u32(&mut input)?;
-            let fingerprint = take(&mut input, 16)?.try_into().unwrap();
-            if compressed_length > MAX_SECTION_COMPRESSED_BYTES {
+            statuses.push(status);
+        }
+        let mut replies = Vec::with_capacity(count);
+        for (status, &indexed_length) in statuses.into_iter().zip(compressed_lengths) {
+            let length = if status == SectionReplyStatus::Data {
+                indexed_length as usize
+            } else {
+                0
+            };
+            if length > MAX_SECTION_COMPRESSED_BYTES {
                 bail!("regional section reply body exceeds its safety bound");
             }
-            replies.push((
-                SectionReply {
-                    generation,
-                    coordinate,
-                    status,
-                    canonical_length,
-                    compressed_crc,
-                    fingerprint,
-                    compressed: Vec::new(),
-                },
-                compressed_length,
-            ));
-        }
-        let mut completed = Vec::with_capacity(count);
-        for (mut reply, length) in replies {
-            reply.compressed = take(&mut input, length)?.to_vec();
+            let reply = SectionReply {
+                status,
+                compressed: take(&mut input, length)?.to_vec(),
+            };
             validate_reply(&reply)?;
-            completed.push(reply);
+            replies.push(reply);
         }
         if !input.is_empty() {
             bail!("trailing regional section reply bytes");
         }
         Ok(Self {
             epoch,
-            replies: completed,
+            start,
+            replies,
         })
     }
 }
 
 fn validate_reply(reply: &SectionReply) -> Result<()> {
-    SectionKey::new(
-        reply.coordinate.level,
-        reply.coordinate.x,
-        reply.coordinate.y,
-        reply.coordinate.z,
-    )?;
-    if reply.generation == 0 || reply.compressed.len() > MAX_SECTION_COMPRESSED_BYTES {
-        bail!("regional section reply identity or bounds are invalid");
+    if reply.compressed.len() > MAX_SECTION_COMPRESSED_BYTES {
+        bail!("regional section reply bounds are invalid");
     }
     match reply.status {
         SectionReplyStatus::Data => {
-            if reply.compressed.is_empty()
-                || reply.canonical_length == 0
-                || reply.fingerprint == [0; 16]
-                || crate::crc::crc32c(&reply.compressed) != reply.compressed_crc
-            {
+            if reply.compressed.is_empty() {
                 bail!("regional data reply metadata is invalid");
             }
         }
         SectionReplyStatus::Empty => {
-            if !reply.compressed.is_empty()
-                || reply.canonical_length != 0
-                || reply.compressed_crc != 0
-                || reply.fingerprint != [0; 16]
-            {
+            if !reply.compressed.is_empty() {
                 bail!("regional empty reply metadata is invalid");
             }
         }
         SectionReplyStatus::StaleGeneration | SectionReplyStatus::Absent => {
-            if !reply.compressed.is_empty()
-                || reply.canonical_length != 0
-                || reply.compressed_crc != 0
-                || reply.fingerprint != [0; 16]
-            {
+            if !reply.compressed.is_empty() {
                 bail!("regional terminal reply contains section metadata");
             }
         }
@@ -567,55 +545,6 @@ pub async fn write_reply_batch<W: AsyncWrite + Unpin>(
     output.write_u32_le(bytes.len() as u32).await?;
     output.write_all(&bytes).await?;
     Ok(())
-}
-
-pub async fn read_reply_batch<R: AsyncRead + Unpin>(
-    input: &mut R,
-) -> Result<Option<SectionReplyBatch>> {
-    let length = match input.read_u32_le().await {
-        Ok(length) => length as usize,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if length > MAX_SECTION_BATCH_BYTES {
-        bail!("regional section reply frame exceeds its safety bound");
-    }
-    let mut bytes = vec![0; length];
-    input.read_exact(&mut bytes).await?;
-    Ok(Some(SectionReplyBatch::decode(&bytes)?))
-}
-
-fn validate_request(request: &SectionRequest) -> Result<()> {
-    SectionKey::new(
-        request.coordinate.level,
-        request.coordinate.x,
-        request.coordinate.y,
-        request.coordinate.z,
-    )?;
-    if request.generation == 0 {
-        bail!("regional section request identity is invalid");
-    }
-    Ok(())
-}
-
-fn put_coordinate(output: &mut Vec<u8>, coordinate: SectionCoordinate) -> Result<()> {
-    SectionKey::new(coordinate.level, coordinate.x, coordinate.y, coordinate.z)?;
-    output.push(coordinate.level);
-    output.extend_from_slice(&coordinate.x.to_le_bytes());
-    output.extend_from_slice(&coordinate.y.to_le_bytes());
-    output.extend_from_slice(&coordinate.z.to_le_bytes());
-    Ok(())
-}
-
-fn take_coordinate(input: &mut &[u8]) -> Result<SectionCoordinate> {
-    let coordinate = SectionCoordinate {
-        level: take_u8(input)?,
-        x: take_i32(input)?,
-        y: take_i32(input)?,
-        z: take_i32(input)?,
-    };
-    SectionKey::new(coordinate.level, coordinate.x, coordinate.y, coordinate.z)?;
-    Ok(coordinate)
 }
 
 fn put_region_identity(output: &mut Vec<u8>, x: i32, z: i32, generation: u64) {
@@ -668,7 +597,7 @@ pub async fn read_request_batch<R: AsyncRead + Unpin>(
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let maximum = 10 + MAX_SECTION_REQUESTS * 45;
+    let maximum = 26 + MAX_SECTION_REQUESTS * 4;
     if length > maximum {
         bail!("regional section request frame exceeds its safety bound");
     }
@@ -764,18 +693,12 @@ mod tests {
 
     #[test]
     fn section_request_batch_round_trips_and_rejects_duplicates() {
-        let request = SectionRequest {
-            generation: 7,
-            coordinate: SectionCoordinate {
-                level: 0,
-                x: -32,
-                y: 1,
-                z: 48,
-            },
-        };
         let batch = SectionRequestBatch {
             epoch: 11,
-            requests: vec![request.clone()],
+            region_x: -2,
+            region_z: 3,
+            generation: 7,
+            ordinals: vec![41],
         };
         assert_eq!(
             SectionRequestBatch::decode(&batch.encode().unwrap()).unwrap(),
@@ -784,7 +707,10 @@ mod tests {
         assert!(
             SectionRequestBatch {
                 epoch: 11,
-                requests: vec![request.clone(), request]
+                region_x: -2,
+                region_z: 3,
+                generation: 7,
+                ordinals: vec![41, 41],
             }
             .encode()
             .is_err()
@@ -795,25 +721,17 @@ mod tests {
     fn section_reply_batch_round_trips_complete_compressed_records() {
         let compressed = vec![1, 2, 3, 4];
         let reply = SectionReply {
-            generation: 8,
-            coordinate: SectionCoordinate {
-                level: 0,
-                x: -32,
-                y: 1,
-                z: 48,
-            },
             status: SectionReplyStatus::Data,
-            canonical_length: 400,
-            compressed_crc: crate::crc::crc32c(&compressed),
-            fingerprint: [7; 16],
             compressed,
         };
         let batch = SectionReplyBatch {
             epoch: 9,
+            start: 3,
             replies: vec![reply],
         };
+        assert_eq!(batch.encode().unwrap().len(), 12 + 1 + 4);
         assert_eq!(
-            SectionReplyBatch::decode(&batch.encode().unwrap()).unwrap(),
+            SectionReplyBatch::decode(&batch.encode().unwrap(), &[4]).unwrap(),
             batch
         );
     }

@@ -201,11 +201,11 @@ final class ClientSession {
         int token;
         Phase phase = Phase.NEW;
         RegionalProtocol.RegionIndex index;
-        RegionalProtocol.SectionMeta meta;
+        int ordinal = -1;
         RegionalSectionCodec.SectionData decoded;
         VoxyRenderSystem.SectionPublication publication;
         RegionalProtocol.RegionIndex pendingIndex;
-        RegionalProtocol.SectionMeta pendingMeta;
+        int pendingOrdinal = -1;
         byte[] received;
         boolean receivedFromCache;
 
@@ -508,25 +508,28 @@ final class ClientSession {
             RegionalProtocol.RegionIndex index = this.indexFor(key);
             if (index == null) this.ensureRegion(key);
             else {
-                RegionalProtocol.SectionMeta meta = index.section(key);
-                if (meta == null) this.retireDemand(key); else this.bind(demand, index, meta);
+                int ordinal = index.ordinal(key);
+                if (ordinal < 0 || !index.isPresent(ordinal)) this.retireDemand(key);
+                else this.bind(demand, index, ordinal);
             }
         }
 
         boolean addChildren(long parent) {
             RegionalProtocol.RegionIndex index = this.indexFor(parent);
             if (index == null) return false;
-            RegionalProtocol.SectionMeta parentMeta = index.section(parent);
-            if (parentMeta == null || SectionKey.level(parent) == 0) return true;
+            int parentOrdinal = index.ordinal(parent);
+            if (parentOrdinal < 0 || !index.isPresent(parentOrdinal)
+                    || SectionKey.level(parent) == 0) return true;
             if (!this.coverageBindQueue.isEmpty()) return false;
-            int childMask = parentMeta.childMask();
+            int childMask = index.childMask(parentOrdinal);
             int requiredCacheSlots = 0;
             for (int child = 0; child < 8; child++) {
                 if ((childMask & 1 << child) == 0) continue;
                 long key = child(parent, child);
                 if (this.demands.containsKey(key)) continue;
-                RegionalProtocol.SectionMeta childMeta = index.section(key);
-                if (childMeta != null && !childMeta.empty()) requiredCacheSlots++;
+                int childOrdinal = index.ordinal(key);
+                if (childOrdinal >= 0 && index.isPresent(childOrdinal)
+                        && !index.isEmpty(childOrdinal)) requiredCacheSlots++;
             }
             if (requiredCacheSlots > MAX_STAGE_QUEUE - this.cacheQueue.size()) return false;
             for (int child = 0; child < 8; child++) {
@@ -545,9 +548,9 @@ final class ClientSession {
             if (regional != null) for (long key : List.copyOf(regional)) {
                 Demand demand = this.demands.get(key);
                 if (demand == null) continue;
-                RegionalProtocol.SectionMeta meta = index.section(demand.key);
-                if (meta == null) this.retireDemand(demand.key);
-                else this.bind(demand, index, meta);
+                int ordinal = index.ordinal(demand.key);
+                if (ordinal < 0 || !index.isPresent(ordinal)) this.retireDemand(demand.key);
+                else this.bind(demand, index, ordinal);
             }
             var deferred = this.deferredRefinements.iterator();
             while (deferred.hasNext()) {
@@ -575,9 +578,9 @@ final class ClientSession {
             if (demand.coverage && hasTop(key)) {
                 demand.publication = null;
                 demand.pendingIndex = null;
-                demand.pendingMeta = null;
+                demand.pendingOrdinal = -1;
                 demand.index = null;
-                demand.meta = null;
+                demand.ordinal = -1;
                 demand.phase = Phase.NEW;
             } else {
                 this.demands.remove(key);
@@ -602,22 +605,22 @@ final class ClientSession {
             }
         }
 
-        void bind(Demand demand, RegionalProtocol.RegionIndex index,
-                  RegionalProtocol.SectionMeta meta) {
-            if (meta == null) return;
+        void bind(Demand demand, RegionalProtocol.RegionIndex index, int ordinal) {
+            if (ordinal < 0 || !index.isPresent(ordinal)) return;
             if (demand.phase == Phase.PUBLISHING) {
                 demand.pendingIndex = index;
-                demand.pendingMeta = meta;
+                demand.pendingOrdinal = ordinal;
                 return;
             }
-            if (demand.meta != null && demand.phase == Phase.ACTIVE
-                    && demand.meta.fingerprint().equals(meta.fingerprint())
-                    && demand.meta.childMask() == meta.childMask()) {
+            if (demand.index != null && demand.ordinal >= 0 && demand.phase == Phase.ACTIVE
+                    && demand.index.sectionFingerprint(demand.ordinal)
+                            .equals(index.sectionFingerprint(ordinal))
+                    && demand.index.childMask(demand.ordinal) == index.childMask(ordinal)) {
                 demand.index = index;
-                demand.meta = meta;
+                demand.ordinal = ordinal;
                 return;
             }
-            if (!meta.empty() && this.cacheQueue.size() >= MAX_STAGE_QUEUE) {
+            if (!index.isEmpty(ordinal) && this.cacheQueue.size() >= MAX_STAGE_QUEUE) {
                 if (demand.phase != Phase.ACTIVE) {
                     demand.token++;
                     demand.received = null;
@@ -625,17 +628,17 @@ final class ClientSession {
                     demand.phase = Phase.WAITING;
                 }
                 demand.pendingIndex = index;
-                demand.pendingMeta = meta;
+                demand.pendingOrdinal = ordinal;
                 this.deferBind(demand);
                 return;
             }
             demand.pendingIndex = null;
-            demand.pendingMeta = null;
+            demand.pendingOrdinal = -1;
             this.pendingBindSet.remove(demand.key);
             demand.token++;
             if (demand.phase == Phase.ACTIVE) this.activeCount--;
             demand.index = index;
-            demand.meta = meta;
+            demand.ordinal = ordinal;
             demand.decoded = null;
             demand.received = null;
             this.queueBound(demand);
@@ -643,7 +646,7 @@ final class ClientSession {
 
         void queueBound(Demand demand) {
             demand.phase = Phase.NEW;
-            if (demand.meta.empty()) this.publishEmpty(demand);
+            if (demand.index.isEmpty(demand.ordinal)) this.publishEmpty(demand);
             else {
                 demand.phase = Phase.CACHE;
                 this.enqueueStage(this.cacheQueue, demand);
@@ -672,12 +675,12 @@ final class ClientSession {
                 if (!this.pendingBindSet.remove(key)) continue;
                 Demand demand = this.demands.get(key);
                 if (demand == null || demand.pendingIndex == null
-                        || demand.pendingMeta == null) continue;
+                        || demand.pendingOrdinal < 0) continue;
                 RegionalProtocol.RegionIndex index = demand.pendingIndex;
-                RegionalProtocol.SectionMeta meta = demand.pendingMeta;
+                int ordinal = demand.pendingOrdinal;
                 demand.pendingIndex = null;
-                demand.pendingMeta = null;
-                this.bind(demand, index, meta);
+                demand.pendingOrdinal = -1;
+                this.bind(demand, index, ordinal);
             }
         }
 
@@ -743,10 +746,10 @@ final class ClientSession {
             int token = demand.token;
             long key = demand.key;
             RegionalProtocol.RegionIndex index = demand.index;
-            RegionalProtocol.SectionMeta meta = demand.meta;
+            int ordinal = demand.ordinal;
             this.sectionWorkers.execute(() -> {
                 try {
-                    putEvent(new CacheResult(key, token, this.cache.get(index, meta)));
+                    putEvent(new CacheResult(key, token, this.cache.get(index, ordinal)));
                 } catch (Throwable failure) {
                     putEvent(new CacheResult(key, token, null));
                 } finally {
@@ -803,6 +806,7 @@ final class ClientSession {
             ArrayDeque<StageRef> queue = this.coverageNetworkQueue.isEmpty()
                     ? this.refinementNetworkQueue : this.coverageNetworkQueue;
             long bytes = 0;
+            RegionalProtocol.RegionIndex batchIndex = null;
             while (result.size() < REQUEST_BATCH) {
                 StageRef ref = queue.peekFirst();
                 if (ref == null) break;
@@ -811,13 +815,15 @@ final class ClientSession {
                     queue.removeFirst();
                     continue;
                 }
-                long next = demand.meta.compressedLength();
+                if (batchIndex != null && demand.index != batchIndex) break;
+                long next = demand.index.compressedLength(demand.ordinal);
                 if (next > MAX_IN_FLIGHT_BYTES) {
                     throw new IllegalStateException(
                             "one indexed section exceeds the network byte ceiling");
                 }
                 if (bytes + next > available) break;
                 queue.removeFirst();
+                if (batchIndex == null) batchIndex = demand.index;
                 result.add(demand);
                 bytes += next;
             }
@@ -828,15 +834,18 @@ final class ClientSession {
             long epoch = ++this.requestEpoch;
             if (epoch == 0) epoch = ++this.requestEpoch;
             long reservedBytes = selected.stream()
-                    .mapToLong(demand -> demand.meta.compressedLength()).sum();
-            List<RegionalProtocol.SectionRequest> requests = new ArrayList<>(selected.size());
+                    .mapToLong(demand -> demand.index.compressedLength(demand.ordinal)).sum();
+            RegionalProtocol.RegionIndex index = selected.getFirst().index;
+            List<Integer> ordinals = new ArrayList<>(selected.size());
             for (Demand demand : selected) {
-                requests.add(new RegionalProtocol.SectionRequest(
-                        demand.index.generation(), demand.key));
+                if (demand.index != index) {
+                    throw new IOException("regional request batch spans multiple indexes");
+                }
+                ordinals.add(demand.ordinal);
             }
             RegionalProtocol.Lane lane = selected.getFirst().coverage
                     ? RegionalProtocol.Lane.COVERAGE : RegionalProtocol.Lane.REFINEMENT;
-            boolean accepted = this.quic.requestSections(lane, epoch, requests,
+            boolean accepted = this.quic.requestSections(lane, epoch, index, ordinals,
                     new RegionalQuicClient.BatchReceiver() {
                         @Override public void batch(List<RegionalProtocol.SectionReply> replies) {
                             for (RegionalProtocol.SectionReply reply : replies) {
@@ -866,12 +875,11 @@ final class ClientSession {
             Demand demand = this.demands.get(reply.key());
             if (demand == null || demand.phase != Phase.REQUESTED
                     || demand.index.generation() != reply.generation()) return;
-            RegionalProtocol.SectionMeta meta = demand.meta;
+            if (demand.ordinal != reply.ordinal()) return;
             switch (reply.status()) {
                 case DATA -> {
-                    if (!reply.fingerprint().equals(meta.fingerprint())
-                            || reply.canonicalLength() != meta.canonicalLength()
-                            || reply.compressed().length != meta.compressedLength()) {
+                    if (reply.compressed().length
+                            != demand.index.compressedLength(demand.ordinal)) {
                         throw new IOException("regional section reply disagrees with its index");
                     }
                     this.receivedBytes += reply.compressed().length;
@@ -881,7 +889,9 @@ final class ClientSession {
                     this.enqueueStage(this.decodeQueue, demand);
                 }
                 case EMPTY -> {
-                    if (!meta.empty()) throw new IOException("unexpected empty regional section");
+                    if (!demand.index.isEmpty(demand.ordinal)) {
+                        throw new IOException("unexpected empty regional section");
+                    }
                     this.publishEmpty(demand);
                 }
                 case STALE -> {
@@ -916,24 +926,26 @@ final class ClientSession {
             demand.phase = Phase.DECODING;
             long key = demand.key;
             int token = demand.token;
-            RegionalProtocol.SectionMeta meta = demand.meta;
             RegionalProtocol.RegionIndex index = demand.index;
+            int ordinal = demand.ordinal;
             RegionalSectionCodec.Mappings mappings = this.mappings;
             byte[] compressed = demand.received;
             boolean cached = demand.receivedFromCache;
             demand.received = null;
             this.sectionWorkers.execute(() -> {
                 try {
-                    byte[] canonical = this.codec.decompress(compressed, meta.canonicalLength());
+                    byte[] canonical = this.codec.decompress(
+                            compressed, index.canonicalLength(ordinal));
                     RegionalSectionCodec.SectionData section = this.codec.decode(
-                            key, meta.childMask(), canonical, meta.fingerprint(), mappings);
+                            key, index.childMask(ordinal), canonical,
+                            index.sectionFingerprint(ordinal), mappings);
                     putEvent(new DecodedResult(key, token, section));
                     if (!cached) {
-                        try { this.cache.put(index, meta, compressed); }
+                        try { this.cache.put(index, ordinal, compressed); }
                         catch (IOException ignored) {}
                     }
                 } catch (Throwable failure) {
-                    if (cached) this.cache.quarantine(index, meta);
+                    if (cached) this.cache.quarantine(index, ordinal);
                     putEvent(cached ? new CacheCorrupt(key, token) : new WorkerFailed(failure));
                 } finally {
                     this.sectionTaskSlots.release();
@@ -1000,7 +1012,7 @@ final class ClientSession {
         void publishEmpty(Demand demand) {
             demand.phase = Phase.PUBLISHING;
             BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.token + 1L,
-                    (byte) demand.meta.childMask());
+                    (byte) demand.index.childMask(demand.ordinal));
             try {
                 enqueueMain(new PublishTask(this, demand.key, demand.token, empty,
                         demand.publication));
@@ -1042,9 +1054,9 @@ final class ClientSession {
                 this.activated++;
                 if (demand.pendingIndex != null) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
-                    RegionalProtocol.SectionMeta meta = demand.pendingMeta;
-                    demand.pendingIndex = null; demand.pendingMeta = null;
-                    this.bind(demand, index, meta);
+                    int ordinal = demand.pendingOrdinal;
+                    demand.pendingIndex = null; demand.pendingOrdinal = -1;
+                    this.bind(demand, index, ordinal);
                 }
             }
         }

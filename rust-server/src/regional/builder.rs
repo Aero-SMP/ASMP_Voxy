@@ -13,7 +13,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, RwLock},
 };
@@ -23,7 +23,199 @@ pub struct RegionalBuildStats {
     pub chunks_read: usize,
     pub generated_chunks: usize,
     pub sections_by_level: [usize; crate::MAX_LOD as usize + 1],
+    pub reused_sections: usize,
     pub output_bytes: u64,
+}
+
+/// Publishes a normal saved-world update by rebuilding only changed 2x2-chunk groups and their
+/// ancestors. Every unaffected section keeps its exact compressed representation.
+#[allow(clippy::too_many_arguments)]
+pub fn rebuild_region_incremental(
+    source: &AnvilWorld,
+    registry: &Arc<RwLock<Registry>>,
+    header: &RegionHeader,
+    previous: &RegionFile,
+    source_table: &RegionSourceTable,
+    changed_groups: &BTreeSet<(i32, i32)>,
+    output: impl AsRef<Path>,
+    source_output: impl AsRef<Path>,
+    world_identity: [u8; 32],
+    generation: u64,
+    layout: RegionLayout,
+) -> Result<(RegionFile, RegionalBuildStats)> {
+    if changed_groups.is_empty()
+        || previous.region() != (header.region_x, header.region_z)
+        || previous.layout() != layout
+        || source_table.terrain_generation != generation
+    {
+        bail!("incremental regional rebuild identity is invalid");
+    }
+    let initial_catalog = read_lock(registry)?.snapshot();
+    let initial_catalog_bytes = Catalog::from_snapshot(&initial_catalog)?.encode()?;
+    let mut file = RegionFileBuilder::new(
+        world_identity,
+        *blake3::hash(&initial_catalog_bytes).as_bytes(),
+        initial_catalog.catalog_id,
+        header.region_x,
+        header.region_z,
+        generation,
+        layout,
+    )?;
+    let mut stats = RegionalBuildStats::default();
+    let mut affected_horizontal = vec![BTreeSet::new(); layout.levels as usize];
+    affected_horizontal[0] = changed_groups.clone();
+    for lod in 1..layout.levels as usize {
+        affected_horizontal[lod] = affected_horizontal[lod - 1]
+            .iter()
+            .map(|&(x, z)| (x.div_euclid(2), z.div_euclid(2)))
+            .collect();
+    }
+
+    let top = layout.levels - 1;
+    for &(x, z) in &affected_horizontal[top as usize] {
+        let column = rebuild_changed_column(
+            source,
+            registry,
+            previous,
+            &mut file,
+            layout,
+            &affected_horizontal,
+            top,
+            x,
+            z,
+            &mut stats,
+        )?;
+        insert_column(&mut file, column)?;
+    }
+
+    let final_catalog = {
+        let mut registry = write_lock(registry)?;
+        registry.save()?;
+        registry.snapshot()
+    };
+    if final_catalog.catalog_id != initial_catalog.catalog_id {
+        bail!("catalog identity changed during an incremental regional rebuild");
+    }
+    let final_catalog_bytes = Catalog::from_snapshot(&final_catalog)?.encode()?;
+    file.set_catalog_fingerprint(*blake3::hash(&final_catalog_bytes).as_bytes())?;
+
+    for ordinal in 0..layout.entry_count()? {
+        let coordinate = layout.coordinate(header.region_x, header.region_z, ordinal)?;
+        if !affected_horizontal[coordinate.level as usize].contains(&(coordinate.x, coordinate.z)) {
+            file.copy_ordinal_from(previous, ordinal)?;
+            stats.reused_sections +=
+                usize::from(previous.entry_ordinal(ordinal as u32)?.is_present());
+        }
+    }
+
+    verify_header(source, header, "incremental regional rebuild")?;
+    let region = file.write_atomic(output)?;
+    source_table.write_atomic(source_output)?;
+    stats.output_bytes = region.path().metadata()?.len();
+    Ok((region, stats))
+}
+
+type SectionColumn = BTreeMap<i32, Section>;
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_changed_column(
+    source: &AnvilWorld,
+    registry: &Arc<RwLock<Registry>>,
+    previous: &RegionFile,
+    output: &mut RegionFileBuilder,
+    layout: RegionLayout,
+    affected: &[BTreeSet<(i32, i32)>],
+    level: u8,
+    x: i32,
+    z: i32,
+    stats: &mut RegionalBuildStats,
+) -> Result<SectionColumn> {
+    if !affected[level as usize].contains(&(x, z)) {
+        bail!("incremental rebuild descended into an unaffected column");
+    }
+    if level == 0 {
+        let group = source.load_level_zero_group(x, z, registry)?;
+        stats.chunks_read += 4;
+        stats.generated_chunks += group.chunks.iter().filter(|chunk| chunk.is_some()).count();
+        let mut sections = SectionColumn::new();
+        if group.chunks.iter().any(Option::is_some) {
+            for y in layout.level_y_range(0)? {
+                let key = SectionKey::new(0, x, y, z)?;
+                sections.insert(y, group.build(key, source)?.section);
+                stats.sections_by_level[0] += 1;
+            }
+        }
+        return Ok(sections);
+    }
+
+    let child_level = level - 1;
+    let mut changed_children = BTreeMap::<(i32, i32), SectionColumn>::new();
+    for dz in 0..2i32 {
+        for dx in 0..2i32 {
+            let coordinate = (x * 2 + dx, z * 2 + dz);
+            if affected[child_level as usize].contains(&coordinate) {
+                let child = rebuild_changed_column(
+                    source,
+                    registry,
+                    previous,
+                    output,
+                    layout,
+                    affected,
+                    child_level,
+                    coordinate.0,
+                    coordinate.1,
+                    stats,
+                )?;
+                changed_children.insert(coordinate, child);
+            }
+        }
+    }
+
+    let opacity = read_lock(registry)?.opacity_table();
+    let mut parents = SectionColumn::new();
+    for y in layout.level_y_range(level)? {
+        let key = SectionKey::new(level, x, y, z)?;
+        let keys = child_keys(key)?;
+        let mut loaded: [Option<Section>; 8] = std::array::from_fn(|_| None);
+        for (slot, child) in keys.iter().copied().enumerate() {
+            let horizontal = (child.x, child.z);
+            if !changed_children.contains_key(&horizontal) {
+                loaded[slot] =
+                    previous
+                        .read_section(SectionCoordinate::from(child))?
+                        .map(|frame| Section {
+                            key: child,
+                            non_empty_children: frame.non_empty_children,
+                            cells: frame.cells,
+                        });
+            }
+        }
+        let inputs = std::array::from_fn(|slot| {
+            let child = keys[slot];
+            changed_children
+                .get(&(child.x, child.z))
+                .and_then(|column| column.get(&child.y))
+                .or(loaded[slot].as_ref())
+        });
+        if inputs.iter().any(Option::is_some) {
+            parents.insert(y, build_parent_from_refs(key, &inputs, &opacity)?);
+            stats.sections_by_level[level as usize] += 1;
+        }
+    }
+    for column in changed_children.into_values() {
+        insert_column(output, column)?;
+    }
+    Ok(parents)
+}
+
+fn insert_column(output: &mut RegionFileBuilder, column: SectionColumn) -> Result<()> {
+    for section in column.into_values() {
+        output.insert(
+            SectionCoordinate::from(section.key),
+            SectionFrame::new(section.non_empty_children, section.cells)?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Rebuilds one complete regional shard from its authoritative Anvil snapshot. Exact source cells
@@ -180,12 +372,7 @@ pub fn rebuild_region(
 
     // Publication must describe one source snapshot. A changed marker/header aborts this bounded
     // transaction; the caller retries the region rather than publishing mixed old/new cells.
-    let current = source
-        .region_header(header.region_x, header.region_z)?
-        .context("Anvil region disappeared during regional rebuild")?;
-    if current.file_marker != header.file_marker || current.entries != header.entries {
-        bail!("Anvil region changed during regional rebuild");
-    }
+    verify_header(source, header, "regional rebuild")?;
     let region = file.write_atomic(output)?;
     // Terrain is durable first. If this smaller publication fails or the process stops here, the
     // old source marker causes one safe regional rebuild on restart.
@@ -216,6 +403,37 @@ fn child_refs(
         }
     }
     Ok(output)
+}
+
+fn child_keys(parent: SectionKey) -> Result<[SectionKey; 8]> {
+    if parent.level == 0 {
+        bail!("level-zero section has no child keys");
+    }
+    let mut output = [parent; 8];
+    for dy in 0..2i32 {
+        for dz in 0..2i32 {
+            for dx in 0..2i32 {
+                let slot = (dx | (dz << 1) | (dy << 2)) as usize;
+                output[slot] = SectionKey::new(
+                    parent.level - 1,
+                    parent.x * 2 + dx,
+                    parent.y * 2 + dy,
+                    parent.z * 2 + dz,
+                )?;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn verify_header(source: &AnvilWorld, header: &RegionHeader, operation: &str) -> Result<()> {
+    let current = source
+        .region_header(header.region_x, header.region_z)?
+        .with_context(|| format!("Anvil region disappeared during {operation}"))?;
+    if current.file_marker != header.file_marker || current.entries != header.entries {
+        bail!("Anvil region changed during {operation}");
+    }
+    Ok(())
 }
 
 fn insert_frame(output: &mut RegionFileBuilder, section: &Section) -> Result<()> {

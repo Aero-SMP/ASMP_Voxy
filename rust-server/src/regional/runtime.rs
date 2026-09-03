@@ -1,4 +1,7 @@
-use super::{ChunkSourceRecord, RegionFile, RegionLayout, RegionSourceTable, rebuild_region};
+use super::{
+    ChunkSourceRecord, RegionFile, RegionLayout, RegionSourceTable, rebuild_region,
+    rebuild_region_incremental,
+};
 use crate::{
     anvil::{AnvilWorld, RegionHeader},
     read_lock,
@@ -31,6 +34,7 @@ pub struct RegionalRuntime {
     layout: RegionLayout,
     regions: RwLock<BTreeMap<(i32, i32), Arc<RegionFile>>>,
     sources: RwLock<BTreeMap<(i32, i32), RegionSourceTable>>,
+    recovering: RwLock<BTreeSet<(i32, i32)>>,
     maintenance: Mutex<()>,
     priority: Mutex<PriorityRequests>,
 }
@@ -107,6 +111,7 @@ impl RegionalRuntime {
             layout,
             regions: RwLock::new(regions),
             sources: RwLock::new(sources),
+            recovering: RwLock::new(BTreeSet::new()),
             maintenance: Mutex::new(()),
             priority: Mutex::new(PriorityRequests::default()),
         })
@@ -177,8 +182,8 @@ impl RegionalRuntime {
         Ok(())
     }
 
-    /// Removes only the corrupt generation observed by a reader. The immutable open file may
-    /// finish serving other reads, while the publication worker rebuilds a clean replacement.
+    /// Quarantines only the corrupt generation observed by a reader. Its already-open immutable
+    /// file remains available as last-known-good display state while a clean replacement builds.
     pub fn quarantine_generation(
         &self,
         region_x: i32,
@@ -190,17 +195,16 @@ impl RegionalRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("regional maintenance lock poisoned"))?;
         let coordinate = (region_x, region_z);
-        let removed = {
-            let mut regions = write_lock(&self.regions)?;
+        {
+            let regions = read_lock(&self.regions)?;
             if regions
                 .get(&coordinate)
                 .is_none_or(|region| region.generation() != generation)
             {
                 return Ok(false);
             }
-            regions.remove(&coordinate)
-        };
-        if removed.is_none() {
+        }
+        if !write_lock(&self.recovering)?.insert(coordinate) {
             return Ok(false);
         }
         write_lock(&self.sources)?.remove(&coordinate);
@@ -239,6 +243,7 @@ impl RegionalRuntime {
         for coordinate in stored_coordinates.difference(&headers.keys().copied().collect()) {
             write_lock(&self.regions)?.remove(coordinate);
             write_lock(&self.sources)?.remove(coordinate);
+            write_lock(&self.recovering)?.remove(coordinate);
             remove_if_exists(&self.terrain_path(*coordinate))?;
             remove_if_exists(&self.source_path(*coordinate))?;
             result.removed.push(*coordinate);
@@ -287,30 +292,68 @@ impl RegionalRuntime {
                 continue;
             }
 
-            if let (Some(region), Some(previous)) = (&region, stored_source)
-                && previous.terrain_generation == region.generation()
-                && let Some(updated) = self.probe_metadata_only(header, &previous)?
-            {
-                updated.write_atomic(self.source_path(coordinate))?;
-                write_lock(&self.sources)?.insert(coordinate, updated);
-                result.metadata_only += 1;
-                continue;
-            }
-
             let generation = region.as_ref().map_or(1, |region| region.generation() + 1);
-            let (built, stats) = rebuild_region(
-                &self.source,
-                &self.registry,
-                header,
-                self.terrain_path(coordinate),
-                self.source_path(coordinate),
-                self.world_identity,
-                generation,
-                self.layout,
-            )?;
+            let incremental = if let (Some(region), Some(previous)) = (&region, stored_source)
+                && previous.terrain_generation == region.generation()
+            {
+                let probe = self.probe_saved_changes(header, &previous, generation)?;
+                if probe.changed_groups.is_empty() {
+                    probe.table.write_atomic(self.source_path(coordinate))?;
+                    write_lock(&self.sources)?.insert(coordinate, probe.table);
+                    result.metadata_only += 1;
+                    continue;
+                }
+                Some((region.clone(), probe))
+            } else {
+                None
+            };
+            let (built, stats) = if let Some((previous, probe)) = incremental {
+                match rebuild_region_incremental(
+                    &self.source,
+                    &self.registry,
+                    header,
+                    &previous,
+                    &probe.table,
+                    &probe.changed_groups,
+                    self.terrain_path(coordinate),
+                    self.source_path(coordinate),
+                    self.world_identity,
+                    generation,
+                    self.layout,
+                ) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        eprintln!(
+                            "{}: incremental shard ({},{}) failed; rebuilding the bounded region safely: {error:#}",
+                            self.dimension, coordinate.0, coordinate.1
+                        );
+                        rebuild_region(
+                            &self.source,
+                            &self.registry,
+                            header,
+                            self.terrain_path(coordinate),
+                            self.source_path(coordinate),
+                            self.world_identity,
+                            generation,
+                            self.layout,
+                        )?
+                    }
+                }
+            } else {
+                rebuild_region(
+                    &self.source,
+                    &self.registry,
+                    header,
+                    self.terrain_path(coordinate),
+                    self.source_path(coordinate),
+                    self.world_identity,
+                    generation,
+                    self.layout,
+                )?
+            };
             let source = RegionSourceTable::open(self.source_path(coordinate))?;
             eprintln!(
-                "{}: regional shard ({},{}) generation {} chunks={}/{} sections={:?} bytes={}",
+                "{}: regional shard ({},{}) generation {} chunks={}/{} sections={:?} reused={} bytes={}",
                 self.dimension,
                 coordinate.0,
                 coordinate.1,
@@ -318,10 +361,12 @@ impl RegionalRuntime {
                 stats.generated_chunks,
                 stats.chunks_read,
                 stats.sections_by_level,
+                stats.reused_sections,
                 stats.output_bytes
             );
             write_lock(&self.regions)?.insert(coordinate, Arc::new(built));
             write_lock(&self.sources)?.insert(coordinate, source);
+            write_lock(&self.recovering)?.remove(&coordinate);
             result
                 .changed
                 .push((coordinate.0, coordinate.1, generation));
@@ -334,6 +379,13 @@ impl RegionalRuntime {
     }
 
     fn header_is_current(&self, coordinate: (i32, i32), header: &RegionHeader) -> bool {
+        if self
+            .recovering
+            .read()
+            .map_or(true, |recovering| recovering.contains(&coordinate))
+        {
+            return false;
+        }
         let Ok(regions) = self.regions.read() else {
             return false;
         };
@@ -348,19 +400,21 @@ impl RegionalRuntime {
         })
     }
 
-    /// Returns an updated source table only when every changed Anvil record normalizes to the
-    /// same terrain. A real semantic change returns `None` and triggers a regional rebuild.
-    fn probe_metadata_only(
+    /// Reads only Anvil records whose header changed. Semantic changes identify the exact 2x2
+    /// chunk groups whose LOD columns and ancestors need replacement.
+    fn probe_saved_changes(
         &self,
         header: &RegionHeader,
         previous: &RegionSourceTable,
-    ) -> Result<Option<RegionSourceTable>> {
+        generation: u64,
+    ) -> Result<SavedChangeProbe> {
         let mut updated = RegionSourceTable::new(
             header.region_x,
             header.region_z,
-            previous.terrain_generation,
+            generation,
             header.file_marker,
         )?;
+        let mut changed_groups = BTreeSet::new();
         let base_x = header.region_x * 32;
         let base_z = header.region_z * 32;
         for (slot, entry) in header.entries.iter().copied().enumerate() {
@@ -390,7 +444,10 @@ impl RegionalRuntime {
                 if current.generated != old.generated
                     || current.semantic_fingerprint != old.semantic_fingerprint
                 {
-                    return Ok(None);
+                    changed_groups.insert((
+                        (base_x + i32::from(local_x)).div_euclid(2),
+                        (base_z + i32::from(local_z)).div_euclid(2),
+                    ));
                 }
                 current
             };
@@ -403,7 +460,13 @@ impl RegionalRuntime {
         if current.file_marker != header.file_marker || current.entries != header.entries {
             bail!("Anvil region changed during metadata-only probe");
         }
-        Ok(Some(updated))
+        if changed_groups.is_empty() {
+            updated.terrain_generation = previous.terrain_generation;
+        }
+        Ok(SavedChangeProbe {
+            table: updated,
+            changed_groups,
+        })
     }
 
     fn terrain_path(&self, coordinate: (i32, i32)) -> PathBuf {
@@ -415,6 +478,11 @@ impl RegionalRuntime {
         self.root
             .join(format!("r.{}.{}.vxsource", coordinate.0, coordinate.1))
     }
+}
+
+struct SavedChangeProbe {
+    table: RegionSourceTable,
+    changed_groups: BTreeSet<(i32, i32)>,
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {

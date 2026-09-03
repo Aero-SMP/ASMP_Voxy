@@ -12,7 +12,7 @@ use std::{
 
 const REGION_MAGIC: &[u8; 8] = b"VXYRGN\0\0";
 const REGION_HEADER_BYTES: usize = 256;
-const SECTION_ENTRY_BYTES: usize = 48;
+pub(crate) const SECTION_ENTRY_BYTES: usize = 48;
 const ZSTD_LEVEL: i32 = 1;
 const MAX_REGION_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SECTION_CANONICAL_BYTES: usize = 4 * 1024 * 1024;
@@ -212,7 +212,7 @@ impl RegionSectionEntry {
         self.flags & SECTION_FLAG_EMPTY != 0
     }
 
-    fn encode(self) -> [u8; SECTION_ENTRY_BYTES] {
+    pub(crate) fn encode(self) -> [u8; SECTION_ENTRY_BYTES] {
         let mut output = [0u8; SECTION_ENTRY_BYTES];
         output[0..2].copy_from_slice(&self.flags.to_le_bytes());
         output[2] = self.non_empty_children;
@@ -224,7 +224,7 @@ impl RegionSectionEntry {
         output
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != SECTION_ENTRY_BYTES || bytes[3..8] != [0; 5] || bytes[44..] != [0; 4] {
             bail!("invalid regional section directory entry");
         }
@@ -276,25 +276,35 @@ impl RegionSectionEntry {
         Ok(())
     }
 
-    pub(crate) fn validate_client(self) -> Result<()> {
-        if self.flags & !KNOWN_ENTRY_FLAGS != 0 {
-            bail!("regional section entry has unknown flags");
+    pub(crate) fn validate_packed(self) -> Result<()> {
+        self.validate_shape()
+    }
+}
+
+#[derive(Debug)]
+enum PreparedPayload {
+    Owned(Vec<u8>),
+    Reused {
+        file: Arc<File>,
+        offset: u64,
+        length: u32,
+        crc: u32,
+    },
+}
+
+impl PreparedPayload {
+    fn length(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.len(),
+            Self::Reused { length, .. } => *length as usize,
         }
-        let mut stored = self;
-        if stored.is_present() && !stored.is_empty() {
-            // Payload placement and compressed CRC are server-file metadata and are intentionally
-            // absent from the compact client index.
-            stored.payload_offset = 1;
-            stored.compressed_crc = 1;
-        }
-        stored.validate_shape()
     }
 }
 
 #[derive(Debug, Default)]
 struct PreparedEntry {
     directory: RegionSectionEntry,
-    compressed: Option<Vec<u8>>,
+    payload: Option<PreparedPayload>,
 }
 
 #[derive(Debug)]
@@ -366,7 +376,7 @@ impl RegionFileBuilder {
             non_empty_children: frame.non_empty_children,
             ..RegionSectionEntry::default()
         };
-        let compressed = if frame.is_empty() {
+        let payload = if frame.is_empty() {
             None
         } else {
             let canonical = frame.encode()?;
@@ -383,11 +393,45 @@ impl RegionFileBuilder {
             entry
                 .fingerprint
                 .copy_from_slice(&blake3::hash(&canonical).as_bytes()[..16]);
-            Some(compressed)
+            Some(PreparedPayload::Owned(compressed))
         };
         self.sections[index] = PreparedEntry {
             directory: entry,
-            compressed,
+            payload,
+        };
+        Ok(())
+    }
+
+    /// Reuses one verified compressed payload without decoding or recompressing it. The payload
+    /// offset is assigned when this new immutable generation is written.
+    pub fn copy_ordinal_from(&mut self, source: &RegionFile, ordinal: usize) -> Result<()> {
+        if source.region() != (self.region_x, self.region_z)
+            || source.layout() != self.layout
+            || ordinal >= self.sections.len()
+        {
+            bail!("regional section reuse identity is invalid");
+        }
+        if self.sections[ordinal].directory.is_present() {
+            bail!("regional section ordinal was inserted twice");
+        }
+        let mut entry = source.entry_ordinal(ordinal as u32)?;
+        if !entry.is_present() {
+            return Ok(());
+        }
+        let payload = if entry.is_empty() {
+            None
+        } else {
+            Some(PreparedPayload::Reused {
+                file: source.file.clone(),
+                offset: entry.payload_offset,
+                length: entry.compressed_length,
+                crc: entry.compressed_crc,
+            })
+        };
+        entry.payload_offset = 0;
+        self.sections[ordinal] = PreparedEntry {
+            directory: entry,
+            payload,
         };
         Ok(())
     }
@@ -409,10 +453,10 @@ impl RegionFileBuilder {
                 .context("regional directory byte length overflow")? as u64;
         let mut next_payload = payload_offset;
         for section in &mut self.sections {
-            if let Some(compressed) = &section.compressed {
+            if let Some(payload) = &section.payload {
                 section.directory.payload_offset = next_payload;
                 next_payload = next_payload
-                    .checked_add(compressed.len() as u64)
+                    .checked_add(payload.length() as u64)
                     .context("regional payload extent overflow")?;
             }
         }
@@ -456,9 +500,31 @@ impl RegionFileBuilder {
                 .with_context(|| format!("create {}", temporary.display()))?;
             file.write_all(&header)?;
             file.write_all(&directory_bytes)?;
+            let mut reuse_buffer = vec![0u8; 64 * 1024];
             for section in self.sections {
-                if let Some(compressed) = section.compressed {
-                    file.write_all(&compressed)?;
+                match section.payload {
+                    Some(PreparedPayload::Owned(compressed)) => file.write_all(&compressed)?,
+                    Some(PreparedPayload::Reused {
+                        file: source,
+                        mut offset,
+                        length,
+                        crc,
+                    }) => {
+                        let mut remaining = length as usize;
+                        let mut actual_crc = 0;
+                        while remaining != 0 {
+                            let count = remaining.min(reuse_buffer.len());
+                            source.read_exact_at(&mut reuse_buffer[..count], offset)?;
+                            actual_crc = crc32c::crc32c_append(actual_crc, &reuse_buffer[..count]);
+                            file.write_all(&reuse_buffer[..count])?;
+                            offset += count as u64;
+                            remaining -= count;
+                        }
+                        if actual_crc != crc {
+                            bail!("reused regional section compressed checksum mismatch");
+                        }
+                    }
+                    None => {}
                 }
             }
             if file.metadata()?.len() != file_length {
@@ -695,8 +761,30 @@ impl RegionFile {
         Ok(self.sections[index])
     }
 
+    pub fn entry_ordinal(&self, ordinal: u32) -> Result<RegionSectionEntry> {
+        self.sections
+            .get(ordinal as usize)
+            .copied()
+            .context("regional section ordinal is out of range")
+    }
+
     pub fn read_compressed(&self, coordinate: SectionCoordinate) -> Result<Option<Vec<u8>>> {
         let entry = self.entry(coordinate)?;
+        if !entry.is_present() || entry.is_empty() {
+            return Ok(None);
+        }
+        let mut compressed = vec![0u8; entry.compressed_length as usize];
+        self.file
+            .read_exact_at(&mut compressed, entry.payload_offset)
+            .with_context(|| format!("read section payload from {}", self.path.display()))?;
+        if crc32c(&compressed) != entry.compressed_crc {
+            bail!("regional section compressed checksum mismatch");
+        }
+        Ok(Some(compressed))
+    }
+
+    pub fn read_compressed_ordinal(&self, ordinal: u32) -> Result<Option<Vec<u8>>> {
+        let entry = self.entry_ordinal(ordinal)?;
         if !entry.is_present() || entry.is_empty() {
             return Ok(None);
         }
@@ -822,6 +910,39 @@ mod tests {
         assert!(!old.read_section(coordinate).unwrap().unwrap().is_empty());
         assert_eq!(new.generation(), 2);
         assert!(new.read_section(coordinate).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replacement_reuses_verified_compressed_section_without_decoding() {
+        let temporary = TemporaryDirectory::new();
+        let path = temporary.0.join("r.-2.3.vxregion");
+        let coordinate = SectionCoordinate {
+            level: 0,
+            x: -32,
+            y: 0,
+            z: 48,
+        };
+        let mut first = builder(1);
+        let mut cells = vec![Cell::AIR; SECTION_VOLUME];
+        cells[31] = Cell {
+            block: 2,
+            biome: 3,
+            light: 4,
+        };
+        let expected = SectionFrame::new(0, cells).unwrap();
+        first.insert(coordinate, expected.clone()).unwrap();
+        let old = first.write_atomic(&path).unwrap();
+        let ordinal = old.layout().index(-2, 3, coordinate).unwrap();
+        let old_entry = old.entry_ordinal(ordinal as u32).unwrap();
+
+        let mut second = builder(2);
+        second.copy_ordinal_from(&old, ordinal).unwrap();
+        let new = second.write_atomic(&path).unwrap();
+        let new_entry = new.entry_ordinal(ordinal as u32).unwrap();
+        assert_eq!(new_entry.compressed_length, old_entry.compressed_length);
+        assert_eq!(new_entry.compressed_crc, old_entry.compressed_crc);
+        assert_eq!(new_entry.fingerprint, old_entry.fingerprint);
+        assert_eq!(new.read_section(coordinate).unwrap(), Some(expected));
     }
 
     #[test]

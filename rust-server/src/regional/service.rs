@@ -257,86 +257,70 @@ impl RegionalResponder {
         request: &SectionRequestBatch,
         mut emit: impl FnMut(SectionReplyBatch) -> Result<()>,
     ) -> Result<()> {
+        let region = self.runtime.region(request.region_x, request.region_z)?;
+        let current_generation = region.as_ref().map(|region| region.generation());
         let mut current = Vec::new();
-        let mut current_bytes = 10usize;
-        for requested in &request.requests {
-            let side = 16i32 >> requested.coordinate.level;
-            let region_x = requested.coordinate.x.div_euclid(side);
-            let region_z = requested.coordinate.z.div_euclid(side);
-            let reply = if let Some(region) = self.runtime.region(region_x, region_z)? {
-                if region.generation() != requested.generation {
-                    terminal_reply(
-                        requested,
-                        SectionReplyStatus::StaleGeneration,
-                        region.generation(),
-                    )
+        let mut current_bytes = 12usize;
+        let mut start = 0u16;
+        let mut damaged = false;
+        for (position, &ordinal) in request.ordinals.iter().enumerate() {
+            let reply = if let Some(region) = region.as_ref() {
+                if damaged || current_generation != Some(request.generation) {
+                    terminal_reply(SectionReplyStatus::StaleGeneration)
                 } else {
-                    let entry = region.entry(requested.coordinate)?;
+                    let entry = region.entry_ordinal(ordinal)?;
                     if !entry.is_present() {
-                        terminal_reply(requested, SectionReplyStatus::Absent, region.generation())
+                        terminal_reply(SectionReplyStatus::Absent)
                     } else if entry.is_empty() {
                         SectionReply {
-                            generation: region.generation(),
-                            coordinate: requested.coordinate,
                             status: SectionReplyStatus::Empty,
-                            canonical_length: 0,
-                            compressed_crc: 0,
-                            fingerprint: [0; 16],
                             compressed: Vec::new(),
                         }
                     } else {
-                        match region.read_compressed(requested.coordinate) {
+                        match region.read_compressed_ordinal(ordinal) {
                             Ok(Some(compressed)) => SectionReply {
-                                generation: region.generation(),
-                                coordinate: requested.coordinate,
                                 status: SectionReplyStatus::Data,
-                                canonical_length: entry.canonical_length,
-                                compressed_crc: entry.compressed_crc,
-                                fingerprint: entry.fingerprint,
                                 compressed,
                             },
-                            Ok(None) => terminal_reply(
-                                requested,
-                                SectionReplyStatus::StaleGeneration,
-                                requested.generation,
-                            ),
+                            Ok(None) => terminal_reply(SectionReplyStatus::StaleGeneration),
                             Err(error) => {
                                 let removed = self.runtime.quarantine_generation(
-                                    region_x,
-                                    region_z,
+                                    request.region_x,
+                                    request.region_z,
                                     region.generation(),
                                 )?;
                                 if removed {
                                     eprintln!(
-                                        "{}: quarantined damaged regional shard ({region_x},{region_z}) generation {} after payload read: {error:#}",
+                                        "{}: quarantined damaged regional shard ({},{}) generation {} after payload read: {error:#}",
                                         self.runtime.dimension(),
+                                        request.region_x,
+                                        request.region_z,
                                         region.generation(),
                                     );
                                     self.wake.notify_one();
                                 }
-                                terminal_reply(
-                                    requested,
-                                    SectionReplyStatus::StaleGeneration,
-                                    requested.generation,
-                                )
+                                damaged = true;
+                                terminal_reply(SectionReplyStatus::StaleGeneration)
                             }
                         }
                     }
                 }
             } else {
-                terminal_reply(requested, SectionReplyStatus::Absent, requested.generation)
+                terminal_reply(SectionReplyStatus::Absent)
             };
-            let reply_bytes = 50usize
+            let reply_bytes = 1usize
                 .checked_add(reply.compressed.len())
                 .context("regional reply size overflow")?;
             if !current.is_empty() && current_bytes + reply_bytes > TARGET_SECTION_BATCH_BYTES {
                 let batch = SectionReplyBatch {
                     epoch: request.epoch,
+                    start,
                     replies: std::mem::take(&mut current),
                 };
                 batch.encode()?;
                 emit(batch)?;
-                current_bytes = 10;
+                start = position as u16;
+                current_bytes = 12;
             }
             current_bytes = current_bytes
                 .checked_add(reply_bytes)
@@ -346,6 +330,7 @@ impl RegionalResponder {
         if !current.is_empty() {
             let batch = SectionReplyBatch {
                 epoch: request.epoch,
+                start,
                 replies: current,
             };
             batch.encode()?;
@@ -401,18 +386,9 @@ impl CatalogCache {
     }
 }
 
-fn terminal_reply(
-    request: &super::wire::SectionRequest,
-    status: SectionReplyStatus,
-    generation: u64,
-) -> SectionReply {
+fn terminal_reply(status: SectionReplyStatus) -> SectionReply {
     SectionReply {
-        generation,
-        coordinate: request.coordinate,
         status,
-        canonical_length: 0,
-        compressed_crc: 0,
-        fingerprint: [0; 16],
         compressed: Vec::new(),
     }
 }

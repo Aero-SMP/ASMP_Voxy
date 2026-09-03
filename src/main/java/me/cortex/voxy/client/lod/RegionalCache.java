@@ -38,9 +38,8 @@ final class RegionalCache implements AutoCloseable {
         }
     }
 
-    byte[] get(RegionalProtocol.RegionIndex index,
-               RegionalProtocol.SectionMeta section) throws IOException {
-        if (section.empty()) return null;
+    byte[] get(RegionalProtocol.RegionIndex index, int ordinal) throws IOException {
+        if (index.isEmpty(ordinal)) return null;
         Shard shard;
         synchronized (this) {
             shard = shard(index, false);
@@ -48,17 +47,16 @@ final class RegionalCache implements AutoCloseable {
         }
         if (shard == null) return null;
         try {
-            return shard.get(key(section));
+            return shard.get(key(index, ordinal));
         } finally {
             release(shard);
         }
     }
 
-    void put(RegionalProtocol.RegionIndex index,
-             RegionalProtocol.SectionMeta section, byte[] compressed)
+    void put(RegionalProtocol.RegionIndex index, int ordinal, byte[] compressed)
             throws IOException {
-        if (section.empty() || compressed.length != section.compressedLength()) return;
-        CacheKey key = key(section);
+        if (index.isEmpty(ordinal) || compressed.length != index.compressedLength(ordinal)) return;
+        CacheKey key = key(index, ordinal);
         long added = RECORD_BYTES + (long) compressed.length;
         Shard shard;
         synchronized (this) {
@@ -86,15 +84,14 @@ final class RegionalCache implements AutoCloseable {
         }
     }
 
-    synchronized void quarantine(RegionalProtocol.RegionIndex index,
-                                 RegionalProtocol.SectionMeta section) {
+    synchronized void quarantine(RegionalProtocol.RegionIndex index, int ordinal) {
         try {
             Shard shard = shard(index, false);
-            if (shard == null || !shard.contains(key(section))) return;
+            if (shard == null || !shard.contains(key(index, ordinal))) return;
             long added = RECORD_BYTES;
             if (shard.length() + added <= MAX_SHARD_BYTES
                     && ensureBudget(added, shard.path)) {
-                shard.remove(key(section));
+                shard.remove(key(index, ordinal));
                 this.cacheBytes += added;
             } else {
                 if (shard.users == 0) resetShard(index, shard);
@@ -197,8 +194,8 @@ final class RegionalCache implements AutoCloseable {
         return this.root.resolve("r." + x + "." + z + ".vxcache");
     }
 
-    private static CacheKey key(RegionalProtocol.SectionMeta section) {
-        return new CacheKey(section.fingerprint(), section.compressedLength());
+    private static CacheKey key(RegionalProtocol.RegionIndex index, int ordinal) {
+        return new CacheKey(index.sectionFingerprint(ordinal), index.compressedLength(ordinal));
     }
 
     private static long regionKey(int x, int z) {

@@ -16,7 +16,6 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -152,10 +151,11 @@ final class RegionalQuicClient implements AutoCloseable {
     }
 
     boolean requestSections(RegionalProtocol.Lane priority, long epoch,
-                            List<RegionalProtocol.SectionRequest> requests,
+                            RegionalProtocol.RegionIndex index, List<Integer> ordinals,
                             BatchReceiver receiver) throws IOException {
         Objects.requireNonNull(priority, "priority");
-        LaneTask task = new LaneTask(epoch, List.copyOf(requests),
+        LaneTask task = new LaneTask(epoch, Objects.requireNonNull(index, "index"),
+                List.copyOf(ordinals),
                 Objects.requireNonNull(receiver, "receiver"));
         List<LaneWorker> group = this.lanes[priority.ordinal()];
         int start = Math.floorMod(this.nextLane[priority.ordinal()].getAndIncrement(), group.size());
@@ -217,20 +217,15 @@ final class RegionalQuicClient implements AutoCloseable {
                         return;
                     }
                     try {
-                        output.write(RegionalProtocol.sectionRequest(task.epoch, task.requests));
+                        output.write(RegionalProtocol.sectionRequest(
+                                task.epoch, task.index, task.ordinals));
                         output.flush();
-                        HashSet<Long> remaining = new HashSet<>();
-                        for (RegionalProtocol.SectionRequest request : task.requests) {
-                            remaining.add(request.key());
-                        }
-                        while (!remaining.isEmpty()) {
+                        int received = 0;
+                        while (received < task.ordinals.size()) {
                             List<RegionalProtocol.SectionReply> replies =
-                                    RegionalProtocol.readReplyBatch(input, task.epoch);
-                            for (RegionalProtocol.SectionReply reply : replies) {
-                                if (!remaining.remove(reply.key())) {
-                                    throw new IOException("unrequested or duplicate regional reply");
-                                }
-                            }
+                                    RegionalProtocol.readReplyBatch(input, task.epoch, task.index,
+                                            task.ordinals, received);
+                            received += replies.size();
                             task.receiver.batch(replies);
                         }
                         task.receiver.complete();
@@ -255,8 +250,8 @@ final class RegionalQuicClient implements AutoCloseable {
         }
     }
 
-    private record LaneTask(long epoch, List<RegionalProtocol.SectionRequest> requests,
-                            BatchReceiver receiver) {}
+    private record LaneTask(long epoch, RegionalProtocol.RegionIndex index,
+                            List<Integer> ordinals, BatchReceiver receiver) {}
 
     private void fail(Throwable cause) {
         Throwable actual = cause == null ? new IOException("regional QUIC connection failed") : cause;

@@ -44,8 +44,7 @@ final class RegionalProtocol {
     static final int S_SHUTDOWN = 0xff;
 
     private static final int INDEX_HEADER_BYTES = 36;
-    private static final int INDEX_ENTRY_BYTES = 32;
-    private static final int REPLY_HEADER_BYTES = 50;
+    private static final int INDEX_ENTRY_BYTES = 48;
     private static final byte[] INDEX_MAGIC = "VXYRIDX\0".getBytes(StandardCharsets.US_ASCII);
 
     private RegionalProtocol() {}
@@ -95,35 +94,91 @@ final class RegionalProtocol {
         boolean isZero() { return this.equals(ZERO); }
     }
 
-    record SectionMeta(int ordinal, long cacheOffset, int flags, int childMask,
-                       int compressedLength, int canonicalLength,
-                       Fingerprint fingerprint) {
-        SectionMeta {
-            Objects.requireNonNull(fingerprint, "fingerprint");
-            if (ordinal < 0 || cacheOffset < 0 || (flags & SECTION_FLAG_PRESENT) == 0
-                    || (flags & ~(SECTION_FLAG_PRESENT | SECTION_FLAG_EMPTY)) != 0
-                    || (childMask & ~0xff) != 0
-                    || compressedLength < 0 || compressedLength > MAX_SECTION_BYTES
-                    || canonicalLength < 0 || canonicalLength > MAX_SECTION_BYTES) {
-                throw new IllegalArgumentException("invalid regional section metadata");
-            }
-            boolean empty = (flags & SECTION_FLAG_EMPTY) != 0;
-            if (empty != (compressedLength == 0 && canonicalLength == 0 && fingerprint.isZero())) {
-                throw new IllegalArgumentException("regional empty-section metadata disagrees");
-            }
-        }
-        boolean empty() { return (this.flags & SECTION_FLAG_EMPTY) != 0; }
-    }
+    static final class RegionIndex {
+        private final int regionX;
+        private final int regionZ;
+        private final long generation;
+        private final Fingerprint fingerprint;
+        private final int minBaseY;
+        private final int baseYCount;
+        private final int levels;
+        private final int entryCount;
+        private final byte[] packed;
 
-    record RegionIndex(int regionX, int regionZ, long generation, Fingerprint fingerprint,
-                       int minBaseY,
-                       int baseYCount, int levels, int entryCount, long cachePayloadBytes,
-                       java.util.Map<Long, SectionMeta> sections) {
-        RegionIndex {
-            sections = java.util.Map.copyOf(sections);
+        private RegionIndex(int regionX, int regionZ, long generation,
+                            Fingerprint fingerprint, int minBaseY, int baseYCount,
+                            int levels, int entryCount, byte[] packed) {
+            this.regionX = regionX;
+            this.regionZ = regionZ;
+            this.generation = generation;
+            this.fingerprint = fingerprint;
+            this.minBaseY = minBaseY;
+            this.baseYCount = baseYCount;
+            this.levels = levels;
+            this.entryCount = entryCount;
+            this.packed = packed;
         }
 
-        SectionMeta section(long key) { return this.sections.get(key); }
+        int regionX() { return this.regionX; }
+        int regionZ() { return this.regionZ; }
+        long generation() { return this.generation; }
+        Fingerprint fingerprint() { return this.fingerprint; }
+        int entryCount() { return this.entryCount; }
+
+        int ordinal(long key) {
+            int level = SectionKey.level(key);
+            if (level < 0 || level >= this.levels) return -1;
+            int side = 16 >> level;
+            int x = SectionKey.x(key), y = SectionKey.y(key), z = SectionKey.z(key);
+            int localX = x - this.regionX * side;
+            int localZ = z - this.regionZ * side;
+            int minY = Math.floorDiv(this.minBaseY, 1 << level);
+            int maxBase = this.minBaseY + this.baseYCount - 1;
+            int yCount = Math.floorDiv(maxBase, 1 << level) - minY + 1;
+            int localY = y - minY;
+            if (localX < 0 || localX >= side || localZ < 0 || localZ >= side
+                    || localY < 0 || localY >= yCount) return -1;
+            int offset = 0;
+            for (int previous = 0; previous < level; previous++) {
+                int previousSide = 16 >> previous;
+                int previousMinY = Math.floorDiv(this.minBaseY, 1 << previous);
+                int previousY = Math.floorDiv(maxBase, 1 << previous) - previousMinY + 1;
+                offset += previousSide * previousSide * previousY;
+            }
+            return offset + (localY * side + localZ) * side + localX;
+        }
+
+        long key(int ordinal) throws IOException {
+            return coordinateFor(this.regionX, this.regionZ, this.minBaseY,
+                    this.baseYCount, this.levels, ordinal);
+        }
+
+        boolean isPresent(int ordinal) {
+            return (flags(ordinal) & SECTION_FLAG_PRESENT) != 0;
+        }
+        boolean isEmpty(int ordinal) {
+            return (flags(ordinal) & SECTION_FLAG_EMPTY) != 0;
+        }
+        int childMask(int ordinal) { return Byte.toUnsignedInt(this.packed[offset(ordinal) + 2]); }
+        int compressedLength(int ordinal) { return readInt(this.packed, offset(ordinal) + 16); }
+        int canonicalLength(int ordinal) { return readInt(this.packed, offset(ordinal) + 20); }
+        int compressedCrc(int ordinal) { return readInt(this.packed, offset(ordinal) + 24); }
+        Fingerprint sectionFingerprint(int ordinal) {
+            int offset = offset(ordinal) + 28;
+            return new Fingerprint(readLong(this.packed, offset), readLong(this.packed, offset + 8));
+        }
+
+        private int flags(int ordinal) {
+            int offset = offset(ordinal);
+            return Byte.toUnsignedInt(this.packed[offset])
+                    | Byte.toUnsignedInt(this.packed[offset + 1]) << 8;
+        }
+        private int offset(int ordinal) {
+            if (ordinal < 0 || ordinal >= this.entryCount) {
+                throw new IndexOutOfBoundsException("regional section ordinal " + ordinal);
+            }
+            return INDEX_HEADER_BYTES + ordinal * INDEX_ENTRY_BYTES;
+        }
     }
 
     sealed interface Control permits ServerHello, RegionMessage, RegionAbsent,
@@ -139,20 +194,13 @@ final class RegionalProtocol {
     record ServerError(int code, String message) implements Control {}
     record ServerShutdown(String message) implements Control {}
 
-    record SectionRequest(long generation, long key) {
-        SectionRequest {
-            validateKey(generation, key);
-        }
-    }
-
-    record SectionReply(long generation, long key, Status status,
-                        int canonicalLength, int compressedCrc,
-                        Fingerprint fingerprint, byte[] compressed) {
+    record SectionReply(long generation, int ordinal, long key, Status status, byte[] compressed) {
         SectionReply {
+            if (generation == 0 || ordinal < 0) {
+                throw new IllegalArgumentException("invalid local section reply identity");
+            }
             Objects.requireNonNull(status, "status");
-            Objects.requireNonNull(fingerprint, "fingerprint");
             compressed = Objects.requireNonNull(compressed, "compressed");
-            validateKey(generation, key);
         }
     }
 
@@ -206,18 +254,20 @@ final class RegionalProtocol {
         }
     }
 
-    static byte[] sectionRequest(long epoch, List<SectionRequest> requests) throws IOException {
-        if (epoch == 0 || requests.isEmpty() || requests.size() > MAX_SECTION_REQUESTS) {
+    static byte[] sectionRequest(long epoch, RegionIndex index, List<Integer> ordinals)
+            throws IOException {
+        if (epoch == 0 || ordinals.isEmpty() || ordinals.size() > MAX_SECTION_REQUESTS) {
             throw new IOException("invalid regional request batch");
         }
-        ByteArrayOutputStream payload = new ByteArrayOutputStream(10 + requests.size() * 21);
-        putLong(payload, epoch); putShort(payload, requests.size());
-        HashSet<Long> unique = new HashSet<>();
-        for (SectionRequest request : requests) {
-            if (!unique.add(request.key)) {
+        ByteArrayOutputStream payload = new ByteArrayOutputStream(26 + ordinals.size() * 4);
+        putLong(payload, epoch); putInt(payload, index.regionX()); putInt(payload, index.regionZ());
+        putLong(payload, index.generation()); putShort(payload, ordinals.size());
+        HashSet<Integer> unique = new HashSet<>();
+        for (int ordinal : ordinals) {
+            if (ordinal < 0 || ordinal >= index.entryCount() || !unique.add(ordinal)) {
                 throw new IOException("duplicate regional section request");
             }
-            putLong(payload, request.generation); putKey(payload, request.key);
+            putInt(payload, ordinal);
         }
         byte[] body = payload.toByteArray();
         ByteArrayOutputStream frame = new ByteArrayOutputStream(body.length + 4);
@@ -225,45 +275,40 @@ final class RegionalProtocol {
         return frame.toByteArray();
     }
 
-    static List<SectionReply> readReplyBatch(InputStream input, long expectedEpoch)
-            throws IOException {
+    static List<SectionReply> readReplyBatch(InputStream input, long expectedEpoch,
+                                              RegionIndex index, List<Integer> ordinals,
+                                              int expectedStart) throws IOException {
         long rawLength = readU32(input);
-        if (rawLength < 10 || rawLength > MAX_SECTION_BATCH_BYTES) {
+        if (rawLength < 12 || rawLength > MAX_SECTION_BATCH_BYTES) {
             throw new IOException("invalid regional reply frame length");
         }
         ByteBuffer body = ByteBuffer.wrap(readExact(input, (int) rawLength))
                 .order(ByteOrder.LITTLE_ENDIAN);
         long epoch = body.getLong();
+        int start = Short.toUnsignedInt(body.getShort());
         int count = Short.toUnsignedInt(body.getShort());
-        if (epoch != expectedEpoch || count < 1 || count > MAX_SECTION_REQUESTS
-                || body.remaining() < count * REPLY_HEADER_BYTES) {
+        if (epoch != expectedEpoch || start != expectedStart || count < 1
+                || count > MAX_SECTION_REQUESTS || start + count > ordinals.size()
+                || body.remaining() < count) {
             throw new IOException("invalid regional reply batch header");
         }
-        record Header(long generation, long key, Status status,
-                      int canonical, int length, int crc, Fingerprint fingerprint) {}
-        List<Header> headers = new ArrayList<>(count);
-        for (int index = 0; index < count; index++) {
-            Status status = Status.from(Byte.toUnsignedInt(body.get()));
-            long generation = body.getLong();
-            long key = readKey(body);
-            int canonical = body.getInt(); int length = body.getInt(); int crc = body.getInt();
-            Fingerprint fingerprint = Fingerprint.read(body);
-            if (length < 0 || length > MAX_SECTION_BYTES || canonical < 0
-                    || canonical > MAX_SECTION_BYTES) {
-                throw new IOException("regional section body exceeds its safety bound");
-            }
-            headers.add(new Header(generation, key, status, canonical,
-                    length, crc, fingerprint));
+        List<Status> statuses = new ArrayList<>(count);
+        for (int position = 0; position < count; position++) {
+            statuses.add(Status.from(Byte.toUnsignedInt(body.get())));
         }
         List<SectionReply> replies = new ArrayList<>(count);
-        for (Header header : headers) {
-            if (body.remaining() < header.length) throw new IOException("truncated section body");
-            byte[] compressed = new byte[header.length];
+        for (int position = 0; position < count; position++) {
+            int ordinal = ordinals.get(start + position);
+            Status status = statuses.get(position);
+            int length = status == Status.DATA ? index.compressedLength(ordinal) : 0;
+            if (length < 0 || length > MAX_SECTION_BYTES || body.remaining() < length) {
+                throw new IOException("truncated or oversized regional section body");
+            }
+            byte[] compressed = new byte[length];
             body.get(compressed);
-            SectionReply reply = new SectionReply(header.generation, header.key,
-                    header.status, header.canonical, header.crc,
-                    header.fingerprint, compressed);
-            validateReply(reply);
+            validateReply(index, ordinal, status, compressed);
+            SectionReply reply = new SectionReply(index.generation(), ordinal,
+                    index.key(ordinal), status, compressed);
             replies.add(reply);
         }
         if (body.hasRemaining()) throw new IOException("trailing regional reply bytes");
@@ -288,30 +333,42 @@ final class RegionalProtocol {
                 || input.remaining() != expectedCount * INDEX_ENTRY_BYTES) {
             throw new IOException("regional index layout disagrees with its entries");
         }
-        java.util.HashMap<Long, SectionMeta> sections = new java.util.HashMap<>();
-        long cacheOffset = 0;
         for (int index = 0; index < expectedCount; index++) {
             int flags = Short.toUnsignedInt(input.getShort());
             int childMask = Byte.toUnsignedInt(input.get());
-            if (input.get() != 0) throw new IOException("nonzero regional index reserved byte");
+            for (int reserved = 0; reserved < 5; reserved++) {
+                if (input.get() != 0) throw new IOException("nonzero regional index reserved byte");
+            }
+            long payloadOffset = input.getLong();
             int compressed = input.getInt(); int canonicalLength = input.getInt();
+            int compressedCrc = input.getInt();
             Fingerprint entryFingerprint = Fingerprint.read(input);
             if (input.getInt() != 0) throw new IOException("nonzero regional index reserved bytes");
             if ((flags & SECTION_FLAG_PRESENT) == 0) {
                 if (flags != 0 || childMask != 0 || compressed != 0
-                        || canonicalLength != 0 || !entryFingerprint.isZero()) {
+                        || payloadOffset != 0 || canonicalLength != 0 || compressedCrc != 0
+                        || !entryFingerprint.isZero()) {
                     throw new IOException("absent regional index entry contains metadata");
                 }
                 continue;
             }
-            long key = coordinateFor(regionX, regionZ, minBaseY, baseYCount, levels, index);
-            sections.put(key, new SectionMeta(index, cacheOffset, flags, childMask,
-                    compressed, canonicalLength, entryFingerprint));
-            cacheOffset = Math.addExact(cacheOffset, compressed);
+            if ((flags & ~(SECTION_FLAG_PRESENT | SECTION_FLAG_EMPTY)) != 0
+                    || compressed < 0 || compressed > MAX_SECTION_BYTES
+                    || canonicalLength < 0 || canonicalLength > MAX_SECTION_BYTES) {
+                throw new IOException("invalid regional index entry metadata");
+            }
+            boolean empty = (flags & SECTION_FLAG_EMPTY) != 0;
+            if (empty != (payloadOffset == 0 && compressed == 0 && canonicalLength == 0
+                    && compressedCrc == 0 && entryFingerprint.isZero())) {
+                throw new IOException("regional empty-section metadata disagrees");
+            }
+            if (!empty && (payloadOffset <= 0 || compressed == 0 || canonicalLength == 0
+                    || entryFingerprint.isZero())) {
+                throw new IOException("regional section payload metadata is invalid");
+            }
         }
-        return new RegionIndex(regionX, regionZ, generation, fingerprint,
-                minBaseY, baseYCount, levels,
-                expectedCount, cacheOffset, sections);
+        return new RegionIndex(regionX, regionZ, generation, fingerprint, minBaseY,
+                baseYCount, levels, expectedCount, canonical);
     }
 
     static int crc32c(byte[] bytes) {
@@ -367,34 +424,27 @@ final class RegionalProtocol {
         }
     }
 
-    private static void validateReply(SectionReply reply) throws IOException {
-        boolean noBody = reply.compressed.length == 0;
-        switch (reply.status) {
+    private static void validateReply(RegionIndex index, int ordinal, Status status,
+                                      byte[] compressed) throws IOException {
+        boolean noBody = compressed.length == 0;
+        switch (status) {
             case DATA -> {
-                if (noBody || reply.canonicalLength == 0 || reply.fingerprint.isZero()
-                        || crc32c(reply.compressed) != reply.compressedCrc) {
+                if (!index.isPresent(ordinal) || index.isEmpty(ordinal) || noBody
+                        || compressed.length != index.compressedLength(ordinal)
+                        || crc32c(compressed) != index.compressedCrc(ordinal)) {
                     throw new IOException("invalid regional data reply");
                 }
             }
             case EMPTY -> {
-                if (!noBody || reply.canonicalLength != 0 || reply.compressedCrc != 0
-                        || !reply.fingerprint.isZero()) {
+                if (!noBody || !index.isPresent(ordinal) || !index.isEmpty(ordinal)) {
                     throw new IOException("invalid regional empty reply");
                 }
             }
             case STALE, ABSENT -> {
-                if (!noBody || reply.canonicalLength != 0
-                        || reply.compressedCrc != 0 || !reply.fingerprint.isZero()) {
+                if (!noBody) {
                     throw new IOException("terminal regional reply contains metadata");
                 }
             }
-        }
-    }
-
-    private static void validateKey(long generation, long key) {
-        int level = SectionKey.level(key);
-        if (generation == 0 || level < 0 || level > 4) {
-            throw new IllegalArgumentException("section is not owned by its regional shard");
         }
     }
 
@@ -428,14 +478,17 @@ final class RegionalProtocol {
         return total;
     }
 
-    private static long readKey(ByteBuffer input) {
-        int level = Byte.toUnsignedInt(input.get());
-        return SectionKey.pack(level, input.getInt(), input.getInt(), input.getInt());
+
+    private static int readInt(byte[] bytes, int offset) {
+        return Byte.toUnsignedInt(bytes[offset])
+                | Byte.toUnsignedInt(bytes[offset + 1]) << 8
+                | Byte.toUnsignedInt(bytes[offset + 2]) << 16
+                | bytes[offset + 3] << 24;
     }
 
-    private static void putKey(ByteArrayOutputStream output, long key) {
-        output.write(SectionKey.level(key)); putInt(output, SectionKey.x(key));
-        putInt(output, SectionKey.y(key)); putInt(output, SectionKey.z(key));
+    private static long readLong(byte[] bytes, int offset) {
+        return Integer.toUnsignedLong(readInt(bytes, offset))
+                | (long) readInt(bytes, offset + 4) << 32;
     }
 
     private static byte[] control(int kind, byte[] payload) {
