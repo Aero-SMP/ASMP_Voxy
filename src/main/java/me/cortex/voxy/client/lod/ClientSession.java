@@ -55,6 +55,8 @@ final class ClientSession {
     private static final int MAX_IN_FLIGHT_INDEXES = 128;
     private static final int MAX_SECTION_TASKS = 64;
     private static final int MAX_STAGE_QUEUE = 32_768;
+    private static final int MAX_RENDER_ADMISSIONS = 1_024;
+    private static final int COVERAGE_RENDER_RESERVE = 64;
     private static final int REQUEST_BATCH = 256;
     private static final long RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
 
@@ -213,10 +215,25 @@ final class ClientSession {
         int pendingOrdinal = -1;
         byte[] received;
         boolean receivedFromCache;
+        RenderAdmission renderAdmission;
 
         Demand(long key) {
             this.key = key;
             this.coverage = SectionKey.level(key) == SectionKey.MAX_LOD_LAYER;
+        }
+    }
+
+    private static final class RenderAdmission {
+        private final Session owner;
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private RenderAdmission(Session owner) { this.owner = owner; }
+
+        private void release() {
+            if (!this.released.compareAndSet(false, true)) return;
+            this.owner.renderAdmissions.remove(this);
+            this.owner.renderAdmissionSlots.release();
+            this.owner.signal();
         }
     }
 
@@ -237,6 +254,8 @@ final class ClientSession {
         final ArrayBlockingQueue<Event> events = new ArrayBlockingQueue<>(MAX_EVENTS);
         final Semaphore wakeup = new Semaphore(0);
         final Semaphore sectionTaskSlots = new Semaphore(MAX_SECTION_TASKS);
+        final Semaphore renderAdmissionSlots = new Semaphore(MAX_RENDER_ADMISSIONS);
+        final Set<RenderAdmission> renderAdmissions = ConcurrentHashMap.newKeySet();
         final ExecutorService sectionWorkers;
         final RegionalSectionCodec codec = new RegionalSectionCodec();
 
@@ -248,6 +267,7 @@ final class ClientSession {
         final Set<Long> absentRegions = new HashSet<>();
         final Map<Long, LinkedHashSet<Long>> demandsByRegion = new HashMap<>();
         final Map<Long, LinkedHashSet<Long>> demandsByTop = new HashMap<>();
+        final Set<Long> missingCoverage = new HashSet<>();
         final Set<Long> deferredRefinements = new LinkedHashSet<>();
         final Set<Long> coarseningRoots = new HashSet<>();
         final Object publicationLock = new Object();
@@ -263,7 +283,7 @@ final class ClientSession {
         final ArrayDeque<StageRef> refinementNetworkQueue = new ArrayDeque<>();
         final ArrayDeque<StageRef> decodeQueue = new ArrayDeque<>();
         final ArrayDeque<StageRef> meshQueue = new ArrayDeque<>();
-        final ArrayDeque<StageRef> publicationQueue = new ArrayDeque<>();
+        final ArrayDeque<PublicationRef> publicationQueue = new ArrayDeque<>();
 
         RegionalQuicClient quic;
         RegionalCache cache;
@@ -273,6 +293,9 @@ final class ClientSession {
         RegionalSectionCodec.Mappings mappings;
         boolean catalogRequested;
         int inFlightBatches;
+        int inFlightSections;
+        int cacheLookupsInFlight;
+        int decodesInFlight;
         long inFlightBytes;
         long requestEpoch = 1;
         long receivedBytes;
@@ -451,10 +474,20 @@ final class ClientSession {
                         this.ensureCatalog(this.requiredCatalogFingerprint);
                     }
                     case IndexReady ready -> this.installIndex(ready.index);
-                    case CacheResult result -> this.acceptCache(result);
-                    case CacheCorrupt corrupt -> this.acceptCacheCorrupt(corrupt);
+                    case CacheResult result -> {
+                        this.cacheLookupsInFlight = Math.max(0,
+                                this.cacheLookupsInFlight - 1);
+                        this.acceptCache(result);
+                    }
+                    case CacheCorrupt corrupt -> {
+                        this.decodesInFlight = Math.max(0, this.decodesInFlight - 1);
+                        this.acceptCacheCorrupt(corrupt);
+                    }
                     case SectionResult result -> this.acceptSection(result.reply);
-                    case DecodedResult result -> this.acceptDecoded(result);
+                    case DecodedResult result -> {
+                        this.decodesInFlight = Math.max(0, this.decodesInFlight - 1);
+                        this.acceptDecoded(result);
+                    }
                     case MeshedResult result -> this.acceptMeshed(result);
                     case PublicationQueued result -> this.acceptPublication(result);
                     case Coarsened result -> this.finishCoarsening(result.parent);
@@ -464,6 +497,8 @@ final class ClientSession {
                     }
                     case BatchComplete complete -> {
                         this.inFlightBatches = Math.max(0, this.inFlightBatches - 1);
+                        this.inFlightSections = Math.max(0,
+                                this.inFlightSections - complete.sectionCount);
                         this.inFlightBytes = Math.max(0,
                                 this.inFlightBytes - complete.reservedBytes);
                     }
@@ -550,6 +585,7 @@ final class ClientSession {
             Demand demand = this.demands.remove(key);
             if (demand == null || demand.coverage) return;
             demand.token++;
+            this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
             demand.decoded = null;
             demand.pendingIndex = null;
@@ -595,6 +631,7 @@ final class ClientSession {
             if (this.demands.containsKey(key)) return;
             Demand demand = new Demand(key);
             this.demands.put(key, demand);
+            if (demand.coverage) this.missingCoverage.add(key);
             this.demandsByRegion.computeIfAbsent(regionFor(key), ignored -> new LinkedHashSet<>())
                     .add(key);
             this.demandsByTop.computeIfAbsent(topAncestor(key), ignored -> new LinkedHashSet<>())
@@ -665,11 +702,15 @@ final class ClientSession {
             Demand demand = this.demands.get(key);
             if (demand == null) return;
             demand.token++;
+            this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
             demand.decoded = null;
             if (demand.phase == Phase.ACTIVE) this.activeCount--;
             if (demand.publication != null) demand.publication.close();
             if (demand.coverage && hasTop(key)) {
+                // An authoritative absent section represents air, not coverage work waiting for
+                // renderer admission. A later region generation will add it back when it binds.
+                this.missingCoverage.remove(key);
                 demand.publication = null;
                 demand.pendingIndex = null;
                 demand.pendingOrdinal = -1;
@@ -677,6 +718,7 @@ final class ClientSession {
                 demand.ordinal = -1;
                 demand.phase = Phase.NEW;
             } else {
+                this.missingCoverage.remove(key);
                 this.demands.remove(key);
                 long region = regionFor(key);
                 removeOwned(this.demandsByRegion, region, key);
@@ -717,6 +759,7 @@ final class ClientSession {
             if (!index.isEmpty(ordinal) && this.cacheQueue.size() >= MAX_STAGE_QUEUE) {
                 if (demand.phase != Phase.ACTIVE) {
                     demand.token++;
+                    this.releaseAdmission(demand, demand.renderAdmission);
                     demand.received = null;
                     demand.decoded = null;
                     demand.phase = Phase.WAITING;
@@ -730,18 +773,25 @@ final class ClientSession {
             demand.pendingOrdinal = -1;
             this.pendingBindSet.remove(demand.key);
             demand.token++;
-            if (demand.phase == Phase.ACTIVE) this.activeCount--;
+            this.releaseAdmission(demand, demand.renderAdmission);
+            if (demand.phase == Phase.ACTIVE) {
+                this.activeCount--;
+                if (demand.coverage) this.missingCoverage.add(demand.key);
+            }
             demand.index = index;
             demand.ordinal = ordinal;
             demand.decoded = null;
             demand.received = null;
+            if (demand.coverage) this.missingCoverage.add(demand.key);
             this.queueBound(demand);
         }
 
         void queueBound(Demand demand) {
             demand.phase = Phase.NEW;
-            if (demand.index.isEmpty(demand.ordinal)) this.publishEmpty(demand);
-            else {
+            if (demand.index.isEmpty(demand.ordinal)) {
+                demand.phase = Phase.DECODED;
+                this.enqueueStage(this.meshQueue, demand);
+            } else {
                 demand.phase = Phase.CACHE;
                 this.enqueueStage(this.cacheQueue, demand);
             }
@@ -878,7 +928,8 @@ final class ClientSession {
         }
 
         void scheduleCache() {
-            while (this.sectionTaskSlots.tryAcquire()) {
+            int remaining = this.cacheQueue.size();
+            while (remaining-- > 0 && this.sectionTaskSlots.tryAcquire()) {
                 StageRef ref = this.cacheQueue.pollFirst();
                 if (ref == null) {
                     this.sectionTaskSlots.release();
@@ -889,6 +940,12 @@ final class ClientSession {
                     this.sectionTaskSlots.release();
                     continue;
                 }
+                if (!this.hasPipelineHeadroom(demand.coverage)) {
+                    this.sectionTaskSlots.release();
+                    this.cacheQueue.addLast(ref);
+                    continue;
+                }
+                this.cacheLookupsInFlight++;
                 this.lookupCache(demand);
             }
         }
@@ -899,9 +956,12 @@ final class ClientSession {
             if (available <= 0) return result;
             ArrayDeque<StageRef> queue = this.coverageNetworkQueue.isEmpty()
                     ? this.refinementNetworkQueue : this.coverageNetworkQueue;
+            boolean coverage = queue == this.coverageNetworkQueue;
+            int sectionHeadroom = this.pipelineHeadroom(coverage);
+            if (sectionHeadroom <= 0) return result;
             long bytes = 0;
             RegionalProtocol.RegionIndex batchIndex = null;
-            while (result.size() < REQUEST_BATCH) {
+            while (result.size() < Math.min(REQUEST_BATCH, sectionHeadroom)) {
                 StageRef ref = queue.peekFirst();
                 if (ref == null) break;
                 Demand demand = this.demands.get(ref.key);
@@ -947,7 +1007,7 @@ final class ClientSession {
                             }
                         }
                         @Override public void complete() {
-                            putEvent(new BatchComplete(reservedBytes));
+                            putEvent(new BatchComplete(reservedBytes, selected.size()));
                         }
                         @Override public void failed(Throwable failure) {
                             putEvent(new WorkerFailed(failure));
@@ -961,6 +1021,7 @@ final class ClientSession {
             }
             for (Demand demand : selected) demand.phase = Phase.REQUESTED;
             this.inFlightBatches++;
+            this.inFlightSections += selected.size();
             this.inFlightBytes += reservedBytes;
             return true;
         }
@@ -986,7 +1047,8 @@ final class ClientSession {
                     if (!demand.index.isEmpty(demand.ordinal)) {
                         throw new IOException("unexpected empty regional section");
                     }
-                    this.publishEmpty(demand);
+                    demand.phase = Phase.DECODED;
+                    this.enqueueStage(this.meshQueue, demand);
                 }
                 case STALE -> {
                     long region = regionFor(demand.key);
@@ -1001,7 +1063,8 @@ final class ClientSession {
         void scheduleDecoding() {
             if (this.mappings == null
                     || !this.catalogFingerprint.equals(this.requiredCatalogFingerprint)) return;
-            while (this.sectionTaskSlots.tryAcquire()) {
+            int remaining = this.decodeQueue.size();
+            while (remaining-- > 0 && this.sectionTaskSlots.tryAcquire()) {
                 StageRef ref = this.decodeQueue.pollFirst();
                 if (ref == null) {
                     this.sectionTaskSlots.release();
@@ -1012,6 +1075,12 @@ final class ClientSession {
                     this.sectionTaskSlots.release();
                     continue;
                 }
+                if (!this.hasRenderAdmissionHeadroom(demand.coverage)) {
+                    this.sectionTaskSlots.release();
+                    this.decodeQueue.addLast(ref);
+                    continue;
+                }
+                this.decodesInFlight++;
                 this.decode(demand);
             }
         }
@@ -1059,93 +1128,135 @@ final class ClientSession {
 
         void scheduleMeshing() {
             int remaining = this.meshQueue.size();
-            while (remaining-- > 0 && this.sectionTaskSlots.tryAcquire()) {
+            while (remaining-- > 0) {
+                if (this.renderAdmissionSlots.availablePermits() == 0) return;
                 StageRef ref = this.meshQueue.pollFirst();
-                if (ref == null) {
-                    this.sectionTaskSlots.release();
-                    return;
-                }
+                if (ref == null) return;
                 Demand demand = this.demands.get(ref.key);
-                if (!current(demand, ref.token, Phase.DECODED)) {
-                    this.sectionTaskSlots.release();
+                if (!current(demand, ref.token, Phase.DECODED)) continue;
+                boolean empty = demand.index.isEmpty(demand.ordinal);
+                if (!empty && !this.mesher.modelsReady(demand.decoded)) {
+                    this.meshQueue.addLast(ref);
                     continue;
                 }
-                if (!this.mesher.modelsReady(demand.decoded)) {
-                    this.sectionTaskSlots.release();
+                if (!empty && !this.sectionTaskSlots.tryAcquire()) {
+                    this.meshQueue.addFirst(ref);
+                    return;
+                }
+                RenderAdmission admission = this.tryRenderAdmission(demand);
+                if (admission == null) {
+                    if (!empty) this.sectionTaskSlots.release();
                     this.meshQueue.addLast(ref);
+                    continue;
+                }
+                demand.renderAdmission = admission;
+                if (empty) {
+                    this.publishEmpty(demand, admission);
                     continue;
                 }
                 demand.phase = Phase.MESHING;
                 long key = demand.key; int token = demand.token;
                 RegionalSectionCodec.SectionData decoded = demand.decoded;
-                this.sectionWorkers.execute(() -> {
-                    try {
-                        putEvent(new MeshedResult(key, token,
-                                this.mesher.mesh(decoded, token + 1L)));
-                    } catch (Throwable failure) {
-                        putEvent(new WorkerFailed(failure));
-                    } finally {
-                        this.sectionTaskSlots.release();
-                        signal();
-                    }
-                });
+                try {
+                    this.sectionWorkers.execute(() -> {
+                        try {
+                            putEvent(new MeshedResult(key, token,
+                                    this.mesher.mesh(decoded, token + 1L), admission));
+                        } catch (Throwable failure) {
+                            admission.release();
+                            putEvent(new WorkerFailed(failure));
+                        } finally {
+                            this.sectionTaskSlots.release();
+                            signal();
+                        }
+                    });
+                } catch (RuntimeException failure) {
+                    this.sectionTaskSlots.release();
+                    this.releaseAdmission(demand, admission);
+                    throw failure;
+                }
             }
         }
 
         void acceptMeshed(MeshedResult result) throws InterruptedException {
             Demand demand = this.demands.get(result.key);
-            if (!current(demand, result.token, Phase.MESHING)) {
+            if (!current(demand, result.token, Phase.MESHING)
+                    || demand.renderAdmission != result.admission) {
                 result.geometry.free();
+                result.admission.release();
                 return;
             }
             demand.phase = Phase.PUBLISHING;
-            enqueueMain(new PublishTask(this, demand, result.token, result.geometry,
-                    demand.publication));
+            try {
+                enqueueMain(new PublishTask(this, demand, result.token, result.geometry,
+                        demand.publication, result.admission));
+            } catch (InterruptedException interrupted) {
+                result.geometry.free();
+                this.releaseAdmission(demand, result.admission);
+                throw interrupted;
+            }
         }
 
-        void publishEmpty(Demand demand) {
+        void publishEmpty(Demand demand, RenderAdmission admission) {
             demand.phase = Phase.PUBLISHING;
             BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.token + 1L,
                     (byte) demand.index.childMask(demand.ordinal));
             try {
                 enqueueMain(new PublishTask(this, demand, demand.token, empty,
-                        demand.publication));
+                        demand.publication, admission));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 empty.free();
+                this.releaseAdmission(demand, admission);
                 this.fail(interrupted);
             }
         }
 
         void acceptPublication(PublicationQueued result) throws IOException {
             Demand demand = this.demands.get(result.key);
-            if (!current(demand, result.token, Phase.PUBLISHING)) {
+            if (!current(demand, result.token, Phase.PUBLISHING)
+                    || demand.renderAdmission != result.admission) {
                 if (!this.isCoarsening(result.key)) result.publication.close();
+                result.admission.release();
                 return;
             }
             demand.publication = result.publication;
-            this.enqueueStage(this.publicationQueue, demand);
+            if (this.publicationQueue.size() >= MAX_STAGE_QUEUE) {
+                throw new IllegalStateException(
+                        "regional publication queue exceeded its safety bound");
+            }
+            this.publicationQueue.addLast(new PublicationRef(demand.key, demand.token,
+                    result.admission));
         }
 
         void pollPublications() throws IOException {
             int remaining = this.publicationQueue.size();
             while (remaining-- > 0) {
-                StageRef ref = this.publicationQueue.pollFirst();
+                PublicationRef ref = this.publicationQueue.pollFirst();
                 if (ref == null) return;
                 Demand demand = this.demands.get(ref.key);
                 if (!current(demand, ref.token, Phase.PUBLISHING)
-                        || demand.publication == null) continue;
+                        || demand.publication == null
+                        || demand.renderAdmission != ref.admission) {
+                    ref.admission.release();
+                    continue;
+                }
                 Optional<Throwable> failure = demand.publication.activationFailure();
-                if (failure.isPresent()) throw new IOException(
-                        "regional renderer publication failed", failure.orElseThrow());
+                if (failure.isPresent()) {
+                    this.releaseAdmission(demand, ref.admission);
+                    throw new IOException("regional renderer publication failed",
+                            failure.orElseThrow());
+                }
                 if (!demand.publication.activationFencePassed()) {
                     this.publicationQueue.addLast(ref);
                     continue;
                 }
                 demand.phase = Phase.ACTIVE;
                 this.activeCount++;
+                if (demand.coverage) this.missingCoverage.remove(demand.key);
                 demand.decoded = null;
                 this.activated++;
+                this.releaseAdmission(demand, ref.admission);
                 if (demand.pendingIndex != null) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
                     int ordinal = demand.pendingOrdinal;
@@ -1153,6 +1264,50 @@ final class ClientSession {
                     this.bind(demand, index, ordinal);
                 }
             }
+        }
+
+        RenderAdmission tryRenderAdmission(Demand demand) {
+            int available = this.renderAdmissionSlots.availablePermits();
+            if (available == 0 || (!demand.coverage
+                    && available <= this.renderAdmissionReserve())) return null;
+            if (!this.renderAdmissionSlots.tryAcquire()) return null;
+            RenderAdmission admission = new RenderAdmission(this);
+            this.renderAdmissions.add(admission);
+            return admission;
+        }
+
+        boolean hasPipelineHeadroom(boolean coverage) {
+            return this.pipelineHeadroom(coverage) > 0;
+        }
+
+        boolean hasRenderAdmissionHeadroom(boolean coverage) {
+            int reserve = coverage ? 0 : this.renderAdmissionReserve();
+            return this.renderAdmissionSlots.availablePermits() > reserve;
+        }
+
+        int renderAdmissionReserve() {
+            for (long key : this.missingCoverage) {
+                if (!this.absentRegions.contains(regionFor(key))) {
+                    return COVERAGE_RENDER_RESERVE;
+                }
+            }
+            return 0;
+        }
+
+        int pipelineHeadroom(boolean coverage) {
+            int reserved = coverage ? 0 : this.renderAdmissionReserve();
+            int committed = this.inFlightSections + this.cacheLookupsInFlight
+                    + this.decodeQueue.size() + this.decodesInFlight + this.meshQueue.size();
+            return Math.max(0, this.renderAdmissionSlots.availablePermits()
+                    - reserved - committed);
+        }
+
+        void releaseAdmission(Demand demand, RenderAdmission admission) {
+            if (admission == null) return;
+            if (demand != null && demand.renderAdmission == admission) {
+                demand.renderAdmission = null;
+            }
+            admission.release();
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
@@ -1174,7 +1329,10 @@ final class ClientSession {
             this.refinementNetworkQueue.clear();
             this.decodeQueue.clear();
             this.meshQueue.clear();
-            this.publicationQueue.clear();
+            PublicationRef publication;
+            while ((publication = this.publicationQueue.pollFirst()) != null) {
+                publication.admission.release();
+            }
             this.refinementAdmissionQueue.clear();
             this.refinementAdmissionSet.clear();
             this.coverageBindQueue.clear();
@@ -1191,10 +1349,10 @@ final class ClientSession {
                     }
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    return;
+                    break;
                 }
             }
-            if (event instanceof MeshedResult meshed) meshed.geometry.free();
+            discardEvent(event);
         }
 
         void signal() { this.wakeup.release(); }
@@ -1210,6 +1368,10 @@ final class ClientSession {
                     + " active=" + this.activeCount + " regions=" + this.indexes.size()
                     + " coarsening=" + this.coarseningRoots.size()
                     + " batches=" + this.inFlightBatches + " inFlightBytes=" + this.inFlightBytes
+                    + " renderPending=" + this.renderAdmissions.size()
+                    + " coverageMissing=" + this.missingCoverage.size()
+                    + " meshQueue=" + this.meshQueue.size()
+                    + " publishQueue=" + this.publicationQueue.size()
                     + " received=" + this.receivedBytes
                     + " failure=" + String.valueOf(this.failure);
         }
@@ -1231,9 +1393,15 @@ final class ClientSession {
             for (Demand demand : this.demands.values()) {
                 if (demand.publication != null) demand.publication.close();
             }
+            Event event;
+            while ((event = this.events.poll()) != null) discardEvent(event);
+            for (RenderAdmission admission : List.copyOf(this.renderAdmissions)) {
+                admission.release();
+            }
             this.demands.clear();
             this.demandsByRegion.clear();
             this.demandsByTop.clear();
+            this.missingCoverage.clear();
             this.subscribedRegions.clear();
             this.refinementEvents.clear();
             this.queuedRefinements.clear();
@@ -1247,6 +1415,7 @@ final class ClientSession {
 
     private record DemandEvent(boolean add, long key) {}
     private record StageRef(long key, int token) {}
+    private record PublicationRef(long key, int token, RenderAdmission admission) {}
 
     private sealed interface Event permits CatalogReady, IndexReady, CacheResult, CacheCorrupt,
             SectionResult, DecodedResult, MeshedResult, PublicationQueued, Coarsened,
@@ -1260,13 +1429,15 @@ final class ClientSession {
     private record SectionResult(RegionalProtocol.SectionReply reply) implements Event {}
     private record DecodedResult(long key, int token,
                                  RegionalSectionCodec.SectionData section) implements Event {}
-    private record MeshedResult(long key, int token, BuiltSection geometry) implements Event {}
+    private record MeshedResult(long key, int token, BuiltSection geometry,
+                                RenderAdmission admission) implements Event {}
     private record PublicationQueued(long key, int token,
-                                     VoxyRenderSystem.SectionPublication publication)
+                                     VoxyRenderSystem.SectionPublication publication,
+                                     RenderAdmission admission)
             implements Event {}
     private record Coarsened(long parent) implements Event {}
     private record CoarsenFailed(long parent, Throwable failure) implements Event {}
-    private record BatchComplete(long reservedBytes) implements Event {}
+    private record BatchComplete(long reservedBytes, int sectionCount) implements Event {}
     private record WorkerFailed(Throwable failure) implements Event {}
 
     private interface MainTask {
@@ -1295,22 +1466,41 @@ final class ClientSession {
     }
 
     private record PublishTask(Session owner, Demand demand, int token, BuiltSection geometry,
-                               VoxyRenderSystem.SectionPublication previous) implements MainTask {
+                               VoxyRenderSystem.SectionPublication previous,
+                               RenderAdmission admission) implements MainTask {
         @Override public void run(VoxyRenderSystem renderer) {
             VoxyRenderSystem.SectionPublication publication;
             synchronized (this.owner.publicationLock) {
                 if (this.demand.token != this.token
-                        || this.demand.phase != Phase.PUBLISHING) {
+                        || this.demand.phase != Phase.PUBLISHING
+                        || this.demand.renderAdmission != this.admission) {
                     this.geometry.free();
+                    this.admission.release();
                     return;
                 }
                 publication = this.owner.publisher.publish(this.demand.key, this.geometry,
                         Optional.ofNullable(this.previous), () -> this.demand.token == this.token
-                                && this.demand.phase == Phase.PUBLISHING);
+                                && this.demand.phase == Phase.PUBLISHING
+                                && this.demand.renderAdmission == this.admission
+                                && this.owner.open.get());
             }
-            this.owner.putEvent(new PublicationQueued(this.demand.key, this.token, publication));
+            this.owner.putEvent(new PublicationQueued(this.demand.key, this.token, publication,
+                    this.admission));
         }
-        @Override public void cancel() { this.geometry.free(); }
+        @Override public void cancel() {
+            this.geometry.free();
+            this.admission.release();
+        }
+    }
+
+    private static void discardEvent(Event event) {
+        if (event instanceof MeshedResult meshed) {
+            meshed.geometry.free();
+            meshed.admission.release();
+        } else if (event instanceof PublicationQueued queued) {
+            queued.publication.close();
+            queued.admission.release();
+        }
     }
 
     private static void enqueueMain(MainTask task) throws InterruptedException {

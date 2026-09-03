@@ -298,6 +298,32 @@ public class AsyncNodeManager {
             hierarchyAdvanced = true;
         }
 
+        // Coarsening frees geometry and must not wait behind publications which may require that
+        // capacity. Its release transaction still crosses the normal GPU fence before storage is
+        // reclaimed.
+        {
+            int coarsenings = this.coarsenQueue.size();
+            while (coarsenings-- > 0) {
+                RendererTransaction transaction = this.coarsenQueue.peek();
+                if (transaction == null) break;
+                try {
+                    long parent = transaction.positions.iterator().next();
+                    if (!this.manager.coarsenSubtree(transaction.sourceRevision, parent)) {
+                        topologyDeferred = true;
+                        break;
+                    }
+                    this.coarsenQueue.poll();
+                    workDone++;
+                    hierarchyAdvanced = true;
+                    this.completedRendererTransactions.add(transaction);
+                } catch (Throwable failure) {
+                    this.coarsenQueue.poll();
+                    workDone++;
+                    transaction.failure.accept(failure);
+                }
+            }
+        }
+
         // Resolve topology work first. A directly selected descendant may arrive before its
         // request owner, so retain its complete geometry and retry only after hierarchy progress.
         boolean deferredAdvanced = false;
@@ -330,30 +356,6 @@ public class AsyncNodeManager {
                 this.deferredRegionalSectionPublications.addLast(publication);
             }
         }
-
-        {
-            int coarsenings = this.coarsenQueue.size();
-            while (coarsenings-- > 0) {
-                RendererTransaction transaction = this.coarsenQueue.peek();
-                if (transaction == null) break;
-                try {
-                    long parent = transaction.positions.iterator().next();
-                    if (!this.manager.coarsenSubtree(transaction.sourceRevision, parent)) {
-                        topologyDeferred = true;
-                        break;
-                    }
-                    this.coarsenQueue.poll();
-                    workDone++;
-                    hierarchyAdvanced = true;
-                    this.completedRendererTransactions.add(transaction);
-                } catch (Throwable failure) {
-                    this.coarsenQueue.poll();
-                    workDone++;
-                    transaction.failure.accept(failure);
-                }
-            }
-        }
-
 
         if (this.workCounter.addAndGet(-workDone) < 0) {
             try {
