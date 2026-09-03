@@ -32,6 +32,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -88,7 +89,7 @@ final class ClientSession {
 
     static void refinementRequested(long parent) {
         Session current = active;
-        if (current != null) current.refinementEvents.add(parent);
+        if (current != null) current.enqueueRefinement(parent);
     }
 
     static void resetDemand() {
@@ -190,7 +191,7 @@ final class ClientSession {
     }
 
     private enum Phase {
-        NEW, CACHE, NETWORK, REQUESTED, RECEIVED, DECODING, DECODED, MESHING,
+        NEW, WAITING, CACHE, NETWORK, REQUESTED, RECEIVED, DECODING, DECODED, MESHING,
         PUBLISHING, ACTIVE
     }
 
@@ -225,6 +226,7 @@ final class ClientSession {
         final AtomicBoolean resetRequested = new AtomicBoolean();
         final ConcurrentLinkedQueue<DemandEvent> demandEvents = new ConcurrentLinkedQueue<>();
         final ConcurrentLinkedQueue<Long> refinementEvents = new ConcurrentLinkedQueue<>();
+        final Set<Long> queuedRefinements = ConcurrentHashMap.newKeySet();
         final ArrayBlockingQueue<Event> events = new ArrayBlockingQueue<>(MAX_EVENTS);
         final Semaphore wakeup = new Semaphore(0);
         final Semaphore sectionTaskSlots = new Semaphore(MAX_SECTION_TASKS);
@@ -240,6 +242,11 @@ final class ClientSession {
         final Map<Long, LinkedHashSet<Long>> demandsByRegion = new HashMap<>();
         final Map<Long, LinkedHashSet<Long>> demandsByTop = new HashMap<>();
         final Set<Long> deferredRefinements = new LinkedHashSet<>();
+        final ArrayDeque<Long> refinementAdmissionQueue = new ArrayDeque<>();
+        final Set<Long> refinementAdmissionSet = new HashSet<>();
+        final ArrayDeque<Long> coverageBindQueue = new ArrayDeque<>();
+        final ArrayDeque<Long> refinementBindQueue = new ArrayDeque<>();
+        final Set<Long> pendingBindSet = new HashSet<>();
         final ArrayDeque<Long> regionQueue = new ArrayDeque<>();
         final Set<Long> queuedRegions = new HashSet<>();
         final ArrayDeque<StageRef> cacheQueue = new ArrayDeque<>();
@@ -456,6 +463,8 @@ final class ClientSession {
             if (this.resetRequested.getAndSet(false)) {
                 for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
                 this.deferredRefinements.clear();
+                this.refinementEvents.clear();
+                this.queuedRefinements.clear();
                 this.clearStageQueues();
             }
             DemandEvent event;
@@ -473,8 +482,18 @@ final class ClientSession {
             }
             Long parent;
             while ((parent = this.refinementEvents.poll()) != null) {
+                this.queuedRefinements.remove(parent);
                 if (!hasTop(topAncestor(parent))) continue;
-                if (!this.addChildren(parent)) this.deferredRefinements.add(parent);
+                if (this.deferredRefinements.contains(parent)
+                        || this.refinementAdmissionSet.contains(parent)) continue;
+                if (this.indexFor(parent) == null) this.deferredRefinements.add(parent);
+                else if (!this.addChildren(parent)) this.deferRefinementAdmission(parent);
+            }
+        }
+
+        void enqueueRefinement(long parent) {
+            if (this.queuedRefinements.add(parent)) {
+                this.refinementEvents.add(parent);
             }
         }
 
@@ -499,7 +518,17 @@ final class ClientSession {
             if (index == null) return false;
             RegionalProtocol.SectionMeta parentMeta = index.section(parent);
             if (parentMeta == null || SectionKey.level(parent) == 0) return true;
+            if (!this.coverageBindQueue.isEmpty()) return false;
             int childMask = parentMeta.childMask();
+            int requiredCacheSlots = 0;
+            for (int child = 0; child < 8; child++) {
+                if ((childMask & 1 << child) == 0) continue;
+                long key = child(parent, child);
+                if (this.demands.containsKey(key)) continue;
+                RegionalProtocol.SectionMeta childMeta = index.section(key);
+                if (childMeta != null && !childMeta.empty()) requiredCacheSlots++;
+            }
+            if (requiredCacheSlots > MAX_STAGE_QUEUE - this.cacheQueue.size()) return false;
             for (int child = 0; child < 8; child++) {
                 if ((childMask & 1 << child) == 0) continue;
                 long key = child(parent, child);
@@ -520,8 +549,13 @@ final class ClientSession {
                 if (meta == null) this.retireDemand(demand.key);
                 else this.bind(demand, index, meta);
             }
-            this.deferredRefinements.removeIf(parent ->
-                    regionFor(parent) == region && this.addChildren(parent));
+            var deferred = this.deferredRefinements.iterator();
+            while (deferred.hasNext()) {
+                long parent = deferred.next();
+                if (regionFor(parent) != region) continue;
+                deferred.remove();
+                if (!this.addChildren(parent)) this.deferRefinementAdmission(parent);
+            }
         }
 
         void retireRegion(long region) {
@@ -583,6 +617,21 @@ final class ClientSession {
                 demand.meta = meta;
                 return;
             }
+            if (!meta.empty() && this.cacheQueue.size() >= MAX_STAGE_QUEUE) {
+                if (demand.phase != Phase.ACTIVE) {
+                    demand.token++;
+                    demand.received = null;
+                    demand.decoded = null;
+                    demand.phase = Phase.WAITING;
+                }
+                demand.pendingIndex = index;
+                demand.pendingMeta = meta;
+                this.deferBind(demand);
+                return;
+            }
+            demand.pendingIndex = null;
+            demand.pendingMeta = null;
+            this.pendingBindSet.remove(demand.key);
             demand.token++;
             if (demand.phase == Phase.ACTIVE) this.activeCount--;
             demand.index = index;
@@ -605,10 +654,63 @@ final class ClientSession {
             this.scheduleMeshing();
             this.scheduleDecoding();
             this.scheduleCache();
+            this.admitPendingBinds();
+            this.admitDeferredRefinements();
             while (this.inFlightBatches < MAX_IN_FLIGHT_BATCHES) {
                 List<Demand> selected = this.selectNetworkBatch();
                 if (selected.isEmpty()) break;
                 if (!this.sendBatch(selected)) break;
+            }
+        }
+
+        void admitPendingBinds() {
+            while (this.cacheQueue.size() < MAX_STAGE_QUEUE) {
+                ArrayDeque<Long> queue = this.coverageBindQueue.isEmpty()
+                        ? this.refinementBindQueue : this.coverageBindQueue;
+                Long key = queue.pollFirst();
+                if (key == null) return;
+                if (!this.pendingBindSet.remove(key)) continue;
+                Demand demand = this.demands.get(key);
+                if (demand == null || demand.pendingIndex == null
+                        || demand.pendingMeta == null) continue;
+                RegionalProtocol.RegionIndex index = demand.pendingIndex;
+                RegionalProtocol.SectionMeta meta = demand.pendingMeta;
+                demand.pendingIndex = null;
+                demand.pendingMeta = null;
+                this.bind(demand, index, meta);
+            }
+        }
+
+        void deferBind(Demand demand) {
+            if (!this.pendingBindSet.add(demand.key)) return;
+            (demand.coverage ? this.coverageBindQueue : this.refinementBindQueue)
+                    .addLast(demand.key);
+        }
+
+        void admitDeferredRefinements() {
+            while (true) {
+                Long parent = this.refinementAdmissionQueue.peekFirst();
+                if (parent == null) return;
+                if (!hasTop(topAncestor(parent))) {
+                    this.refinementAdmissionQueue.removeFirst();
+                    this.refinementAdmissionSet.remove(parent);
+                    continue;
+                }
+                if (this.indexFor(parent) == null) {
+                    this.refinementAdmissionQueue.removeFirst();
+                    this.refinementAdmissionSet.remove(parent);
+                    this.deferredRefinements.add(parent);
+                    continue;
+                }
+                if (!this.addChildren(parent)) return;
+                this.refinementAdmissionQueue.removeFirst();
+                this.refinementAdmissionSet.remove(parent);
+            }
+        }
+
+        void deferRefinementAdmission(long parent) {
+            if (this.refinementAdmissionSet.add(parent)) {
+                this.refinementAdmissionQueue.addLast(parent);
             }
         }
 
@@ -967,6 +1069,11 @@ final class ClientSession {
             this.decodeQueue.clear();
             this.meshQueue.clear();
             this.publicationQueue.clear();
+            this.refinementAdmissionQueue.clear();
+            this.refinementAdmissionSet.clear();
+            this.coverageBindQueue.clear();
+            this.refinementBindQueue.clear();
+            this.pendingBindSet.clear();
         }
 
         void putEvent(Event event) {
@@ -1021,6 +1128,9 @@ final class ClientSession {
             this.demandsByRegion.clear();
             this.demandsByTop.clear();
             this.subscribedRegions.clear();
+            this.refinementEvents.clear();
+            this.queuedRefinements.clear();
+            this.deferredRefinements.clear();
             this.clearStageQueues();
         }
     }

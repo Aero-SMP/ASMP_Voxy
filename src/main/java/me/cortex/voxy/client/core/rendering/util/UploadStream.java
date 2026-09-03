@@ -22,6 +22,7 @@ import static org.lwjgl.opengl.GL44.GL_CLIENT_STORAGE_BIT;
 import static org.lwjgl.opengl.GL45C.glFlushMappedNamedBufferRange;
 
 public class UploadStream {
+    public static final int CAPACITY_BYTES = 1 << 26;
     public static final int BASE_ALLOCATION_ALIGNEMENT = Math.max(Capabilities.INSTANCE.ssboBindingAlignment, 16);
 
     private final AllocationArena allocationArena = new AllocationArena();
@@ -64,7 +65,8 @@ public class UploadStream {
         size = alignUp(size, BASE_ALLOCATION_ALIGNEMENT);
 
         if (size > this.uploadBuffer.size()) {
-            throw new IllegalArgumentException();
+            throw new IllegalArgumentException("one upload exceeds the "
+                    + this.uploadBuffer.size() + "-byte upload-stream safety ceiling: " + size);
         }
 
         long addr;
@@ -165,7 +167,7 @@ public class UploadStream {
 
     //A upload instance instead of passing one around by reference
     // MUST ONLY BE USED ON THE RENDER THREAD
-    public static final UploadStream INSTANCE = new UploadStream(1<<26);//64 mb upload buffer
+    public static final UploadStream INSTANCE = new UploadStream(CAPACITY_BYTES);//64 mb upload buffer
 
     public static long alignUp(long val, long alignment) {
         return ((val+alignment-1)/alignment)*alignment;

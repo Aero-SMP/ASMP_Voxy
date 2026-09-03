@@ -24,6 +24,7 @@ public class BasicAsyncGeometryManager {
     private final Int2ObjectOpenHashMap<MemoryBuffer> heapUploads = new Int2ObjectOpenHashMap<>(1024);//Uploads into the buffer at the given location
     private final IntOpenHashSet heapRemoveUploads = new IntOpenHashSet(1024);//Any removals are added here, so that it can be properly synced
     private long usedCapacity = 0;
+    private long pendingUploadBytes = 0;
 
     public BasicAsyncGeometryManager(int maxSectionCount, long geometryCapacity) {
         this.allocationSet = new HierarchicalBitSet(maxSectionCount);
@@ -101,6 +102,7 @@ public class BasicAsyncGeometryManager {
         //Free the upload if it was uploading
         var buf = this.heapUploads.remove(ptr);
         if (buf != null) {
+            this.pendingUploadBytes -= buf.size;
             buf.free();
         }
         this.heapRemoveUploads.add(ptr);
@@ -122,6 +124,7 @@ public class BasicAsyncGeometryManager {
         if (this.heapUploads.put(addr, section.geometryBuffer) != null) {
             throw new IllegalStateException("Addr: " + addr);
         }
+        this.pendingUploadBytes += section.geometryBuffer.size;
         this.heapRemoveUploads.remove(addr);
         //Create Meta
         return new SectionMeta(section.position, section.aabb, addr, size, section.offsets, section.childExistence);
@@ -129,6 +132,17 @@ public class BasicAsyncGeometryManager {
 
     public Int2ObjectOpenHashMap<MemoryBuffer> getUploads() {
         return this.heapUploads;
+    }
+
+    public long getPendingUploadBytes() {
+        return this.pendingUploadBytes;
+    }
+
+    public void uploadsDrained() {
+        if (!this.heapUploads.isEmpty()) {
+            throw new IllegalStateException("geometry uploads were not drained");
+        }
+        this.pendingUploadBytes = 0;
     }
 
     public IntOpenHashSet getHeapRemovals() {

@@ -43,6 +43,8 @@ import static org.lwjgl.opengl.GL43C.*;
 //An "async host" for a NodeManager, has specific synchonius entry and exit points
 // this is done off thread to reduce the amount of work done on the render thread, improving frame stability and reducing runtime overhead
 public class AsyncNodeManager {
+    private static final long MAX_SYNC_GEOMETRY_BYTES = 16L << 20;
+    private static final int MAX_SYNC_REGIONAL_PUBLICATIONS = 1_024;
     private static final VarHandle RESULT_HANDLE;
     private static final VarHandle RESULT_CACHE_1_HANDLE;
     private static final VarHandle RESULT_CACHE_2_HANDLE;
@@ -89,6 +91,7 @@ public class AsyncNodeManager {
     private final IntOpenHashSet cleanerIdResetClear = new IntOpenHashSet();//Tells the cleaner if it needs to clear the id to 0, or reset the id to the current frame
 
     private boolean needsWaitForSync = false;
+    private boolean retryDeferredAfterSync = false;
 
     public AsyncNodeManager(int maxNodeCount, BasicSectionGeometryData geometryData) {
         //Note: geometry data is the data store/source, not the management, it is just a raw store of data
@@ -173,10 +176,11 @@ public class AsyncNodeManager {
             .compile();
 
     private void run() {
-        if (this.workCounter.get() <= 0) {
+        if (this.workCounter.get() <= 0 && !this.retryDeferredAfterSync) {
             //TODO: here, instead of parking, we can do more work on other sub-tasks such as filtering the mesh build queue
             LockSupport.park();
-            if (this.workCounter.get() <= 0 || !this.running) {//No work
+            if ((this.workCounter.get() <= 0 && !this.retryDeferredAfterSync)
+                    || !this.running) {//No work
                 return;
             }
             //This is a funny thing, wait a bit, this allows for better batching, but this thread is independent of everything else so waiting a bit should be mostly ok
@@ -289,9 +293,23 @@ public class AsyncNodeManager {
 
         // Resolve topology work first. A directly selected descendant may arrive before its
         // request owner, so retain its complete geometry and retry only after hierarchy progress.
-        if (hierarchyAdvanced) this.retryDeferredRegionalSectionPublications();
-        while (hasGeometryCapacity()) {
-            RegionalSectionPublication publication = this.regionalSectionQueue.poll();
+        boolean deferredAdvanced = false;
+        boolean regionalBatchLimited = false;
+        if (hierarchyAdvanced || this.retryDeferredAfterSync) {
+            this.retryDeferredAfterSync = false;
+            DeferredRetry retry = this.retryDeferredRegionalSectionPublications();
+            deferredAdvanced = retry.advanced();
+            regionalBatchLimited = retry.batchLimited();
+            this.retryDeferredAfterSync = retry.batchLimited();
+        }
+        while (!regionalBatchLimited && hasGeometryCapacity()) {
+            RegionalSectionPublication publication = this.regionalSectionQueue.peek();
+            if (publication == null) break;
+            if (!this.regionalSyncBatchHasRoom(publication)) {
+                regionalBatchLimited = true;
+                break;
+            }
+            publication = this.regionalSectionQueue.poll();
             if (publication == null) break;
             workDone++;
             if (!this.processRegionalSectionPublication(publication)) {
@@ -312,7 +330,7 @@ public class AsyncNodeManager {
             }
         }
 
-        if (workDone == 0) {//Nothing happened, which is odd, but just return
+        if (workDone == 0 && !deferredAdvanced) {//Nothing happened, which is odd, but just return
             //Should probably log that nothing happened, at least once
             if (topologyDeferred) LockSupport.parkNanos(10_000_000L);
             return;
@@ -345,6 +363,7 @@ public class AsyncNodeManager {
                     val.getValue().free();
                 }
                 this.geometryManager.getUploads().clear();
+                this.geometryManager.uploadsDrained();
             }
 
             this.geometryManager.getHeapRemovals().clear();//We dont do removals on new data (as there is "none")
@@ -392,6 +411,7 @@ public class AsyncNodeManager {
                     val.getValue().free();
                 }
                 add.clear();
+                this.geometryManager.uploadsDrained();
             }
         }
 
@@ -443,6 +463,7 @@ public class AsyncNodeManager {
         this.needsWaitForSync |= results.cleanerOperations.size() > 1024;
         this.needsWaitForSync |= results.scatterWriteLocationMap.size() > 4096;
         this.needsWaitForSync |= results.tlnDelta.size() > 10;
+        this.needsWaitForSync |= regionalBatchLimited || this.retryDeferredAfterSync;
 
         if (!RESULT_HANDLE.compareAndSet(this, null, results)) {
             throw new IllegalArgumentException("Should always have null");
@@ -455,22 +476,50 @@ public class AsyncNodeManager {
                 > 50_000_000L;
     }
 
-    private void retryDeferredRegionalSectionPublications() {
+    private DeferredRetry retryDeferredRegionalSectionPublications() {
         int remaining = this.deferredRegionalSectionPublications.size();
+        boolean advanced = false;
         while (remaining-- > 0 && hasGeometryCapacity()) {
             RegionalSectionPublication publication =
-                    this.deferredRegionalSectionPublications.removeFirst();
+                    this.deferredRegionalSectionPublications.peekFirst();
+            if (!this.regionalSyncBatchHasRoom(publication)) {
+                return new DeferredRetry(advanced, true);
+            }
+            this.deferredRegionalSectionPublications.removeFirst();
             if (!this.processRegionalSectionPublication(publication)) {
                 this.deferredRegionalSectionPublications.addLast(publication);
+            } else {
+                advanced = true;
             }
         }
+        return new DeferredRetry(advanced, false);
     }
+
+    private boolean regionalSyncBatchHasRoom(RegionalSectionPublication publication) {
+        int publications = this.completedRegionalSectionPublications.size();
+        if (publications >= MAX_SYNC_REGIONAL_PUBLICATIONS) return false;
+        BuiltSection geometry = publication.geometry();
+        long bytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
+        return publications == 0
+                || this.geometryManager.getPendingUploadBytes() + bytes
+                <= MAX_SYNC_GEOMETRY_BYTES;
+    }
+
+    private record DeferredRetry(boolean advanced, boolean batchLimited) {}
 
     /** Uploads one complete node, or retains it until its indexed parent path exists. */
     private boolean processRegionalSectionPublication(RegionalSectionPublication publication) {
         BuiltSection geometry = publication.geometry();
         boolean transferred = false;
         try {
+            long geometryBytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
+            long stagedBytes = UploadStream.alignUp(geometryBytes,
+                    UploadStream.BASE_ALLOCATION_ALIGNEMENT)
+                    + UploadStream.alignUp(16, UploadStream.BASE_ALLOCATION_ALIGNEMENT);
+            if (stagedBytes > UploadStream.CAPACITY_BYTES) {
+                throw new IllegalArgumentException("one regional section exceeds the render "
+                        + "upload safety ceiling: " + geometryBytes + " bytes");
+            }
             if (publication.previousRevision() >= 0) {
                 if (!this.manager.finalizeStagedRoot(publication.previousRevision())) {
                     return false;
