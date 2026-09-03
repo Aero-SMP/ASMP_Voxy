@@ -31,10 +31,12 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.CRC32C;
@@ -57,6 +59,7 @@ final class KwikQuicClient implements QuicClient {
     private static final long MAX_RESPONSE_COMPRESSED_BYTES = 16L << 20;
     private static final long MAX_RESPONSE_CANONICAL_BYTES = 64L << 20;
     private static final long STREAM_RECEIVE_BYTES = MAX_RESPONSE_COMPRESSED_BYTES + 64 * 1024;
+    private static final int MAX_PENDING_BODIES_PER_STREAM = 4;
     private static final DirectBodyPool BODY_POOL = new DirectBodyPool();
 
     private final QuicClientConnection connection;
@@ -342,9 +345,12 @@ final class KwikQuicClient implements QuicClient {
                 throw new IOException("Voxy object response batch exceeds protocol bounds");
             }
 
-            BodySink body = BODY_POOL.acquire((int) compressed);
+            ReleaseGate gate = handle.acquireBody();
+            BodySink body = null;
             boolean owned = false;
+            boolean delivered = false;
             try {
+                body = BODY_POOL.acquire((int) compressed);
                 CRC32C checksum = new CRC32C();
                 readBody(input, body.buffer, transfer, checksum, handle);
                 body.buffer.flip();
@@ -359,9 +365,11 @@ final class KwikQuicClient implements QuicClient {
                     throw new IOException("invalid Voxy object envelope", error);
                 }
                 owned = true;
-                handle.object(object);
+                handle.object(object, gate);
+                delivered = true;
             } finally {
-                if (!owned) body.release.run();
+                if (!owned && body != null) body.release.run();
+                if (!delivered) gate.release();
             }
         }
         requireFin(input);
@@ -577,7 +585,8 @@ final class KwikQuicClient implements QuicClient {
     private static final class RequestHandle implements Request {
         private final ObjectReceiver receiver;
         private final AtomicReference<QuicStream> stream = new AtomicReference<>();
-        private final AtomicReference<ReleaseGate> gate = new AtomicReference<>();
+        private final Semaphore bodyCredits = new Semaphore(MAX_PENDING_BODIES_PER_STREAM);
+        private final Set<ReleaseGate> gates = ConcurrentHashMap.newKeySet();
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private final AtomicBoolean finished = new AtomicBoolean();
 
@@ -598,24 +607,44 @@ final class KwikQuicClient implements QuicClient {
             if (!this.cancelled.get() && !this.finished.get()) this.receiver.progress();
         }
 
-        private void object(EncodedObject object) throws IOException {
+        private ReleaseGate acquireBody() throws IOException {
+            try {
+                this.bodyCredits.acquire();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while awaiting Voxy body credit", interrupted);
+            }
+            if (this.cancelled.get() || this.finished.get()) {
+                this.bodyCredits.release();
+                throw new IOException("Voxy object request ended before its body arrived");
+            }
+            ReleaseGate gate = new ReleaseGate(this);
+            this.gates.add(gate);
+            if (this.cancelled.get() || this.finished.get()) {
+                gate.release();
+                throw new IOException("Voxy object request ended before its body arrived");
+            }
+            return gate;
+        }
+
+        private void object(EncodedObject object, ReleaseGate gate) throws IOException {
             if (this.cancelled.get() || this.finished.get()) {
                 object.close();
+                gate.release();
                 return;
             }
-            ReleaseGate current = new ReleaseGate();
-            this.gate.set(current);
-            if (this.cancelled.get()) current.release();
             try {
-                this.receiver.object(object, current::release);
+                this.receiver.object(object, gate::release);
             } catch (Throwable failure) {
                 object.close();
-                current.release();
+                gate.release();
                 if (failure instanceof IOException io) throw io;
                 throw new IOException("Voxy object receiver failed", failure);
             }
-            current.await();
-            this.gate.compareAndSet(current, null);
+        }
+
+        private void release(ReleaseGate gate) {
+            if (this.gates.remove(gate)) this.bodyCredits.release();
         }
 
         private void complete() {
@@ -637,8 +666,7 @@ final class KwikQuicClient implements QuicClient {
         public void cancel() {
             if (!this.cancelled.compareAndSet(false, true)) return;
             this.finished.set(true);
-            ReleaseGate gate = this.gate.get();
-            if (gate != null) gate.release();
+            for (ReleaseGate gate : this.gates) gate.release();
             QuicStream stream = this.stream.get();
             if (stream != null) reset(stream);
         }
@@ -650,20 +678,15 @@ final class KwikQuicClient implements QuicClient {
     }
 
     private static final class ReleaseGate {
-        private final CountDownLatch latch = new CountDownLatch(1);
+        private final RequestHandle owner;
         private final AtomicBoolean released = new AtomicBoolean();
 
-        private void release() {
-            if (this.released.compareAndSet(false, true)) this.latch.countDown();
+        private ReleaseGate(RequestHandle owner) {
+            this.owner = owner;
         }
 
-        private void await() throws IOException {
-            try {
-                this.latch.await();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new IOException("interrupted while consuming a Voxy object", interrupted);
-            }
+        private void release() {
+            if (this.released.compareAndSet(false, true)) this.owner.release(this);
         }
     }
 

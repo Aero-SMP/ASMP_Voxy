@@ -985,12 +985,15 @@ final class ClientSession {
             ActiveRequest request;
             while ((request = this.readyRequests.poll()) != null) {
                 request.beginOwnerDrain();
-                NetworkHandoff input = request.beginNetworkDecode();
-                if (input != null) {
+                NetworkHandoff input;
+                while ((input = request.beginNetworkDecode()) != null) {
                     decodeObject(request, input.encoded, input.release, false);
                 }
                 DecodedObjectEvent decoded = request.takeNetworkDecode();
-                if (decoded != null) acceptDecodedObject(decoded);
+                while (decoded != null) {
+                    acceptDecodedObject(decoded);
+                    decoded = request.takeNetworkDecode();
+                }
                 while ((decoded = request.takeCachedDecode()) != null) {
                     acceptDecodedObject(decoded);
                 }
@@ -2354,7 +2357,7 @@ final class ClientSession {
             private boolean latencyRecorded;
             private boolean ownerQueued;
             private long lastProgressNanos = this.startedNanos;
-            private NetworkHandoff networkHandoff;
+            private final ArrayDeque<NetworkHandoff> networkHandoffs = new ArrayDeque<>();
             private final ArrayDeque<DecodedObjectEvent> cachedDecodeHandoffs =
                     new ArrayDeque<>();
 
@@ -2413,15 +2416,12 @@ final class ClientSession {
                         release.run();
                         return;
                     }
-                    if (this.networkHandoff != null) {
-                        malformed = new IOException(
-                                "QUIC provider delivered an object before releasing its predecessor");
-                    } else if (!this.pendingNetwork.remove(object.hash())) {
+                    if (!this.pendingNetwork.remove(object.hash())) {
                         malformed = new IOException(
                                 "QUIC stream returned an unrequested object");
                     } else {
                         this.processing++;
-                        this.networkHandoff = new NetworkHandoff(object, release);
+                        this.networkHandoffs.addLast(new NetworkHandoff(object, release));
                     }
                 }
                 if (malformed != null) {
@@ -2476,24 +2476,32 @@ final class ClientSession {
             }
 
             private synchronized NetworkHandoff beginNetworkDecode() {
-                if (this.networkHandoff == null || this.networkHandoff.stage != 0) return null;
-                this.networkHandoff.stage = 1;
-                return this.networkHandoff;
+                for (NetworkHandoff handoff : this.networkHandoffs) {
+                    if (handoff.stage != 0) continue;
+                    handoff.stage = 1;
+                    return handoff;
+                }
+                return null;
             }
 
             private void completeNetworkDecode(EncodedObject encoded, DecodedObject decoded,
                                                Throwable failure, Runnable release) {
+                boolean accepted = false;
                 synchronized (this) {
-                    NetworkHandoff handoff = this.networkHandoff;
-                    if (handoff == null || handoff.stage != 1
-                            || handoff.encoded != encoded || handoff.release != release) {
-                        encoded.close();
-                        release.run();
-                        return;
+                    for (NetworkHandoff handoff : this.networkHandoffs) {
+                        if (handoff.stage != 1 || handoff.encoded != encoded
+                                || handoff.release != release) continue;
+                        handoff.decoded = decoded;
+                        handoff.failure = failure;
+                        handoff.stage = 2;
+                        accepted = true;
+                        break;
                     }
-                    handoff.decoded = decoded;
-                    handoff.failure = failure;
-                    handoff.stage = 2;
+                }
+                if (!accepted) {
+                    encoded.close();
+                    release.run();
+                    return;
                 }
                 signalOwner();
             }
@@ -2522,11 +2530,15 @@ final class ClientSession {
             }
 
             private synchronized DecodedObjectEvent takeNetworkDecode() {
-                NetworkHandoff handoff = this.networkHandoff;
-                if (handoff == null || handoff.stage != 2) return null;
-                this.networkHandoff = null;
-                return new DecodedObjectEvent(this, handoff.encoded, handoff.decoded,
-                        handoff.failure, handoff.release, false);
+                var iterator = this.networkHandoffs.iterator();
+                while (iterator.hasNext()) {
+                    NetworkHandoff handoff = iterator.next();
+                    if (handoff.stage != 2) continue;
+                    iterator.remove();
+                    return new DecodedObjectEvent(this, handoff.encoded, handoff.decoded,
+                            handoff.failure, handoff.release, false);
+                }
+                return null;
             }
 
             private synchronized DecodedObjectEvent takeCachedDecode() {
@@ -2540,13 +2552,12 @@ final class ClientSession {
             }
 
             private void releaseOwnedHandoff() {
-                Runnable release = null;
+                ArrayList<NetworkHandoff> network = new ArrayList<>();
                 ArrayList<DecodedObjectEvent> cached = new ArrayList<>();
                 synchronized (this) {
-                    if (this.networkHandoff != null) {
-                        release = this.networkHandoff.release;
-                        this.networkHandoff.encoded.close();
-                        this.networkHandoff = null;
+                    NetworkHandoff handoff;
+                    while ((handoff = this.networkHandoffs.pollFirst()) != null) {
+                        network.add(handoff);
                         if (this.processing > 0) this.processing--;
                     }
                     DecodedObjectEvent event;
@@ -2555,7 +2566,13 @@ final class ClientSession {
                         if (this.processing > 0) this.processing--;
                     }
                 }
-                if (release != null) release.run();
+                for (NetworkHandoff handoff : network) {
+                    try {
+                        handoff.encoded.close();
+                    } finally {
+                        handoff.release.run();
+                    }
+                }
                 for (DecodedObjectEvent event : cached) {
                     try {
                         event.encoded.close();

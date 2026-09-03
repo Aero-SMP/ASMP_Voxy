@@ -47,8 +47,9 @@ interface QuicClient extends AutoCloseable {
 
     interface ObjectReceiver {
         /**
-         * Called on a provider I/O worker. The stream remains read-paused until the consumer
-         * invokes {@code release}, propagating decoder/cache backpressure to QUIC flow control.
+         * Called on a provider I/O worker. The provider permits only a small bounded number of
+         * unreleased bodies per stream; invoking {@code release} returns one body credit and
+         * propagates decoder/cache backpressure to QUIC flow control.
          */
         void object(EncodedObject object, Runnable release);
         /** Records validated response progress without queueing work on the connection owner. */
