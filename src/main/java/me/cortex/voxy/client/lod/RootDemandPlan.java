@@ -286,6 +286,7 @@ public final class RootDemandPlan {
     /** Selected neighbor context retained for residency, but never used as request authority. */
     private final Map<Hash256, ContentPriority> selectedNeighborContent = new LinkedHashMap<>();
     private final PrimitivePriorityMarks primitivePriorities = new PrimitivePriorityMarks();
+    private final PrimitivePriorityMarks primitiveRequestable = new PrimitivePriorityMarks();
     private final Map<Hash256, LinkedHashSet<Long>> bindingsByObject = new HashMap<>();
     private final Map<Long, Optional<Binding>> resolutions = new LinkedHashMap<>();
     private boolean metadataCapacityBlocked;
@@ -529,13 +530,34 @@ public final class RootDemandPlan {
     public void requestObjectsByHandle(int[] handles, byte[] priorities, int count) {
         requirePrimitiveHandles(handles, priorities, count);
         for (int index = 0; index < count; index++) {
+            validatedMicrotileHandle(handles[index]);
+            primitivePriority(priorities[index]);
+        }
+        // The GPU rows are already lane/score sorted. Move them to the queue front in reverse so
+        // an incomplete frontier can improve priority without cancelling demand it cannot see.
+        for (int index = count - 1; index >= 0; index--) {
             Hash256 hash = validatedMicrotileHandle(handles[index]);
             ContentPriority priority = primitivePriority(priorities[index]);
-            requestSelectorObject(hash, priority);
+            requestSelectorObject(hash, priority, true);
+        }
+    }
+
+    /** Retains additions-only request authority without inventing work from a partial frontier. */
+    public void retainContentRequests(int[] handles, byte[] priorities, int count) {
+        requirePrimitiveHandles(handles, priorities, count);
+        for (int index = 0; index < count; index++) {
+            Hash256 hash = validatedMicrotileHandle(handles[index]);
+            ContentPriority priority = primitivePriority(priorities[index]);
+            this.requestedContent.merge(hash, priority, RootDemandPlan::higherPriority);
         }
     }
 
     private void requestSelectorObject(Hash256 hash, ContentPriority priority) {
+        requestSelectorObject(hash, priority, false);
+    }
+
+    private void requestSelectorObject(Hash256 hash, ContentPriority priority,
+                                       boolean prioritize) {
         ContentPriority previous = this.requestedContent.get(hash);
         if (previous == null || previous.queuePriority < priority.queuePriority) {
             this.requestedContent.put(hash, priority);
@@ -546,8 +568,10 @@ public final class RootDemandPlan {
         // residency and turn the same object back into network work. A confirmed physical
         // residency miss uses retryMissingResidentObject() instead.
         if (!this.processedObjects.contains(hash)
-                && (previous != effective || !queuedAt(hash, effective))) {
-            refreshContentPriority(hash);
+                && !this.objectInFlight.contains(hash)
+                && (prioritize || previous != effective || !queuedAt(hash, effective))) {
+            removeFromContentQueues(hash);
+            queueContent(hash, effective, prioritize);
         }
     }
 
@@ -634,43 +658,56 @@ public final class RootDemandPlan {
             desired.merge(hash, priority, (left, right) ->
                     left.queuePriority >= right.queuePriority ? left : right);
         }
-        for (Hash256 old : List.copyOf(this.requestedContent.keySet())) {
-            if (desired.containsKey(old)) continue;
-            this.requestedContent.remove(old);
-            removeFromContentQueues(old);
-        }
+        this.requestedContent.clear();
+        this.coverageQueue.clear();
+        this.currentViewQueue.clear();
+        this.predictedQueue.clear();
         for (Map.Entry<Hash256, ContentPriority> entry : desired.entrySet()) {
             Hash256 hash = entry.getKey();
             ContentPriority priority = entry.getValue();
-            ContentPriority previous = this.requestedContent.put(hash, priority);
-            if (!this.processedObjects.contains(hash)
-                    && (previous != priority || !queuedAt(hash, priority))) {
-                refreshContentPriority(hash);
+            this.requestedContent.put(hash, priority);
+            if (!this.processedObjects.contains(hash) && !this.objectInFlight.contains(hash)) {
+                queueContent(hash, priority, false);
             }
         }
     }
 
     /** Primitive complete-frontier request reconciliation. */
-    public void reconcileContentRequests(int[] handles, byte[] priorities, int count) {
+    public void reconcileContentRequests(int[] handles, byte[] priorities, int count,
+                                         int[] requestableHandles,
+                                         byte[] requestablePriorities,
+                                         int requestableCount) {
         requirePrimitiveHandles(handles, priorities, count);
+        requirePrimitiveHandles(requestableHandles, requestablePriorities, requestableCount);
         PrimitivePriorityMarks desired = this.primitivePriorities.begin(
                 this.objectsByHandle.size(), handles, priorities, count);
-        var iterator = this.requestedContent.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<Hash256, ContentPriority> old = iterator.next();
-            Integer handle = this.objectHandles.get(old.getKey());
-            if (handle != null && desired.contains(handle)) continue;
-            iterator.remove();
-            removeFromContentQueues(old.getKey());
+        PrimitivePriorityMarks requestable = this.primitiveRequestable.begin(
+                this.objectsByHandle.size(), requestableHandles,
+                requestablePriorities, requestableCount);
+        // Authenticate the whole replacement before mutating the live request authority.
+        for (int index = 0; index < desired.count; index++) {
+            validatedMicrotileHandle(desired.handles[index]);
         }
+        for (int index = 0; index < requestable.count; index++) {
+            int handle = requestable.handles[index];
+            validatedMicrotileHandle(handle);
+            if (!desired.contains(handle)) {
+                throw new IllegalArgumentException(
+                        "requestable object is outside request authority");
+            }
+        }
+        this.requestedContent.clear();
+        this.coverageQueue.clear();
+        this.currentViewQueue.clear();
+        this.predictedQueue.clear();
         for (int index = 0; index < desired.count; index++) {
             int handle = desired.handles[index];
             Hash256 hash = validatedMicrotileHandle(handle);
             ContentPriority priority = primitivePriority(desired.priorities[index]);
-            ContentPriority previous = this.requestedContent.put(hash, priority);
-            if (!this.processedObjects.contains(hash)
-                    && (previous != priority || !queuedAt(hash, priority))) {
-                refreshContentPriority(hash);
+            this.requestedContent.put(hash, priority);
+            if (requestable.contains(handle) && !this.processedObjects.contains(hash)
+                    && !this.objectInFlight.contains(hash)) {
+                queueContent(hash, priority, false);
             }
         }
     }
@@ -1496,14 +1533,20 @@ public final class RootDemandPlan {
         ContentPriority requested = this.requestedContent.get(hash);
         removeFromContentQueues(hash);
         if (requested == null) return;
+        queueContent(hash, requested, false);
+    }
+
+    private void queueContent(Hash256 hash, ContentPriority requested, boolean first) {
         int priority = requested.queuePriority;
+        LinkedHashSet<Hash256> queue;
         if (priority >= ContentPriority.COVERAGE.queuePriority) {
-            this.coverageQueue.add(hash);
+            queue = this.coverageQueue;
         } else if (priority >= ContentPriority.CURRENT_VIEW.queuePriority) {
-            this.currentViewQueue.add(hash);
+            queue = this.currentViewQueue;
         } else {
-            this.predictedQueue.add(hash);
+            queue = this.predictedQueue;
         }
+        if (first) queue.addFirst(hash); else queue.addLast(hash);
     }
 
     private boolean queuedAt(Hash256 hash, ContentPriority priority) {

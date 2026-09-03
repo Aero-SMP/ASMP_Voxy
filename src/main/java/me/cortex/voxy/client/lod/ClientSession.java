@@ -79,8 +79,13 @@ final class ClientSession {
     private static final int MAX_COVERAGE_OBJECT_STREAMS = 4;
     private static final int MAX_CURRENT_OBJECT_STREAMS = 3;
     private static final int MAX_PREDICTED_OBJECT_STREAMS = 1;
-    private static final int MAX_OBJECT_STREAM_FAILURE_RETRIES = 3;
     private static final int MAX_MICROTILE_REQUEST_BATCH = WireMessage.MAX_REQUEST_ENTRIES;
+    /** Rolling score-ordered window, not a safety ceiling; eight full current-view stream waves. */
+    private static final int CURRENT_REQUEST_WINDOW_OBJECTS =
+            MAX_CURRENT_OBJECT_STREAMS * MAX_MICROTILE_REQUEST_BATCH * 8;
+    private static final int PREDICTED_REQUEST_WINDOW_OBJECTS =
+            MAX_PREDICTED_OBJECT_STREAMS * MAX_MICROTILE_REQUEST_BATCH * 2;
+    private static final int MAX_OBJECT_STREAM_FAILURE_RETRIES = 3;
     private static final long CAMERA_DOMAIN_QUERY_INTERVAL_NANOS =
             TimeUnit.MILLISECONDS.toNanos(100);
     private static final long CAMERA_DOMAIN_QUERY_TIMEOUT_NANOS =
@@ -592,6 +597,7 @@ final class ClientSession {
         private final CutTable coverageCuts = new CutTable();
         private final HandlePriorities selectedContentScratch = new HandlePriorities();
         private final HandlePriorities requestedContentScratch = new HandlePriorities();
+        private final HandlePriorities requestableContentScratch = new HandlePriorities();
         private final HandlePriorities selectedNeighborScratch = new HandlePriorities();
         private final NodeKeys nodeKeyScratch = new NodeKeys();
         private final Map<SpatialNode, Long> lastRelevantSelectionEpoch = new HashMap<>();
@@ -1530,16 +1536,13 @@ final class ClientSession {
             if (this.plan == null) return;
             for (ActiveRequest request : List.copyOf(this.activeRequests)) {
                 if (!isCurrent(request.root) || request.networkFinished()) continue;
-                List<Hash256> remaining = request.remainingNetwork();
-                if (remaining.isEmpty()) continue;
-                boolean required = false;
-                for (Hash256 hash : remaining) {
-                    if (this.plan.inFlightResponseRelevant(hash, request.subtree)) {
-                        required = true;
-                        break;
-                    }
+                // The server emits a request in hash order. Preserve useful work already at the
+                // head, then cancel as soon as obsolete work becomes the next disk/network item.
+                Hash256 next = request.firstRemainingNetwork();
+                if (next != null
+                        && !this.plan.inFlightResponseRelevant(next, request.subtree)) {
+                    cancelRequest(request, true);
                 }
-                if (!required) cancelRequest(request, true);
             }
         }
 
@@ -1718,6 +1721,8 @@ final class ClientSession {
             int objectCapacity = this.plan.objectHandleCount();
             HandlePriorities selectedContent = this.selectedContentScratch.begin(objectCapacity);
             HandlePriorities requestedContent = this.requestedContentScratch.begin(objectCapacity);
+            HandlePriorities requestableContent =
+                    this.requestableContentScratch.begin(objectCapacity);
             HandlePriorities selectedNeighbors = this.selectedNeighborScratch.begin(objectCapacity);
             boolean newHandleNamespace = this.cutPlanRevision != manifestRevision;
             if (newHandleNamespace && this.completeFrontier) invalidateSelectionAuthority();
@@ -1755,8 +1760,17 @@ final class ClientSession {
                         renderableSegment, row);
             }
             SelectionBatch.Segment requestSegment = SelectionBatch.Segment.REQUESTS;
+            int currentRequestable = 0;
+            int predictedRequestable = 0;
             for (int row = 0; row < selection.count(requestSegment); row++) {
-                if (selection.priority(requestSegment, row) != SelectionBatch.Priority.PREDICTED) {
+                SelectionBatch.Priority requestPriority =
+                        selection.priority(requestSegment, row);
+                boolean admitted = switch (requestPriority) {
+                    case COVERAGE -> true;
+                    case CURRENT_VIEW -> currentRequestable < CURRENT_REQUEST_WINDOW_OBJECTS;
+                    case PREDICTED -> predictedRequestable < PREDICTED_REQUEST_WINDOW_OBJECTS;
+                };
+                if (admitted && requestPriority != SelectionBatch.Priority.PREDICTED) {
                     nodeKeys.add(selection.nodeHandle(requestSegment, row),
                             selection.sectionKey(requestSegment, row));
                     mergeCut(this.activationCuts, selection, requestSegment, row);
@@ -1765,19 +1779,38 @@ final class ClientSession {
                                 selection.sectionKey(requestSegment, row));
                     }
                 }
-                if (selection.priority(requestSegment, row) == SelectionBatch.Priority.COVERAGE) {
+                if (requestPriority == SelectionBatch.Priority.COVERAGE) {
                     this.coverageCuts.add(selection.nodeHandle(requestSegment, row),
                             selection.sectionKey(requestSegment, row));
                 }
+                if (!admitted) continue;
+                // Preserve the whole incomplete activation group. Resident and in-flight
+                // members keep useful transfers authorized while missing members stay adjacent
+                // in the GPU's lane/score order.
+                int requestableBefore = requestableContent.count;
                 collectHandles(requestedContent, this.plan,
+                        selection, requestSegment, row, false);
+                // The missing-only request set includes selected complex-neighbour objects.
+                // Keep their resident/in-flight counterparts in the same request authority so
+                // a complete frontier cannot revoke a useful partially completed group.
+                collectSelectedNeighborHandles(requestedContent, this.plan,
+                        selection, requestSegment, row);
+                collectHandles(requestableContent, this.plan,
                         selection, requestSegment, row, true);
                 collectSelectedNeighborHandles(selectedNeighbors, this.plan,
                         selection, requestSegment, row);
+                int added = requestableContent.count - requestableBefore;
+                if (requestPriority == SelectionBatch.Priority.CURRENT_VIEW) {
+                    currentRequestable += added;
+                } else if (requestPriority == SelectionBatch.Priority.PREDICTED) {
+                    predictedRequestable += added;
+                }
             }
             // Coverage requests are emitted first and must get the first activation slots.
-            // Resident fine-detail selections follow only after their hierarchy prerequisites.
-            for (int row = 0; row < selection.count(desiredSegment); row++) {
-                mergeCut(this.activationCuts, selection, desiredSegment, row);
+            // Only fully renderable fallback/detail rows follow; incomplete fine rows enter via
+            // the rolling request window instead of making every owner pass scan the whole view.
+            for (int row = 0; row < selection.count(renderableSegment); row++) {
+                mergeCut(this.activationCuts, selection, renderableSegment, row);
             }
 
             if (selection.permitsCancellation()) {
@@ -1788,15 +1821,19 @@ final class ClientSession {
                 this.plan.reconcileSelectedNeighborContent(selectedNeighbors.handles,
                         selectedNeighbors.priorities, selectedNeighbors.count);
                 this.plan.reconcileContentRequests(requestedContent.handles,
-                        requestedContent.priorities, requestedContent.count);
+                        requestedContent.priorities, requestedContent.count,
+                        requestableContent.handles, requestableContent.priorities,
+                        requestableContent.count);
                 this.plan.reconcileDemand(nodeKeys.keys, nodeKeys.count);
             } else {
                 this.plan.retainSelectedContent(selectedContent.handles,
                         selectedContent.priorities, selectedContent.count);
                 this.plan.retainSelectedNeighborContent(selectedNeighbors.handles,
                         selectedNeighbors.priorities, selectedNeighbors.count);
-                this.plan.requestObjectsByHandle(requestedContent.handles,
+                this.plan.retainContentRequests(requestedContent.handles,
                         requestedContent.priorities, requestedContent.count);
+                this.plan.requestObjectsByHandle(requestableContent.handles,
+                        requestableContent.priorities, requestableContent.count);
                 for (int index = 0; index < nodeKeys.count; index++) {
                     this.plan.addContentDemand(nodeKeys.keys[index]);
                 }
@@ -2613,6 +2650,10 @@ final class ClientSession {
 
             private synchronized List<Hash256> remainingNetwork() {
                 return List.copyOf(this.pendingNetwork);
+            }
+
+            private synchronized Hash256 firstRemainingNetwork() {
+                return this.pendingNetwork.isEmpty() ? null : this.pendingNetwork.getFirst();
             }
 
             private synchronized boolean networkFinished() {
