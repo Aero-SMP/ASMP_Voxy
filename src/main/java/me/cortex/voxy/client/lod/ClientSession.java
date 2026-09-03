@@ -73,6 +73,7 @@ final class ClientSession {
     private static final long ESTIMATED_CONTENT_REQUEST_BYTES = 8L << 10;
     private static final long ESTIMATED_SUBTREE_REQUEST_BYTES = 64L << 10;
     private static final int MAX_ACTIVE_OBJECT_STREAMS = 8;
+    private static final int MAX_DECODER_JOBS = MAX_ACTIVE_OBJECT_STREAMS;
     private static final int MAX_COVERAGE_OBJECT_STREAMS = 4;
     private static final int MAX_CURRENT_OBJECT_STREAMS = 3;
     private static final int MAX_PREDICTED_OBJECT_STREAMS = 1;
@@ -540,7 +541,7 @@ final class ClientSession {
         private final ExecutorService mesherWorker;
         private final ExecutorService cacheReadWorker;
         private final ExecutorService cacheWriteWorker;
-        private final AtomicReference<Thread> decoderThread = new AtomicReference<>();
+        private final Set<Thread> decoderThreads = ConcurrentHashMap.newKeySet();
         private final Set<Thread> mesherThreads = ConcurrentHashMap.newKeySet();
         private final ObjectDecoder decoder;
         private final ArrayBlockingQueue<StateEvent> state = new ArrayBlockingQueue<>(1024);
@@ -647,10 +648,10 @@ final class ClientSession {
             ObjectDecoder openedDecoder = null;
             try {
                 openedQuic = QuicEndpointDiscovery.connect();
-                openedDecoderWorker = Executors.newSingleThreadExecutor(task -> {
+                openedDecoderWorker = Executors.newFixedThreadPool(MAX_DECODER_JOBS, task -> {
                     Thread thread = new Thread(task, "Voxy object decoder");
                     thread.setDaemon(true);
-                    this.decoderThread.set(thread);
+                    this.decoderThreads.add(thread);
                     return thread;
                 });
                 openedMesherWorker = Executors.newFixedThreadPool(MAX_MESHING_JOBS, task -> {
@@ -2731,8 +2732,8 @@ final class ClientSession {
             }
 
             Thread current = Thread.currentThread();
-            boolean worker = current == this.decoderThread.get()
-                    || this.mesherThreads.contains(current);
+            boolean decoderWorker = this.decoderThreads.contains(current);
+            boolean worker = decoderWorker || this.mesherThreads.contains(current);
             long shutdownDeadline = System.nanoTime() + SHUTDOWN_TIMEOUT_NANOS;
             if (!worker) {
                 awaitTermination(this.decoderWorker, shutdownDeadline, "object decoder");
@@ -2740,8 +2741,7 @@ final class ClientSession {
                 awaitTermination(this.cacheReadWorker, shutdownDeadline, "cache reader");
                 awaitTermination(this.cacheWriteWorker, shutdownDeadline, "cache writer");
             } else if (initiator) {
-                ExecutorService other = current == this.decoderThread.get()
-                        ? this.mesherWorker : this.decoderWorker;
+                ExecutorService other = decoderWorker ? this.mesherWorker : this.decoderWorker;
                 awaitTermination(other, shutdownDeadline, "other Voxy worker");
                 awaitTermination(this.cacheReadWorker, shutdownDeadline, "cache reader");
                 awaitTermination(this.cacheWriteWorker, shutdownDeadline, "cache writer");
