@@ -40,6 +40,9 @@ const MAX_ACTIVE_DISK_TURNS: usize = 16;
 const MAX_ACTIVE_NETWORK_TURNS: usize = 16;
 const MAX_ACTIVE_NETWORK_TURNS_PER_SESSION: usize = 2;
 const NETWORK_WRITE_SLICE: Duration = Duration::from_millis(5);
+// Publication can continue at full speed, but replacing a client's immutable root more often
+// than it can make the root useful only discards selection, request, and residency progress.
+const MIN_ROOT_ANNOUNCEMENT_INTERVAL: Duration = Duration::from_secs(5);
 // One scheduler turn and blocking-task handoff can cover several small forward-adjacent objects.
 // Eight client streams therefore retain a strict 2 MiB aggregate read-buffer bound while disk
 // fairness is revisited at least every 256 KiB.
@@ -188,6 +191,37 @@ struct PublisherWorker {
     repairs: mpsc::Receiver<()>,
 }
 
+struct AnnouncementGate {
+    last: Option<Instant>,
+}
+
+impl AnnouncementGate {
+    fn new(has_announced_root: bool, now: Instant) -> Self {
+        Self {
+            last: has_announced_root.then_some(now),
+        }
+    }
+
+    fn permits(
+        &self,
+        has_announced_root: bool,
+        more_work_pending: bool,
+        force: bool,
+        now: Instant,
+    ) -> bool {
+        force
+            || !has_announced_root
+            || !more_work_pending
+            || self.last.is_none_or(|last| {
+                now.saturating_duration_since(last) >= MIN_ROOT_ANNOUNCEMENT_INTERVAL
+            })
+    }
+
+    fn record(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+}
+
 /// All dimension surfaces, publication workers, root leases, and cross-client I/O scheduling.
 pub struct Service {
     registry: Arc<RwLock<Registry>>,
@@ -300,6 +334,8 @@ impl Service {
 
     async fn publisher_loop(self: Arc<Self>, mut worker: PublisherWorker) -> Result<()> {
         let mut repair_pending = false;
+        let mut announcement_gate =
+            AnnouncementGate::new(worker.surface.current()?.is_some(), Instant::now());
         loop {
             let surface = worker.surface.surface.clone();
             let registry = self.registry.clone();
@@ -316,7 +352,13 @@ impl Service {
                 Ok(Ok(pending)) => {
                     repair_pending = false;
                     if let Some(root) = worker.surface.surface.current_root()? {
-                        self.announce(&worker.surface, root, repairing)?;
+                        let now = Instant::now();
+                        let has_announced_root = worker.surface.current()?.is_some();
+                        if announcement_gate.permits(has_announced_root, pending, repairing, now)
+                            && self.announce(&worker.surface, root, repairing)?
+                        {
+                            announcement_gate.record(now);
+                        }
                     }
                     if pending {
                         continue;
@@ -343,14 +385,20 @@ impl Service {
         }
     }
 
-    fn announce(&self, surface: &Arc<SurfaceService>, root: RootRecord, force: bool) -> Result<()> {
+    fn announce(
+        &self,
+        surface: &Arc<SurfaceService>,
+        root: RootRecord,
+        force: bool,
+    ) -> Result<bool> {
         if surface.publish(root)? || force {
             let _ = self.announcements.send(Announcement {
                 dimension: surface.dimension.clone(),
                 root,
             });
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn root_snapshot_for(&self, dimension: &str) -> Result<Option<Announcement>> {
