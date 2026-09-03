@@ -25,8 +25,8 @@ public final class SelectionManifestBuilder {
     private static final long CANONICAL_BYTES_PER_MICROTILE = 8L << 10;
     private static final long GEOMETRY_BYTES_PER_MICROTILE = 24L << 10;
     private static final int POOL_SIZE = 4;
-    private static final ContentLayout EMPTY_CONTENT = new ContentLayout(0, new int[0],
-            new int[0], new int[0], new int[0], 0, 0, 0, 0, 0, 0);
+    private static final ContentLayout EMPTY_CONTENT = new ContentLayout(
+            0, 0, 0, new int[0], 0, 0, 0, 0, 0, 0);
 
     private final SelectionManifest.Pool pool = new SelectionManifest.Pool(POOL_SIZE);
     private final long[] renderableScratch = new long[3];
@@ -157,26 +157,22 @@ public final class SelectionManifestBuilder {
                     layouts[content] = EMPTY_CONTENT;
                     continue;
                 }
-                int[] objects = new int[source.objects().size()];
-                for (int index = 0; index < objects.length; index++) {
-                    objects[index] = plan.selectionObjectHandle(source.objects().get(index).hash());
-                }
-                int[] dependencies = handles(plan, source.dependencies());
-                int[] neighbors = new int[source.neighborDependencies().size()];
-                int[] neighborSources = new int[neighbors.length];
-                for (int index = 0; index < neighbors.length; index++) {
+                int[] neighborSources = new int[source.neighborDependencies().size()];
+                for (int index = 0; index < neighborSources.length; index++) {
                     NeighborDependency dependency = source.neighborDependencies().get(index);
-                    neighbors[index] = plan.selectionObjectHandle(dependency.hash());
                     neighborSources[index] = dependency.sourceMicrotileIndex();
                 }
                 long count = Long.bitCount(source.microtileMask());
-                layouts[content] = new ContentLayout(source.microtileMask(), objects,
-                        dependencies, neighbors, neighborSources, dependencyOffset,
+                layouts[content] = new ContentLayout(source.microtileMask(),
+                        source.objects().size(), source.dependencies().size(), neighborSources,
+                        dependencyOffset,
                         neighborOffset, source.boundarySummary().faceMask(),
                         count * CANONICAL_BYTES_PER_MICROTILE,
                         count * GEOMETRY_BYTES_PER_MICROTILE, 2_000);
-                dependencyOffset = Math.addExact(dependencyOffset, dependencies.length);
-                neighborOffset = Math.addExact(neighborOffset, neighbors.length);
+                dependencyOffset = Math.addExact(
+                        dependencyOffset, source.dependencies().size());
+                neighborOffset = Math.addExact(
+                        neighborOffset, source.neighborDependencies().size());
             }
             nodes[handle] = new Node(handle, RootDemandPlan.sectionKey(spatial), parent,
                     structural.childMask(), children, bounds, structural.geometricErrorQ16(),
@@ -231,14 +227,6 @@ public final class SelectionManifestBuilder {
             result[child] = plan.selectionHandle(new SpatialNode(node.lod() - 1,
                     node.x() * 2 + (child & 1), node.y() * 2 + (child >>> 1 & 1),
                     node.z() * 2 + (child >>> 2 & 1)));
-        }
-        return result;
-    }
-
-    private static int[] handles(RootDemandPlan plan, java.util.List<Hash256> hashes) {
-        int[] result = new int[hashes.size()];
-        for (int index = 0; index < result.length; index++) {
-            result[index] = plan.selectionObjectHandle(hashes.get(index));
         }
         return result;
     }

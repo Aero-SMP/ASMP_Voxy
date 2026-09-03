@@ -125,9 +125,6 @@ public final class SelectionBatch implements AutoCloseable {
     int[] groupTail = EMPTY_INTS;
     int[] groupOrder = EMPTY_INTS;
     int groupingEpoch;
-    int[] costEpoch = EMPTY_INTS;
-    long[] costValues = EMPTY_LONGS;
-    int costingEpoch;
 
     private SelectionBatch(Pool owner) { this.owner = owner; }
 
@@ -164,8 +161,7 @@ public final class SelectionBatch implements AutoCloseable {
         int outputs = grow(this.outputNodeIndexes.length, outputCapacity);
         int candidates = grow(this.candidateNodeIndexesA.length, inputCapacity);
         int nodes = grow(this.groupEpoch.length, manifest.nodeHandleCapacity());
-        int objects = grow(this.costEpoch.length, manifest.objectHandleCapacity());
-        long requiredBytes = storageBytes(inputs, outputs, candidates, nodes, objects);
+        long requiredBytes = storageBytes(inputs, outputs, candidates, nodes);
         this.accountedBytes = requiredBytes;
 
         if (inputs != this.inputNodeIndexes.length) {
@@ -196,11 +192,6 @@ public final class SelectionBatch implements AutoCloseable {
             this.groupHead = new int[nodes];
             this.groupTail = new int[nodes];
             this.groupingEpoch = 0;
-        }
-        if (objects != this.costEpoch.length) {
-            this.costEpoch = new int[objects];
-            this.costValues = new long[objects];
-            this.costingEpoch = 0;
         }
         this.manifest = manifest.retain();
         this.released = false;
@@ -354,15 +345,12 @@ public final class SelectionBatch implements AutoCloseable {
         this.groupHead = EMPTY_INTS;
         this.groupTail = EMPTY_INTS;
         this.groupOrder = EMPTY_INTS;
-        this.costEpoch = EMPTY_INTS;
-        this.costValues = EMPTY_LONGS;
         this.groupingEpoch = 0;
-        this.costingEpoch = 0;
         this.accountedBytes = 0;
     }
 
     private static long storageBytes(int inputs, int outputs, int candidates,
-                                     int nodes, int objects) {
+                                     int nodes) {
         long bytes = 192;
         bytes = Math.addExact(bytes, arrayBytes(3, Integer.BYTES) * 2);
         bytes = Math.addExact(bytes, arrayBytes(2, Integer.BYTES) * 2);
@@ -379,8 +367,7 @@ public final class SelectionBatch implements AutoCloseable {
         bytes = Math.addExact(bytes,
                 arrayBytes(Math.multiplyExact(candidates, 3), Long.BYTES) * 2);
         bytes = Math.addExact(bytes, arrayBytes(nodes, Integer.BYTES) * 3);
-        bytes = Math.addExact(bytes, arrayBytes(objects, Integer.BYTES));
-        return Math.addExact(bytes, arrayBytes(objects, Long.BYTES));
+        return bytes;
     }
 
     private static long arrayBytes(int elements, int width) {

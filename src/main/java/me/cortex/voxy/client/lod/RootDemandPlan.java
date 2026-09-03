@@ -45,7 +45,8 @@ public final class RootDemandPlan {
     /** Protocol cardinality limits for one immutable root. */
     public record Limits(int maxObjects, int maxNodes) {
         public Limits {
-            if (maxObjects < 1 || maxNodes < 1 || maxNodes > MAX_STRUCTURAL_NODES) {
+            if (maxObjects < 1 || maxObjects > ManifestCodec.MAX_OBJECT_REFERENCES
+                    || maxNodes < 1 || maxNodes > MAX_STRUCTURAL_NODES) {
                 throw new IllegalArgumentException("invalid root-demand table limits");
             }
         }
@@ -288,7 +289,6 @@ public final class RootDemandPlan {
     private final Map<Hash256, LinkedHashSet<Long>> bindingsByObject = new HashMap<>();
     private final Map<Long, Optional<Binding>> resolutions = new LinkedHashMap<>();
     private boolean metadataCapacityBlocked;
-    private boolean contentCapacityBlocked;
     private volatile long manifestRevision;
     /** Changes only when the selector's immutable node/object namespace changes. */
     private volatile long selectionTopologyRevision;
@@ -391,7 +391,7 @@ public final class RootDemandPlan {
                 this.expectedObjects.size(), this.processedObjects.size(),
                 this.coverageQueue.size(), this.currentViewQueue.size(),
                 this.predictedQueue.size(), this.objectInFlight.size(),
-                this.metadataCapacityBlocked || this.contentCapacityBlocked, complete, coverage,
+                this.metadataCapacityBlocked, complete, coverage,
                 availableWindowRoots, pendingWindowRoots, absentWindowRoots,
                 sampleAbsentWindowRoot,
                 minX, maxX, minY, maxY, minZ, maxZ);
@@ -983,9 +983,9 @@ public final class RootDemandPlan {
      */
     private void resolveAvailableDemands() {
         boolean discoveryComplete = discoveryComplete();
-        this.contentCapacityBlocked = false;
-        // Resolve coarse coverage before fine detail so a full handle table degrades detail
-        // instead of withholding the hierarchy required for a first draw.
+        // Resolve coarse coverage before fine detail so the first useful selector snapshot has
+        // the hierarchy required for a draw. Descriptor resolution itself grants no object
+        // capability; exact GPU-selected hashes are registered at the selection handoff.
         for (int lod = ManifestCodec.MAX_LOD; lod >= 0; lod--) {
             for (int demandIndex = 0; demandIndex < this.demanded.size(); demandIndex++) {
                 long key = this.demanded.valueAt(demandIndex);
@@ -994,47 +994,7 @@ public final class RootDemandPlan {
                 if (!discoveryComplete && !resolutionAvailable(key)) continue;
                 requireNodeCapacity((long) this.resolutions.size() + 1, "resolved demand");
                 Optional<Binding> binding = resolve(key);
-                LinkedHashMap<Hash256, ExpectedObject> additions = new LinkedHashMap<>();
-                binding.ifPresent(value -> {
-                    for (ContentLayer layer : value.layers()) {
-                        ExpectedObject expected = new ExpectedObject(
-                                MicrotileCodec.objectKind(layer.contentClass()));
-                        for (ContentObject object : layer.objects()) {
-                            validateManifestReference(object.hash(), expected, additions);
-                        }
-                        for (Hash256 dependency : layer.dependencies()) {
-                            validateManifestReference(dependency, expected, additions);
-                        }
-                        ExpectedObject complex = new ExpectedObject(
-                                ObjectKind.COMPLEX_MICROTILE);
-                        for (NeighborDependency dependency : layer.neighborDependencies()) {
-                            validateManifestReference(dependency.hash(), complex, additions);
-                        }
-                    }
-                });
-                // A renderer cut may legitimately reference more distinct immutable objects than
-                // fit in one bounded GPU handle namespace. Keep the unresolved tail as
-                // backpressure; a later, smaller cut will free bindings and retry it here.
-                if (!hasObjectCapacity((long) this.expectedObjects.size() + additions.size())) {
-                    this.contentCapacityBlocked = true;
-                    continue;
-                }
                 this.resolutions.put(key, binding);
-                binding.ifPresent(value -> {
-                    for (ContentLayer layer : value.layers()) {
-                        ObjectKind kind = MicrotileCodec.objectKind(layer.contentClass());
-                        for (ContentObject object : layer.objects()) {
-                            bindExpectedObject(key, object.hash(), kind);
-                        }
-                        for (Hash256 dependency : layer.dependencies()) {
-                            bindExpectedObject(key, dependency, kind);
-                        }
-                        for (NeighborDependency dependency : layer.neighborDependencies()) {
-                            bindExpectedObject(key, dependency.hash(),
-                                    ObjectKind.COMPLEX_MICROTILE);
-                        }
-                    }
-                });
                 // Descriptor visibility changes the immutable renderer manifest even when every
                 // referenced object was already registered by another selected node.
                 this.manifestRevision++;
@@ -1060,9 +1020,13 @@ public final class RootDemandPlan {
         return false;
     }
 
-    private void bindExpectedObject(long key, Hash256 hash, ObjectKind kind) {
-        this.bindingsByObject.computeIfAbsent(hash, ignored -> new LinkedHashSet<>()).add(key);
+    /** Grants one exact GPU-selected object capability and associates its decoded consumers. */
+    void registerSelectedObject(long key, Hash256 hash, ObjectKind kind) {
+        if (!this.resolutions.containsKey(key)) {
+            throw new IllegalArgumentException("selected object belongs to an unresolved node");
+        }
         registerExpectedObject(hash, kind, false);
+        this.bindingsByObject.computeIfAbsent(hash, ignored -> new LinkedHashSet<>()).add(key);
     }
 
     /** Returns only the section keys made installable by this object, avoiding O(N) rescans. */
@@ -1381,8 +1345,8 @@ public final class RootDemandPlan {
     private boolean tryInstallDescriptorPage(Hash256 hash, DescriptorPage page) {
         if (this.descriptorPages.containsKey(hash)) return true;
         // Validate the immutable page at its trust boundary, but do not widen live demand to
-        // every object referenced by all 64 descriptor slots.  Only bindings selected by the
-        // renderer are registered below in resolveAvailableDemands().
+        // every object referenced by all 64 descriptor slots. Only exact hashes selected by the
+        // renderer are registered later at the selection handoff.
         LinkedHashMap<Hash256, ExpectedObject> additions = new LinkedHashMap<>();
         for (int localSlot = 0; localSlot < page.slotCount(); localSlot++) {
             for (Map.Entry<ContentClass, ContentDescriptor> content
@@ -1461,6 +1425,10 @@ public final class RootDemandPlan {
         this.objectHandles.put(hash, this.objectHandles.size());
         this.objectsByHandle.add(hash);
         this.manifestRevision++;
+        // The immutable selector topology records the exact capability namespace bound to this
+        // plan revision. A newly granted handle must therefore invalidate the cached topology;
+        // the protocol ceiling remains enforced by requireObjectCapacity above.
+        this.selectionTopologyRevision++;
         if (enqueue) enqueueExpectedObject(hash);
     }
 
@@ -1628,26 +1596,8 @@ public final class RootDemandPlan {
                 putExpected(retained, entry.getKey(), entry.getValue());
             }
         }
-        // Descriptor pages describe capabilities; resolved renderer demand owns the live
-        // object namespace.  Retaining every object in every resident page recreates the same
-        // capacity leak during pruning.
-        for (Optional<Binding> resolution : this.resolutions.values()) {
-            if (resolution.isEmpty()) continue;
-            for (ContentLayer layer : resolution.orElseThrow().layers()) {
-                ExpectedObject expected = new ExpectedObject(
-                        MicrotileCodec.objectKind(layer.contentClass()));
-                for (ContentObject object : layer.objects()) {
-                    putExpected(retained, object.hash(), expected);
-                }
-                for (Hash256 hash : layer.dependencies()) {
-                    putExpected(retained, hash, expected);
-                }
-                for (NeighborDependency dependency : layer.neighborDependencies()) {
-                    putExpected(retained, dependency.hash(), new ExpectedObject(
-                            ObjectKind.COMPLEX_MICROTILE));
-                }
-            }
-        }
+        // A resolved descriptor is topology, not request authority. Retain only hashes selected,
+        // requested, or already in flight; the next GPU handoff can grant a newly visible hash.
         for (Hash256 hash : this.requestedContent.keySet()) {
             ExpectedObject expected = this.expectedObjects.get(hash);
             if (expected != null) putExpected(retained, hash, expected);

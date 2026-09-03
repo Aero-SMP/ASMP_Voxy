@@ -88,12 +88,9 @@ public final class SelectionManifest implements AutoCloseable {
                     throw new IllegalArgumentException("selection node handle exceeds its bound");
                 }
                 maximumHandle = Math.max(maximumHandle, node.handle);
-                validateContent(node.exterior, objectHandleCapacity,
-                        dependencyStates, neighborStates);
-                validateContent(node.interior, objectHandleCapacity,
-                        dependencyStates, neighborStates);
-                validateContent(node.complex, objectHandleCapacity,
-                        dependencyStates, neighborStates);
+                validateContent(node.exterior, dependencyStates, neighborStates);
+                validateContent(node.interior, dependencyStates, neighborStates);
+                validateContent(node.complex, dependencyStates, neighborStates);
             }
             this.nodeIndexByHandle = new int[maximumHandle + 1];
             Arrays.fill(this.nodeIndexByHandle, NO_HANDLE);
@@ -141,27 +138,21 @@ public final class SelectionManifest implements AutoCloseable {
             return index == NO_HANDLE ? null : this.nodes[index];
         }
 
-        private static void validateContent(ContentLayout content, int objectCapacity,
+        private static void validateContent(ContentLayout content,
                                             int dependencyStates, int neighborStates) {
             Objects.requireNonNull(content, "content");
-            if (content.objectHandles.length != Long.bitCount(content.declaredMask)
-                    || content.dependencyHandles.length > MAX_DEPENDENCIES_PER_CONTENT
-                    || content.neighborDependencyHandles.length > MAX_DEPENDENCIES_PER_CONTENT
-                    || content.neighborDependencyHandles.length
-                    != content.neighborDependencySources.length
+            if (content.objectCount != Long.bitCount(content.declaredMask)
+                    || content.dependencyCount > MAX_DEPENDENCIES_PER_CONTENT
+                    || content.neighborDependencySources.length > MAX_DEPENDENCIES_PER_CONTENT
                     || content.dependencyStateOffset < 0
-                    || content.dependencyStateOffset + content.dependencyHandles.length
+                    || content.dependencyStateOffset + content.dependencyCount
                     > dependencyStates
                     || content.neighborStateOffset < 0
-                    || content.neighborStateOffset + content.neighborDependencyHandles.length
+                    || content.neighborStateOffset + content.neighborDependencySources.length
                     > neighborStates) {
                 throw new IllegalArgumentException("invalid selection content layout");
             }
-            for (int handle : content.objectHandles) validateObjectHandle(handle, objectCapacity);
-            for (int handle : content.dependencyHandles) validateObjectHandle(handle, objectCapacity);
-            for (int index = 0; index < content.neighborDependencyHandles.length; index++) {
-                validateObjectHandle(content.neighborDependencyHandles[index], objectCapacity);
-                int source = content.neighborDependencySources[index];
+            for (int source : content.neighborDependencySources) {
                 if (source < 0 || source >= MICROTILE_COUNT
                         || (content.declaredMask & 1L << source) == 0) {
                     throw new IllegalArgumentException("invalid neighbor dependency source");
@@ -169,17 +160,10 @@ public final class SelectionManifest implements AutoCloseable {
             }
         }
 
-        private static void validateObjectHandle(int handle, int capacity) {
-            if (handle < 0 || handle >= capacity) {
-                throw new IllegalArgumentException("object handle is outside topology");
-            }
-        }
-
         public int nodeCount() { return this.nodes.length; }
         public Node nodeAt(int index) { return this.nodes[index]; }
         public int nodeHandleCapacity() { return this.nodeIndexByHandle.length; }
         public int objectHandleCapacity() { return this.objectHandleCapacity; }
-
         public int indexForHandle(int handle) {
             return handle < 0 || handle >= this.nodeIndexByHandle.length
                     ? NO_HANDLE : this.nodeIndexByHandle[handle];
@@ -202,9 +186,8 @@ public final class SelectionManifest implements AutoCloseable {
     /** Immutable object/dependency layout for one node content class. */
     public static final class ContentLayout {
         private final long declaredMask;
-        private final int[] objectHandles;
-        private final int[] dependencyHandles;
-        private final int[] neighborDependencyHandles;
+        private final int objectCount;
+        private final int dependencyCount;
         private final int[] neighborDependencySources;
         private final int dependencyStateOffset;
         private final int neighborStateOffset;
@@ -213,18 +196,14 @@ public final class SelectionManifest implements AutoCloseable {
         private final long estimatedGeometryBytes;
         private final long estimatedCompletionMicros;
 
-        public ContentLayout(long declaredMask, int[] objectHandles,
-                             int[] dependencyHandles, int[] neighborDependencyHandles,
+        public ContentLayout(long declaredMask, int objectCount, int dependencyCount,
                              int[] neighborDependencySources, int dependencyStateOffset,
                              int neighborStateOffset, int boundaryFaceMask,
                              long estimatedCanonicalBytes, long estimatedGeometryBytes,
                              long estimatedCompletionMicros) {
             this.declaredMask = declaredMask;
-            this.objectHandles = Objects.requireNonNull(objectHandles, "object handles");
-            this.dependencyHandles = Objects.requireNonNull(dependencyHandles,
-                    "dependency handles");
-            this.neighborDependencyHandles = Objects.requireNonNull(neighborDependencyHandles,
-                    "neighbor handles");
+            this.objectCount = objectCount;
+            this.dependencyCount = dependencyCount;
             this.neighborDependencySources = Objects.requireNonNull(neighborDependencySources,
                     "neighbor sources");
             this.dependencyStateOffset = dependencyStateOffset;
@@ -233,19 +212,18 @@ public final class SelectionManifest implements AutoCloseable {
             this.estimatedCanonicalBytes = estimatedCanonicalBytes;
             this.estimatedGeometryBytes = estimatedGeometryBytes;
             this.estimatedCompletionMicros = estimatedCompletionMicros;
-            if ((boundaryFaceMask & ~0x3f) != 0 || estimatedCanonicalBytes < 0
+            if (objectCount < 0 || dependencyCount < 0
+                    || (boundaryFaceMask & ~0x3f) != 0 || estimatedCanonicalBytes < 0
                     || estimatedGeometryBytes < 0 || estimatedCompletionMicros < 0) {
                 throw new IllegalArgumentException("invalid content layout metadata");
             }
         }
 
         public long declaredMask() { return this.declaredMask; }
-        public int[] objectHandlesInternal() { return this.objectHandles; }
-        public int[] dependencyHandlesInternal() { return this.dependencyHandles; }
-        public int[] neighborDependencyHandlesInternal() { return this.neighborDependencyHandles; }
         public int[] neighborDependencySourcesInternal() { return this.neighborDependencySources; }
-        public int dependencyCount() { return this.dependencyHandles.length; }
-        public int neighborDependencyCount() { return this.neighborDependencyHandles.length; }
+        public int objectCount() { return this.objectCount; }
+        public int dependencyCount() { return this.dependencyCount; }
+        public int neighborDependencyCount() { return this.neighborDependencySources.length; }
         public int boundaryFaceMask() { return this.boundaryFaceMask; }
         public long estimatedCanonicalBytes() { return this.estimatedCanonicalBytes; }
         public long estimatedGeometryBytes() { return this.estimatedGeometryBytes; }
@@ -404,7 +382,7 @@ public final class SelectionManifest implements AutoCloseable {
                                    boolean resident, boolean inFlight) {
         ensureWritable();
         ContentLayout layout = contentLayout(nodeIndex, contentClass);
-        if (index < 0 || index >= layout.dependencyHandles.length) {
+        if (index < 0 || index >= layout.dependencyCount) {
             throw new IndexOutOfBoundsException(index);
         }
         this.storage.dependencies[layout.dependencyStateOffset + index] = state(resident, inFlight);
@@ -414,7 +392,7 @@ public final class SelectionManifest implements AutoCloseable {
                                  boolean resident, boolean inFlight) {
         ensureWritable();
         ContentLayout layout = contentLayout(nodeIndex, contentClass);
-        if (index < 0 || index >= layout.neighborDependencyHandles.length) {
+        if (index < 0 || index >= layout.neighborDependencySources.length) {
             throw new IndexOutOfBoundsException(index);
         }
         this.storage.neighbors[layout.neighborStateOffset + index] = state(resident, inFlight);

@@ -95,9 +95,9 @@ final class SelectionCutPlanner {
                         && (fullyRenderable(manifest, parentIndex,
                         exterior, interior, complex)
                         || childCount > 1
-                        || missingBytes(batch, manifest, parentIndex,
+                        || missingBytes(manifest, parentIndex,
                         exterior, interior, complex)
-                        < missingBytes(batch, manifest, sourceNodes, sourceMasks,
+                        < missingBytes(manifest, sourceNodes, sourceMasks,
                                 batch.groupHead[parentIndex], batch.candidateNext));
                 if (collapse) {
                     targetNodes[nextCount] = parentIndex;
@@ -342,38 +342,34 @@ final class SelectionCutPlanner {
         return false;
     }
 
-    private static long missingBytes(SelectionBatch batch, SelectionManifest manifest,
+    private static long missingBytes(SelectionManifest manifest,
                                      int[] nodes, long[] masks, int first, int[] next) {
-        int epoch = nextCostingEpoch(batch);
         long total = 0;
         for (int row = first; row >= 0; row = next[row]) {
-            total = addNodeCosts(batch, epoch, total, manifest, nodes[row], masks[row * 3],
+            total = addNodeCosts(total, manifest, nodes[row], masks[row * 3],
                     masks[row * 3 + 1], masks[row * 3 + 2]);
             if (total == Long.MAX_VALUE) return total;
         }
         return total;
     }
 
-    private static long missingBytes(SelectionBatch batch, SelectionManifest manifest,
+    private static long missingBytes(SelectionManifest manifest,
                                      int nodeIndex, long exterior, long interior, long complex) {
-        int epoch = nextCostingEpoch(batch);
-        return addNodeCosts(batch, epoch, 0, manifest, nodeIndex,
+        return addNodeCosts(0, manifest, nodeIndex,
                 exterior, interior, complex);
     }
 
-    private static long addNodeCosts(SelectionBatch batch, int epoch, long total,
-                                     SelectionManifest manifest, int nodeIndex,
+    private static long addNodeCosts(long total, SelectionManifest manifest, int nodeIndex,
                                      long exterior, long interior, long complex) {
-        total = addContentCosts(batch, epoch, total, manifest, nodeIndex,
+        total = addContentCosts(total, manifest, nodeIndex,
                 ContentClass.EXTERIOR, exterior);
-        total = addContentCosts(batch, epoch, total, manifest, nodeIndex,
+        total = addContentCosts(total, manifest, nodeIndex,
                 ContentClass.INTERIOR, interior);
-        return addContentCosts(batch, epoch, total, manifest, nodeIndex,
+        return addContentCosts(total, manifest, nodeIndex,
                 ContentClass.COMPLEX, complex);
     }
 
-    private static long addContentCosts(SelectionBatch batch, int epoch, long total,
-                                        SelectionManifest manifest, int nodeIndex,
+    private static long addContentCosts(long total, SelectionManifest manifest, int nodeIndex,
                                         ContentClass contentClass, long selected) {
         if (selected == 0 || total == Long.MAX_VALUE) return total;
         ContentLayout state = manifest.contentLayout(nodeIndex, contentClass);
@@ -382,46 +378,31 @@ final class SelectionCutPlanner {
                 Math.max(1, Long.bitCount(available))));
         long requestable = selected & ~(manifest.residentMask(nodeIndex, contentClass)
                 | manifest.inFlightMask(nodeIndex, contentClass));
-        int denseIndex = 0;
-        int[] objects = state.objectHandlesInternal();
-        for (int microtile = 0; microtile < Long.SIZE; microtile++) {
-            long bit = 1L << microtile;
-            if ((state.declaredMask() & bit) == 0) continue;
-            int handle = objects[denseIndex++];
-            if ((requestable & bit) != 0) total = addCost(batch, epoch, total, handle, unit);
-        }
+        // Costing is deliberately local to the selected masks. Registering every descriptor
+        // hash merely to deduplicate an estimate was what exhausted the capability table.
+        total = addCost(total, unit, Long.bitCount(requestable));
         long dependencyUnit = Math.max(1024L, unit >>> 2);
-        int[] dependencies = state.dependencyHandlesInternal();
-        for (int index = 0; index < dependencies.length; index++) {
+        for (int index = 0; index < state.dependencyCount(); index++) {
             if (!manifest.dependencyResident(nodeIndex, contentClass, index)
                     && !manifest.dependencyInFlight(nodeIndex, contentClass, index)) {
-                total = addCost(batch, epoch, total, dependencies[index], dependencyUnit);
+                total = addCost(total, dependencyUnit, 1);
             }
         }
-        int[] neighbors = state.neighborDependencyHandlesInternal();
         int[] sources = state.neighborDependencySourcesInternal();
-        for (int index = 0; index < neighbors.length; index++) {
+        for (int index = 0; index < sources.length; index++) {
             if ((selected & 1L << sources[index]) != 0
                     && !manifest.neighborResident(nodeIndex, contentClass, index)
                     && !manifest.neighborInFlight(nodeIndex, contentClass, index)) {
-                total = addCost(batch, epoch, total, neighbors[index], dependencyUnit);
+                total = addCost(total, dependencyUnit, 1);
             }
         }
         return total;
     }
 
-    private static long addCost(SelectionBatch batch, int epoch, long total,
-                                int handle, long value) {
-        if (batch.costEpoch[handle] == epoch) {
-            long previous = batch.costValues[handle];
-            if (value <= previous) return total;
-            value -= previous;
-            batch.costValues[handle] += value;
-        } else {
-            batch.costEpoch[handle] = epoch;
-            batch.costValues[handle] = value;
-        }
-        return Long.MAX_VALUE - total < value ? Long.MAX_VALUE : total + value;
+    private static long addCost(long total, long unit, long count) {
+        if (count == 0) return total;
+        long available = Long.MAX_VALUE - total;
+        return unit > available / count ? Long.MAX_VALUE : total + unit * count;
     }
 
     private static int nextGroupingEpoch(SelectionBatch batch) {
@@ -430,14 +411,6 @@ final class SelectionCutPlanner {
             batch.groupingEpoch = 1;
         }
         return batch.groupingEpoch;
-    }
-
-    private static int nextCostingEpoch(SelectionBatch batch) {
-        if (++batch.costingEpoch == 0) {
-            Arrays.fill(batch.costEpoch, 0);
-            batch.costingEpoch = 1;
-        }
-        return batch.costingEpoch;
     }
 
     private static long divideCeil(long value, long divisor) {

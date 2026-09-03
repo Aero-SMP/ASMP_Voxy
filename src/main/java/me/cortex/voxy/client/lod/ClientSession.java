@@ -15,6 +15,8 @@ import me.cortex.voxy.client.lod.ManifestCodec.DescriptorPage;
 import me.cortex.voxy.client.lod.ManifestCodec.RootDirectory;
 import me.cortex.voxy.client.lod.ManifestCodec.SpatialNode;
 import me.cortex.voxy.client.lod.RootDemandPlan.Binding;
+import me.cortex.voxy.client.lod.RootDemandPlan.ContentLayer;
+import me.cortex.voxy.client.lod.RootDemandPlan.ContentObject;
 import me.cortex.voxy.client.lod.RootDemandPlan.ContentPriority;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.client.core.model.CatalogMapper;
@@ -1706,7 +1708,7 @@ final class ClientSession {
                 }
                 selection.disableCancellation();
             }
-            int objectCapacity = selection.manifest().objectHandleCapacity();
+            int objectCapacity = this.plan.objectHandleCount();
             HandlePriorities selectedContent = this.selectedContentScratch.begin(objectCapacity);
             HandlePriorities requestedContent = this.requestedContentScratch.begin(objectCapacity);
             HandlePriorities selectedNeighbors = this.selectedNeighborScratch.begin(objectCapacity);
@@ -1730,16 +1732,19 @@ final class ClientSession {
                             selection.nodeHandle(desiredSegment, row), key);
                 }
                 mergeCut(this.desiredCuts, selection, desiredSegment, row);
-                collectHandles(selectedContent, selection, desiredSegment, row, false);
-                collectSelectedNeighborHandles(selectedNeighbors, selection, desiredSegment, row);
+                collectHandles(selectedContent, this.plan,
+                        selection, desiredSegment, row, false);
+                collectSelectedNeighborHandles(selectedNeighbors, this.plan,
+                        selection, desiredSegment, row);
             }
             SelectionBatch.Segment renderableSegment = SelectionBatch.Segment.RENDERABLE;
             for (int row = 0; row < selection.count(renderableSegment); row++) {
                 nodeKeys.add(selection.nodeHandle(renderableSegment, row),
                         selection.sectionKey(renderableSegment, row));
                 mergeCut(this.renderableCuts, selection, renderableSegment, row);
-                collectHandles(selectedContent, selection, renderableSegment, row, false);
-                collectSelectedNeighborHandles(selectedNeighbors, selection,
+                collectHandles(selectedContent, this.plan,
+                        selection, renderableSegment, row, false);
+                collectSelectedNeighborHandles(selectedNeighbors, this.plan, selection,
                         renderableSegment, row);
             }
             SelectionBatch.Segment requestSegment = SelectionBatch.Segment.REQUESTS;
@@ -1757,8 +1762,10 @@ final class ClientSession {
                     this.coverageCuts.add(selection.nodeHandle(requestSegment, row),
                             selection.sectionKey(requestSegment, row));
                 }
-                collectHandles(requestedContent, selection, requestSegment, row, true);
-                collectSelectedNeighborHandles(selectedNeighbors, selection, requestSegment, row);
+                collectHandles(requestedContent, this.plan,
+                        selection, requestSegment, row, true);
+                collectSelectedNeighborHandles(selectedNeighbors, this.plan,
+                        selection, requestSegment, row);
             }
             // Coverage requests are emitted first and must get the first activation slots.
             // Resident fine-detail selections follow only after their hierarchy prerequisites.
@@ -2988,95 +2995,122 @@ final class ClientSession {
                 exterior, interior, complex);
     }
 
-    private static void collectHandles(HandlePriorities result,
+    private static void collectHandles(HandlePriorities result, RootDemandPlan plan,
                                        SelectionBatch batch, SelectionBatch.Segment segment,
                                        int row, boolean requestsOnly) {
         ContentPriority priority = contentPriority(batch.priority(segment, row));
         int nodeIndex = batch.nodeIndex(segment, row);
+        long sectionKey = batch.sectionKey(segment, row);
+        Binding binding = plan.binding(sectionKey).orElse(null);
+        if (binding == null) return;
         SelectionManifest manifest = batch.manifest();
         for (int ordinal = 0; ordinal < 3; ordinal++) {
             var contentClass = contentClass(ordinal);
             long selected = batch.selectedMask(segment, row, contentClass);
             if (selected == 0) continue;
+            ContentLayer layer = contentLayer(binding, ordinal);
+            if (layer == null) {
+                throw new IllegalStateException("selected content class lacks a binding");
+            }
             var layout = batch.contentLayout(segment, row, contentClass);
-            addSelectedObjects(result, manifest, nodeIndex, contentClass, layout,
-                    selected, priority, requestsOnly);
-            addDependencies(result, manifest, nodeIndex, contentClass, layout,
-                    priority, requestsOnly);
-            if (requestsOnly) addSelectedNeighbors(result, manifest, nodeIndex,
-                    contentClass, layout, selected, priority, true);
+            addSelectedObjects(result, plan, sectionKey, manifest, nodeIndex, contentClass,
+                    layer, selected, priority, requestsOnly);
+            addDependencies(result, plan, sectionKey, manifest, nodeIndex, contentClass,
+                    layer, priority, requestsOnly);
+            if (requestsOnly) addSelectedNeighbors(result, plan, sectionKey, manifest,
+                    nodeIndex, contentClass, layer, selected, priority, true);
         }
     }
 
     /** Retains selected neighbor context without granting request authority to the CPU. */
     private static void collectSelectedNeighborHandles(
-            HandlePriorities result, SelectionBatch batch,
+            HandlePriorities result, RootDemandPlan plan, SelectionBatch batch,
             SelectionBatch.Segment segment, int row) {
         ContentPriority priority = contentPriority(batch.priority(segment, row));
         int nodeIndex = batch.nodeIndex(segment, row);
+        long sectionKey = batch.sectionKey(segment, row);
+        Binding binding = plan.binding(sectionKey).orElse(null);
+        if (binding == null) return;
         SelectionManifest manifest = batch.manifest();
         for (int ordinal = 0; ordinal < 3; ordinal++) {
             var contentClass = contentClass(ordinal);
             long selected = batch.selectedMask(segment, row, contentClass);
-            if (selected != 0) addSelectedNeighbors(result, manifest, nodeIndex,
-                    contentClass, batch.contentLayout(segment, row, contentClass),
-                    selected, priority, false);
+            ContentLayer layer = contentLayer(binding, ordinal);
+            if (selected != 0 && layer != null) {
+                addSelectedNeighbors(result, plan, sectionKey, manifest, nodeIndex,
+                        contentClass, layer, selected, priority, false);
+            }
         }
     }
 
     private static void addSelectedObjects(HandlePriorities target,
+                                           RootDemandPlan plan, long sectionKey,
                                            SelectionManifest manifest, int nodeIndex,
                                            SelectionManifest.ContentClass contentClass,
-                                           SelectionManifest.ContentLayout state,
+                                           ContentLayer layer,
                                            long selected, ContentPriority priority,
                                            boolean missingOnly) {
         long accepted = missingOnly
                 ? selected & ~(manifest.residentMask(nodeIndex, contentClass)
                 | manifest.inFlightMask(nodeIndex, contentClass)) : selected;
-        int dense = 0;
-        int[] handles = state.objectHandlesInternal();
-        for (int microtile = 0; microtile < Long.SIZE; microtile++) {
-            long bit = 1L << microtile;
-            if ((state.declaredMask() & bit) == 0) continue;
-            int handle = handles[dense++];
-            if ((accepted & bit) != 0) mergePriority(target, handle, priority);
+        for (ContentObject object : layer.objects()) {
+            if ((accepted & 1L << object.microtileIndex()) == 0) continue;
+            mergePriority(target, plan, sectionKey, object.hash(), object.kind(), priority);
         }
     }
 
     private static void addDependencies(HandlePriorities target,
+                                        RootDemandPlan plan, long sectionKey,
                                         SelectionManifest manifest, int nodeIndex,
                                         SelectionManifest.ContentClass contentClass,
-                                        SelectionManifest.ContentLayout state,
+                                        ContentLayer layer,
                                         ContentPriority priority, boolean missingOnly) {
-        int[] handles = state.dependencyHandlesInternal();
-        for (int index = 0; index < handles.length; index++) {
+        ObjectKind kind = MicrotileCodec.objectKind(layer.contentClass());
+        for (int index = 0; index < layer.dependencies().size(); index++) {
             if (!missingOnly
                     || !manifest.dependencyResident(nodeIndex, contentClass, index)
                     && !manifest.dependencyInFlight(nodeIndex, contentClass, index)) {
-                mergePriority(target, handles[index], priority);
+                mergePriority(target, plan, sectionKey,
+                        layer.dependencies().get(index), kind, priority);
             }
         }
     }
 
     private static void addSelectedNeighbors(HandlePriorities target,
+                                             RootDemandPlan plan, long sectionKey,
                                              SelectionManifest manifest, int nodeIndex,
                                              SelectionManifest.ContentClass contentClass,
-                                             SelectionManifest.ContentLayout state,
+                                             ContentLayer layer,
                                              long selected, ContentPriority priority,
                                              boolean missingOnly) {
-        int[] handles = state.neighborDependencyHandlesInternal();
-        int[] sources = state.neighborDependencySourcesInternal();
-        for (int index = 0; index < handles.length; index++) {
-            if ((selected & 1L << sources[index]) == 0) continue;
+        for (int index = 0; index < layer.neighborDependencies().size(); index++) {
+            var dependency = layer.neighborDependencies().get(index);
+            if ((selected & 1L << dependency.sourceMicrotileIndex()) == 0) continue;
             if (missingOnly && (manifest.neighborResident(nodeIndex, contentClass, index)
                     || manifest.neighborInFlight(nodeIndex, contentClass, index))) continue;
-            mergePriority(target, handles[index], priority);
+            mergePriority(target, plan, sectionKey, dependency.hash(),
+                    ObjectKind.COMPLEX_MICROTILE, priority);
         }
     }
 
-    private static void mergePriority(HandlePriorities target, int handle,
+    private static void mergePriority(HandlePriorities target, RootDemandPlan plan,
+                                      long sectionKey, Hash256 hash, ObjectKind kind,
                                       ContentPriority priority) {
-        target.add(handle, priority);
+        plan.registerSelectedObject(sectionKey, hash, kind);
+        target.add(plan.selectionObjectHandle(hash), priority);
+    }
+
+    private static ContentLayer contentLayer(Binding binding, int ordinal) {
+        ContentClass expected = switch (ordinal) {
+            case 0 -> ContentClass.EXTERIOR;
+            case 1 -> ContentClass.INTERIOR;
+            case 2 -> ContentClass.COMPLEX;
+            default -> throw new IllegalArgumentException("invalid content class");
+        };
+        for (ContentLayer layer : binding.layers()) {
+            if (layer.contentClass() == expected) return layer;
+        }
+        return null;
     }
 
     private static long selectedMasks(SelectionBatch batch, SelectionBatch.Segment segment,
@@ -3272,8 +3306,15 @@ final class ClientSession {
         }
 
         private void add(int handle, ContentPriority priority) {
-            if (handle < 0 || handle >= this.epochs.length) {
+            if (handle < 0) {
                 throw new IllegalArgumentException("selection object handle is outside its manifest");
+            }
+            if (handle >= this.epochs.length) {
+                int capacity = grow(this.epochs.length, handle + 1);
+                this.epochs = java.util.Arrays.copyOf(this.epochs, capacity);
+                this.slotByHandle = java.util.Arrays.copyOf(this.slotByHandle, capacity);
+                this.priorityByHandle = java.util.Arrays.copyOf(
+                        this.priorityByHandle, capacity);
             }
             byte value = (byte) priority.ordinal();
             if (this.epochs[handle] == this.epoch) {
@@ -3286,6 +3327,11 @@ final class ClientSession {
             this.epochs[handle] = this.epoch;
             this.priorityByHandle[handle] = value;
             this.slotByHandle[handle] = this.count;
+            if (this.count == this.handles.length) {
+                int capacity = grow(this.handles.length, this.count + 1);
+                this.handles = java.util.Arrays.copyOf(this.handles, capacity);
+                this.priorities = java.util.Arrays.copyOf(this.priorities, capacity);
+            }
             this.handles[this.count] = handle;
             this.priorities[this.count] = value;
             this.count++;
