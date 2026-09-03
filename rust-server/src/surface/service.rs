@@ -40,7 +40,11 @@ const MAX_ACTIVE_DISK_TURNS: usize = 16;
 const MAX_ACTIVE_NETWORK_TURNS: usize = 16;
 const MAX_ACTIVE_NETWORK_TURNS_PER_SESSION: usize = 2;
 const NETWORK_WRITE_SLICE: Duration = Duration::from_millis(5);
-const TRANSFER_CHUNK_BYTES: usize = 32 * 1024;
+// One scheduler turn and blocking-task handoff can cover several small forward-adjacent objects.
+// Eight client streams therefore retain a strict 2 MiB aggregate read-buffer bound while disk
+// fairness is revisited at least every 256 KiB.
+const DISK_BATCH_BYTES: usize = 256 * 1024;
+const DISK_BATCH_MAX_GAP_BYTES: u64 = 4 * 1024;
 // Keep one small, coordinated stream budget on both peers. Coverage can use half of it,
 // while current-view and speculative work cannot crowd out the correctness-critical lane.
 const ACTIVE_STREAMS_PER_LANE: [usize; 3] = [4, 3, 1];
@@ -888,39 +892,50 @@ impl Service {
             }
         };
         write_object_success(&mut send, response.len()).await?;
-        let mut buffer = vec![0u8; TRANSFER_CHUNK_BYTES];
-        for object in response {
-            send.write_all(&object.header).await?;
-            let mut offset = 0u64;
-            let mut compressed_crc = 0u32;
-            while offset < object.source.compressed_size() {
-                let length = usize::try_from(
-                    (object.source.compressed_size() - offset).min(TRANSFER_CHUNK_BYTES as u64),
-                )?;
-                let disk_turn = tokio::select! {
-                    turn = self.scheduler.disk_turn(guard.id, request.lane) => {
-                        turn.context("object disk scheduler stopped")?
-                    }
-                    _ = send.stopped() => return Ok(()),
-                };
-                let source = object.source.clone();
-                let (returned, read) = tokio::task::spawn_blocking(move || {
-                    let read = source.read_exact_at(offset, &mut buffer[..length]);
-                    (buffer, read)
-                })
-                .await?;
-                buffer = returned;
-                drop(disk_turn);
-                if let Err(error) = read {
+        let mut object_index = 0usize;
+        let mut object_offset = 0u64;
+        let mut compressed_crc = 0u32;
+        let mut disk_buffer = vec![0u8; DISK_BATCH_BYTES];
+        while object_index < response.len() {
+            let (reads, next_object, next_offset) =
+                prepare_disk_batch(&response, object_index, object_offset)?;
+            let disk_turn = tokio::select! {
+                turn = self.scheduler.disk_turn(guard.id, request.lane) => {
+                    turn.context("object disk scheduler stopped")?
+                }
+                _ = send.stopped() => return Ok(()),
+            };
+            let read = tokio::task::spawn_blocking(move || {
+                for part in &reads {
+                    part.source.read_exact_at(
+                        part.object_offset,
+                        &mut disk_buffer[part.buffer_offset..part.buffer_offset + part.length],
+                    )?;
+                }
+                Ok::<_, anyhow::Error>((reads, disk_buffer))
+            })
+            .await?;
+            drop(disk_turn);
+            let (reads, returned_buffer) = match read {
+                Ok(read) => read,
+                Err(error) => {
                     let _ = send.reset(VarInt::from_u32(8));
                     self.fail_leased_root(&surface, &roots, guard.id, request.root)
                         .await?;
                     return Err(error);
                 }
-                compressed_crc = crc32c_append(compressed_crc, &buffer[..length]);
-                if offset + length as u64 == object.source.compressed_size()
-                    && compressed_crc != object.source.compressed_crc()
-                {
+            };
+            disk_buffer = returned_buffer;
+            for part in reads {
+                let object = &response[part.object_index];
+                if part.object_offset == 0 {
+                    send.write_all(&object.header).await?;
+                }
+                let bytes = &disk_buffer[part.buffer_offset..part.buffer_offset + part.length];
+                compressed_crc = crc32c_append(compressed_crc, bytes);
+                let object_complete =
+                    part.object_offset + part.length as u64 == object.source.compressed_size();
+                if object_complete && compressed_crc != object.source.compressed_crc() {
                     let _ = send.reset(VarInt::from_u32(8));
                     self.fail_leased_root(&surface, &roots, guard.id, request.root)
                         .await?;
@@ -930,7 +945,7 @@ impl Service {
                     );
                 }
                 let mut written = 0usize;
-                while written < length {
+                while written < bytes.len() {
                     let network_turn = tokio::select! {
                         turn = self.scheduler.network_turn(guard.id, request.lane) => {
                             turn.context("object network scheduler stopped")?
@@ -939,7 +954,7 @@ impl Service {
                     };
                     let stopped = send.stopped();
                     let write = tokio::select! {
-                        write = send.write(&buffer[written..length]) => Some(write),
+                        write = send.write(&bytes[written..]) => Some(write),
                         _ = tokio::time::sleep(NETWORK_WRITE_SLICE) => None,
                         _ = stopped => return Ok(()),
                     };
@@ -952,8 +967,12 @@ impl Service {
                         written += count;
                     }
                 }
-                offset += length as u64;
+                if object_complete {
+                    compressed_crc = 0;
+                }
             }
+            object_index = next_object;
+            object_offset = next_offset;
         }
         send.finish()?;
         Ok(())
@@ -1589,6 +1608,61 @@ impl SessionRoots {
 struct ResponseObject {
     source: StoredObjectSource,
     header: [u8; OBJECT_RESPONSE_HEADER_BYTES],
+}
+
+struct PendingDiskRead {
+    source: StoredObjectSource,
+    object_index: usize,
+    object_offset: u64,
+    buffer_offset: usize,
+    length: usize,
+}
+
+fn prepare_disk_batch(
+    response: &[ResponseObject],
+    mut object_index: usize,
+    mut object_offset: u64,
+) -> Result<(Vec<PendingDiskRead>, usize, u64)> {
+    let mut reads = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut previous_complete = None::<StoredObjectSource>;
+    while object_index < response.len() && batch_bytes < DISK_BATCH_BYTES {
+        let object = &response[object_index];
+        if object_offset == 0
+            && previous_complete.as_ref().is_some_and(|previous| {
+                !previous.followed_by_within(&object.source, DISK_BATCH_MAX_GAP_BYTES)
+            })
+        {
+            break;
+        }
+        let remaining = object
+            .source
+            .compressed_size()
+            .checked_sub(object_offset)
+            .context("object disk cursor exceeds its stored extent")?;
+        if remaining == 0 {
+            bail!("stored compressed object has an empty payload");
+        }
+        let length = usize::try_from(remaining.min((DISK_BATCH_BYTES - batch_bytes) as u64))?;
+        reads.push(PendingDiskRead {
+            source: object.source.clone(),
+            object_index,
+            object_offset,
+            buffer_offset: batch_bytes,
+            length,
+        });
+        batch_bytes += length;
+        object_offset += length as u64;
+        if object_offset == object.source.compressed_size() {
+            previous_complete = Some(object.source.clone());
+            object_index += 1;
+            object_offset = 0;
+        }
+    }
+    if reads.is_empty() {
+        bail!("object disk batch made no progress");
+    }
+    Ok((reads, object_index, object_offset))
 }
 
 fn prepare_response(

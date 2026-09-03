@@ -194,6 +194,26 @@ impl StoredObjectSource {
         self.location.compressed_crc
     }
 
+    /// Whether `next` is a forward-near payload in the same immutable pack file. This is an
+    /// optimization hint only: callers still issue an independently bounded positional read for
+    /// every payload extent, so intervening record bytes are never exposed as object content.
+    pub fn followed_by_within(&self, next: &Self, maximum_gap: u64) -> bool {
+        if !Arc::ptr_eq(&self.file, &next.file) {
+            return false;
+        }
+        let Some(end) = self
+            .location
+            .payload_offset()
+            .checked_add(self.location.compressed_size)
+        else {
+            return false;
+        };
+        next.location
+            .payload_offset()
+            .checked_sub(end)
+            .is_some_and(|gap| gap <= maximum_gap)
+    }
+
     pub fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<()> {
         let end = offset
             .checked_add(output.len() as u64)
