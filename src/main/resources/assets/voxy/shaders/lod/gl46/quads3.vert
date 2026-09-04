@@ -47,8 +47,9 @@ void main() {
     taaOffset = taaShift();
 
     QuadData quad;
-    uvec2 pos = positionBuffer[gl_BaseInstance];
-    setupQuad(quad, quadData[uint(gl_VertexID)>>2], pos, (gl_VertexID&3) == 1);
+    uvec4 drawData = positionBuffer[gl_BaseInstance];
+    uvec2 pos = drawData.xy;
+    setupQuad(quad, quadData[drawData.z + (uint(gl_VertexID)>>2)], pos, (gl_VertexID&3) == 1);
 
     uint cornerId = gl_VertexID&3;
 

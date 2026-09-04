@@ -18,7 +18,12 @@ public final class Viewport {
     public final GlBuffer drawCountCallBuffer = new GlBuffer(1024).zero();
     public final GlBuffer drawCallBuffer = new GlBuffer(5 * 4 * (MDICSectionRenderer.OPAQUE_DRAW_COUNT
             + MDICSectionRenderer.TRANSLUCENT_DRAW_COUNT + MDICSectionRenderer.TEMPORAL_DRAW_COUNT)).zero();
-    public final GlBuffer positionScratchBuffer = new GlBuffer(8 * 400_000).zero();
+    // One uvec4 per generated command: packed section position plus the full
+    // unsigned geometry offset. Keeping the offset out of signed baseVertex lets
+    // the renderer address geometry stores larger than 4 GiB.
+    public final GlBuffer positionScratchBuffer = new GlBuffer(16L
+            * (MDICSectionRenderer.OPAQUE_DRAW_COUNT + MDICSectionRenderer.TRANSLUCENT_DRAW_COUNT
+            + MDICSectionRenderer.TEMPORAL_DRAW_COUNT)).zero();
     public final GlBuffer indirectLookupBuffer = new GlBuffer(HierarchicalOcclusionTraverser.MAX_QUEUE_SIZE * 4 + 4);
     public final GlBuffer visibilityBuffer;
 

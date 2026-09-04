@@ -18,6 +18,13 @@ import static org.lwjgl.opengl.GL11C.GL_NO_ERROR;
 //System to allow reuse/recycling of render buffer/texture allocations
 // specfically the geometry buffer and texture atlas allocation
 public class RenderResourceReuse {
+    private static final long MIB = 1024L * 1024L;
+    private static final long GIB = 1024L * MIB;
+    private static final long VRAM_RESERVE = 4L * GIB;
+    private static final long MINIMUM_GEOMETRY_CAPACITY = 256L * MIB;
+    // Geometry pointers are unsigned 32-bit quad indexes, not byte offsets.
+    // Leave one allocation quantum unused so -1 remains the OOM sentinel.
+    private static final long MAX_ADDRESSABLE_GEOMETRY = (1L << 35) - 1024;
     private static final ArrayList<GlTexture> MODEL_TEXTURE_CACHE = new ArrayList<>();
     private static final ArrayList<GlBuffer> GEOMETRY_BUFFER_CACHE = new ArrayList<>();
 
@@ -99,15 +106,15 @@ public class RenderResourceReuse {
         GEOMETRY_BUFFER_CACHE.add(geometryBuffer);
     }
 
-    private static long getGeometryBufferSize() {
+    public static long getGeometryBufferSize() {
         int requestedMib = VoxyConfig.CONFIG.geometryMemoryMib;
         if (requestedMib > 0) {
-            long requested = requestedMib * 1024L * 1024L;
-            long limit = Math.min(Capabilities.INSTANCE.ssboMaxSize, (1L << 32) - 1024);
+            long requested = requestedMib * MIB;
+            long limit = getSafeGeometryMemoryLimitBytes();
             if (Capabilities.INSTANCE.canQueryGpuMemory) {
                 long free = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
-                long safeAvailable = free - (1536L * 1024L * 1024L);
-                if (safeAvailable <= 0) safeAvailable = Math.max(64L * 1024L * 1024L, free / 2);
+                long safeAvailable = free - (1536L * MIB);
+                if (safeAvailable <= 0) safeAvailable = Math.max(64L * MIB, free / 2);
                 limit = Math.min(limit, safeAvailable);
             }
             long alignment = Math.max(1024, Capabilities.INSTANCE.ssboBindingAlignment);
@@ -119,6 +126,23 @@ public class RenderResourceReuse {
             return capacity;
         }
 
+        return getAutomaticGeometryBufferSize();
+    }
+
+    public static long getSafeGeometryMemoryLimitBytes() {
+        long limit = Math.min(Capabilities.INSTANCE.ssboMaxSize, MAX_ADDRESSABLE_GEOMETRY);
+        long totalVram = Capabilities.INSTANCE.totalDedicatedMemory;
+        if (totalVram > 0) {
+            long safeVram = totalVram > VRAM_RESERVE
+                    ? totalVram - VRAM_RESERVE
+                    : Math.max(MINIMUM_GEOMETRY_CAPACITY, totalVram / 4);
+            limit = Math.min(limit, safeVram);
+        }
+        return alignDown(Math.max(Math.min(MINIMUM_GEOMETRY_CAPACITY,
+                Math.min(Capabilities.INSTANCE.ssboMaxSize, MAX_ADDRESSABLE_GEOMETRY)), limit));
+    }
+
+    public static long getAutomaticGeometryBufferSize() {
         long geometryCapacity = Math.min((1L<<(64-Long.numberOfLeadingZeros(Capabilities.INSTANCE.ssboMaxSize-1)))<<1, 1L<<32)-1024/*(1L<<32)-1024*/;
         if (Capabilities.INSTANCE.isIntel) {
             geometryCapacity = Math.max(geometryCapacity, 1L<<30);//intel moment, force min 1gb
@@ -147,6 +171,11 @@ public class RenderResourceReuse {
 
             geometryCapacity = Math.min(geometryCapacity, limit);
         }
-        return geometryCapacity;
+        return alignDown(Math.min(geometryCapacity, getSafeGeometryMemoryLimitBytes()));
+    }
+
+    private static long alignDown(long bytes) {
+        long alignment = Math.max(1024, Capabilities.INSTANCE.ssboBindingAlignment);
+        return Math.max(alignment, bytes - bytes % alignment);
     }
 }

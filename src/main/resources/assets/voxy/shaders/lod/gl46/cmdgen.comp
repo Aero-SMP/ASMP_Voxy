@@ -23,14 +23,15 @@ layout(binding = TRANSLUCENT_DISTANCE_BUFFER_BINDING, std430) restrict buffer Tr
 };
 
 //Note: if i want reverse indexing i need to use the index buffer offset to offset
-void writeCmd(uint idx, uint instance, uint offset, uint quadCount) {
+void writeCmd(uint idx, uint offset, uint quadCount, uvec2 position) {
     DrawCommand cmd;
     cmd.count = quadCount * 6;
     cmd.instanceCount = 1;
     cmd.firstIndex = 0;
-    cmd.baseVertex = int(offset)<<2;
-    cmd.baseInstance = instance;
+    cmd.baseVertex = 0;
+    cmd.baseInstance = idx;
     cmdBuffer[idx] = cmd;
+    positionBuffer[idx] = uvec4(position, offset, 0);
 }
 
 void main() {
@@ -55,7 +56,7 @@ void main() {
         ivec3 relative = ipos-(baseSectionPos>>detail);
         uint drawId = gl_GlobalInvocationID.x;
 
-        positionBuffer[drawId] = extractRawPos(meta);
+        uvec2 rawPosition = extractRawPos(meta);
         uvec4 countsA = meta.b;
         uvec4 countsB = meta.c;
 
@@ -96,9 +97,9 @@ void main() {
         //Double sided quads
         count = countsA.y;
         if (count != 0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;
@@ -106,9 +107,9 @@ void main() {
         //Down
         count = countsA.z;
         if (((msk&(1u<<0))!=0)) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;
@@ -116,9 +117,9 @@ void main() {
         //Up
         count = countsA.w;
         if ((msk&(1u<<1))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;
@@ -126,9 +127,9 @@ void main() {
         //North
         count = countsB.x;
         if ((msk&(1u<<2))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;
@@ -136,9 +137,9 @@ void main() {
         //South
         count = countsB.y;
         if ((msk&(1u<<3))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;
@@ -146,9 +147,9 @@ void main() {
         //West
         count = countsB.z;
         if ((msk&(1u<<4))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;
@@ -156,9 +157,9 @@ void main() {
         //East
         count = countsB.w;
         if ((msk&(1u<<5))!=0) {
-            writeCmd(cmdPtr++, drawId, ptr, count);
+            writeCmd(cmdPtr++, ptr, count, rawPosition);
             if (renderTemporally) {
-                writeCmd(tCmdPtr++, drawId, ptr, count);
+                writeCmd(tCmdPtr++, ptr, count, rawPosition);
             }
         }
         ptr += count;

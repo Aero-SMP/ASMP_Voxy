@@ -13,8 +13,7 @@
   "voxy.config.general.renderDistance.tooltip": "Render distance of voxy in chunks",
 
   "voxy.config.general.geometry_memory": "GPU Memory",
-  "voxy.config.general.geometry_memory.tooltip": "Controls how much GPU memory Voxy can use for LOD geometry. Larger values allow more detailed LODs to stay loaded, but consequently reduce FPS. Auto selects a safe size for your GPU.",
-  "voxy.config.general.geometry_memory.auto": "Auto",
+  "voxy.config.general.geometry_memory.tooltip": "Controls how much GPU memory Voxy can use for LOD geometry. Larger values allow more detailed LODs to stay loaded, but consequently reduce FPS. The default is selected automatically for your GPU; unsafe sizes are hidden.",
 
   "voxy.config.general.environmental_fog": "Enable environmental fog",
   "voxy.config.general.environmental_fog.tooltip": "Enables or disables voxy rendering environmental fog",

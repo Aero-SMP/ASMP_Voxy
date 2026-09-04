@@ -1104,7 +1104,7 @@ public class AsyncNodeManager {
 
     private static class ComputeMemoryCopy {
         public int currentElemCopyAmount;
-        public int maxElementAccess;
+        public long maxElementAccess;
         private MemoryBuffer scratchHeaderBuffer = new MemoryBuffer(1<<16);
         private MemoryBuffer scratchDataBuffer = new MemoryBuffer(1<<20);
 
@@ -1156,7 +1156,8 @@ public class AsyncNodeManager {
         public void upload(int point, MemoryBuffer data) {
             if ((data.size%8)!=0) throw new IllegalStateException("Data must be of size multiple 8");
             int elemSize = (int) (data.size / 8);
-            this.maxElementAccess = Math.max(this.maxElementAccess, point + elemSize);
+            this.maxElementAccess = Math.max(this.maxElementAccess,
+                    Integer.toUnsignedLong(point) + elemSize);
             int header = this.dataUploadPoints.get(point);
             if (header != -1) {
                 //If we already have a header location, we just need to reallocate the data

@@ -26,8 +26,8 @@ public class BasicSectionGeometryData {
     }
 
     private long sparseCommitment = 0;//Tracks the current range of the allocated sparse buffer
-    public void ensureAccessible(int maxElementAccess) {
-        long requiredBytes = (Integer.toUnsignedLong(maxElementAccess)*8L+65535L)&~65535L;
+    public void ensureAccessible(long maxElementAccess) {
+        long requiredBytes = (maxElementAccess*8L+65535L)&~65535L;
         if (requiredBytes > this.geometryBuffer.size()) {
             throw new IllegalArgumentException("Geometry upload exceeds buffer capacity");
         }

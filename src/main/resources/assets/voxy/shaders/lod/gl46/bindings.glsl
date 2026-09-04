@@ -88,7 +88,6 @@ layout(binding = MODEL_COLOUR_BUFFER_BINDING, std430) readonly restrict buffer M
 #define POSITION_SCRATCH_ACCESS readonly
 #endif
 layout(binding = POSITION_SCRATCH_BINDING, std430) POSITION_SCRATCH_ACCESS restrict buffer PositionScratchBuffer {
-    uvec2 positionBuffer[];
+    uvec4 positionBuffer[];
 };
 #endif
-

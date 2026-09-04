@@ -2,6 +2,7 @@ package me.cortex.voxy.client.config;
 
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
+import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.client.iris.IrisUtil;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
@@ -20,6 +21,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 
+import java.util.Arrays;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -65,11 +67,13 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setImpact(OptionImpact.MEDIUM)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
+        int[] geometryMemoryChoices = geometryMemoryChoices();
         var geometryMemory = option(builder.createIntegerOption(GEOMETRY_MEMORY),
-                "voxy.config.general.geometry_memory", () -> geometryMemoryIndex(CFG.geometryMemoryMib),
-                value -> CFG.geometryMemoryMib = GEOMETRY_MEMORY_MIB[value], RENDER_RELOAD)
-                .setRange(new Range(0, GEOMETRY_MEMORY_MIB.length - 1, 1))
-                .setValueFormatter(VoxyConfigMenu::geometryMemoryLabel)
+                "voxy.config.general.geometry_memory",
+                () -> geometryMemoryIndex(effectiveConfiguredGeometryMemoryMib(), geometryMemoryChoices),
+                value -> CFG.geometryMemoryMib = geometryMemoryChoices[value], RENDER_RELOAD)
+                .setRange(new Range(0, geometryMemoryChoices.length - 1, 1))
+                .setValueFormatter(value -> geometryMemoryLabel(geometryMemoryChoices[value]))
                 .setImpact(OptionImpact.HIGH)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
@@ -200,13 +204,35 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         return ResourceLocation.fromNamespaceAndPath("voxy", path);
     }
 
-    private static final int[] GEOMETRY_MEMORY_MIB = {0, 256, 512, 768, 1024, 1536, 2048, 3072, 4096};
+    private static final int[] GEOMETRY_MEMORY_MIB = {
+            256, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192,
+            12 * 1024, 16 * 1024, 20 * 1024, 24 * 1024, 28 * 1024
+    };
 
-    private static int geometryMemoryIndex(int configuredMib) {
+    private static int[] geometryMemoryChoices() {
+        long maximumBytes = RenderResourceReuse.getSafeGeometryMemoryLimitBytes();
+        long maximumMib = (maximumBytes + 1024L * 1024L - 1) / (1024L * 1024L);
+        int count = 0;
+        for (int mib : GEOMETRY_MEMORY_MIB) {
+            if (mib <= maximumMib) count++;
+        }
+        // All supported GPUs should admit 256 MiB. Retaining one clamped entry is
+        // safer than constructing an invalid zero-length slider on a broken driver.
+        if (count == 0) count = 1;
+        return Arrays.copyOf(GEOMETRY_MEMORY_MIB, count);
+    }
+
+    private static int effectiveConfiguredGeometryMemoryMib() {
+        if (CFG.geometryMemoryMib > 0) return CFG.geometryMemoryMib;
+        long automaticBytes = RenderResourceReuse.getAutomaticGeometryBufferSize();
+        return (int) Math.max(1, automaticBytes / (1024L * 1024L));
+    }
+
+    private static int geometryMemoryIndex(int configuredMib, int[] choices) {
         int nearest = 0;
-        int nearestDistance = Math.abs(configuredMib - GEOMETRY_MEMORY_MIB[0]);
-        for (int i = 1; i < GEOMETRY_MEMORY_MIB.length; i++) {
-            int distance = Math.abs(configuredMib - GEOMETRY_MEMORY_MIB[i]);
+        int nearestDistance = Math.abs(configuredMib - choices[0]);
+        for (int i = 1; i < choices.length; i++) {
+            int distance = Math.abs(configuredMib - choices[i]);
             if (distance < nearestDistance) {
                 nearest = i;
                 nearestDistance = distance;
@@ -215,9 +241,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         return nearest;
     }
 
-    private static Component geometryMemoryLabel(int value) {
-        int mib = GEOMETRY_MEMORY_MIB[value];
-        if (mib == 0) return Component.translatable("voxy.config.general.geometry_memory.auto");
+    private static Component geometryMemoryLabel(int mib) {
         if (mib % 1024 == 0) return Component.literal((mib / 1024) + " GiB");
         return Component.literal(mib + " MiB");
     }

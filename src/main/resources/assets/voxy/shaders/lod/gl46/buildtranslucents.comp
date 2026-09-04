@@ -7,6 +7,8 @@ layout(local_size_x = 128) in;
 #define DRAW_COUNT_BUFFER_BINDING 2
 #define SECTION_METADATA_BUFFER_BINDING 3
 #define INDIRECT_SECTION_LOOKUP_BINDING 4
+#define POSITION_SCRATCH_BINDING 6
+#define POSITION_SCRATCH_ACCESS writeonly
 
 #import <voxy:lod/section.glsl>
 #import <voxy:lod/gl46/bindings.glsl>
@@ -15,14 +17,15 @@ layout(binding = TRANSLUCENT_DISTANCE_BUFFER_BINDING, std430) restrict buffer Tr
     uint[] translucentCommandData;
 };
 
-void writeCmd(uint idx, uint instance, uint offset, uint quadCount) {
+void writeCmd(uint idx, uint offset, uint quadCount, uvec2 position) {
     DrawCommand cmd;
     cmd.count = quadCount * 6;
     cmd.instanceCount = 1;
     cmd.firstIndex = 0;
-    cmd.baseVertex = int(offset)<<2;
-    cmd.baseInstance = instance;
+    cmd.baseVertex = 0;
+    cmd.baseInstance = idx;
     cmdBuffer[idx] = cmd;
+    positionBuffer[idx] = uvec4(position, offset, 0);
 }
 
 void main() {
@@ -39,5 +42,5 @@ void main() {
     dist = (TRANSLUCENT_WRITE_BASE-1)-min(dist, (TRANSLUCENT_WRITE_BASE-1));
 
     uint drawPtr = atomicAdd(translucentCommandData[dist],1)+TRANSLUCENT_OFFSET;
-    writeCmd(drawPtr, drawId, extractQuadStart(meta), meta.b.x);
+    writeCmd(drawPtr, extractQuadStart(meta), meta.b.x, extractRawPos(meta));
 }

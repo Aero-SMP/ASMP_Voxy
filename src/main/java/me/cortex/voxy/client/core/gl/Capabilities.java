@@ -7,6 +7,8 @@ import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.system.Platform;
+import oshi.SystemInfo;
+import oshi.hardware.GraphicsCard;
 
 import java.util.Locale;
 
@@ -33,6 +35,7 @@ public class Capabilities {
     public final int ssboBindingAlignment;
     public final boolean canQueryGpuMemory;
     public final long totalDedicatedMemory;//Bytes, dedicated memory
+    public final String rendererName;
     public final boolean compute;
     public final boolean indirectParameters;
     public final boolean isIntel;
@@ -69,6 +72,7 @@ public class Capabilities {
         this.ssboBindingAlignment = glGetInteger(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT);
 
         var vendor = glGetString(GL_VENDOR).toLowerCase(Locale.ROOT);
+        this.rendererName = glGetString(GL_RENDERER);
         this.isIntel = vendor.contains("intel");
         this.isNvidia = vendor.contains("nvidia");
         this.isAmd = vendor.contains("amd")||vendor.contains("radeon");
@@ -78,7 +82,13 @@ public class Capabilities {
         if (this.canQueryGpuMemory) {
             this.totalDedicatedMemory = glGetInteger64(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX)*1024;//Since its in Kb
         } else {
-            this.totalDedicatedMemory = -1;
+            this.totalDedicatedMemory = detectDedicatedGpuMemory(this.rendererName);
+        }
+        if (this.totalDedicatedMemory > 0) {
+            Logger.info("Detected " + (this.totalDedicatedMemory / (1024L * 1024L))
+                    + " MiB of VRAM for " + this.rendererName);
+        } else {
+            Logger.warn("Could not determine dedicated VRAM for " + this.rendererName);
         }
 
         if (this.compute&&this.isAmd) {
@@ -92,6 +102,56 @@ public class Capabilities {
     }
 
     public static void init() {
+    }
+
+    private static long detectDedicatedGpuMemory(String rendererName) {
+        try {
+            String renderer = normalizeAdapterName(rendererName);
+            GraphicsCard soleCard = null;
+            int cardCount = 0;
+            GraphicsCard bestMatch = null;
+            int bestScore = 0;
+            for (GraphicsCard card : new SystemInfo().getHardware().getGraphicsCards()) {
+                if (card.getVRam() <= 0) continue;
+                soleCard = card;
+                cardCount++;
+
+                String candidate = normalizeAdapterName(card.getName());
+                int score = adapterMatchScore(renderer, candidate);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = card;
+                }
+            }
+            if (bestMatch != null && bestScore >= 2) return bestMatch.getVRam();
+            if (cardCount == 1) return soleCard.getVRam();
+        } catch (Throwable failure) {
+            // VRAM discovery is advisory. Unsupported OS/JNA configurations must not
+            // prevent the renderer from starting.
+            Logger.warn("Failed to query graphics adapter memory", failure);
+        }
+        return -1;
+    }
+
+    private static int adapterMatchScore(String renderer, String candidate) {
+        if (renderer.isEmpty() || candidate.isEmpty()) return 0;
+        if (renderer.equals(candidate)) return 100;
+        if (renderer.contains(candidate) || candidate.contains(renderer)) return 50;
+
+        int matches = 0;
+        for (String token : candidate.split(" ")) {
+            if (token.length() >= 3 && renderer.contains(token)) matches++;
+        }
+        return matches;
+    }
+
+    private static String normalizeAdapterName(String name) {
+        if (name == null) return "";
+        return name.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", " ")
+                .replace(" corporation", "")
+                .replace(" graphics", "")
+                .trim();
     }
 
     private static boolean testDepthSampler() {
