@@ -32,7 +32,9 @@ pub struct RegionalRuntime {
     root: PathBuf,
     world_identity: [u8; 32],
     layout: RegionLayout,
-    regions: RwLock<BTreeMap<(i32, i32), Arc<RegionFile>>>,
+    // Keep only generation metadata resident. Region indexes and file handles are opened for the
+    // one request or rebuild that owns them, so world size cannot multiply the full directory.
+    regions: RwLock<BTreeMap<(i32, i32), u64>>,
     sources: RwLock<BTreeMap<(i32, i32), RegionSourceTable>>,
     recovering: RwLock<BTreeSet<(i32, i32)>>,
     maintenance: Mutex<()>,
@@ -44,6 +46,7 @@ struct PriorityRequests {
     order: VecDeque<(i32, i32)>,
     membership: BTreeSet<(i32, i32)>,
     subscriptions: BTreeMap<(i32, i32), usize>,
+    active: BTreeMap<(i32, i32), Arc<RegionFile>>,
 }
 
 impl RegionalRuntime {
@@ -69,6 +72,20 @@ impl RegionalRuntime {
         identity.update(dimension.as_bytes());
         let world_identity = *identity.finalize().as_bytes();
 
+        let source_snapshot = source.region_headers()?;
+        let source_coordinates = source_snapshot
+            .valid
+            .iter()
+            .map(|header| (header.region_x, header.region_z))
+            .chain(
+                source_snapshot
+                    .failed
+                    .iter()
+                    .map(|failed| (failed.region_x, failed.region_z)),
+            )
+            .collect::<BTreeSet<_>>();
+        drop(source_snapshot);
+
         let mut regions = BTreeMap::new();
         let mut sources = BTreeMap::new();
         for entry in fs::read_dir(&root)? {
@@ -77,6 +94,10 @@ impl RegionalRuntime {
             let Some((coordinate, kind)) = parse_file_name(&path) else {
                 continue;
             };
+            if !source_coordinates.contains(&coordinate) {
+                remove_if_exists(&path)?;
+                continue;
+            }
             match kind {
                 RegionalFileKind::Terrain => match RegionFile::open(&path) {
                     Ok(region)
@@ -85,7 +106,7 @@ impl RegionalRuntime {
                             && region.catalog_id() == catalog_id
                             && region.layout() == layout =>
                     {
-                        regions.insert(coordinate, Arc::new(region));
+                        regions.insert(coordinate, region.generation());
                     }
                     Ok(_) | Err(_) => crate::quarantine(&path),
                 },
@@ -100,7 +121,7 @@ impl RegionalRuntime {
         sources.retain(|coordinate, table| {
             regions
                 .get(coordinate)
-                .is_some_and(|region| region.generation() == table.terrain_generation)
+                .is_some_and(|generation| *generation == table.terrain_generation)
         });
         Ok(Self {
             dimension,
@@ -126,7 +147,43 @@ impl RegionalRuntime {
     }
 
     pub fn region(&self, x: i32, z: i32) -> Result<Option<Arc<RegionFile>>> {
-        Ok(read_lock(&self.regions)?.get(&(x, z)).cloned())
+        let coordinate = (x, z);
+        if let Some(region) = self
+            .priority
+            .lock()
+            .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?
+            .active
+            .get(&coordinate)
+            .cloned()
+        {
+            return Ok(Some(region));
+        }
+        let Some(generation) = read_lock(&self.regions)?.get(&coordinate).copied() else {
+            return Ok(None);
+        };
+        match self.open_generation(coordinate, generation) {
+            Ok(region) => {
+                let region = Arc::new(region);
+                let mut priority = self
+                    .priority
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?;
+                if priority.subscriptions.contains_key(&coordinate) {
+                    priority.active.insert(coordinate, region.clone());
+                }
+                Ok(Some(region))
+            }
+            Err(error) => {
+                let removed = self.quarantine_generation(x, z, generation)?;
+                if removed {
+                    eprintln!(
+                        "{}: quarantined damaged regional shard ({x},{z}) generation {generation} while opening it: {error:#}",
+                        self.dimension
+                    );
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Moves an explicitly requested shard ahead of background import work. Duplicate hints are
@@ -178,6 +235,7 @@ impl RegionalRuntime {
         if remove {
             queue.subscriptions.remove(&coordinate);
             queue.membership.remove(&coordinate);
+            queue.active.remove(&coordinate);
         }
         Ok(())
     }
@@ -199,7 +257,7 @@ impl RegionalRuntime {
             let regions = read_lock(&self.regions)?;
             if regions
                 .get(&coordinate)
-                .is_none_or(|region| region.generation() != generation)
+                .is_none_or(|current| *current != generation)
             {
                 return Ok(false);
             }
@@ -207,8 +265,14 @@ impl RegionalRuntime {
         if !write_lock(&self.recovering)?.insert(coordinate) {
             return Ok(false);
         }
+        write_lock(&self.regions)?.remove(&coordinate);
         write_lock(&self.sources)?.remove(&coordinate);
         crate::quarantine(&self.terrain_path(coordinate));
+        self.priority
+            .lock()
+            .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?
+            .active
+            .remove(&coordinate);
         remove_if_exists(&self.source_path(coordinate))?;
         self.prioritize_region(region_x, region_z)?;
         Ok(true)
@@ -244,6 +308,11 @@ impl RegionalRuntime {
             write_lock(&self.regions)?.remove(coordinate);
             write_lock(&self.sources)?.remove(coordinate);
             write_lock(&self.recovering)?.remove(coordinate);
+            self.priority
+                .lock()
+                .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?
+                .active
+                .remove(coordinate);
             remove_if_exists(&self.terrain_path(*coordinate))?;
             remove_if_exists(&self.source_path(*coordinate))?;
             result.removed.push(*coordinate);
@@ -283,7 +352,11 @@ impl RegionalRuntime {
 
         for coordinate in order {
             let header = &headers[&coordinate];
-            let region = read_lock(&self.regions)?.get(&coordinate).cloned();
+            let region = read_lock(&self.regions)?
+                .get(&coordinate)
+                .copied()
+                .map(|generation| self.open_generation(coordinate, generation))
+                .transpose()?;
             let stored_source = read_lock(&self.sources)?.get(&coordinate).cloned();
             if let (Some(region), Some(stored_source)) = (&region, &stored_source)
                 && stored_source.terrain_generation == region.generation()
@@ -364,7 +437,16 @@ impl RegionalRuntime {
                 stats.reused_sections,
                 stats.output_bytes
             );
-            write_lock(&self.regions)?.insert(coordinate, Arc::new(built));
+            write_lock(&self.regions)?.insert(coordinate, built.generation());
+            {
+                let mut priority = self
+                    .priority
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?;
+                if priority.subscriptions.contains_key(&coordinate) {
+                    priority.active.insert(coordinate, Arc::new(built));
+                }
+            }
             write_lock(&self.sources)?.insert(coordinate, source);
             write_lock(&self.recovering)?.remove(&coordinate);
             result
@@ -392,12 +474,25 @@ impl RegionalRuntime {
         let Ok(sources) = self.sources.read() else {
             return false;
         };
-        regions.get(&coordinate).is_some_and(|region| {
+        regions.get(&coordinate).is_some_and(|generation| {
             sources.get(&coordinate).is_some_and(|source| {
-                source.terrain_generation == region.generation()
+                source.terrain_generation == *generation
                     && source.header_matches(&header.entries, header.file_marker)
             })
         })
+    }
+
+    fn open_generation(&self, coordinate: (i32, i32), generation: u64) -> Result<RegionFile> {
+        let region = RegionFile::open(self.terrain_path(coordinate))?;
+        if region.region() != coordinate
+            || region.generation() != generation
+            || region.world_identity() != self.world_identity
+            || region.catalog_id() != read_lock(&self.registry)?.catalog_id()
+            || region.layout() != self.layout
+        {
+            bail!("regional generation metadata disagrees with its file");
+        }
+        Ok(region)
     }
 
     /// Reads only Anvil records whose header changed. Semantic changes identify the exact 2x2
