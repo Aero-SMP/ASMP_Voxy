@@ -74,6 +74,9 @@ public class BasicAsyncGeometryManager {
                     Integer.toUnsignedLong(required), largest);
         }
         int address = Math.toIntExact(rawAddress);
+        boolean metadataInstalled = false;
+        boolean uploadInstalled = false;
+        boolean accountingInstalled = false;
         try {
             if (newId > this.sectionMetadata.size()) {
                 throw new IllegalStateException("section ID allocator skipped metadata entries");
@@ -83,18 +86,34 @@ public class BasicAsyncGeometryManager {
             }
             SectionMeta metadata = new SectionMeta(section.position, section.aabb, address,
                     elements, section.offsets, section.childExistence);
-            if (newId == this.sectionMetadata.size()) this.sectionMetadata.add(metadata);
-            else this.sectionMetadata.set(newId, metadata);
-            this.usedCapacity += required;
-            if (this.heapUploads.put(address, section.geometryBuffer) != null) {
+            if (this.heapUploads.containsKey(address)) {
                 throw new IllegalStateException("geometry address is already uploading");
             }
+            if (newId == this.sectionMetadata.size()) this.sectionMetadata.add(metadata);
+            else this.sectionMetadata.set(newId, metadata);
+            metadataInstalled = true;
+            this.heapUploads.put(address, section.geometryBuffer);
+            uploadInstalled = true;
             this.pendingUploadBytes += section.geometryBuffer.size;
+            this.usedCapacity += required;
+            accountingInstalled = true;
             this.heapRemoveUploads.remove(address);
             this.invalidatedIds.add(newId);
             return new Admission(AdmissionStatus.ACCEPTED, newId,
                     Integer.toUnsignedLong(required), this.allocationHeap.getLargestFreeSize());
         } catch (RuntimeException | Error failure) {
+            if (accountingInstalled) {
+                this.pendingUploadBytes -= section.geometryBuffer.size;
+                this.usedCapacity -= required;
+            }
+            if (uploadInstalled) this.heapUploads.remove(address);
+            if (metadataInstalled) {
+                if (newId == this.sectionMetadata.size() - 1) {
+                    this.sectionMetadata.remove(this.sectionMetadata.size() - 1);
+                } else {
+                    this.sectionMetadata.set(newId, null);
+                }
+            }
             this.allocationHeap.free(address);
             this.allocationSet.free(newId);
             throw failure;
@@ -239,6 +258,10 @@ public class BasicAsyncGeometryManager {
 
     public long getGeometryUsedBytes() {
         return this.usedCapacity * GEOMETRY_ELEMENT_SIZE;
+    }
+
+    public long getLargestFreeGeometryUnits() {
+        return this.allocationHeap.getLargestFreeSize();
     }
 
     public IntOpenHashSet getUpdateIds() {

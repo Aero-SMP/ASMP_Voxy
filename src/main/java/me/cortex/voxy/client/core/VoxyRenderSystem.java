@@ -133,6 +133,16 @@ public class VoxyRenderSystem {
         return nodes == null ? 0 : nodes.geometryCapacityBytes();
     }
 
+    public long regionalLargestFreeGeometryUnits() {
+        AsyncNodeManager nodes = this.nodeManager;
+        return nodes == null ? 0 : nodes.largestFreeGeometryUnits();
+    }
+
+    public int regionalGeometrySectionCount() {
+        AsyncNodeManager nodes = this.nodeManager;
+        return nodes == null ? 0 : nodes.usedGeometrySections();
+    }
+
     public long regionalGeometryPublicationLimitBytes() {
         AsyncNodeManager nodes = this.nodeManager;
         return nodes == null ? 0 : nodes.geometryPublicationLimitBytes();

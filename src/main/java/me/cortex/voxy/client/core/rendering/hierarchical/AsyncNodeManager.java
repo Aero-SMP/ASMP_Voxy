@@ -50,7 +50,6 @@ import static org.lwjgl.opengl.GL43C.*;
 // this is done off thread to reduce the amount of work done on the render thread, improving frame stability and reducing runtime overhead
 public class AsyncNodeManager {
     private static final long MAX_SYNC_GEOMETRY_BYTES = 16L << 20;
-    private static final int MAX_SYNC_REGIONAL_PUBLICATIONS = 1_024;
     private static final long[] BATCH_START_LATENCY_BUCKET_NANOS = {
             100_000L, 500_000L, 1_000_000L, 4_000_000L, 16_000_000L
     };
@@ -519,6 +518,8 @@ public class AsyncNodeManager {
 
         results.geometrySectionCount = this.geometryManager.getSectionCount();
         results.usedGeometry = this.geometryManager.getGeometryUsedBytes();
+        this.largestFreeGeometryUnits = this.geometryManager.getLargestFreeGeometryUnits();
+        this.usedGeometrySections = results.geometrySectionCount;
         results.currentMaxNodeId = this.manager.getCurrentMaxNodeId();
 
         this.needsWaitForSync |= results.geometryUpload.currentElemCopyAmount*8L > 2L<<20;//2mb limit per frame
@@ -535,7 +536,6 @@ public class AsyncNodeManager {
 
     private boolean regionalSyncBatchHasRoom(RegionalSectionPublication publication) {
         int publications = this.completedRegionalSectionPublications.size();
-        if (publications >= MAX_SYNC_REGIONAL_PUBLICATIONS) return false;
         BuiltSection geometry = publication.geometry();
         long bytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
         return publications == 0
@@ -849,6 +849,8 @@ public class AsyncNodeManager {
     }
 
     private volatile long usedGeometryAmount = 0;
+    private volatile long largestFreeGeometryUnits;
+    private volatile int usedGeometrySections;
     //==================================================================================================================
     //Incoming events
 
@@ -983,6 +985,14 @@ public class AsyncNodeManager {
         return this.geometryCapacity;
     }
 
+    public long largestFreeGeometryUnits() {
+        return this.largestFreeGeometryUnits;
+    }
+
+    public int usedGeometrySections() {
+        return this.usedGeometrySections;
+    }
+
     public long geometryPublicationLimitBytes() {
         return this.geometryCapacity;
     }
@@ -1085,11 +1095,11 @@ public class AsyncNodeManager {
                 }
                 throw new IllegalStateException("Voxy renderer is not running");
             }
-            for (RegionalSectionPublication publication : publications) {
-                publication.timing().recordRendererQueued(rendererQueuedNanos);
-            }
             if (this.regionalBatchHandoff != null) {
                 throw new IllegalStateException("regional renderer handoff is occupied");
+            }
+            for (RegionalSectionPublication publication : publications) {
+                publication.timing().recordRendererQueued(rendererQueuedNanos);
             }
             long enqueuedNanos = System.nanoTime();
             this.regionalBatchHandoff = new RegionalPublicationBatch(publications, enqueuedNanos);

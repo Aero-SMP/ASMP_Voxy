@@ -124,6 +124,25 @@ final class RegionalQuicClient implements AutoCloseable {
     }
 
     String description() { return this.description; }
+    record LaneSnapshot(int idle, int active, int activeSections, long bodyBytes) {}
+    LaneSnapshot laneSnapshot() {
+        int idle = 0;
+        int active = 0;
+        int activeSections = 0;
+        long bodyBytes = 0;
+        for (List<LaneWorker> group : this.lanes) for (LaneWorker lane : group) {
+            synchronized (lane) {
+                if (lane.active) {
+                    active++;
+                    activeSections += lane.activeSections;
+                    bodyBytes += lane.currentBodyBytes;
+                } else {
+                    idle++;
+                }
+            }
+        }
+        return new LaneSnapshot(idle, active, activeSections, bodyBytes);
+    }
     boolean isOpen() {
         return !this.closed.get() && this.failure.get() == null && this.connection.isConnected();
     }
@@ -209,6 +228,8 @@ final class RegionalQuicClient implements AutoCloseable {
         private final RegionalProtocol.Lane priority;
         private LaneTask task;
         private boolean active;
+        private int activeSections;
+        private long currentBodyBytes;
         private volatile QuicStream stream;
 
         private LaneWorker(RegionalProtocol.Lane priority) { this.priority = priority; }
@@ -216,6 +237,7 @@ final class RegionalQuicClient implements AutoCloseable {
         private synchronized boolean tryAssign(LaneTask offered) {
             if (this.active || closed.get()) return false;
             this.active = true;
+            this.activeSections = offered.ordinals.size();
             this.task = offered;
             this.notifyAll();
             return true;
@@ -230,6 +252,8 @@ final class RegionalQuicClient implements AutoCloseable {
 
         private synchronized void finishTask() {
             this.active = false;
+            this.activeSections = 0;
+            this.currentBodyBytes = 0;
             this.notifyAll();
             signalActivity();
         }
@@ -252,7 +276,17 @@ final class RegionalQuicClient implements AutoCloseable {
                         int received = 0;
                         while (received < task.ordinals.size()) {
                             received += RegionalProtocol.readReplyBatch(input, task.epoch,
-                                    task.index, task.ordinals, received, task.receiver::reply);
+                                    task.index, task.ordinals, received, reply -> {
+                                        synchronized (this) {
+                                            this.currentBodyBytes = reply.compressed() == null
+                                                    ? 0 : reply.compressed().length;
+                                        }
+                                        try {
+                                            task.receiver.reply(reply);
+                                        } finally {
+                                            synchronized (this) { this.currentBodyBytes = 0; }
+                                        }
+                                    });
                         }
                         task.receiver.complete();
                         this.finishTask();
@@ -275,6 +309,8 @@ final class RegionalQuicClient implements AutoCloseable {
                 pending = this.task;
                 this.task = null;
                 this.active = false;
+                this.activeSections = 0;
+                this.currentBodyBytes = 0;
                 this.notifyAll();
             }
             if (pending != null) pending.receiver.failed(closedFailure());

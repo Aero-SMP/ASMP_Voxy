@@ -34,6 +34,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     static final class RegionDemand {
         final long key;
         int users;
+        int coverageUsers;
         int highestBucket;
         long announcedGeneration;
         long installedGeneration;
@@ -52,18 +53,13 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         final long regionKey;
         final boolean coverage;
         final long topOwner;
-        long revision = 1;
-        long regionGeneration;
-        int ordinal = -1;
+        volatile long revision = 1;
+        volatile long regionGeneration;
         int pixelBucket;
         int latestDetailEpoch = -1;
-        int latestRetentionEpoch = -1;
         boolean desired = true;
-        CandidateState candidate = CandidateState.NONE;
+        volatile CandidateState candidate = CandidateState.NONE;
         Retention retention = Retention.SELECTED;
-        Object index;
-        Object publication;
-        long installedBytes;
 
         ReadyKind readyKind;
         int readyBucket = -1;
@@ -254,6 +250,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         this.demands.put(demand.key, demand);
         RegionDemand region = this.regions.computeIfAbsent(demand.regionKey, RegionDemand::new);
         region.users++;
+        if (demand.coverage) region.coverageUsers++;
         region.members.put(demand.key, demand);
         region.highestBucket = Math.max(region.highestBucket, demand.pixelBucket);
         return demand;
@@ -273,14 +270,23 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
 
     void readyRegion(RegionDemand region) {
         if (region != null && this.regions.get(region.key) == region && !region.requested
-                && !region.absent && region.index == null) {
+                && (!region.subscribed || !region.absent && region.index == null)) {
             this.readyRegions.put(region.key, region);
         }
     }
 
     RegionDemand pollRegion() {
         if (this.readyRegions.isEmpty()) return null;
-        long key = this.readyRegions.keySet().iterator().next();
+        RegionDemand selected = null;
+        for (RegionDemand candidate : this.readyRegions.values()) {
+            if (selected == null
+                    || candidate.coverageUsers > 0 && selected.coverageUsers == 0
+                    || (candidate.coverageUsers > 0) == (selected.coverageUsers > 0)
+                    && candidate.highestBucket > selected.highestBucket) {
+                selected = candidate;
+            }
+        }
+        long key = Objects.requireNonNull(selected).key;
         return this.readyRegions.remove(key);
     }
 
@@ -295,6 +301,13 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             throw new IllegalStateException("regional demand accounting underflow");
         }
         region.members.remove(demand.key);
+        if (demand.coverage && --region.coverageUsers < 0) {
+            throw new IllegalStateException("regional coverage accounting underflow");
+        }
+        if (demand.pixelBucket == region.highestBucket) {
+            region.highestBucket = region.members.values().stream()
+                    .mapToInt(member -> member.pixelBucket).max().orElse(0);
+        }
         if (region.users == 0) {
             this.regions.remove(region.key);
             this.readyRegions.remove(region.key);
@@ -308,9 +321,18 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         requireCurrent(demand);
         bucket = Math.max(0, Math.min(this.pixelBuckets - 1, bucket));
         if (demand.pixelBucket == bucket) return;
+        int previousBucket = demand.pixelBucket;
         ReadyKind kind = demand.readyKind;
         if (kind != null) unlinkReady(demand);
         demand.pixelBucket = bucket;
+        RegionDemand region = this.regions.get(demand.regionKey);
+        if (region != null) {
+            if (bucket > region.highestBucket) region.highestBucket = bucket;
+            else if (previousBucket == region.highestBucket && bucket < previousBucket) {
+                region.highestBucket = region.members.values().stream()
+                        .mapToInt(member -> member.pixelBucket).max().orElse(0);
+            }
+        }
         if (kind != null) ready(demand, kind);
     }
 
