@@ -15,6 +15,7 @@ import me.cortex.voxy.debugtest.DebugTestOrdering;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
+import net.minecraft.commands.arguments.ResourceLocationArgument;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
@@ -91,7 +92,7 @@ final class LiveServerTestHarness {
         var timeout = Commands.argument("timeout_ms", LongArgumentType.longArg(1, 3_600_000))
                 .executes(context -> pose(context.getSource(), uuid(context, "run"),
                         LongArgumentType.getLong(context, "step"),
-                        StringArgumentType.getString(context, "dimension"),
+                        ResourceLocationArgument.getId(context, "dimension").toString(),
                         DoubleArgumentType.getDouble(context, "x"),
                         DoubleArgumentType.getDouble(context, "y"),
                         DoubleArgumentType.getDouble(context, "z"),
@@ -103,7 +104,7 @@ final class LiveServerTestHarness {
         var z = Commands.argument("z", DoubleArgumentType.doubleArg()).then(yaw);
         var y = Commands.argument("y", DoubleArgumentType.doubleArg()).then(z);
         var x = Commands.argument("x", DoubleArgumentType.doubleArg()).then(y);
-        var dimension = Commands.argument("dimension", StringArgumentType.word()).then(x);
+        var dimension = Commands.argument("dimension", ResourceLocationArgument.id()).then(x);
         var poseStep = Commands.argument("step", LongArgumentType.longArg(1)).then(dimension);
         var poseRun = Commands.argument("run", StringArgumentType.word()).then(poseStep);
         root.then(Commands.literal("pose").then(poseRun));
