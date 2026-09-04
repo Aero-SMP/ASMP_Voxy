@@ -41,6 +41,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         boolean requested;
         boolean subscribed;
         boolean absent;
+        int resourceSlot = -1;
         final LinkedHashMap<Long, Demand> members = new LinkedHashMap<>();
 
         RegionDemand(long key) { this.key = key; }
@@ -311,6 +312,13 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         if (kind != null) unlinkReady(demand);
         demand.pixelBucket = bucket;
         if (kind != null) ready(demand, kind);
+    }
+
+    void revise(Demand demand) {
+        requireCurrent(demand);
+        unlinkReady(demand);
+        demand.revision = ++this.nextRevision;
+        if (demand.revision == 0) demand.revision = ++this.nextRevision;
     }
 
     void ready(Demand demand, ReadyKind kind) {

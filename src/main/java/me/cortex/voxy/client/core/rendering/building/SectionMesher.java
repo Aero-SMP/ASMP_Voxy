@@ -30,11 +30,19 @@ public final class SectionMesher {
     }
 
     public void requestModels(RegionalSectionCodec.SectionData section) {
-        for (int block : section.usedBlocks()) this.bakery.requestBlockBake(block);
+        this.requestModels(section.usedBlocks());
+    }
+
+    public void requestModels(int[] blocks) {
+        for (int block : blocks) this.bakery.requestBlockBake(block);
     }
 
     public boolean modelsReady(RegionalSectionCodec.SectionData section) {
-        for (int block : section.usedBlocks()) {
+        return this.modelsReady(section.usedBlocks());
+    }
+
+    public boolean modelsReady(int[] blocks) {
+        for (int block : blocks) {
             if (!this.models.isModelReadyForBlockId(block)) return false;
         }
         return true;
