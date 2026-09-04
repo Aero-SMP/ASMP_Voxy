@@ -224,6 +224,8 @@ final class ClientSession {
         long geometryBytes, activeGeometryBytes;
         volatile int geometryAccountToken;
         final AtomicBoolean geometryAccounted = new AtomicBoolean();
+        volatile int publishingAccountToken;
+        final AtomicBoolean publishingGeometryAccounted = new AtomicBoolean();
         int latestRefinementEpoch = -1;
         int latestDormancyEpoch = -1;
         boolean dormant;
@@ -486,6 +488,7 @@ final class ClientSession {
         volatile int cameraSectionX;
         volatile int cameraSectionZ;
         final AtomicLong completedGeometryBytes = new AtomicLong();
+        final AtomicLong publishingGeometryBytes = new AtomicLong();
         volatile Throwable failure;
 
         Session(long id, String dimension, VoxyRenderSystem renderer) {
@@ -1010,7 +1013,8 @@ final class ClientSession {
                 Demand child = this.demands.get(key);
                 if (key != parent && contains(parent, key) && child != null) {
                     bytes += child.activeGeometryBytes;
-                    hasWork |= child.activeGeometryBytes != 0 || child.geometryAccounted.get();
+                    hasWork |= child.activeGeometryBytes != 0 || child.geometryAccounted.get()
+                            || child.publishingGeometryAccounted.get();
                 }
             }
             if (!hasWork) return 0;
@@ -1041,6 +1045,8 @@ final class ClientSession {
             if (demand == null || demand.coverage) return;
             this.forgetDormancyForSubtree(key);
             this.discardCompletedGeometry(demand);
+            this.releasePublishingGeometryAccounting(demand,
+                    demand.publishingAccountToken);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
@@ -1151,6 +1157,8 @@ final class ClientSession {
             if (demand == null) return;
             this.forgetDormancyForSubtree(key);
             this.discardCompletedGeometry(demand);
+            this.releasePublishingGeometryAccounting(demand,
+                    demand.publishingAccountToken);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
@@ -1721,7 +1729,8 @@ final class ClientSession {
 
         long geometryDeficitBytes() {
             return this.selectedGeometryBytes()
-                    + this.completedGeometryBytes.get() - this.geometryTargetBytes();
+                    + this.completedGeometryBytes.get() + this.publishingGeometryBytes.get()
+                    - this.geometryTargetBytes();
         }
 
         long physicalGeometryDeficitBytes() {
@@ -1737,10 +1746,38 @@ final class ClientSession {
             this.releaseGeometryAccounting(demand, demand.geometryAccountToken);
         }
 
-        void releaseGeometryAccounting(Demand demand, int token) {
-            if (demand.geometryAccountToken != token
-                    || !demand.geometryAccounted.compareAndSet(true, false)) return;
-            this.completedGeometryBytes.addAndGet(-demand.geometryBytes);
+        boolean releaseGeometryAccounting(Demand demand, int token) {
+            synchronized (demand) {
+                if (demand.geometryAccountToken != token
+                        || !demand.geometryAccounted.compareAndSet(true, false)) return false;
+                this.completedGeometryBytes.addAndGet(-demand.geometryBytes);
+                return true;
+            }
+        }
+
+        void transferGeometryAccounting(Demand demand, int token) {
+            synchronized (demand) {
+                if (!this.releaseGeometryAccounting(demand, token)) return;
+                demand.publishingAccountToken = token;
+                if (!demand.publishingGeometryAccounted.compareAndSet(false, true)) {
+                    throw new IllegalStateException(
+                            "regional publishing geometry was accounted twice");
+                }
+                this.publishingGeometryBytes.addAndGet(demand.geometryBytes);
+            }
+        }
+
+        void releasePublishingGeometryAccounting(Demand demand, int token) {
+            synchronized (demand) {
+                if (demand.publishingAccountToken != token
+                        || !demand.publishingGeometryAccounted.compareAndSet(true, false)) return;
+                this.publishingGeometryBytes.addAndGet(-demand.geometryBytes);
+            }
+        }
+
+        void releaseAllGeometryAccounting(Demand demand, int token) {
+            this.releaseGeometryAccounting(demand, token);
+            this.releasePublishingGeometryAccounting(demand, token);
         }
 
         void acceptPublication(PublicationQueued result) throws IOException {
@@ -1748,7 +1785,7 @@ final class ClientSession {
             if (demand != result.demand || !current(demand, result.token, Phase.PUBLISHING)
                     || demand.renderAdmission != result.admission) {
                 if (!this.isCoarsening(result.key)) result.publication.close();
-                this.releaseGeometryAccounting(result.demand, result.token);
+                this.releaseAllGeometryAccounting(result.demand, result.token);
                 result.admission.release();
                 return;
             }
@@ -1775,7 +1812,7 @@ final class ClientSession {
                 }
                 Optional<Throwable> failure = demand.publication.activationFailure();
                 if (failure.isPresent()) {
-                    this.releaseGeometryAccounting(demand, ref.token);
+                    this.releaseAllGeometryAccounting(demand, ref.token);
                     this.releaseAdmission(demand, ref.admission);
                     throw new IOException("regional renderer publication failed",
                             failure.orElseThrow());
@@ -1790,7 +1827,7 @@ final class ClientSession {
                 if (demand.coverage) this.missingCoverage.remove(demand.key);
                 demand.decoded = null;
                 this.activated++;
-                this.releaseGeometryAccounting(demand, ref.token);
+                this.releaseAllGeometryAccounting(demand, ref.token);
                 this.releaseAdmission(demand, ref.admission);
                 if (demand.pendingIndex != null) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
@@ -1919,6 +1956,7 @@ final class ClientSession {
                     + " dormantRoots=" + this.dormantRoots.size()
                     + " dormantPendingFree=" + this.pendingDormantEvictionBytes
                     + " geometryCompleted=" + this.completedGeometryBytes.get()
+                    + " geometryPublishing=" + this.publishingGeometryBytes.get()
                     + " geometryTarget=" + this.geometryTargetBytes()
                     + " dormancyTransitions=" + this.dormancyTransitions
                     + " wakes=" + this.wakes + " instantWakes=" + this.instantWakes
@@ -1968,6 +2006,7 @@ final class ClientSession {
             this.activeGeometryBytes = 0;
             this.dormantGeometryBytes = 0;
             this.pendingDormantEvictionBytes = 0;
+            this.publishingGeometryBytes.set(0);
             this.clearStageQueues();
         }
     }
@@ -2034,7 +2073,7 @@ final class ClientSession {
                         || this.demand.phase != Phase.PUBLISHING
                         || this.demand.renderAdmission != this.admission) {
                     this.geometry.free();
-                    this.owner.releaseGeometryAccounting(this.demand, this.token);
+                    this.owner.releaseAllGeometryAccounting(this.demand, this.token);
                     this.admission.release();
                     return;
                 }
@@ -2043,14 +2082,14 @@ final class ClientSession {
                                 && this.demand.phase == Phase.PUBLISHING
                                 && this.demand.renderAdmission == this.admission
                                 && this.owner.open.get(),
-                        () -> this.owner.releaseGeometryAccounting(this.demand, this.token));
+                        () -> this.owner.transferGeometryAccounting(this.demand, this.token));
             }
             this.owner.putEvent(new PublicationQueued(this.owner, this.demand, this.demand.key,
                     this.token, publication, this.admission));
         }
         @Override public void cancel() {
             this.geometry.free();
-            this.owner.releaseGeometryAccounting(this.demand, this.token);
+            this.owner.releaseAllGeometryAccounting(this.demand, this.token);
             this.admission.release();
         }
     }
@@ -2061,7 +2100,7 @@ final class ClientSession {
             meshed.admission.release();
         } else if (event instanceof PublicationQueued queued) {
             queued.publication.close();
-            queued.owner.releaseGeometryAccounting(queued.demand, queued.token);
+            queued.owner.releaseAllGeometryAccounting(queued.demand, queued.token);
             queued.admission.release();
         }
     }
