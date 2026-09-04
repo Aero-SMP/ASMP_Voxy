@@ -24,6 +24,7 @@ public final class DebugHarnessBehaviorTest {
         latestSampleIsConstantSizeAndRejectsStaleCompletion();
         prismArgumentFileLaunchIsAccepted();
         explicitGameDirectoryIsCanonicalized();
+        prismInstanceIsDerivedFromGameDirectory();
         System.out.println("debug harness Java behavior tests passed");
     }
 
@@ -117,15 +118,31 @@ public final class DebugHarnessBehaviorTest {
                 "explicit game directory was not canonicalized");
     }
 
+    private static void prismInstanceIsDerivedFromGameDirectory() {
+        Object instance = invokePrivateRestartMethod("prismInstanceId",
+                new Class<?>[] {Path.class},
+                Path.of("instances", "Aero SMP-4.1", "minecraft"));
+        check("Aero SMP-4.1".equals(instance), "Prism instance ID was not preserved");
+        Object invalid = invokePrivateRestartMethod("prismInstanceId",
+                new Class<?>[] {Path.class}, Path.of("ordinary-game-directory"));
+        check(invalid == null, "non-Prism directory produced an instance ID");
+    }
+
     private static void invokeGameDirectoryCanonicalization(ArrayList<String> command,
                                                             Path gameDirectory) {
+        invokePrivateRestartMethod("canonicalizeGameDirectory",
+                new Class<?>[] {ArrayList.class, Path.class}, command, gameDirectory);
+    }
+
+    private static Object invokePrivateRestartMethod(String name, Class<?>[] types,
+                                                     Object... arguments) {
         try {
-            Class<?> helper = Class.forName(
-                    "me.cortex.voxy.client.lod.ClientUpdateRestart");
-            Method method = helper.getDeclaredMethod(
-                    "canonicalizeGameDirectory", ArrayList.class, Path.class);
+            Class<?> helper = Class.forName(name.equals("prismInstanceId")
+                    ? "me.cortex.voxy.client.lod.ClientAutoUpdater"
+                    : "me.cortex.voxy.client.lod.ClientUpdateRestart");
+            Method method = helper.getDeclaredMethod(name, types);
             method.setAccessible(true);
-            method.invoke(null, command, gameDirectory);
+            return method.invoke(null, arguments);
         } catch (InvocationTargetException failure) {
             throw new AssertionError("restart command was rejected", failure.getCause());
         } catch (ReflectiveOperationException failure) {

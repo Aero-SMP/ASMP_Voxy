@@ -533,13 +533,13 @@ final class ClientAutoUpdater {
         ProcessHandle.Info info = current.info();
         String executable = info.command().orElseThrow(
                 () -> new IOException("current Java executable is unavailable"));
-        List<String> restartCommand = currentCommand(current.pid(), info, executable);
+        RestartLaunch restart = restartLaunch(current, info, executable, gameDirectory);
 
         Path updaterDirectory = gameDirectory.resolve(".voxy-updater");
         Path commandFile = updaterDirectory.resolve("restart-command.bin");
-        writeRestartCommand(commandFile, restartCommand);
+        writeRestartCommand(commandFile, restart.command);
 
-        List<String> helper = new ArrayList<>(7);
+        List<String> helper = new ArrayList<>(8);
         helper.add(executable);
         helper.add("-cp");
         helper.add(installed.toString());
@@ -547,6 +547,7 @@ final class ClientAutoUpdater {
         helper.add(Long.toString(current.pid()));
         helper.add(gameDirectory.toString());
         helper.add(commandFile.toString());
+        helper.add(Boolean.toString(restart.launcherDispatch));
         Path restartLog = updaterDirectory.resolve("restart.log");
         Process process;
         try {
@@ -574,6 +575,47 @@ final class ClientAutoUpdater {
             throw new IOException("restart helper failed to accept launch command; see "
                     + restartLog);
         }
+    }
+
+    private static RestartLaunch restartLaunch(ProcessHandle current,
+                                                ProcessHandle.Info info,
+                                                String javaExecutable,
+                                                Path gameDirectory)
+            throws IOException, InterruptedException {
+        Path prism = prismLauncherAncestor(current);
+        String instance = prismInstanceId(gameDirectory);
+        if (prism != null && instance != null) {
+            return new RestartLaunch(List.of(prism.toString(), "--launch", instance), true);
+        }
+        return new RestartLaunch(
+                currentCommand(current.pid(), info, javaExecutable), false);
+    }
+
+    private static Path prismLauncherAncestor(ProcessHandle process) {
+        ProcessHandle candidate = process;
+        for (int depth = 0; depth < 16; depth++) {
+            candidate = candidate.parent().orElse(null);
+            if (candidate == null) return null;
+            String executable = candidate.info().command().orElse(null);
+            if (executable == null) continue;
+            try {
+                Path path = Path.of(executable);
+                Path name = path.getFileName();
+                if (name != null && name.toString().toLowerCase(java.util.Locale.ROOT)
+                        .contains("prismlauncher")) return path;
+            } catch (RuntimeException ignored) {}
+        }
+        return null;
+    }
+
+    private static String prismInstanceId(Path gameDirectory) {
+        Path normalized = gameDirectory.toAbsolutePath().normalize();
+        Path name = normalized.getFileName();
+        Path instance = normalized.getParent();
+        if (name == null || !name.toString().equalsIgnoreCase("minecraft")
+                || instance == null || instance.getFileName() == null) return null;
+        String id = instance.getFileName().toString();
+        return id.isBlank() ? null : id;
     }
 
     private static List<String> currentCommand(long pid, ProcessHandle.Info info,
@@ -779,5 +821,6 @@ final class ClientAutoUpdater {
     }
 
     private record Artifact(String filename, String version) {}
+    private record RestartLaunch(List<String> command, boolean launcherDispatch) {}
     private record CommandResult(int exitCode, String output) {}
 }

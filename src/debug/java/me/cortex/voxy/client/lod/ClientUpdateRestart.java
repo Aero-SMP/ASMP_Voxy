@@ -26,10 +26,11 @@ final class ClientUpdateRestart {
     private ClientUpdateRestart() {}
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 3) throw new IllegalArgumentException("missing restart command");
+        if (arguments.length != 4) throw new IllegalArgumentException("missing restart command");
         long oldPid = Long.parseLong(arguments[0]);
         Path gameDirectory = Path.of(arguments[1]);
         Path commandFile = Path.of(arguments[2]);
+        boolean launcherDispatch = Boolean.parseBoolean(arguments[3]);
         Path restartLog = gameDirectory.resolve(".voxy-updater").resolve("restart.log");
         Path launchLog = gameDirectory.resolve(".voxy-updater")
                 .resolve("relaunched-java.log");
@@ -48,9 +49,14 @@ final class ClientUpdateRestart {
                     .redirectErrorStream(true)
                     .redirectOutput(ProcessBuilder.Redirect.appendTo(launchLog.toFile()))
                     .start();
-            append(restartLog, "new-process-started pid=" + launched.pid());
+            append(restartLog, "new-process-started pid=" + launched.pid()
+                    + " launcherDispatch=" + launcherDispatch);
             try {
                 int exitCode = launched.onExit().get(45, TimeUnit.SECONDS).exitValue();
+                if (launcherDispatch && exitCode == 0) {
+                    append(restartLog, "launcher-dispatch-complete");
+                    return;
+                }
                 throw new IOException("restarted Java process exited during startup: "
                         + exitCode);
             } catch (TimeoutException running) {
