@@ -1,10 +1,11 @@
 package me.cortex.voxy.client.lod;
 
-import java.util.ArrayDeque;
+import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiConsumer;
 
 /**
@@ -14,7 +15,8 @@ import java.util.function.BiConsumer;
  * coalescing mailboxes; runnable membership is intrusive, so reprioritising or cancelling a
  * section never leaves a stale job behind.</p>
  */
-final class SectionDemandTable {
+final class SectionDemandTable<D extends SectionDemandTable.Demand>
+        extends AbstractMap<Long, D> {
     enum CandidateState {
         NONE, WAIT_REGION, READY_SOURCE, NETWORK_OWNED, WORKER_OWNED, WAIT_MODELS,
         RENDERER_OWNED
@@ -42,7 +44,7 @@ final class SectionDemandTable {
         RegionDemand(long key) { this.key = key; }
     }
 
-    static final class Demand {
+    static class Demand {
         final long key;
         final long regionKey;
         final boolean coverage;
@@ -152,6 +154,17 @@ final class SectionDemandTable {
             else this.rotation.put(region, Boolean.TRUE);
             return result;
         }
+
+        Demand poll(long region) {
+            IntrusiveList list = this.regions.get(region);
+            if (list == null) return null;
+            Demand result = list.removeFirst();
+            this.size--;
+            this.rotation.remove(region);
+            if (list.size == 0) this.regions.remove(region);
+            else this.rotation.put(region, Boolean.TRUE);
+            return result;
+        }
     }
 
     /** Latest-value mailbox; its memory is bounded by distinct identities, not event count. */
@@ -180,7 +193,7 @@ final class SectionDemandTable {
     private final int pixelBuckets;
     private final long sessionEpoch;
     private long nextRevision;
-    private final Map<Long, Demand> demands = new LinkedHashMap<>();
+    private final Map<Long, D> demands = new LinkedHashMap<>();
     private final Map<Long, RegionDemand> regions = new HashMap<>();
     private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>();
     private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>();
@@ -226,29 +239,35 @@ final class SectionDemandTable {
         this.regionMailbox.take().forEach(consumer);
     }
 
-    Demand add(long key, long regionKey, long topOwner, boolean coverage, int bucket) {
-        Demand existing = this.demands.get(key);
+    D adopt(D demand) {
+        Objects.requireNonNull(demand, "demand");
+        D existing = this.demands.get(demand.key);
         if (existing != null) return existing;
-        Demand demand = new Demand(key, regionKey, topOwner, coverage,
-                Math.max(0, Math.min(this.pixelBuckets - 1, bucket)));
         demand.revision = ++this.nextRevision;
         if (demand.revision == 0) demand.revision = ++this.nextRevision;
-        this.demands.put(key, demand);
-        RegionDemand region = this.regions.computeIfAbsent(regionKey, RegionDemand::new);
+        demand.pixelBucket = Math.max(0, Math.min(this.pixelBuckets - 1,
+                demand.pixelBucket));
+        this.demands.put(demand.key, demand);
+        RegionDemand region = this.regions.computeIfAbsent(demand.regionKey, RegionDemand::new);
         region.users++;
         region.highestBucket = Math.max(region.highestBucket, demand.pixelBucket);
         return demand;
     }
 
-    Demand get(long key) { return this.demands.get(key); }
-    int size() { return this.demands.size(); }
-    Iterable<Demand> values() { return this.demands.values(); }
+    @Override public D get(Object key) { return this.demands.get(key); }
+    D get(long key) { return this.demands.get(key); }
+    @Override public boolean containsKey(Object key) { return this.demands.containsKey(key); }
+    @Override public int size() { return this.demands.size(); }
+    @Override public java.util.Collection<D> values() { return this.demands.values(); }
+    @Override public Set<Entry<Long, D>> entrySet() {
+        return java.util.Collections.unmodifiableSet(this.demands.entrySet());
+    }
     RegionDemand region(long key) { return this.regions.get(key); }
     Iterable<RegionDemand> regions() { return this.regions.values(); }
     int regionCount() { return this.regions.size(); }
 
-    Demand remove(long key) {
-        Demand demand = this.demands.remove(key);
+    D remove(long key) {
+        D demand = this.demands.remove(key);
         if (demand == null) return null;
         unlinkReady(demand);
         RegionDemand region = this.regions.get(demand.regionKey);
@@ -289,17 +308,24 @@ final class SectionDemandTable {
         demand.candidate = Objects.requireNonNull(state, "state");
     }
 
-    Demand poll(ReadyKind kind) {
+    D poll(ReadyKind kind) {
         // Structural coverage wins regardless of its pixel bucket.
         for (int bucket = this.pixelBuckets - 1; bucket >= 0; bucket--) {
             Demand coverage = this.ready[kind.ordinal()][1][bucket].poll();
-            if (coverage != null) return finishPoll(coverage);
+            if (coverage != null) return finishPollTyped(coverage);
         }
         for (int bucket = this.pixelBuckets - 1; bucket >= 0; bucket--) {
             Demand refinement = this.ready[kind.ordinal()][0][bucket].poll();
-            if (refinement != null) return finishPoll(refinement);
+            if (refinement != null) return finishPollTyped(refinement);
         }
         return null;
+    }
+
+    D pollSameRegion(ReadyKind kind, long region, boolean coverage, int pixelBucket) {
+        int bucket = coverage ? this.pixelBuckets - 1
+                : Math.max(0, Math.min(this.pixelBuckets - 1, pixelBucket));
+        Demand demand = this.ready[kind.ordinal()][coverage ? 1 : 0][bucket].poll(region);
+        return demand == null ? null : finishPollTyped(demand);
     }
 
     private Demand finishPoll(Demand demand) {
@@ -310,6 +336,9 @@ final class SectionDemandTable {
         demand.readyNext = null;
         return demand;
     }
+
+    @SuppressWarnings("unchecked")
+    private D finishPollTyped(Demand demand) { return (D) finishPoll(demand); }
 
     void unlinkReady(Demand demand) {
         if (demand == null || demand.readyKind == null) return;
@@ -341,7 +370,7 @@ final class SectionDemandTable {
                 && demand.regionGeneration == ticket.regionGeneration();
     }
 
-    void clear() {
+    @Override public void clear() {
         for (Demand demand : this.demands.values()) unlinkReady(demand);
         this.demands.clear();
         this.regions.clear();

@@ -18,7 +18,7 @@ public final class SectionDemandTableBehaviorTest {
     }
 
     private static void retainsOneHundredThousandDetailTransitions() {
-        SectionDemandTable table = new SectionDemandTable(16);
+        SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(16);
         for (long key = 0; key < 100_000; key++) table.offerDetail(key, 1, (int) key & 15, 1);
         check(table.pendingInputCount() == 100_000, "distinct detail facts were dropped");
         Map<Long, SectionDemandTable.DetailUpdate> drained = new HashMap<>();
@@ -28,7 +28,7 @@ public final class SectionDemandTableBehaviorTest {
     }
 
     private static void coalescesNewestUnsignedEpoch() {
-        SectionDemandTable table = new SectionDemandTable(8);
+        SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(8);
         table.offerDetail(7, 1, 1, Integer.MAX_VALUE);
         table.offerDetail(7, 2, 2, Integer.MIN_VALUE);
         table.offerDetail(7, 3, 3, Integer.MAX_VALUE - 1);
@@ -41,8 +41,8 @@ public final class SectionDemandTableBehaviorTest {
     }
 
     private static void priorityMovesOneMembership() {
-        SectionDemandTable table = new SectionDemandTable(8);
-        SectionDemandTable.Demand demand = table.add(1, 4, 9, false, 1);
+        SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(8);
+        SectionDemandTable.Demand demand = table.adopt(demand(1, 4, 9, false, 1));
         table.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
         table.setPriority(demand, 7);
         check(table.readyCount(SectionDemandTable.ReadyKind.SOURCE) == 1,
@@ -55,11 +55,11 @@ public final class SectionDemandTableBehaviorTest {
     }
 
     private static void coveragePrecedesFairRegionalRefinement() {
-        SectionDemandTable table = new SectionDemandTable(8);
-        SectionDemandTable.Demand lowA = table.add(1, 10, 100, false, 7);
-        SectionDemandTable.Demand lowA2 = table.add(2, 10, 100, false, 7);
-        SectionDemandTable.Demand lowB = table.add(3, 20, 100, false, 7);
-        SectionDemandTable.Demand coverage = table.add(4, 30, 100, true, 0);
+        SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(8);
+        SectionDemandTable.Demand lowA = table.adopt(demand(1, 10, 100, false, 7));
+        SectionDemandTable.Demand lowA2 = table.adopt(demand(2, 10, 100, false, 7));
+        SectionDemandTable.Demand lowB = table.adopt(demand(3, 20, 100, false, 7));
+        SectionDemandTable.Demand coverage = table.adopt(demand(4, 30, 100, true, 0));
         table.ready(lowA, SectionDemandTable.ReadyKind.NETWORK);
         table.ready(lowA2, SectionDemandTable.ReadyKind.NETWORK);
         table.ready(lowB, SectionDemandTable.ReadyKind.NETWORK);
@@ -76,9 +76,9 @@ public final class SectionDemandTableBehaviorTest {
     }
 
     private static void finalSectionReleasesRegion() {
-        SectionDemandTable table = new SectionDemandTable(4);
-        table.add(1, 77, 1, false, 0);
-        table.add(2, 77, 1, false, 0);
+        SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(4);
+        table.adopt(demand(1, 77, 1, false, 0));
+        table.adopt(demand(2, 77, 1, false, 0));
         table.remove(1);
         check(table.regionCount() == 1 && table.region(77).users == 1,
                 "region was released too early");
@@ -87,15 +87,20 @@ public final class SectionDemandTableBehaviorTest {
     }
 
     private static void staleTicketCannotMutateReplacement() {
-        SectionDemandTable table = new SectionDemandTable(4, 9);
-        SectionDemandTable.Demand first = table.add(1, 2, 3, false, 0);
+        SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(4, 9);
+        SectionDemandTable.Demand first = table.adopt(demand(1, 2, 3, false, 0));
         first.regionGeneration = 5;
         SectionDemandTable.Ticket ticket = first.ticket(9, 0);
         check(table.current(ticket), "fresh ticket was rejected");
         table.remove(1);
-        SectionDemandTable.Demand replacement = table.add(1, 2, 3, false, 0);
+        SectionDemandTable.Demand replacement = table.adopt(demand(1, 2, 3, false, 0));
         replacement.regionGeneration = 5;
         check(!table.current(ticket), "stale ticket matched replacement demand");
+    }
+
+    private static SectionDemandTable.Demand demand(long key, long region, long top,
+                                                     boolean coverage, int bucket) {
+        return new SectionDemandTable.Demand(key, region, top, coverage, bucket);
     }
 
     private static void check(boolean condition, String message) {
