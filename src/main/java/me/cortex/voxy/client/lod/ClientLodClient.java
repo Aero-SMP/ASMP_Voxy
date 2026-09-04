@@ -45,10 +45,6 @@ public final class ClientLodClient {
         ClientSession.detailAction(key, action, bucket, epoch);
     }
 
-    public static boolean detailPressure() {
-        return ClientSession.detailPressure();
-    }
-
     public static void resetDemand() {
         ClientSession.resetDemand();
     }

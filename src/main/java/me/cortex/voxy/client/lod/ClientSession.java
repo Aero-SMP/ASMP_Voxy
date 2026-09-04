@@ -1,5 +1,7 @@
 package me.cortex.voxy.client.lod;
 
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.model.CatalogMapper;
@@ -59,6 +61,8 @@ final class ClientSession {
     private static final int MAX_RENDER_ADMISSIONS = 1_024;
     private static final int COVERAGE_RENDER_RESERVE = 64;
     private static final int REQUEST_BATCH = 256;
+    private static final int MAX_DORMANT_EVICTIONS_PER_BATCH = 64;
+    private static final long MIN_DORMANT_EVICTION_BATCH_BYTES = 16L << 20;
     private static final long RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     private static final Object LIFECYCLE = new Object();
@@ -93,11 +97,6 @@ final class ClientSession {
     static void detailAction(long key, int action, int bucket, int epoch) {
         Session current = active;
         if (current != null) current.acceptDetailAction(key, action, bucket, epoch);
-    }
-
-    static boolean detailPressure() {
-        Session current = active;
-        return current != null && current.geometryDeficitBytes() >= 0;
     }
 
     static void resetDemand() {
@@ -139,6 +138,10 @@ final class ClientSession {
                     current.start();
                 }
             }
+        }
+        if (current != null) {
+            current.updateCamera((int) Math.floor(minecraft.player.getX()) >> 5,
+                    (int) Math.floor(minecraft.player.getZ()) >> 5);
         }
 
         current = active;
@@ -222,13 +225,30 @@ final class ClientSession {
         volatile int geometryAccountToken;
         final AtomicBoolean geometryAccounted = new AtomicBoolean();
         int latestRefinementEpoch = -1;
-        int latestCoarseningEpoch = -1;
+        int latestDormancyEpoch = -1;
+        boolean dormant;
+        int dormantBucket;
+        long lastSelectedSequence;
         boolean detailRejected;
         long budgetBlockedSinceNanos;
 
         Demand(long key) {
             this.key = key;
             this.coverage = SectionKey.level(key) == SectionKey.MAX_LOD_LAYER;
+        }
+    }
+
+    private static final class DormantRoot {
+        final long key;
+        long bytes;
+        int bucket;
+        long lastSelectedSequence;
+
+        DormantRoot(long key, long bytes, int bucket, long lastSelectedSequence) {
+            this.key = key;
+            this.bytes = bytes;
+            this.bucket = bucket;
+            this.lastSelectedSequence = lastSelectedSequence;
         }
     }
 
@@ -261,7 +281,8 @@ final class ClientSession {
 
         synchronized boolean offer(long key, int action, int bucket, int epoch) {
             if (action != HierarchicalOcclusionTraverser.ACTION_REFINE
-                    && action != HierarchicalOcclusionTraverser.ACTION_COARSEN_CANDIDATE) {
+                    && action != HierarchicalOcclusionTraverser.ACTION_DORMANT
+                    && action != HierarchicalOcclusionTraverser.ACTION_WAKE) {
                 return false;
             }
             bucket = Math.max(0, Math.min(BUCKETS - 1, bucket));
@@ -415,6 +436,9 @@ final class ClientSession {
         final Map<Long, LinkedHashSet<Long>> demandsByTop = new HashMap<>();
         final Set<Long> missingCoverage = new HashSet<>();
         final Set<Long> coarseningRoots = new HashSet<>();
+        final Long2ObjectOpenHashMap<DormantRoot> dormantRoots =
+                new Long2ObjectOpenHashMap<>();
+        final Long2LongOpenHashMap pendingDormantEvictions = new Long2LongOpenHashMap();
         final Object publicationLock = new Object();
         final ArrayDeque<Long> coverageBindQueue = new ArrayDeque<>();
         final ArrayDeque<Long> refinementBindQueue = new ArrayDeque<>();
@@ -444,9 +468,24 @@ final class ClientSession {
         long requestEpoch = 1;
         long receivedBytes;
         long activated;
+        long activeGeometryBytes;
+        long dormantGeometryBytes;
+        long pendingDormantEvictionBytes;
+        long selectionSequence;
+        long dormancyTransitions;
+        long wakes;
+        long instantWakes;
+        long capEvictions;
+        long admissionEvictions;
+        long dormantBytesFreedAfterFences;
+        long correctiveAccountingRebuilds;
+        long lastEvictionDistanceSquared;
+        long lastEvictionAge;
+        int lastEvictionBucket = -1;
         int activeCount;
+        volatile int cameraSectionX;
+        volatile int cameraSectionZ;
         final AtomicLong completedGeometryBytes = new AtomicLong();
-        volatile int detailAdmissionFloor;
         volatile Throwable failure;
 
         Session(long id, String dimension, VoxyRenderSystem renderer) {
@@ -469,9 +508,12 @@ final class ClientSession {
 
         void start() { this.thread.start(); }
 
+        void updateCamera(int sectionX, int sectionZ) {
+            this.cameraSectionX = sectionX;
+            this.cameraSectionZ = sectionZ;
+        }
+
         void acceptDetailAction(long key, int action, int bucket, int epoch) {
-            if (action == HierarchicalOcclusionTraverser.ACTION_REFINE
-                    && bucket < this.detailAdmissionFloor) return;
             if (this.frontier.offer(key, action, bucket, epoch)) this.signal();
         }
 
@@ -642,9 +684,9 @@ final class ClientSession {
                     }
                     case MeshedResult result -> this.acceptMeshed(result);
                     case PublicationQueued result -> this.acceptPublication(result);
-                    case Coarsened result -> this.finishCoarsening(result.parent);
+                    case Coarsened result -> this.finishCoarsening(result.parent, true);
                     case CoarsenFailed failed -> {
-                        this.finishCoarsening(failed.parent);
+                        this.finishCoarsening(failed.parent, false);
                         throw new IOException("regional subtree coarsening failed", failed.failure);
                     }
                     case BatchComplete complete -> {
@@ -663,6 +705,8 @@ final class ClientSession {
         void drainDemand() {
             if (this.resetRequested.getAndSet(false)) {
                 for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
+                this.dormantRoots.clear();
+                this.dormantGeometryBytes = 0;
                 this.frontier.clear();
                 this.clearStageQueues();
             }
@@ -682,8 +726,8 @@ final class ClientSession {
         }
 
         void drainDetailFrontier() {
-            if (this.renderer.regionalGeometryUsedBytes() + this.completedGeometryBytes.get()
-                    < this.geometryTargetBytes() * 3L / 4L) this.detailAdmissionFloor = 0;
+            this.drainDormancyTransitions();
+            this.evictDormant(this.dormantGeometryBytes - this.dormantCapBytes(), false);
             // Coverage retains its independent reserve; detail consumes only the remaining
             // pipeline and the steady-state portion of the geometry arena.
             for (int bucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
@@ -702,10 +746,6 @@ final class ClientSession {
                             || SectionKey.level(parent) == 0 || this.isCoarsening(parent)
                             || demand.detailRejected
                             || !newerEpoch(epoch, demand.latestRefinementEpoch)) continue;
-                    if (bucket < this.detailAdmissionFloor) {
-                        demand.latestRefinementEpoch = epoch;
-                        continue;
-                    }
                     if (this.geometryDeficitBytes() >= 0) {
                         this.frontier.offer(parent, action, bucket, epoch);
                         break;
@@ -727,64 +767,254 @@ final class ClientSession {
                     demand.latestRefinementEpoch = epoch;
                 }
             }
-
-            if (this.geometryDeficitBytes() < 0) {
-                this.discardRetentionActions();
-                return;
-            }
-            if (!this.coarseningRoots.isEmpty()) return;
-            int started = 0;
-            for (int bucket = 0;
-                 bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT && started < 64;
-                 bucket++) {
-                int remaining = this.frontier.size(bucket);
-                while (remaining-- > 0 && started < 64 && this.frontier.poll(bucket)) {
-                    long parent = this.frontier.key;
-                    int action = this.frontier.action;
-                    int epoch = this.frontier.epoch;
-                    if (action != HierarchicalOcclusionTraverser.ACTION_COARSEN_CANDIDATE) {
-                        this.frontier.offer(parent, action, bucket, epoch);
-                        continue;
-                    }
-                    Demand demand = this.demands.get(parent);
-                    if (demand == null || demand.phase != Phase.ACTIVE
-                            || this.overlapsCoarsening(parent)
-                            || !newerEpoch(epoch, demand.latestCoarseningEpoch)) continue;
-                    if (this.coarsen(parent) == 0) continue;
-                    demand.latestCoarseningEpoch = epoch;
-                    this.detailAdmissionFloor = Math.max(this.detailAdmissionFloor, bucket + 1);
-                    started++;
-                }
-                // Retire one bounded batch from the lowest-value available bucket. Its renderer
-                // fences must cross before authoritative arena usage can justify touching a more
-                // valuable bucket.
-                if (started != 0) break;
-            }
         }
 
-        void discardRetentionActions() {
+        void drainDormancyTransitions() {
             for (int bucket = 0;
                  bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT; bucket++) {
                 int remaining = this.frontier.size(bucket);
                 while (remaining-- > 0 && this.frontier.poll(bucket)) {
-                    if (this.frontier.action == HierarchicalOcclusionTraverser.ACTION_REFINE) {
-                        this.frontier.offer(this.frontier.key, this.frontier.action, bucket,
-                                this.frontier.epoch);
+                    long key = this.frontier.key;
+                    int action = this.frontier.action;
+                    int epoch = this.frontier.epoch;
+                    if (action == HierarchicalOcclusionTraverser.ACTION_REFINE) {
+                        this.frontier.offer(key, action, bucket, epoch);
+                    } else if (action == HierarchicalOcclusionTraverser.ACTION_DORMANT) {
+                        this.markDormant(key, bucket, epoch);
+                    } else if (action == HierarchicalOcclusionTraverser.ACTION_WAKE) {
+                        this.wakeDormant(key, epoch);
                     }
                 }
             }
+        }
+
+        void markDormant(long key, int bucket, int epoch) {
+            Demand demand = this.demands.get(key);
+            if (demand == null || demand.publication == null || this.isCoarsening(key)
+                    || !newerEpoch(epoch, demand.latestDormancyEpoch)) return;
+            demand.latestDormancyEpoch = epoch;
+            demand.dormantBucket = bucket;
+            demand.lastSelectedSequence = ++this.selectionSequence;
+            if (!demand.dormant) {
+                demand.dormant = true;
+                this.dormancyTransitions++;
+            }
+            DormantRoot ancestor = this.dormantAncestor(key);
+            if (ancestor != null) return;
+            this.removeDormantDescendants(key);
+            long bytes = this.descendantActiveBytes(key);
+            if (bytes == 0) return;
+            DormantRoot previous = this.dormantRoots.put(key,
+                    new DormantRoot(key, bytes, bucket, demand.lastSelectedSequence));
+            if (previous != null) this.dormantGeometryBytes -= previous.bytes;
+            this.dormantGeometryBytes += bytes;
+            this.validateGeometryAccounting();
+        }
+
+        void wakeDormant(long key, int epoch) {
+            Demand demand = this.demands.get(key);
+            if (demand == null || !newerEpoch(epoch, demand.latestDormancyEpoch)) return;
+            demand.latestDormancyEpoch = epoch;
+            demand.lastSelectedSequence = ++this.selectionSequence;
+            boolean transitioned = demand.dormant;
+            demand.dormant = false;
+            DormantRoot root = this.removeDormantRoot(key);
+            if (transitioned) this.wakes++;
+            if (root != null) {
+                this.instantWakes++;
+                this.restoreNestedDormantRoots(key);
+            }
+            this.validateGeometryAccounting();
+        }
+
+        void restoreNestedDormantRoots(long parent) {
+            Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
+            if (owned == null) return;
+            for (int level = SectionKey.level(parent) - 1; level >= 0; level--) {
+                for (long key : owned) {
+                    Demand child = this.demands.get(key);
+                    if (child == null || !child.dormant || SectionKey.level(key) != level
+                            || !contains(parent, key) || child.publication == null
+                            || this.dormantAncestor(key) != null) continue;
+                    long bytes = this.descendantActiveBytes(key);
+                    if (bytes == 0) continue;
+                    this.dormantRoots.put(key, new DormantRoot(key, bytes,
+                            child.dormantBucket, child.lastSelectedSequence));
+                    this.dormantGeometryBytes += bytes;
+                }
+            }
+        }
+
+        DormantRoot dormantAncestor(long key) {
+            while (SectionKey.level(key) < SectionKey.MAX_LOD_LAYER) {
+                key = parent(key);
+                DormantRoot root = this.dormantRoots.get(key);
+                if (root != null) return root;
+            }
+            return null;
+        }
+
+        long descendantActiveBytes(long parent) {
+            Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
+            long bytes = 0;
+            if (owned != null) for (long key : owned) {
+                Demand child = this.demands.get(key);
+                if (key != parent && child != null && contains(parent, key)) {
+                    bytes += child.activeGeometryBytes;
+                }
+            }
+            return bytes;
+        }
+
+        DormantRoot removeDormantRoot(long key) {
+            DormantRoot root = this.dormantRoots.remove(key);
+            if (root != null) this.dormantGeometryBytes -= root.bytes;
+            return root;
+        }
+
+        void removeDormantDescendants(long parent) {
+            var iterator = this.dormantRoots.long2ObjectEntrySet().fastIterator();
+            while (iterator.hasNext()) {
+                DormantRoot root = iterator.next().getValue();
+                if (root.key != parent && contains(parent, root.key)) {
+                    this.dormantGeometryBytes -= root.bytes;
+                    iterator.remove();
+                }
+            }
+        }
+
+        void forgetDormancyForSubtree(long parent) {
+            var iterator = this.dormantRoots.long2ObjectEntrySet().fastIterator();
+            while (iterator.hasNext()) {
+                DormantRoot root = iterator.next().getValue();
+                if (contains(parent, root.key)) {
+                    this.dormantGeometryBytes -= root.bytes;
+                    iterator.remove();
+                }
+            }
+            Demand demand = this.demands.get(parent);
+            if (demand != null) demand.dormant = false;
+        }
+
+        void evictDormant(long requiredBytes, boolean forAdmission) {
+            if (requiredBytes <= 0 || this.dormantRoots.isEmpty()) return;
+            long target = Math.max(requiredBytes, MIN_DORMANT_EVICTION_BATCH_BYTES);
+            long scheduled = 0;
+            int evictions = 0;
+            while (scheduled < target && evictions < MAX_DORMANT_EVICTIONS_PER_BATCH
+                    && !this.dormantRoots.isEmpty()) {
+                DormantRoot root = this.selectDormantEviction();
+                if (root == null) break;
+                Demand demand = this.demands.get(root.key);
+                boolean valid = demand != null && demand.dormant
+                        && demand.publication != null && !this.overlapsCoarsening(root.key);
+                this.removeDormantRoot(root.key);
+                if (!valid) {
+                    this.correctiveAccountingRebuilds++;
+                    continue;
+                }
+                demand.dormant = false;
+                long age = Math.max(0, this.selectionSequence - root.lastSelectedSequence);
+                long distance = this.distanceSquared(root.key);
+                long bytes = this.coarsen(root.key);
+                if (bytes == 0) continue;
+                this.pendingDormantEvictions.put(root.key, bytes);
+                this.pendingDormantEvictionBytes += bytes;
+                scheduled += bytes;
+                evictions++;
+                if (forAdmission) this.admissionEvictions++;
+                else this.capEvictions++;
+                this.lastEvictionDistanceSquared = distance;
+                this.lastEvictionBucket = root.bucket;
+                this.lastEvictionAge = age;
+            }
+            this.validateGeometryAccounting();
+        }
+
+        DormantRoot selectDormantEviction() {
+            DormantRoot selected = null;
+            boolean selectedOutside = false;
+            long selectedDistance = 0;
+            for (DormantRoot candidate : this.dormantRoots.values()) {
+                Demand demand = this.demands.get(candidate.key);
+                if (demand == null || !demand.dormant || demand.publication == null) {
+                    return candidate;
+                }
+                if (this.overlapsCoarsening(candidate.key)) continue;
+                boolean outside = !hasTop(topAncestor(candidate.key));
+                long distance = this.distanceSquared(candidate.key);
+                if (selected == null || outside && !selectedOutside
+                        || outside == selectedOutside && (distance > selectedDistance
+                        || distance == selectedDistance && (candidate.bucket < selected.bucket
+                        || candidate.bucket == selected.bucket
+                        && candidate.lastSelectedSequence < selected.lastSelectedSequence))) {
+                    selected = candidate;
+                    selectedOutside = outside;
+                    selectedDistance = distance;
+                }
+            }
+            return selected;
+        }
+
+        long distanceSquared(long key) {
+            int level = SectionKey.level(key);
+            long centerX2 = ((long) SectionKey.x(key) << (level + 1)) + (1L << level);
+            long centerZ2 = ((long) SectionKey.z(key) << (level + 1)) + (1L << level);
+            long dx = centerX2 - ((long) this.cameraSectionX * 2L + 1L);
+            long dz = centerZ2 - ((long) this.cameraSectionZ * 2L + 1L);
+            return dx * dx + dz * dz;
+        }
+
+        void setActiveGeometryBytes(Demand demand, long bytes) {
+            long delta = bytes - demand.activeGeometryBytes;
+            if (delta == 0) return;
+            demand.activeGeometryBytes = bytes;
+            this.activeGeometryBytes += delta;
+            DormantRoot root = this.dormantAncestor(demand.key);
+            if (root != null) {
+                root.bytes += delta;
+                this.dormantGeometryBytes += delta;
+            }
+            this.validateGeometryAccounting();
+        }
+
+        void validateGeometryAccounting() {
+            if (this.activeGeometryBytes >= 0 && this.dormantGeometryBytes >= 0
+                    && this.dormantGeometryBytes <= this.activeGeometryBytes) return;
+            this.correctiveAccountingRebuilds++;
+            long active = 0;
+            for (Demand demand : this.demands.values()) active += demand.activeGeometryBytes;
+            long dormant = 0;
+            var iterator = this.dormantRoots.long2ObjectEntrySet().fastIterator();
+            while (iterator.hasNext()) {
+                DormantRoot root = iterator.next().getValue();
+                Demand demand = this.demands.get(root.key);
+                if (demand == null || !demand.dormant || demand.publication == null) {
+                    iterator.remove();
+                    continue;
+                }
+                root.bytes = this.descendantActiveBytes(root.key);
+                if (root.bytes == 0) iterator.remove();
+                else dormant += root.bytes;
+            }
+            this.activeGeometryBytes = Math.max(0, active);
+            this.dormantGeometryBytes = Math.max(0, Math.min(dormant,
+                    this.activeGeometryBytes));
         }
 
         long coarsen(long parent) {
             Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
             long bytes = 0;
+            boolean hasWork = false;
             if (owned != null) for (long key : owned) {
                 Demand child = this.demands.get(key);
-                if (key != parent && contains(parent, key) && child != null)
-                    bytes += child.activeGeometryBytes
-                            + (child.geometryAccounted.get() ? child.geometryBytes : 0);
+                if (key != parent && contains(parent, key) && child != null) {
+                    bytes += child.activeGeometryBytes;
+                    hasWork |= child.activeGeometryBytes != 0 || child.geometryAccounted.get();
+                }
             }
-            if (bytes == 0) return 0;
+            if (!hasWork) return 0;
+            this.forgetDormancyForSubtree(parent);
             this.coarseningRoots.add(parent);
             synchronized (this.publicationLock) {
                 for (long key : List.copyOf(owned)) {
@@ -796,7 +1026,10 @@ final class ClientSession {
                         () -> this.putEvent(new Coarsened(parent)),
                         failure -> this.putEvent(new CoarsenFailed(parent, failure)));
             }
-            return bytes;
+            // A completed CPU-side replacement is canceled above but was never physical GPU
+            // occupancy. Return only bytes the fence will actually release; one is a success
+            // sentinel for an all-empty/candidate-only subtree.
+            return Math.max(1, bytes);
         }
 
         static boolean newerEpoch(int candidate, int previous) {
@@ -806,6 +1039,7 @@ final class ClientSession {
         void retireDetailDemand(long key) {
             Demand demand = this.demands.remove(key);
             if (demand == null || demand.coverage) return;
+            this.forgetDormancyForSubtree(key);
             this.discardCompletedGeometry(demand);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
@@ -814,6 +1048,7 @@ final class ClientSession {
             demand.pendingIndex = null;
             demand.pendingOrdinal = -1;
             if (demand.phase == Phase.ACTIVE) this.activeCount--;
+            this.setActiveGeometryBytes(demand, 0);
             // One fenced renderer operation owns the whole subtree; do not close each child.
             demand.publication = null;
             long region = regionFor(key);
@@ -837,8 +1072,14 @@ final class ClientSession {
             return false;
         }
 
-        void finishCoarsening(long parent) {
+        void finishCoarsening(long parent, boolean succeeded) {
             this.coarseningRoots.remove(parent);
+            long bytes = this.pendingDormantEvictions.remove(parent);
+            if (bytes != 0) {
+                this.pendingDormantEvictionBytes = Math.max(0,
+                        this.pendingDormantEvictionBytes - bytes);
+                if (succeeded) this.dormantBytesFreedAfterFences += bytes;
+            }
         }
 
         void addDemand(long key) {
@@ -908,12 +1149,14 @@ final class ClientSession {
         void retireDemand(long key) {
             Demand demand = this.demands.get(key);
             if (demand == null) return;
+            this.forgetDormancyForSubtree(key);
             this.discardCompletedGeometry(demand);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
             demand.decoded = null;
             if (demand.phase == Phase.ACTIVE) this.activeCount--;
+            this.setActiveGeometryBytes(demand, 0);
             if (demand.publication != null) demand.publication.close();
             if (demand.coverage && hasTop(key)) {
                 // An authoritative absent section represents air, not coverage work waiting for
@@ -1425,6 +1668,14 @@ final class ClientSession {
                     this.readyPublicationQueue.addLast(ref);
                     continue;
                 }
+                long physicalDeficit = this.physicalGeometryDeficitBytes();
+                if (physicalDeficit > 0) {
+                    this.evictDormant(physicalDeficit, true);
+                    if (this.physicalGeometryDeficitBytes() > 0) {
+                        this.readyPublicationQueue.addLast(ref);
+                        continue;
+                    }
+                }
                 demand.budgetBlockedSinceNanos = 0;
                 BuiltSection geometry = demand.completedGeometry;
                 demand.completedGeometry = null;
@@ -1460,9 +1711,23 @@ final class ClientSession {
             return this.renderer.regionalGeometryCapacityBytes() * 825L / 1_000L;
         }
 
+        long dormantCapBytes() {
+            return this.renderer.regionalGeometryCapacityBytes() / 3L;
+        }
+
+        long selectedGeometryBytes() {
+            return Math.max(0, this.activeGeometryBytes - this.dormantGeometryBytes);
+        }
+
         long geometryDeficitBytes() {
-            return this.renderer.regionalGeometryUsedBytes()
+            return this.selectedGeometryBytes()
                     + this.completedGeometryBytes.get() - this.geometryTargetBytes();
+        }
+
+        long physicalGeometryDeficitBytes() {
+            return this.renderer.regionalGeometryUsedBytes()
+                    + this.completedGeometryBytes.get() - this.pendingDormantEvictionBytes
+                    - this.renderer.regionalGeometryPublicationLimitBytes();
         }
 
         void discardCompletedGeometry(Demand demand) {
@@ -1520,7 +1785,7 @@ final class ClientSession {
                     continue;
                 }
                 demand.phase = Phase.ACTIVE;
-                demand.activeGeometryBytes = demand.geometryBytes;
+                this.setActiveGeometryBytes(demand, demand.geometryBytes);
                 this.activeCount++;
                 if (demand.coverage) this.missingCoverage.remove(demand.key);
                 demand.decoded = null;
@@ -1639,15 +1904,31 @@ final class ClientSession {
                     + " batches=" + this.inFlightBatches + " inFlightBytes=" + this.inFlightBytes
                     + " renderPending=" + this.renderAdmissions.size()
                     + " detailFrontier=" + this.frontier.size()
-                    + " detailFloor=" + this.detailAdmissionFloor
                     + " detailDropped=" + this.frontier.dropped()
                     + " coverageMissing=" + this.missingCoverage.size()
                     + " meshQueue=" + this.meshQueue.size()
                     + " readyQueue=" + this.readyPublicationQueue.size()
                     + " publishQueue=" + this.publicationQueue.size()
                     + " geometryUsed=" + this.renderer.regionalGeometryUsedBytes()
+                    + " geometryPhysicalLimit="
+                    + this.renderer.regionalGeometryPublicationLimitBytes()
+                    + " geometryActive=" + this.activeGeometryBytes
+                    + " geometrySelected=" + this.selectedGeometryBytes()
+                    + " geometryDormant=" + this.dormantGeometryBytes
+                    + " geometryDormantCap=" + this.dormantCapBytes()
+                    + " dormantRoots=" + this.dormantRoots.size()
+                    + " dormantPendingFree=" + this.pendingDormantEvictionBytes
                     + " geometryCompleted=" + this.completedGeometryBytes.get()
                     + " geometryTarget=" + this.geometryTargetBytes()
+                    + " dormancyTransitions=" + this.dormancyTransitions
+                    + " wakes=" + this.wakes + " instantWakes=" + this.instantWakes
+                    + " dormantCapEvictions=" + this.capEvictions
+                    + " dormantAdmissionEvictions=" + this.admissionEvictions
+                    + " dormantFreed=" + this.dormantBytesFreedAfterFences
+                    + " dormantLastEvictionDistance2=" + this.lastEvictionDistanceSquared
+                    + " dormantLastEvictionBucket=" + this.lastEvictionBucket
+                    + " dormantLastEvictionAge=" + this.lastEvictionAge
+                    + " geometryAccountingCorrections=" + this.correctiveAccountingRebuilds
                     + " received=" + this.receivedBytes
                     + " failure=" + String.valueOf(this.failure);
         }
@@ -1682,6 +1963,11 @@ final class ClientSession {
             this.subscribedRegions.clear();
             this.frontier.clear();
             this.coarseningRoots.clear();
+            this.dormantRoots.clear();
+            this.pendingDormantEvictions.clear();
+            this.activeGeometryBytes = 0;
+            this.dormantGeometryBytes = 0;
+            this.pendingDormantEvictionBytes = 0;
             this.clearStageQueues();
         }
     }

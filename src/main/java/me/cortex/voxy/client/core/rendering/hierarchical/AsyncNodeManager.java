@@ -45,6 +45,7 @@ import static org.lwjgl.opengl.GL43C.*;
 // this is done off thread to reduce the amount of work done on the render thread, improving frame stability and reducing runtime overhead
 public class AsyncNodeManager {
     private static final long MAX_SYNC_GEOMETRY_BYTES = 16L << 20;
+    private static final long MIN_FREE_GEOMETRY_BYTES = 50_000_000L;
     private static final int MAX_SYNC_REGIONAL_PUBLICATIONS = 1_024;
     private static final VarHandle RESULT_HANDLE;
     private static final VarHandle RESULT_CACHE_1_HANDLE;
@@ -492,7 +493,7 @@ public class AsyncNodeManager {
 
     private boolean hasGeometryCapacity() {
         return this.geometryCapacity - this.geometryManager.getGeometryUsedBytes()
-                > 50_000_000L;
+                > MIN_FREE_GEOMETRY_BYTES;
     }
 
     private DeferredRetry retryDeferredRegionalSectionPublications() {
@@ -865,6 +866,10 @@ public class AsyncNodeManager {
 
     public long geometryCapacityBytes() {
         return this.geometryCapacity;
+    }
+
+    public long geometryPublicationLimitBytes() {
+        return Math.max(0, this.geometryCapacity - MIN_FREE_GEOMETRY_BYTES);
     }
 
     /**

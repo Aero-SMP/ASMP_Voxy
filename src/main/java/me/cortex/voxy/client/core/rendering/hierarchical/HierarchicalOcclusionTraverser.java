@@ -12,7 +12,6 @@ import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.client.lod.ClientLodClient;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import org.lwjgl.system.MemoryUtil;
@@ -33,7 +32,8 @@ public class HierarchicalOcclusionTraverser {
     public static final int DETAIL_BUCKET_COUNT = 32;
     public static final int ACTIONS_PER_BUCKET = 256;
     public static final int ACTION_REFINE = 0;
-    public static final int ACTION_COARSEN_CANDIDATE = 1;
+    public static final int ACTION_DORMANT = 1;
+    public static final int ACTION_WAKE = 2;
     public static final int MAX_QUEUE_SIZE = 200_000;
 
 
@@ -223,8 +223,6 @@ public class HierarchicalOcclusionTraverser {
         ptr += 4;
         MemoryUtil.memPutInt(ptr, this.coarsenGraceFrames);
         ptr += 4;
-        MemoryUtil.memPutInt(ptr, ClientLodClient.detailPressure() ? 1 : 0);
-
 
     }
 

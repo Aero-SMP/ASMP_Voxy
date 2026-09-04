@@ -34,7 +34,8 @@ public class NodeCleaner {
 
 
     public void tick() {
-        this.visibilityId++;
+        // The high bit is the traversal's persistent dormant-state bit.
+        this.visibilityId = (this.visibilityId + 1) & Integer.MAX_VALUE;
     }
 
     public void updateIds(IntOpenHashSet collection) {

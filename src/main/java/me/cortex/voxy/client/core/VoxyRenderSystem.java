@@ -107,6 +107,11 @@ public class VoxyRenderSystem {
         return nodes == null ? 0 : nodes.geometryCapacityBytes();
     }
 
+    public long regionalGeometryPublicationLimitBytes() {
+        AsyncNodeManager nodes = this.nodeManager;
+        return nodes == null ? 0 : nodes.geometryPublicationLimitBytes();
+    }
+
     private SectionPublication publishRegionalSection(
             long position, BuiltSection geometry, Optional<SectionPublication> previous,
             BooleanSupplier current, Runnable reserved) {

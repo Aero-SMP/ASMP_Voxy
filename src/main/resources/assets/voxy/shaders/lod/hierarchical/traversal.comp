@@ -5,7 +5,11 @@
 layout(local_size_x=LOCAL_SIZE) in;
 
 #define ACTION_REFINE 0u
-#define ACTION_COARSEN_CANDIDATE 1u
+#define ACTION_DORMANT 1u
+#define ACTION_WAKE 2u
+#define DORMANT_TRACKER_BIT (1u<<31)
+#define DESCEND_DETAIL_SCORE 1.10f
+#define RETAIN_DETAIL_SCORE 0.90f
 
 #import <voxy:lod/frustum.glsl>
 
@@ -22,7 +26,6 @@ layout(binding = SCENE_UNIFORM_BINDING, std140) uniform SceneUniform {
     float renderDistance;
     uint finalPass;
     uint coarsenGraceFrames;
-    uint detailPressure;
 };
 
 #import <voxy:lod/hierarchical/queue.glsl>
@@ -51,17 +54,19 @@ uint actionHash(uint value) {
     return value ^ (value >> 16);
 }
 
-void addDetailAction(in UnpackedNode node, uint action, uint bucket) {
+bool addDetailAction(in UnpackedNode node, uint action, uint bucket) {
     // Rotate overflow selection by node and frame instead of favoring traversal order forever.
-    uint mask = action == ACTION_REFINE ? 3u : 15u;
-    if ((actionHash(getId(node) ^ actionEpoch) & mask) != 0u) return;
+    uint mask = action == ACTION_REFINE ? 3u : 0u;
+    if ((actionHash(getId(node) ^ actionEpoch) & mask) != 0u) return false;
     bucket = min(bucket, DETAIL_BUCKET_COUNT - 1u);
     uint slot = atomicAdd(actionCounts[bucket], 1u);
     if (slot < ACTIONS_PER_BUCKET) {
         uvec2 position = getRawPos(node);
         detailActions[bucket * ACTIONS_PER_BUCKET + slot] =
                 uvec4(position.x, position.y, action, actionEpoch);
+        return true;
     }
+    return false;
 }
 
 void enqueueChildren(in UnpackedNode node) {
@@ -92,39 +97,67 @@ bool isWithinRenderDistance(in UnpackedNode node) {
     return close.x*close.x+close.z*close.z <= renderDistance;
 }
 
-void addColdCoarsening(in UnpackedNode node, uint bucket) {
-    if (finalPass != 0u && detailPressure != 0u
-            && hasChildren(node) && !childListIsEmpty(node)
-            && frameId - lastRenderFrame[getId(node)] >= coarsenGraceFrames) {
-        addDetailAction(node, ACTION_COARSEN_CANDIDATE, bucket);
+bool isDormant(in UnpackedNode node) {
+    return (lastRenderFrame[getId(node)] & DORMANT_TRACKER_BIT) != 0u;
+}
+
+void setDormant(in UnpackedNode node, bool dormant, uint bucket) {
+    if (finalPass == 0u || isDormant(node) == dormant) return;
+    uint action = dormant ? ACTION_DORMANT : ACTION_WAKE;
+    // Change state only after reserving feedback. Overflow retries the transition next frame,
+    // keeping CPU accounting conservative without emitting a permanent per-frame event.
+    if (!addDetailAction(node, action, bucket)) return;
+    if (dormant) atomicOr(lastRenderFrame[getId(node)], DORMANT_TRACKER_BIT);
+    else atomicAnd(lastRenderFrame[getId(node)], ~DORMANT_TRACKER_BIT);
+}
+
+void addColdDormancy(in UnpackedNode node, uint bucket) {
+    uint tracker = lastRenderFrame[getId(node)];
+    if (finalPass != 0u && hasChildren(node) && !childListIsEmpty(node)
+            && hasMesh(node) && !isEmptyMesh(node)
+            && ((frameId - (tracker & ~DORMANT_TRACKER_BIT))
+                    & ~DORMANT_TRACKER_BIT) >= coarsenGraceFrames) {
+        setDormant(node, true, bucket);
     }
 }
 
 void traverse(in UnpackedNode node) {
     setupScreenspace(node);
     if (outsideFrustum()) {
-        addColdCoarsening(node, 1u);
+        addColdDormancy(node, 1u);
         return;
     }
     if (isCulledByHiz()) {
-        addColdCoarsening(node, 2u);
+        addColdDormancy(node, 2u);
         return;
     }
 
     float score = projectedDetailScore();
     uint bucket = detailScoreBucket(score);
-    if (finalPass != 0u) lastRenderFrame[getId(node)] = frameId;
+    if (finalPass != 0u) {
+        lastRenderFrame[getId(node)] = (lastRenderFrame[getId(node)]
+                & DORMANT_TRACKER_BIT) | (frameId & ~DORMANT_TRACKER_BIT);
+    }
 
     if (hasChildren(node) && !childListIsEmpty(node)) {
-        if (finalPass != 0u && detailPressure != 0u) {
-            addDetailAction(node, ACTION_COARSEN_CANDIDATE, max(3u, bucket));
+        bool parentRenderable = hasMesh(node) && !isEmptyMesh(node);
+        bool dormant = isDormant(node);
+        if (!parentRenderable || score >= DESCEND_DETAIL_SCORE) {
+            setDormant(node, false, bucket);
+            enqueueChildren(node);
+        } else if (score <= RETAIN_DETAIL_SCORE) {
+            setDormant(node, true, bucket);
+            enqueueSelfForRender(node);
+        } else if (dormant) {
+            enqueueSelfForRender(node);
+        } else {
+            enqueueChildren(node);
         }
-        // Installed topology, rather than a pixel threshold, determines the rendered cut.
-        enqueueChildren(node);
         return;
     }
 
     // A retained parent is the complete fallback until its child group becomes active.
+    setDormant(node, false, bucket);
     if (hasMesh(node)) enqueueSelfForRender(node);
     if (finalPass != 0u && node.lodLevel != 0u && !isTerminal(node) && score >= 1.0f) {
         addDetailAction(node, ACTION_REFINE, bucket);
@@ -137,5 +170,5 @@ void main() {
     UnpackedNode node;
     unpackNode(node, nodeId);
     if (isWithinRenderDistance(node)) traverse(node);
-    else addColdCoarsening(node, 0u);
+    else addColdDormancy(node, 0u);
 }
