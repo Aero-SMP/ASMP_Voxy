@@ -675,6 +675,11 @@ public class AsyncNodeManager {
                 || !results.regionalSectionPublications.isEmpty()) {
             // glFenceSync is ordered after every upload, metadata scatter and top-level pointer
             // command emitted above. Polling happens on later render frames and never waits.
+            long submittedNanos = System.nanoTime();
+            for (RegionalSectionPublication publication
+                    : results.regionalSectionPublications) {
+                publication.timing().recordGpuUploadSubmitted(submittedNanos);
+            }
             this.queueGpuCompletion(new ArrayList<>(results.rendererTransactions),
                     new ArrayList<>(results.regionalSectionPublications));
         }
@@ -781,9 +786,14 @@ public class AsyncNodeManager {
     private final ConcurrentLinkedDeque<RendererTransaction> coarsenQueue =
             new ConcurrentLinkedDeque<>();
 
+    public interface RegionalPublicationTiming {
+        void recordRendererQueued(long nowNanos);
+        void recordGpuUploadSubmitted(long nowNanos);
+    }
+
     private record RegionalSectionPublication(BuiltSection geometry, long previousRevision,
                                              BooleanSupplier current, Runnable reserved,
-                                             Runnable success,
+                                             RegionalPublicationTiming timing, Runnable success,
                                              Runnable canceled,
                                              Consumer<Throwable> failure) {}
 
@@ -877,12 +887,14 @@ public class AsyncNodeManager {
      * Ownership of {@code geometry} transfers immediately to this manager.
      */
     public void publishRegionalSection(BuiltSection geometry, long previousRevision,
-                                      BooleanSupplier current, Runnable reserved, Runnable success,
+                                      BooleanSupplier current, Runnable reserved,
+                                      RegionalPublicationTiming timing, Runnable success,
                                       Runnable canceled,
                                       Consumer<Throwable> failure) {
         Objects.requireNonNull(geometry, "geometry");
         Objects.requireNonNull(current, "current");
         Objects.requireNonNull(reserved, "reserved");
+        Objects.requireNonNull(timing, "timing");
         Objects.requireNonNull(success, "success");
         Objects.requireNonNull(canceled, "canceled");
         Objects.requireNonNull(failure, "failure");
@@ -891,8 +903,9 @@ public class AsyncNodeManager {
             failure.accept(new IllegalStateException("Voxy renderer is not running"));
             return;
         }
+        timing.recordRendererQueued(System.nanoTime());
         this.regionalSectionQueue.add(new RegionalSectionPublication(geometry, previousRevision,
-                current, reserved, success, canceled, failure));
+                current, reserved, timing, success, canceled, failure));
         this.addWork();
     }
 

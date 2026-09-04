@@ -35,6 +35,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -57,6 +58,11 @@ public class VoxyRenderSystem {
     private BasicSectionGeometryData geometryData;
     private AsyncNodeManager nodeManager;
     private final AtomicLong regionalSectionRevision = new AtomicLong(1);
+    private static final long[] PUBLICATION_LATENCY_BUCKET_NANOS = {
+            1_000_000L, 4_000_000L, 16_000_000L, 50_000_000L, 200_000_000L
+    };
+    private final PublicationLatencyCounters[][] regionalPublicationLatencies =
+            createPublicationLatencyCounters();
 
     /** The renderer-local translation table populated exclusively from the catalog. */
     public CatalogMapper getMapper() {
@@ -71,7 +77,8 @@ public class VoxyRenderSystem {
     }
 
     public interface SectionPublisher {
-        SectionPublication publish(long position, BuiltSection geometry,
+        SectionPublication publish(long position, BuiltSection geometry, boolean coverage,
+                                   long meshCompletedNanos,
                                    Optional<SectionPublication> previous,
                                    BooleanSupplier current, Runnable reserved);
         void coarsen(long parent, Runnable success, Consumer<Throwable> failure);
@@ -81,9 +88,11 @@ public class VoxyRenderSystem {
         return new SectionPublisher() {
             @Override
             public SectionPublication publish(long position, BuiltSection geometry,
+                                              boolean coverage, long meshCompletedNanos,
                                               Optional<SectionPublication> previous,
                                               BooleanSupplier current, Runnable reserved) {
-                return publishRegionalSection(position, geometry, previous, current, reserved);
+                return publishRegionalSection(position, geometry, coverage,
+                        meshCompletedNanos, previous, current, reserved);
             }
 
             @Override
@@ -112,8 +121,21 @@ public class VoxyRenderSystem {
         return nodes == null ? 0 : nodes.geometryPublicationLimitBytes();
     }
 
+    public String regionalPublicationLatencySnapshot() {
+        return "publishLatencyBuckets=<1ms,<4ms,<16ms,<50ms,<200ms,>=200ms"
+                + " publishCoverage=" + publicationLatencyLane(0)
+                + " publishRefinement=" + publicationLatencyLane(1);
+    }
+
+    private String publicationLatencyLane(int lane) {
+        return "meshToQueue:" + this.regionalPublicationLatencies[lane][0].snapshot()
+                + ";queueToGpu:" + this.regionalPublicationLatencies[lane][1].snapshot()
+                + ";gpuToActive:" + this.regionalPublicationLatencies[lane][2].snapshot();
+    }
+
     private SectionPublication publishRegionalSection(
-            long position, BuiltSection geometry, Optional<SectionPublication> previous,
+            long position, BuiltSection geometry, boolean coverage, long meshCompletedNanos,
+            Optional<SectionPublication> previous,
             BooleanSupplier current, Runnable reserved) {
         if (geometry.position != position) {
             throw new IllegalArgumentException("regional geometry is bound to the wrong section");
@@ -121,23 +143,27 @@ public class VoxyRenderSystem {
         RegionalSectionPublication previousPublication = previous
                 .map(value -> requireRegionalSectionPublication(position, value))
                 .orElse(null);
-        return queueRegionalSection(position, geometry, previousPublication, false,
+        return queueRegionalSection(position, geometry, previousPublication, false, coverage,
+                meshCompletedNanos,
                 Objects.requireNonNull(current, "current"),
                 Objects.requireNonNull(reserved, "reserved"));
     }
 
     private RegionalSectionPublication queueRegionalSection(
             long position, BuiltSection geometry, RegionalSectionPublication previous,
-            boolean removal, BooleanSupplier current, Runnable reserved) {
+            boolean removal, boolean coverage, long meshCompletedNanos,
+            BooleanSupplier current, Runnable reserved) {
         long revision = this.regionalSectionRevision.getAndIncrement();
         if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
                 geometry.aabb, geometry.geometryBuffer, geometry.offsets);
         RegionalSectionPublication publication = new RegionalSectionPublication(
-                this.nodeManager, position, revision, removal);
+                this.nodeManager, position, revision, removal, coverage, meshCompletedNanos);
         long previousRevision = previous == null ? -1 : previous.revision;
-        this.nodeManager.publishRegionalSection(queued, previousRevision, current, reserved, () ->
+        this.nodeManager.publishRegionalSection(queued, previousRevision, current, reserved,
+                publication, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
+                    publication.recordActivationFencePassed(System.nanoTime());
                     publication.activated.set(true);
                     if (previous != null) previous.markSafeToRelease();
                     if (removal) publication.markSafeToRelease();
@@ -171,11 +197,15 @@ public class VoxyRenderSystem {
     }
 
     private final class RegionalSectionPublication
-            implements SectionPublication {
+            implements SectionPublication, AsyncNodeManager.RegionalPublicationTiming {
         private final AsyncNodeManager renderer;
         private final long position;
         private final long revision;
         private final boolean removal;
+        private final boolean coverage;
+        private final long meshCompletedNanos;
+        private volatile long rendererQueuedNanos;
+        private volatile long gpuUploadSubmittedNanos;
         private final AtomicBoolean activated = new AtomicBoolean();
         private final AtomicBoolean retired = new AtomicBoolean();
         private final AtomicBoolean closeRequested = new AtomicBoolean();
@@ -184,11 +214,36 @@ public class VoxyRenderSystem {
         private volatile Throwable failure;
 
         private RegionalSectionPublication(AsyncNodeManager renderer, long position,
-                                           long revision, boolean removal) {
+                                           long revision, boolean removal, boolean coverage,
+                                           long meshCompletedNanos) {
             this.renderer = renderer;
             this.position = position;
             this.revision = revision;
             this.removal = removal;
+            this.coverage = coverage;
+            this.meshCompletedNanos = meshCompletedNanos;
+        }
+
+        @Override
+        public void recordRendererQueued(long nowNanos) {
+            if (this.removal) return;
+            this.rendererQueuedNanos = nowNanos;
+            regionalPublicationLatencies[this.coverage ? 0 : 1][0]
+                    .record(nowNanos - this.meshCompletedNanos);
+        }
+
+        @Override
+        public void recordGpuUploadSubmitted(long nowNanos) {
+            if (this.removal || this.rendererQueuedNanos == 0) return;
+            this.gpuUploadSubmittedNanos = nowNanos;
+            regionalPublicationLatencies[this.coverage ? 0 : 1][1]
+                    .record(nowNanos - this.rendererQueuedNanos);
+        }
+
+        private void recordActivationFencePassed(long nowNanos) {
+            if (this.removal || this.gpuUploadSubmittedNanos == 0) return;
+            regionalPublicationLatencies[this.coverage ? 0 : 1][2]
+                    .record(nowNanos - this.gpuUploadSubmittedNanos);
         }
 
         @Override
@@ -219,7 +274,8 @@ public class VoxyRenderSystem {
             // Retirement removes this complete subtree. The old geometry remains active until
             // the zero-child replacement and every descendant retirement cross their fences.
             BuiltSection empty = BuiltSection.emptyWithChildren(this.position, (byte) 0);
-            queueRegionalSection(this.position, empty, this, true, () -> true, () -> {});
+            queueRegionalSection(this.position, empty, this, true, false, 0,
+                    () -> true, () -> {});
         }
 
         private void cancelBeforeStaging() {
@@ -249,6 +305,47 @@ public class VoxyRenderSystem {
 
         private void markSafeToRelease() {
             this.retired.set(true);
+        }
+    }
+
+    private static PublicationLatencyCounters[][] createPublicationLatencyCounters() {
+        PublicationLatencyCounters[][] counters = new PublicationLatencyCounters[2][3];
+        for (int lane = 0; lane < counters.length; lane++) {
+            for (int stage = 0; stage < counters[lane].length; stage++) {
+                counters[lane][stage] = new PublicationLatencyCounters();
+            }
+        }
+        return counters;
+    }
+
+    private static final class PublicationLatencyCounters {
+        private final AtomicLong count = new AtomicLong();
+        private final AtomicLong maximumNanos = new AtomicLong();
+        private final AtomicLongArray buckets =
+                new AtomicLongArray(PUBLICATION_LATENCY_BUCKET_NANOS.length + 1);
+
+        void record(long nanos) {
+            if (nanos < 0) return;
+            this.count.incrementAndGet();
+            long maximum = this.maximumNanos.get();
+            while (nanos > maximum
+                    && !this.maximumNanos.compareAndSet(maximum, nanos)) {
+                maximum = this.maximumNanos.get();
+            }
+            int bucket = 0;
+            while (bucket < PUBLICATION_LATENCY_BUCKET_NANOS.length
+                    && nanos >= PUBLICATION_LATENCY_BUCKET_NANOS[bucket]) bucket++;
+            this.buckets.incrementAndGet(bucket);
+        }
+
+        String snapshot() {
+            StringBuilder result = new StringBuilder().append(this.count.get()).append('/')
+                    .append(this.maximumNanos.get() / 1_000).append("us/");
+            for (int bucket = 0; bucket < this.buckets.length(); bucket++) {
+                if (bucket != 0) result.append(',');
+                result.append(this.buckets.get(bucket));
+            }
+            return result.toString();
         }
     }
 

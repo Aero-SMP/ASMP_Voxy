@@ -50,8 +50,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * keys; nothing scans or retains historical object identities.
  */
 final class ClientSession {
-    private static final int MAX_MAIN_TASKS = 8_192;
-    private static final int MAX_MAIN_PER_TICK = 2_048;
+    private static final int MAX_CATALOG_TASKS = 8_192;
+    private static final int MAX_CATALOGS_PER_TICK = 2_048;
     private static final int MAX_EVENTS = 16_384;
     private static final int MAX_IN_FLIGHT_BATCHES = 16;
     private static final long MAX_IN_FLIGHT_BYTES = 128L * 1024 * 1024;
@@ -68,8 +68,8 @@ final class ClientSession {
 
     private static final Object LIFECYCLE = new Object();
     private static final LinkedHashSet<Long> TOP_LEVEL = new LinkedHashSet<>();
-    private static final ArrayBlockingQueue<MainTask> MAIN =
-            new ArrayBlockingQueue<>(MAX_MAIN_TASKS);
+    private static final ArrayBlockingQueue<CatalogTask> CATALOG_TASKS =
+            new ArrayBlockingQueue<>(MAX_CATALOG_TASKS);
     private static final AtomicLong SESSION_IDS = new AtomicLong();
     private static volatile Session active;
     private static volatile String activeDimension;
@@ -146,17 +146,15 @@ final class ClientSession {
         }
 
         current = active;
-        for (int count = 0; count < MAX_MAIN_PER_TICK; count++) {
-            MainTask task = MAIN.poll();
+        for (int count = 0; count < MAX_CATALOGS_PER_TICK; count++) {
+            CatalogTask task = CATALOG_TASKS.poll();
             if (task == null) break;
             if (task.owner() != current || current == null || !current.open.get()) {
-                task.cancel();
                 continue;
             }
             try {
                 task.run(renderer);
             } catch (Throwable failure) {
-                task.cancel();
                 current.fail(failure);
             }
         }
@@ -182,12 +180,12 @@ final class ClientSession {
     private static void stopLocked(Session session) {
         if (active == session) active = null;
         session.close();
-        MainTask task;
-        ArrayDeque<MainTask> retained = new ArrayDeque<>();
-        while ((task = MAIN.poll()) != null) {
-            if (task.owner() == session) task.cancel(); else retained.add(task);
+        CatalogTask task;
+        ArrayDeque<CatalogTask> retained = new ArrayDeque<>();
+        while ((task = CATALOG_TASKS.poll()) != null) {
+            if (task.owner() != session) retained.add(task);
         }
-        MAIN.addAll(retained);
+        CATALOG_TASKS.addAll(retained);
     }
 
     private static void requireTop(long key) {
@@ -222,6 +220,7 @@ final class ClientSession {
         boolean receivedFromCache;
         RenderAdmission renderAdmission;
         BuiltSection completedGeometry;
+        long meshCompletedNanos;
         long geometryBytes, activeGeometryBytes;
         volatile int geometryAccountToken;
         final AtomicBoolean geometryAccounted = new AtomicBoolean();
@@ -613,7 +612,7 @@ final class ClientSession {
             // response which triggered it and is therefore the best requirement to retain.
             this.requiredCatalogFingerprint = message.fingerprint();
             CatalogCodec.Catalog catalog = CatalogCodec.decode(message.canonical());
-            enqueueMain(new CatalogTask(this, catalog, message.fingerprint()));
+            enqueueCatalog(new CatalogTask(this, catalog, message.fingerprint()));
         }
 
         void acceptRegion(RegionalProtocol.RegionMessage message) throws IOException {
@@ -703,7 +702,6 @@ final class ClientSession {
                         this.acceptDecoded(result);
                     }
                     case MeshedResult result -> this.acceptMeshed(result);
-                    case PublicationQueued result -> this.acceptPublication(result);
                     case Coarsened result -> this.finishCoarsening(result.parent, true);
                     case CoarsenFailed failed -> {
                         this.finishCoarsening(failed.parent, false);
@@ -1612,8 +1610,9 @@ final class ClientSession {
                 try {
                     this.sectionWorkers.execute(() -> {
                         try {
-                            putEvent(new MeshedResult(key, token,
-                                    this.mesher.mesh(decoded, token + 1L), admission));
+                            BuiltSection geometry = this.mesher.mesh(decoded, token + 1L);
+                            putEvent(new MeshedResult(key, token, geometry, admission,
+                                    System.nanoTime()));
                         } catch (Throwable failure) {
                             admission.release();
                             putEvent(new WorkerFailed(failure));
@@ -1638,22 +1637,23 @@ final class ClientSession {
                 result.admission.release();
                 return;
             }
-            this.completeGeometry(demand, result.geometry);
+            this.completeGeometry(demand, result.geometry, result.completedNanos);
         }
 
         void publishEmpty(Demand demand, RenderAdmission admission) {
             BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.token + 1L,
                     (byte) demand.index.childMask(demand.ordinal));
-            this.completeGeometry(demand, empty);
+            this.completeGeometry(demand, empty, System.nanoTime());
         }
 
-        void completeGeometry(Demand demand, BuiltSection geometry) {
+        void completeGeometry(Demand demand, BuiltSection geometry, long completedNanos) {
             demand.renderAdmission.transferGeometryReservation();
             if (!demand.geometryAccounted.compareAndSet(false, true)) {
                 geometry.free();
                 throw new IllegalStateException("regional geometry was completed twice");
             }
             demand.completedGeometry = geometry;
+            demand.meshCompletedNanos = completedNanos;
             demand.geometryBytes = geometry.geometryBuffer == null ? 0
                     : (geometry.geometryBuffer.size + 1023L) & ~1023L;
             int level = SectionKey.level(demand.key);
@@ -1673,7 +1673,7 @@ final class ClientSession {
             else this.readyPublicationQueue.addLast(ref);
         }
 
-        void scheduleReadyPublications() throws InterruptedException {
+        void scheduleReadyPublications() {
             int remaining = this.readyPublicationQueue.size();
             while (remaining-- > 0) {
                 StageRef ref = this.readyPublicationQueue.pollFirst();
@@ -1706,17 +1706,47 @@ final class ClientSession {
                     }
                 }
                 demand.budgetBlockedSinceNanos = 0;
-                BuiltSection geometry = demand.completedGeometry;
+                this.publishReady(demand, ref.token);
+            }
+        }
+
+        void publishReady(Demand demand, int token) {
+            BuiltSection geometry = demand.completedGeometry;
+            RenderAdmission admission = demand.renderAdmission;
+            synchronized (this.publicationLock) {
+                if (!this.open.get() || !current(demand, token, Phase.READY)
+                        || geometry == null || demand.completedGeometry != geometry
+                        || admission == null || demand.renderAdmission != admission) {
+                    if (demand.completedGeometry == geometry && geometry != null) {
+                        this.discardCompletedGeometry(demand);
+                        this.releaseAdmission(demand, admission);
+                    }
+                    return;
+                }
+                if (this.publicationQueue.size() >= MAX_STAGE_QUEUE) {
+                    throw new IllegalStateException(
+                            "regional publication queue exceeded its safety bound");
+                }
+                VoxyRenderSystem.SectionPublication previous = demand.publication;
                 demand.completedGeometry = null;
                 demand.phase = Phase.PUBLISHING;
+                VoxyRenderSystem.SectionPublication publication = null;
                 try {
-                    enqueueMain(new PublishTask(this, demand, ref.token, geometry,
-                            demand.publication, demand.renderAdmission));
-                } catch (InterruptedException interrupted) {
-                    geometry.free();
-                    this.releaseGeometryAccounting(demand, ref.token);
-                    this.releaseAdmission(demand, demand.renderAdmission);
-                    throw interrupted;
+                    publication = this.publisher.publish(demand.key, geometry, demand.coverage,
+                            demand.meshCompletedNanos, Optional.ofNullable(previous),
+                            () -> demand.token == token
+                                    && demand.phase == Phase.PUBLISHING
+                                    && demand.renderAdmission == admission
+                                    && this.open.get(),
+                            () -> this.transferGeometryAccounting(demand, token));
+                    demand.publication = publication;
+                    this.publicationQueue.addLast(new PublicationRef(demand.key, token,
+                            admission));
+                } catch (RuntimeException | Error failure) {
+                    if (publication == null) geometry.free(); else publication.close();
+                    this.releaseAllGeometryAccounting(demand, token);
+                    this.releaseAdmission(demand, admission);
+                    throw failure;
                 }
             }
         }
@@ -1800,24 +1830,6 @@ final class ClientSession {
         void releaseAllGeometryAccounting(Demand demand, int token) {
             this.releaseGeometryAccounting(demand, token);
             this.releasePublishingGeometryAccounting(demand, token);
-        }
-
-        void acceptPublication(PublicationQueued result) throws IOException {
-            Demand demand = this.demands.get(result.key);
-            if (demand != result.demand || !current(demand, result.token, Phase.PUBLISHING)
-                    || demand.renderAdmission != result.admission) {
-                if (!this.isCoarsening(result.key)) result.publication.close();
-                this.releaseAllGeometryAccounting(result.demand, result.token);
-                result.admission.release();
-                return;
-            }
-            demand.publication = result.publication;
-            if (this.publicationQueue.size() >= MAX_STAGE_QUEUE) {
-                throw new IllegalStateException(
-                        "regional publication queue exceeded its safety bound");
-            }
-            this.publicationQueue.addLast(new PublicationRef(demand.key, demand.token,
-                    result.admission));
         }
 
         void pollPublications() throws IOException {
@@ -2004,6 +2016,7 @@ final class ClientSession {
                     + " dormantLastEvictionBucket=" + this.lastEvictionBucket
                     + " dormantLastEvictionAge=" + this.lastEvictionAge
                     + " geometryAccountingCorrections=" + this.correctiveAccountingRebuilds
+                    + ' ' + this.renderer.regionalPublicationLatencySnapshot()
                     + " received=" + this.receivedBytes
                     + " failure=" + String.valueOf(this.failure);
         }
@@ -2054,7 +2067,7 @@ final class ClientSession {
     private record PublicationRef(long key, int token, RenderAdmission admission) {}
 
     private sealed interface Event permits CatalogReady, IndexReady, CacheResult, CacheCorrupt,
-            SectionResult, DecodedResult, MeshedResult, PublicationQueued, Coarsened,
+            SectionResult, DecodedResult, MeshedResult, Coarsened,
             CoarsenFailed, BatchComplete, WorkerFailed {}
     private record CatalogReady(RegionalProtocol.Hash32 fingerprint,
                                 RegionalSectionCodec.Mappings mappings) implements Event {}
@@ -2066,25 +2079,15 @@ final class ClientSession {
     private record DecodedResult(long key, int token,
                                  RegionalSectionCodec.SectionData section) implements Event {}
     private record MeshedResult(long key, int token, BuiltSection geometry,
-                                RenderAdmission admission) implements Event {}
-    private record PublicationQueued(Session owner, Demand demand, long key, int token,
-                                     VoxyRenderSystem.SectionPublication publication,
-                                     RenderAdmission admission)
-            implements Event {}
+                                RenderAdmission admission, long completedNanos) implements Event {}
     private record Coarsened(long parent) implements Event {}
     private record CoarsenFailed(long parent, Throwable failure) implements Event {}
     private record BatchComplete(long reservedBytes, int sectionCount) implements Event {}
     private record WorkerFailed(Throwable failure) implements Event {}
 
-    private interface MainTask {
-        Session owner();
-        void run(VoxyRenderSystem renderer) throws Exception;
-        default void cancel() {}
-    }
-
     private record CatalogTask(Session owner, CatalogCodec.Catalog catalog,
-                               RegionalProtocol.Hash32 fingerprint) implements MainTask {
-        @Override public void run(VoxyRenderSystem renderer) {
+                               RegionalProtocol.Hash32 fingerprint) {
+        void run(VoxyRenderSystem renderer) {
             CatalogMapper mapper = renderer.getMapper();
             int[] blocks = new int[this.catalog.blocks().size()];
             int[] biomes = new int[this.catalog.biomes().size()];
@@ -2101,53 +2104,17 @@ final class ClientSession {
         }
     }
 
-    private record PublishTask(Session owner, Demand demand, int token, BuiltSection geometry,
-                               VoxyRenderSystem.SectionPublication previous,
-                               RenderAdmission admission) implements MainTask {
-        @Override public void run(VoxyRenderSystem renderer) {
-            VoxyRenderSystem.SectionPublication publication;
-            synchronized (this.owner.publicationLock) {
-                if (this.demand.token != this.token
-                        || this.demand.phase != Phase.PUBLISHING
-                        || this.demand.renderAdmission != this.admission) {
-                    this.geometry.free();
-                    this.owner.releaseAllGeometryAccounting(this.demand, this.token);
-                    this.admission.release();
-                    return;
-                }
-                publication = this.owner.publisher.publish(this.demand.key, this.geometry,
-                        Optional.ofNullable(this.previous), () -> this.demand.token == this.token
-                                && this.demand.phase == Phase.PUBLISHING
-                                && this.demand.renderAdmission == this.admission
-                                && this.owner.open.get(),
-                        () -> this.owner.transferGeometryAccounting(this.demand, this.token));
-            }
-            this.owner.putEvent(new PublicationQueued(this.owner, this.demand, this.demand.key,
-                    this.token, publication, this.admission));
-        }
-        @Override public void cancel() {
-            this.geometry.free();
-            this.owner.releaseAllGeometryAccounting(this.demand, this.token);
-            this.admission.release();
-        }
-    }
-
     private static void discardEvent(Event event) {
         if (event instanceof MeshedResult meshed) {
             meshed.geometry.free();
             meshed.admission.release();
-        } else if (event instanceof PublicationQueued queued) {
-            queued.publication.close();
-            queued.owner.releaseAllGeometryAccounting(queued.demand, queued.token);
-            queued.admission.release();
         }
     }
 
-    private static void enqueueMain(MainTask task) throws InterruptedException {
+    private static void enqueueCatalog(CatalogTask task) throws InterruptedException {
         while (task.owner().open.get()) {
-            if (MAIN.offer(task, 100, TimeUnit.MILLISECONDS)) return;
+            if (CATALOG_TASKS.offer(task, 100, TimeUnit.MILLISECONDS)) return;
         }
-        task.cancel();
     }
 
     private static boolean current(Demand demand, int token, Phase phase) {
