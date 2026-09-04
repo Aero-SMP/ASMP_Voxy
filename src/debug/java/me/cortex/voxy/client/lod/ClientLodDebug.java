@@ -3,6 +3,7 @@ package me.cortex.voxy.client.lod;
 import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.client.Minecraft;
 import net.neoforged.bus.api.EventPriority;
+import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.client.event.RenderFrameEvent;
 import net.neoforged.neoforge.client.event.ScreenshotEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -58,7 +59,7 @@ public final class ClientLodDebug {
 
     private ClientLodDebug() {}
 
-    static void init() {
+    static void init(IEventBus modBus) {
         if (initialized) return;
         initialized = true;
         NeoForge.EVENT_BUS.addListener(ClientLodDebug::forceFullSpeed);

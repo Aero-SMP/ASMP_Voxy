@@ -11,7 +11,7 @@ public final class ClientLodClient {
     private ClientLodClient() {}
 
     public static void init(IEventBus modBus) {
-        ClientLodDebug.init();
+        ClientLodDebug.init(modBus);
         QuicEndpointDiscovery.register(modBus);
         NeoForge.EVENT_BUS.register(ClientLodClient.class);
     }

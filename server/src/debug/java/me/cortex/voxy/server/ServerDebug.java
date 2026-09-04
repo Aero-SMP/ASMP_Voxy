@@ -1,5 +1,6 @@
 package me.cortex.voxy.server;
 
+import net.neoforged.bus.api.IEventBus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,7 +12,7 @@ final class ServerDebug {
 
     private ServerDebug() {}
 
-    static void initialize() {
+    static void initialize(IEventBus modBus) {
         String version = VoxyServer.class.getPackage().getImplementationVersion();
         LOGGER.info("Voxy version {} role=server debug=true",
                 version == null ? "<UNKNOWN>" : version);

@@ -19,7 +19,7 @@ java {
 sourceSets.main.java.srcDir rootProject.file('shared/src/main/java')
 sourceSets {
     debug {
-        java.srcDirs = ['src/debug/java']
+        java.srcDirs = ['src/debug/java', rootProject.file('shared/src/debug/java')]
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
 }

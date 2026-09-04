@@ -25,7 +25,7 @@ public final class VoxyServer {
     private static volatile boolean accepting;
 
     public VoxyServer(IEventBus modBus) {
-        ServerDebug.initialize();
+        ServerDebug.initialize(modBus);
         modBus.addListener(VoxyServer::registerPayload);
         NeoForge.EVENT_BUS.addListener(VoxyServer::serverStarting);
         NeoForge.EVENT_BUS.addListener(VoxyServer::serverStopping);

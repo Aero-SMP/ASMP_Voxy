@@ -68,7 +68,7 @@ sourceSets.main.java.srcDir 'shared/src/main/java'
 
 sourceSets {
     debug {
-        java.srcDirs = ['src/debug/java']
+        java.srcDirs = ['src/debug/java', 'shared/src/debug/java']
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
 }
