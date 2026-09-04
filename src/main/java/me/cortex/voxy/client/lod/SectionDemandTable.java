@@ -39,7 +39,9 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         long installedGeneration;
         Object index;
         boolean requested;
+        boolean subscribed;
         boolean absent;
+        final LinkedHashMap<Long, Demand> members = new LinkedHashMap<>();
 
         RegionDemand(long key) { this.key = key; }
     }
@@ -195,6 +197,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     private long nextRevision;
     private final Map<Long, D> demands = new LinkedHashMap<>();
     private final Map<Long, RegionDemand> regions = new HashMap<>();
+    private final LinkedHashMap<Long, RegionDemand> readyRegions = new LinkedHashMap<>();
     private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>();
     private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>();
     private final CoalescingMailbox<Long> regionMailbox = new CoalescingMailbox<>();
@@ -250,6 +253,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         this.demands.put(demand.key, demand);
         RegionDemand region = this.regions.computeIfAbsent(demand.regionKey, RegionDemand::new);
         region.users++;
+        region.members.put(demand.key, demand);
         region.highestBucket = Math.max(region.highestBucket, demand.pixelBucket);
         return demand;
     }
@@ -266,6 +270,21 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     Iterable<RegionDemand> regions() { return this.regions.values(); }
     int regionCount() { return this.regions.size(); }
 
+    void readyRegion(RegionDemand region) {
+        if (region != null && this.regions.get(region.key) == region && !region.requested
+                && !region.absent && region.index == null) {
+            this.readyRegions.put(region.key, region);
+        }
+    }
+
+    RegionDemand pollRegion() {
+        if (this.readyRegions.isEmpty()) return null;
+        long key = this.readyRegions.keySet().iterator().next();
+        return this.readyRegions.remove(key);
+    }
+
+    int readyRegionCount() { return this.readyRegions.size(); }
+
     D remove(long key) {
         D demand = this.demands.remove(key);
         if (demand == null) return null;
@@ -274,7 +293,11 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         if (region == null || --region.users < 0) {
             throw new IllegalStateException("regional demand accounting underflow");
         }
-        if (region.users == 0) this.regions.remove(region.key);
+        region.members.remove(demand.key);
+        if (region.users == 0) {
+            this.regions.remove(region.key);
+            this.readyRegions.remove(region.key);
+        }
         demand.desired = false;
         demand.revision++;
         return demand;
@@ -374,6 +397,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         for (Demand demand : this.demands.values()) unlinkReady(demand);
         this.demands.clear();
         this.regions.clear();
+        this.readyRegions.clear();
         this.topMailbox.clear();
         this.detailMailbox.clear();
         this.regionMailbox.clear();

@@ -54,7 +54,6 @@ final class ClientSession {
     private static final int MAX_EVENTS = 16_384;
     private static final int MAX_IN_FLIGHT_BATCHES = 16;
     private static final long MAX_IN_FLIGHT_BYTES = 128L * 1024 * 1024;
-    private static final int MAX_IN_FLIGHT_INDEXES = 128;
     private static final int MAX_SECTION_TASKS = 64;
     private static final int REQUEST_BATCH = 256;
     private static final long RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
@@ -287,12 +286,6 @@ final class ClientSession {
         final int sectionWorkerCount;
         final RegionalSectionCodec codec = new RegionalSectionCodec();
 
-        final Map<Long, RegionalProtocol.RegionIndex> indexes = new HashMap<>();
-        final Map<Long, Long> regionGenerations = new HashMap<>();
-        final Set<Long> requestedRegions = new HashSet<>();
-        final Set<Long> subscribedRegions = new HashSet<>();
-        final Set<Long> absentRegions = new HashSet<>();
-        final Map<Long, LinkedHashSet<Long>> demandsByRegion = new HashMap<>();
         final Map<Long, LinkedHashSet<Long>> demandsByTop = new HashMap<>();
         final Set<Long> missingCoverage = new HashSet<>();
         final Set<Long> coarseningRoots = new HashSet<>();
@@ -300,8 +293,6 @@ final class ClientSession {
                 new Long2ObjectOpenHashMap<>();
         final Long2LongOpenHashMap pendingDormantEvictions = new Long2LongOpenHashMap();
         final Object publicationLock = new Object();
-        final ArrayDeque<Long> regionQueue = new ArrayDeque<>();
-        final Set<Long> queuedRegions = new HashSet<>();
         final ArrayDeque<PublicationRef> publicationQueue = new ArrayDeque<>();
 
         RegionalQuicClient quic;
@@ -434,7 +425,9 @@ final class ClientSession {
                     .resolve(".voxy").resolve("regional");
             this.cache = new RegionalCache(root, this.worldIdentity);
             this.ensureCatalog(hello.catalogFingerprint());
-            for (long region : this.demandsByRegion.keySet()) this.queueRegion(region);
+            for (SectionDemandTable.RegionDemand region : this.demands.regions()) {
+                this.queueRegion(region.key);
+            }
         }
 
         void ensureCatalog(RegionalProtocol.Hash32 fingerprint) throws IOException {
@@ -460,15 +453,16 @@ final class ClientSession {
 
         void acceptRegion(RegionalProtocol.RegionMessage message) throws IOException {
             long region = regionKey(message.regionX(), message.regionZ());
-            this.requestedRegions.remove(region);
-            if (!this.subscribedRegions.contains(region)) return;
-            Long expected = this.regionGenerations.get(region);
-            if (expected != null && expected != 0 && expected != message.generation()) {
+            SectionDemandTable.RegionDemand state = this.demands.region(region);
+            if (state == null || !state.subscribed) return;
+            state.requested = false;
+            long expected = state.announcedGeneration;
+            if (expected != 0 && expected != message.generation()) {
                 this.queueRegion(region);
                 return;
             }
-            this.regionGenerations.put(region, message.generation());
-            this.absentRegions.remove(region);
+            state.announcedGeneration = message.generation();
+            state.absent = false;
             this.ensureCatalog(message.catalogFingerprint());
             byte[] compressed = message.compressed();
             this.sectionWorkers.execute(() -> {
@@ -496,26 +490,46 @@ final class ClientSession {
 
         void acceptRegionAbsent(RegionalProtocol.RegionAbsent message) {
             long region = regionKey(message.regionX(), message.regionZ());
-            this.requestedRegions.remove(region);
-            if (!this.subscribedRegions.contains(region)) return;
-            this.regionGenerations.put(region, 0L);
-            this.absentRegions.add(region);
-            this.indexes.remove(region);
+            SectionDemandTable.RegionDemand state = this.demands.region(region);
+            if (state == null || !state.subscribed) return;
+            state.requested = false;
+            state.announcedGeneration = 0;
+            state.installedGeneration = 0;
+            state.absent = true;
+            state.index = null;
             this.retireRegion(region);
         }
 
         void regionChanged(RegionalProtocol.RegionChanged message) {
             long region = regionKey(message.regionX(), message.regionZ());
-            if (!this.demandsByRegion.containsKey(region) && !this.indexes.containsKey(region)
-                    && !this.requestedRegions.contains(region)) return;
-            this.regionGenerations.put(region, message.generation());
-            this.requestedRegions.remove(region);
-            this.absentRegions.remove(region);
-            this.indexes.remove(region);
-            if (message.generation() == 0) {
-                this.absentRegions.add(region);
+            if (this.demands.region(region) == null) return;
+            this.demands.offerRegion(region, message.generation());
+        }
+
+        void applyRegionChanged(long region, long generation) {
+            SectionDemandTable.RegionDemand state = this.demands.region(region);
+            if (state == null) return;
+            state.announcedGeneration = generation;
+            state.requested = false;
+            state.absent = false;
+            state.index = null;
+            state.installedGeneration = 0;
+            for (SectionDemandTable.Demand base : state.members.values()) {
+                Demand demand = (Demand) base;
+                if (demand.phase == Phase.ACTIVE) continue;
+                this.demands.unlinkReady(demand);
+                this.discardCompletedGeometry(demand);
+                demand.token++;
+                demand.received = null;
+                demand.decoded = null;
+                demand.pendingIndex = null;
+                demand.pendingOrdinal = -1;
+                demand.phase = Phase.WAITING;
+            }
+            if (generation == 0) {
+                state.absent = true;
                 this.retireRegion(region);
-            } else if (this.demandsByRegion.containsKey(region)) {
+            } else {
                 this.queueRegion(region);
             }
         }
@@ -590,8 +604,8 @@ final class ClientSession {
                 }
             }
             long newestRoot = 0;
-            for (long generation : this.regionGenerations.values()) {
-                newestRoot = Math.max(newestRoot, generation);
+            for (SectionDemandTable.RegionDemand region : this.demands.regions()) {
+                newestRoot = Math.max(newestRoot, region.announcedGeneration);
             }
             long retry = Math.max(0, retryAfter - System.nanoTime());
             return new PipelineSnapshot(this.id, this.requestEpoch, newestRoot,
@@ -628,6 +642,7 @@ final class ClientSession {
                     }
                 }
             });
+            this.demands.drainRegions(this::applyRegionChanged);
             this.drainDetailFrontier();
         }
 
@@ -930,6 +945,8 @@ final class ClientSession {
         }
 
         void retireDetailDemand(long key) {
+            long region = regionFor(key);
+            SectionDemandTable.RegionDemand regionState = this.demands.region(region);
             Demand demand = this.demands.remove(key);
             if (demand == null || demand.coverage) return;
             this.forgetDormancyForSubtree(key);
@@ -945,10 +962,8 @@ final class ClientSession {
             this.setActiveGeometryBytes(demand, 0);
             // One fenced renderer operation owns the whole subtree; do not close each child.
             demand.publication = null;
-            long region = regionFor(key);
-            removeOwned(this.demandsByRegion, region, key);
             removeOwned(this.demandsByTop, topAncestor(key), key);
-            if (!this.demandsByRegion.containsKey(region)) this.releaseRegion(region);
+            if (this.demands.region(region) == null) this.releaseRegion(region, regionState);
         }
 
         boolean isCoarsening(long key) {
@@ -986,8 +1001,6 @@ final class ClientSession {
             Demand demand = this.demands.adopt(new Demand(key));
             this.demands.setPriority(demand, bucket);
             if (demand.coverage) this.missingCoverage.add(key);
-            this.demandsByRegion.computeIfAbsent(regionFor(key), ignored -> new LinkedHashSet<>())
-                    .add(key);
             this.demandsByTop.computeIfAbsent(topAncestor(key), ignored -> new LinkedHashSet<>())
                     .add(key);
             RegionalProtocol.RegionIndex index = this.indexFor(key);
@@ -1016,10 +1029,11 @@ final class ClientSession {
 
         void installIndex(RegionalProtocol.RegionIndex index) {
             long region = regionKey(index.regionX(), index.regionZ());
-            if (!Objects.equals(this.regionGenerations.get(region), index.generation())) return;
-            this.indexes.put(region, index);
-            Set<Long> regional = this.demandsByRegion.get(region);
-            if (regional != null) for (long key : List.copyOf(regional)) {
+            SectionDemandTable.RegionDemand state = this.demands.region(region);
+            if (state == null || state.announcedGeneration != index.generation()) return;
+            state.index = index;
+            state.installedGeneration = index.generation();
+            if (!state.members.isEmpty()) for (long key : List.copyOf(state.members.keySet())) {
                 Demand demand = this.demands.get(key);
                 if (demand == null) continue;
                 int ordinal = index.ordinal(demand.key);
@@ -1029,14 +1043,15 @@ final class ClientSession {
         }
 
         void retireRegion(long region) {
-            Set<Long> regional = this.demandsByRegion.get(region);
-            if (regional == null) return;
-            for (long key : List.copyOf(regional)) this.retireDemand(key);
+            SectionDemandTable.RegionDemand state = this.demands.region(region);
+            if (state == null) return;
+            for (long key : List.copyOf(state.members.keySet())) this.retireDemand(key);
         }
 
         void retireDemand(long key) {
             Demand demand = this.demands.get(key);
             if (demand == null) return;
+            this.demands.unlinkReady(demand);
             this.forgetDormancyForSubtree(key);
             this.discardCompletedGeometry(demand);
             this.releasePublishingGeometryAccounting(demand,
@@ -1059,25 +1074,24 @@ final class ClientSession {
                 demand.phase = Phase.NEW;
             } else {
                 this.missingCoverage.remove(key);
-                this.demands.remove(key);
                 long region = regionFor(key);
-                removeOwned(this.demandsByRegion, region, key);
+                SectionDemandTable.RegionDemand regionState = this.demands.region(region);
+                this.demands.remove(key);
                 removeOwned(this.demandsByTop, topAncestor(key), key);
-                if (!this.demandsByRegion.containsKey(region)) this.releaseRegion(region);
+                if (this.demands.region(region) == null) {
+                    this.releaseRegion(region, regionState);
+                }
             }
         }
 
-        void releaseRegion(long region) {
-            this.indexes.remove(region);
-            this.regionGenerations.remove(region);
-            this.requestedRegions.remove(region);
-            this.absentRegions.remove(region);
-            if (!this.subscribedRegions.remove(region) || this.quic == null) return;
+        void releaseRegion(long region, SectionDemandTable.RegionDemand state) {
+            if (state == null || !state.subscribed || this.quic == null) return;
+            state.subscribed = false;
             try {
                 this.quic.releaseRegion((int) region, (int) (region >>> 32));
             } catch (IOException failure) {
-                throw new IllegalStateException("cannot release obsolete regional subscription",
-                        failure);
+                Logger.warn("Could not release obsolete regional subscription; the connection "
+                        + "will discard it", failure);
             }
         }
 
@@ -1098,6 +1112,7 @@ final class ClientSession {
             }
             demand.pendingIndex = null;
             demand.pendingOrdinal = -1;
+            this.demands.unlinkReady(demand);
             this.discardCompletedGeometry(demand);
             demand.token++;
             if (demand.phase == Phase.ACTIVE) {
@@ -1105,6 +1120,7 @@ final class ClientSession {
                 if (demand.coverage) this.missingCoverage.add(demand.key);
             }
             demand.index = index;
+            demand.regionGeneration = index.generation();
             demand.ordinal = ordinal;
             demand.decoded = null;
             demand.received = null;
@@ -1136,22 +1152,18 @@ final class ClientSession {
         void ensureRegion(long key) { this.queueRegion(regionFor(key)); }
 
         void queueRegion(long region) {
-            if (this.indexes.containsKey(region) || this.absentRegions.contains(region)
-                    || this.requestedRegions.contains(region) || !this.queuedRegions.add(region)) return;
-            this.regionQueue.addLast(region);
+            this.demands.readyRegion(this.demands.region(region));
         }
 
         void processRegions() throws IOException {
             if (this.worldIdentity == null) return;
-            while (this.requestedRegions.size() < MAX_IN_FLIGHT_INDEXES) {
-                Long region = this.regionQueue.pollFirst();
-                if (region == null) return;
-                this.queuedRegions.remove(region);
-                if (this.indexes.containsKey(region) || this.absentRegions.contains(region)
-                        || !this.demandsByRegion.containsKey(region)
-                        || !this.requestedRegions.add(region)) continue;
-                this.quic.requestRegion((int) region.longValue(), (int) (region >>> 32));
-                this.subscribedRegions.add(region);
+            SectionDemandTable.RegionDemand region;
+            while ((region = this.demands.pollRegion()) != null) {
+                if (region.index != null || region.absent || region.requested
+                        || region.users == 0) continue;
+                this.quic.requestRegion((int) region.key, (int) (region.key >>> 32));
+                region.requested = true;
+                region.subscribed = true;
             }
         }
 
@@ -1319,8 +1331,12 @@ final class ClientSession {
                 }
                 case STALE -> {
                     long region = regionFor(demand.key);
-                    this.indexes.remove(region);
-                    this.requestedRegions.remove(region);
+                    SectionDemandTable.RegionDemand state = this.demands.region(region);
+                    if (state != null) {
+                        state.index = null;
+                        state.installedGeneration = 0;
+                        state.requested = false;
+                    }
                     this.queueRegion(region);
                 }
                 case ABSENT -> throw new IOException("indexed regional section became absent");
@@ -1586,12 +1602,11 @@ final class ClientSession {
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
-            return this.indexes.get(regionFor(key));
+            SectionDemandTable.RegionDemand region = this.demands.region(regionFor(key));
+            return region == null ? null : (RegionalProtocol.RegionIndex) region.index;
         }
 
         void clearStageQueues() {
-            this.regionQueue.clear();
-            this.queuedRegions.clear();
             this.publicationQueue.clear();
         }
 
@@ -1620,7 +1635,7 @@ final class ClientSession {
 
         String snapshot() {
             return "regional=ACTIVE dimension=" + this.dimension + " desired=" + this.demands.size()
-                    + " active=" + this.activeCount + " regions=" + this.indexes.size()
+                    + " active=" + this.activeCount + " regions=" + this.demands.regionCount()
                     + " coarsening=" + this.coarseningRoots.size()
                     + " batches=" + this.inFlightBatches + " inFlightBytes=" + this.inFlightBytes
                     + " coalescedInputs=" + this.demands.pendingInputCount()
@@ -1679,10 +1694,8 @@ final class ClientSession {
             Event event;
             while ((event = this.events.poll()) != null) discardEvent(event);
             this.demands.clear();
-            this.demandsByRegion.clear();
             this.demandsByTop.clear();
             this.missingCoverage.clear();
-            this.subscribedRegions.clear();
             this.demands.clear();
             this.coarseningRoots.clear();
             this.dormantRoots.clear();
