@@ -26,11 +26,10 @@ final class ClientUpdateRestart {
     private ClientUpdateRestart() {}
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 4) throw new IllegalArgumentException("missing restart command");
+        if (arguments.length != 3) throw new IllegalArgumentException("missing restart command");
         long oldPid = Long.parseLong(arguments[0]);
         Path gameDirectory = Path.of(arguments[1]);
         Path commandFile = Path.of(arguments[2]);
-        boolean launcherDispatch = Boolean.parseBoolean(arguments[3]);
         Path restartLog = gameDirectory.resolve(".voxy-updater").resolve("restart.log");
         Path launchLog = gameDirectory.resolve(".voxy-updater")
                 .resolve("relaunched-java.log");
@@ -38,8 +37,12 @@ final class ClientUpdateRestart {
             append(restartLog, "helper-start oldPid=" + oldPid);
             List<String> command = stabilizeLaunchFiles(
                     readCommand(commandFile), commandFile.getParent(), gameDirectory);
+            List<String> prismCommand = prismLauncherCommand(oldPid, command, gameDirectory);
+            boolean launcherDispatch = prismCommand != null;
+            if (launcherDispatch) command = prismCommand;
             Files.delete(commandFile);
-            append(restartLog, "command-ready arguments=" + command.size());
+            append(restartLog, "command-ready arguments=" + command.size()
+                    + " launcherDispatch=" + launcherDispatch);
             stopOldProcess(oldPid);
             append(restartLog, "old-process-stopped");
             Thread.sleep(500);
@@ -100,6 +103,39 @@ final class ClientUpdateRestart {
         unwrapModrinthLauncher(stable);
         canonicalizeGameDirectory(stable, gameDirectory);
         return stable;
+    }
+
+    private static List<String> prismLauncherCommand(long oldPid, List<String> command,
+                                                     Path gameDirectory) {
+        if (!command.contains("org.prismlauncher.EntryPoint")) return null;
+        String instance = prismInstanceId(gameDirectory);
+        ProcessHandle process = ProcessHandle.of(oldPid).orElse(null);
+        if (instance == null || process == null) return null;
+        for (int depth = 0; depth < 16; depth++) {
+            process = process.parent().orElse(null);
+            if (process == null) return null;
+            String executable = process.info().command().orElse(null);
+            if (executable == null) continue;
+            try {
+                Path path = Path.of(executable);
+                Path name = path.getFileName();
+                if (name != null && name.toString().toLowerCase(java.util.Locale.ROOT)
+                        .contains("prismlauncher")) {
+                    return List.of(path.toString(), "--launch", instance);
+                }
+            } catch (RuntimeException ignored) {}
+        }
+        return null;
+    }
+
+    private static String prismInstanceId(Path gameDirectory) {
+        Path normalized = gameDirectory.toAbsolutePath().normalize();
+        Path name = normalized.getFileName();
+        Path instance = normalized.getParent();
+        if (name == null || !name.toString().equalsIgnoreCase("minecraft")
+                || instance == null || instance.getFileName() == null) return null;
+        String id = instance.getFileName().toString();
+        return id.isBlank() ? null : id;
     }
 
     private static void canonicalizeGameDirectory(ArrayList<String> command,

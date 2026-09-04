@@ -137,9 +137,8 @@ public final class DebugHarnessBehaviorTest {
     private static Object invokePrivateRestartMethod(String name, Class<?>[] types,
                                                      Object... arguments) {
         try {
-            Class<?> helper = Class.forName(name.equals("prismInstanceId")
-                    ? "me.cortex.voxy.client.lod.ClientAutoUpdater"
-                    : "me.cortex.voxy.client.lod.ClientUpdateRestart");
+            Class<?> helper = Class.forName(
+                    "me.cortex.voxy.client.lod.ClientUpdateRestart");
             Method method = helper.getDeclaredMethod(name, types);
             method.setAccessible(true);
             return method.invoke(null, arguments);
