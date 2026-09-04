@@ -733,10 +733,12 @@ final class ClientSession {
                 return;
             }
             if (!this.coarseningRoots.isEmpty()) return;
-            long required = Math.max(1, this.geometryDeficitBytes()), selected = 0;
-            for (int bucket = 0; bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT; bucket++) {
+            int started = 0;
+            for (int bucket = 0;
+                 bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT && started < 64;
+                 bucket++) {
                 int remaining = this.frontier.size(bucket);
-                while (remaining-- > 0 && selected < required && this.frontier.poll(bucket)) {
+                while (remaining-- > 0 && started < 64 && this.frontier.poll(bucket)) {
                     long parent = this.frontier.key;
                     int action = this.frontier.action;
                     int epoch = this.frontier.epoch;
@@ -748,16 +750,15 @@ final class ClientSession {
                     if (demand == null || demand.phase != Phase.ACTIVE
                             || this.overlapsCoarsening(parent)
                             || !newerEpoch(epoch, demand.latestCoarseningEpoch)) continue;
-                    long reclaimable = this.coarsen(parent);
-                    if (reclaimable == 0) continue;
+                    if (this.coarsen(parent) == 0) continue;
                     demand.latestCoarseningEpoch = epoch;
                     this.detailAdmissionFloor = Math.max(this.detailAdmissionFloor, bucket + 1);
-                    selected += reclaimable;
+                    started++;
                 }
-                // Do not speculate into a more valuable bucket using pre-fence byte estimates.
-                // Let the selected lowest-value subtrees cross their renderer fences, then use
-                // the authoritative arena usage to decide whether another bucket is necessary.
-                if (selected != 0) break;
+                // Retire one bounded batch from the lowest-value available bucket. Its renderer
+                // fences must cross before authoritative arena usage can justify touching a more
+                // valuable bucket.
+                if (started != 0) break;
             }
         }
 
