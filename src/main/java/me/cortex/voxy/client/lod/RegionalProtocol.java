@@ -275,44 +275,47 @@ final class RegionalProtocol {
         return frame.toByteArray();
     }
 
-    static List<SectionReply> readReplyBatch(InputStream input, long expectedEpoch,
-                                              RegionIndex index, List<Integer> ordinals,
-                                              int expectedStart) throws IOException {
+    interface ReplyConsumer {
+        void accept(SectionReply reply) throws Exception;
+    }
+
+    static int readReplyBatch(InputStream input, long expectedEpoch,
+                              RegionIndex index, List<Integer> ordinals,
+                              int expectedStart, ReplyConsumer consumer) throws Exception {
         long rawLength = readU32(input);
         if (rawLength < 12 || rawLength > MAX_SECTION_BATCH_BYTES) {
             throw new IOException("invalid regional reply frame length");
         }
-        ByteBuffer body = ByteBuffer.wrap(readExact(input, (int) rawLength))
-                .order(ByteOrder.LITTLE_ENDIAN);
-        long epoch = body.getLong();
-        int start = Short.toUnsignedInt(body.getShort());
-        int count = Short.toUnsignedInt(body.getShort());
+        ByteBuffer header = ByteBuffer.wrap(readExact(input, 12)).order(ByteOrder.LITTLE_ENDIAN);
+        long epoch = header.getLong();
+        int start = Short.toUnsignedInt(header.getShort());
+        int count = Short.toUnsignedInt(header.getShort());
         if (epoch != expectedEpoch || start != expectedStart || count < 1
                 || count > MAX_SECTION_REQUESTS || start + count > ordinals.size()
-                || body.remaining() < count) {
+                || rawLength < 12L + count) {
             throw new IOException("invalid regional reply batch header");
         }
-        List<Status> statuses = new ArrayList<>(count);
+        byte[] encodedStatuses = readExact(input, count);
+        Status[] statuses = new Status[count];
         for (int position = 0; position < count; position++) {
-            statuses.add(Status.from(Byte.toUnsignedInt(body.get())));
+            statuses[position] = Status.from(Byte.toUnsignedInt(encodedStatuses[position]));
         }
-        List<SectionReply> replies = new ArrayList<>(count);
+        long consumed = 12L + count;
         for (int position = 0; position < count; position++) {
             int ordinal = ordinals.get(start + position);
-            Status status = statuses.get(position);
+            Status status = statuses[position];
             int length = status == Status.DATA ? index.compressedLength(ordinal) : 0;
-            if (length < 0 || length > MAX_SECTION_BYTES || body.remaining() < length) {
+            if (length < 0 || length > MAX_SECTION_BYTES || consumed + length > rawLength) {
                 throw new IOException("truncated or oversized regional section body");
             }
-            byte[] compressed = new byte[length];
-            body.get(compressed);
+            byte[] compressed = readExact(input, length);
+            consumed += length;
             validateReply(index, ordinal, status, compressed);
-            SectionReply reply = new SectionReply(index.generation(), ordinal,
-                    index.key(ordinal), status, compressed);
-            replies.add(reply);
+            consumer.accept(new SectionReply(index.generation(), ordinal,
+                    index.key(ordinal), status, compressed));
         }
-        if (body.hasRemaining()) throw new IOException("trailing regional reply bytes");
-        return replies;
+        if (consumed != rawLength) throw new IOException("trailing regional reply bytes");
+        return count;
     }
 
     static RegionIndex decodeIndex(byte[] canonical, Fingerprint fingerprint) throws IOException {

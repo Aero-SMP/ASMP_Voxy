@@ -1521,10 +1521,8 @@ final class ClientSession {
                     ? RegionalProtocol.Lane.COVERAGE : RegionalProtocol.Lane.REFINEMENT;
             boolean accepted = this.quic.requestSections(lane, epoch, index, ordinals,
                     new RegionalQuicClient.BatchReceiver() {
-                        @Override public void batch(List<RegionalProtocol.SectionReply> replies) {
-                            for (RegionalProtocol.SectionReply reply : replies) {
-                                putEvent(new SectionResult(reply));
-                            }
+                        @Override public void reply(RegionalProtocol.SectionReply reply) {
+                            putEvent(new SectionResult(reply));
                         }
                         @Override public void complete() {
                             putEvent(new BatchComplete(reservedBytes, selected.size()));

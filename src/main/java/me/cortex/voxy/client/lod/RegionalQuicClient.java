@@ -18,7 +18,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,7 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Pinned current-only QUIC connection with reusable, independently progressing section lanes. */
 final class RegionalQuicClient implements AutoCloseable {
     interface BatchReceiver {
-        void batch(List<RegionalProtocol.SectionReply> replies) throws Exception;
+        void reply(RegionalProtocol.SectionReply reply) throws Exception;
         void complete();
         void failed(Throwable failure);
     }
@@ -36,7 +35,6 @@ final class RegionalQuicClient implements AutoCloseable {
     private static final String TLS_SERVER_NAME = "voxy.local";
     private static final long STREAM_ERROR_CANCELLED = 0x10;
     private static final long STREAM_RECEIVE_BYTES = 5L * 1024 * 1024;
-    private static final int LANE_QUEUE_CAPACITY = 16;
     private static final int[] LANE_COUNTS = {2, 6};
 
     private final QuicClientConnection connection;
@@ -45,8 +43,8 @@ final class RegionalQuicClient implements AutoCloseable {
     private final OutputStream controlOutput;
     private final ExecutorService workers = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("Voxy regional QUIC-", 0).factory());
-    private final ArrayBlockingQueue<RegionalProtocol.Control> controls =
-            new ArrayBlockingQueue<>(4096);
+    private final Object controlHandoffLock = new Object();
+    private RegionalProtocol.Control controlHandoff;
     @SuppressWarnings("unchecked")
     private final List<LaneWorker>[] lanes = new List[RegionalProtocol.Lane.values().length];
     private final AtomicInteger[] nextLane = new AtomicInteger[RegionalProtocol.Lane.values().length];
@@ -130,11 +128,22 @@ final class RegionalQuicClient implements AutoCloseable {
         return !this.closed.get() && this.failure.get() == null && this.connection.isConnected();
     }
     Throwable failure() { return this.failure.get(); }
-    RegionalProtocol.Control pollControl() { return this.controls.poll(); }
+    RegionalProtocol.Control pollControl() {
+        synchronized (this.controlHandoffLock) {
+            RegionalProtocol.Control result = this.controlHandoff;
+            if (result != null) {
+                this.controlHandoff = null;
+                this.controlHandoffLock.notifyAll();
+            }
+            return result;
+        }
+    }
 
     void setActivityListener(Runnable listener) {
         this.activity.set(Objects.requireNonNull(listener, "listener"));
-        if (!this.controls.isEmpty() || !isOpen()) signalActivity();
+        synchronized (this.controlHandoffLock) {
+            if (this.controlHandoff != null || !isOpen()) signalActivity();
+        }
     }
 
     void hello(String dimension) throws IOException {
@@ -160,7 +169,7 @@ final class RegionalQuicClient implements AutoCloseable {
         List<LaneWorker> group = this.lanes[priority.ordinal()];
         int start = Math.floorMod(this.nextLane[priority.ordinal()].getAndIncrement(), group.size());
         for (int offset = 0; offset < group.size(); offset++) {
-            if (group.get((start + offset) % group.size()).queue.offer(task)) return true;
+            if (group.get((start + offset) % group.size()).tryAssign(task)) return true;
         }
         return false;
     }
@@ -182,8 +191,12 @@ final class RegionalQuicClient implements AutoCloseable {
         try {
             while (!this.closed.get()) {
                 RegionalProtocol.Control control = RegionalProtocol.readControl(this.controlInput);
-                if (!this.controls.offer(control)) {
-                    throw new IOException("regional control queue exceeded its safety bound");
+                synchronized (this.controlHandoffLock) {
+                    while (this.controlHandoff != null && !this.closed.get()) {
+                        this.controlHandoffLock.wait();
+                    }
+                    if (this.closed.get()) return;
+                    this.controlHandoff = control;
                 }
                 signalActivity();
             }
@@ -194,11 +207,32 @@ final class RegionalQuicClient implements AutoCloseable {
 
     private final class LaneWorker {
         private final RegionalProtocol.Lane priority;
-        private final ArrayBlockingQueue<LaneTask> queue =
-                new ArrayBlockingQueue<>(LANE_QUEUE_CAPACITY);
+        private LaneTask task;
+        private boolean active;
         private volatile QuicStream stream;
 
         private LaneWorker(RegionalProtocol.Lane priority) { this.priority = priority; }
+
+        private synchronized boolean tryAssign(LaneTask offered) {
+            if (this.active || closed.get()) return false;
+            this.active = true;
+            this.task = offered;
+            this.notifyAll();
+            return true;
+        }
+
+        private synchronized LaneTask awaitTask() throws InterruptedException {
+            while (this.task == null && !closed.get()) this.wait();
+            LaneTask result = this.task;
+            this.task = null;
+            return result;
+        }
+
+        private synchronized void finishTask() {
+            this.active = false;
+            this.notifyAll();
+            signalActivity();
+        }
 
         private void run() {
             try {
@@ -209,26 +243,19 @@ final class RegionalQuicClient implements AutoCloseable {
                 output.write(this.priority.id);
                 output.flush();
                 while (!closed.get()) {
-                    LaneTask task;
-                    try {
-                        task = this.queue.take();
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
+                    LaneTask task = this.awaitTask();
+                    if (task == null) return;
                     try {
                         output.write(RegionalProtocol.sectionRequest(
                                 task.epoch, task.index, task.ordinals));
                         output.flush();
                         int received = 0;
                         while (received < task.ordinals.size()) {
-                            List<RegionalProtocol.SectionReply> replies =
-                                    RegionalProtocol.readReplyBatch(input, task.epoch, task.index,
-                                            task.ordinals, received);
-                            received += replies.size();
-                            task.receiver.batch(replies);
+                            received += RegionalProtocol.readReplyBatch(input, task.epoch,
+                                    task.index, task.ordinals, received, task.receiver::reply);
                         }
                         task.receiver.complete();
+                        this.finishTask();
                     } catch (Throwable taskFailure) {
                         task.receiver.failed(taskFailure);
                         fail(taskFailure);
@@ -243,10 +270,14 @@ final class RegionalQuicClient implements AutoCloseable {
         private void stop() {
             QuicStream current = this.stream;
             if (current != null) rejectRemoteStream(current);
-            LaneTask task;
-            while ((task = this.queue.poll()) != null) {
-                task.receiver.failed(closedFailure());
+            LaneTask pending;
+            synchronized (this) {
+                pending = this.task;
+                this.task = null;
+                this.active = false;
+                this.notifyAll();
             }
+            if (pending != null) pending.receiver.failed(closedFailure());
         }
     }
 
@@ -273,6 +304,9 @@ final class RegionalQuicClient implements AutoCloseable {
     public void close() {
         if (!this.closed.compareAndSet(false, true)) return;
         for (List<LaneWorker> group : this.lanes) for (LaneWorker lane : group) lane.stop();
+        synchronized (this.controlHandoffLock) {
+            this.controlHandoffLock.notifyAll();
+        }
         rejectRemoteStream(this.control);
         this.connection.close();
         this.workers.shutdownNow();
