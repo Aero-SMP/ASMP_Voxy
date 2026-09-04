@@ -372,6 +372,7 @@ final class ClientSession {
             private State state = State.IDLE;
             private WorkerTask task;
             private WorkerResult result;
+            private boolean completionClaimed;
 
             WorkerSlot(int index) {
                 this.index = index;
@@ -392,7 +393,21 @@ final class ClientSession {
 
             synchronized boolean idle() { return this.state == State.IDLE; }
             synchronized WorkerResult completion() {
-                return this.state == State.COMPLETED ? this.result : null;
+                if (this.state != State.COMPLETED || this.completionClaimed) return null;
+                this.completionClaimed = true;
+                return this.result;
+            }
+
+            synchronized boolean hasCompletion() {
+                return this.state == State.COMPLETED;
+            }
+
+            synchronized void disownCompletion(WorkerResult claimed) {
+                if (this.state != State.COMPLETED || !this.completionClaimed
+                        || this.result != claimed) {
+                    throw new IllegalStateException("worker completion ownership is invalid");
+                }
+                this.result = null;
             }
 
             synchronized void releaseCompletion() {
@@ -400,6 +415,7 @@ final class ClientSession {
                     throw new IllegalStateException("worker has no completed resource");
                 }
                 this.result = null;
+                this.completionClaimed = false;
                 this.state = State.IDLE;
                 this.notifyAll();
             }
@@ -434,6 +450,7 @@ final class ClientSession {
                             return;
                         }
                         this.result = completion;
+                        this.completionClaimed = false;
                         this.state = State.COMPLETED;
                     }
                     signal();
@@ -500,6 +517,7 @@ final class ClientSession {
                 if (this.state == State.CLOSED) return;
                 if (this.result != null) freeWorkerResult(this.result);
                 this.result = null;
+                this.completionClaimed = false;
                 this.task = null;
                 this.state = State.CLOSED;
                 this.notifyAll();
@@ -1501,16 +1519,21 @@ final class ClientSession {
                         Demand demand = this.currentWorkerDemand(geometry.ticket(), worker);
                         if (demand == null) {
                             geometry.geometry().free();
+                            worker.disownCompletion(geometry);
                             this.finishStaleWorker(geometry.ticket(), worker);
                             worker.releaseCompletion();
                             continue;
                         }
                         this.recordWorkerSource(geometry.cacheHit(), geometry.compressedBytes(),
                                 true);
+                        // Once observed, the demand is the sole owner of the mesh buffer. The
+                        // worker remains reserved until renderer admission completes, but must
+                        // neither redeliver nor free a buffer that may already be uploading.
+                        worker.disownCompletion(geometry);
                         demand.completedSlot = worker;
                         this.completeGeometry(demand, geometry.geometry(),
                                 geometry.completedNanos());
-                        // The slot remains COMPLETED and owns the mesh until renderer transfer.
+                        // The slot remains COMPLETED as the exact backpressure resource.
                     }
                     case WorkerFailure failed -> {
                         Demand currentDemand = null;
@@ -1897,7 +1920,7 @@ final class ClientSession {
             demand.completedSlot = null;
             demand.activeWorkerSlot = -1;
             if (geometry != null) geometry.free();
-            if (slot != null && slot.completion() != null) slot.releaseCompletion();
+            if (slot != null && slot.hasCompletion()) slot.releaseCompletion();
             this.releaseGeometryAccounting(demand);
         }
 
@@ -2015,7 +2038,7 @@ final class ClientSession {
         }
 
         void releaseRendererSlot(WorkerSlot slot) {
-            if (slot != null && slot.completion() != null) slot.releaseCompletion();
+            if (slot != null && slot.hasCompletion()) slot.releaseCompletion();
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
