@@ -3,6 +3,7 @@ package me.cortex.voxy.client.lod;
 import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.Screenshot;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
@@ -42,6 +43,8 @@ final class ClientAutoUpdater {
             "/home/printer/Desktop/Creative/logs/client-upload";
     private static final String REMOTE_SCREENSHOTS = "/home/printer/screenshots";
     private static final long POLL_SECONDS = 20;
+    private static final long SCREENSHOT_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
+    private static final String AUTO_SCREENSHOT_PREFIX = "voxy-debug-auto-";
     private static final int SCREENSHOT_QUEUE_CAPACITY = 256;
     private static final int SCREENSHOT_UPLOAD_ATTEMPTS = 3;
     private static final long SCREENSHOT_STABLE_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
@@ -57,6 +60,8 @@ final class ClientAutoUpdater {
     private static volatile boolean restartPending;
     private static boolean restartDisconnectRequested;
     private static long nextConnectNanos;
+    private static long nextScreenshotNanos;
+    private static final AtomicBoolean SCREENSHOT_IN_FLIGHT = new AtomicBoolean();
     private static boolean screenshotDirectoryReady;
 
     private ClientAutoUpdater() {}
@@ -109,6 +114,7 @@ final class ClientAutoUpdater {
             minecraft.stop();
             return;
         }
+        captureScreenshot(minecraft);
         if (!readyToConnect) return;
         if (!minecraft.isGameLoadFinished() || minecraft.getConnection() != null
                 || minecraft.level != null || minecraft.screen == null
@@ -121,6 +127,26 @@ final class ClientAutoUpdater {
                 ServerData.Type.OTHER);
         ConnectScreen.startConnecting(minecraft.screen, minecraft,
                 ServerAddress.parseString(MINECRAFT_SERVER), server, false, null);
+    }
+
+    private static void captureScreenshot(Minecraft minecraft) {
+        if (!minecraft.isGameLoadFinished() || minecraft.level == null) return;
+        long now = System.nanoTime();
+        if (now < nextScreenshotNanos) return;
+        nextScreenshotNanos = now + SCREENSHOT_INTERVAL_NANOS;
+        if (!SCREENSHOT_IN_FLIGHT.compareAndSet(false, true)) return;
+
+        String filename = AUTO_SCREENSHOT_PREFIX + System.currentTimeMillis() + ".png";
+        try {
+            Screenshot.grab(minecraft.gameDirectory, filename,
+                    minecraft.getMainRenderTarget(), ignored ->
+                            SCREENSHOT_IN_FLIGHT.set(false));
+        } catch (RuntimeException | Error failure) {
+            SCREENSHOT_IN_FLIGHT.set(false);
+            ClientLodDebug.updaterEvent("state=AUTO_SCREENSHOT_FAILED type="
+                    + failure.getClass().getSimpleName() + " message="
+                    + oneLine(failure.getMessage()));
+        }
     }
 
     static void queueScreenshot(Path screenshot) {
@@ -180,6 +206,7 @@ final class ClientAutoUpdater {
                 }
                 ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOADED file="
                         + oneLine(screenshotName(screenshot)) + " attempt=" + attempt);
+                cleanupAutomaticScreenshot(screenshot);
                 return;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -209,6 +236,17 @@ final class ClientAutoUpdater {
                 + SCREENSHOT_UPLOAD_ATTEMPTS + " type="
                 + lastFailure.getClass().getSimpleName() + " message="
                 + oneLine(lastFailure.getMessage()));
+    }
+
+    private static void cleanupAutomaticScreenshot(Path screenshot) {
+        if (!screenshotName(screenshot).startsWith(AUTO_SCREENSHOT_PREFIX)) return;
+        try {
+            Files.deleteIfExists(screenshot);
+        } catch (IOException failure) {
+            ClientLodDebug.updaterEvent("state=AUTO_SCREENSHOT_CLEANUP_FAILED file="
+                    + oneLine(screenshotName(screenshot)) + " message="
+                    + oneLine(failure.getMessage()));
+        }
     }
 
     private static void waitForStableScreenshot(Path screenshot)
