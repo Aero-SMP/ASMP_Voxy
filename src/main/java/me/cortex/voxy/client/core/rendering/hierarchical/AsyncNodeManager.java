@@ -18,14 +18,19 @@ import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import org.lwjgl.system.MemoryUtil;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.BooleanSupplier;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.StampedLock;
@@ -47,6 +52,12 @@ public class AsyncNodeManager {
     private static final long MAX_SYNC_GEOMETRY_BYTES = 16L << 20;
     private static final long MIN_FREE_GEOMETRY_BYTES = 50_000_000L;
     private static final int MAX_SYNC_REGIONAL_PUBLICATIONS = 1_024;
+    private static final int MAX_REGIONAL_BATCH_PUBLICATIONS = 32_768;
+    private static final long[] BATCH_START_LATENCY_BUCKET_NANOS = {
+            100_000L, 500_000L, 1_000_000L, 4_000_000L, 16_000_000L
+    };
+    private static final int[] BATCH_SECTION_BUCKET_LIMITS = {1, 4, 16, 64, 256};
+    private static final ThreadMXBean THREAD_MX_BEAN = ManagementFactory.getThreadMXBean();
     private static final VarHandle RESULT_HANDLE;
     private static final VarHandle RESULT_CACHE_1_HANDLE;
     private static final VarHandle RESULT_CACHE_2_HANDLE;
@@ -70,7 +81,9 @@ public class AsyncNodeManager {
     private final BasicAsyncGeometryManager geometryManager;
     private final BasicSectionGeometryData geometryData;
 
-    private final AtomicInteger workCounter = new AtomicInteger();
+    /** A level-triggered notification, not an estimate of queued item count. */
+    private final AtomicBoolean workPending = new AtomicBoolean();
+    private final Object submissionLock = new Object();
     private final ArrayList<RendererTransaction> completedRendererTransactions = new ArrayList<>();
     private final ArrayList<RegionalSectionPublication> completedRegionalSectionPublications =
             new ArrayList<>();
@@ -94,6 +107,24 @@ public class AsyncNodeManager {
 
     private boolean needsWaitForSync = false;
     private boolean retryDeferredAfterSync = false;
+    private volatile boolean waitingForRenderSync;
+
+    private final AtomicLong submittedRegionalBatches = new AtomicLong();
+    private final AtomicLong submittedRegionalSections = new AtomicLong();
+    private final AtomicLong maximumRegionalBatchSections = new AtomicLong();
+    private final AtomicLongArray regionalBatchSectionBuckets =
+            new AtomicLongArray(BATCH_SECTION_BUCKET_LIMITS.length + 1);
+    private final LatencyCounters regionalBatchStartLatency =
+            new LatencyCounters(BATCH_START_LATENCY_BUCKET_NANOS);
+    private final AtomicLong managerWakeups = new AtomicLong();
+    private final AtomicLong regionalRenderSyncs = new AtomicLong();
+    private final AtomicLong regionalRenderSyncPublications = new AtomicLong();
+    private final AtomicLong regionalRenderSyncBytes = new AtomicLong();
+    private final AtomicLong maximumRegionalRenderSyncPublications = new AtomicLong();
+    private final AtomicLong maximumRegionalRenderSyncBytes = new AtomicLong();
+    private final AtomicLong regionalBatchSyncSplits = new AtomicLong();
+    private final AtomicLong workerCpuNanos = new AtomicLong();
+    private final AtomicLong workerIdleNanos = new AtomicLong();
 
     public AsyncNodeManager(int maxNodeCount, BasicSectionGeometryData geometryData) {
         //Note: geometry data is the data store/source, not the management, it is just a raw store of data
@@ -107,7 +138,16 @@ public class AsyncNodeManager {
         this.thread = new Thread(()->{
             try {
                 while (this.running) {
-                    this.run();
+                    if (!this.awaitWork()) continue;
+                    long cpuStart = currentThreadCpuNanos();
+                    try {
+                        this.run();
+                    } finally {
+                        long cpuEnd = currentThreadCpuNanos();
+                        if (cpuStart >= 0 && cpuEnd >= cpuStart) {
+                            this.workerCpuNanos.addAndGet(cpuEnd - cpuStart);
+                        }
+                    }
                 }
             } catch (Exception e) {
                 Logger.error("Critical error occurred in async processor, things will be broken", e);
@@ -150,6 +190,34 @@ public class AsyncNodeManager {
         });
     }
 
+    /**
+     * Consumes one level-triggered notification before doing work. An enqueue racing with the
+     * transition to park either changes the flag or leaves an unpark permit, so it cannot be
+     * lost. No timed coalescing is performed here: a complete producer batch is ready already.
+     */
+    private boolean awaitWork() {
+        boolean notified = this.workPending.getAndSet(false);
+        if (notified || this.retryDeferredAfterSync) return this.running;
+        long idleStart = System.nanoTime();
+        while (this.running) {
+            LockSupport.park();
+            this.managerWakeups.incrementAndGet();
+            notified = this.workPending.getAndSet(false);
+            if (notified || this.retryDeferredAfterSync) break;
+        }
+        this.workerIdleNanos.addAndGet(System.nanoTime() - idleStart);
+        return this.running;
+    }
+
+    private static long currentThreadCpuNanos() {
+        try {
+            return THREAD_MX_BEAN.isCurrentThreadCpuTimeSupported()
+                    ? THREAD_MX_BEAN.getCurrentThreadCpuTime() : -1;
+        } catch (RuntimeException ignored) {
+            return -1;
+        }
+    }
+
     private SyncResults getMakeResultObject() {
         SyncResults resultSet = (SyncResults)RESULT_CACHE_1_HANDLE.getAndSet(this, null);
         if (resultSet == null) {//Not in the first object
@@ -178,21 +246,6 @@ public class AsyncNodeManager {
             .compile();
 
     private void run() {
-        if (this.workCounter.get() <= 0 && !this.retryDeferredAfterSync) {
-            //TODO: here, instead of parking, we can do more work on other sub-tasks such as filtering the mesh build queue
-            LockSupport.park();
-            if ((this.workCounter.get() <= 0 && !this.retryDeferredAfterSync)
-                    || !this.running) {//No work
-                return;
-            }
-            //This is a funny thing, wait a bit, this allows for better batching, but this thread is independent of everything else so waiting a bit should be mostly ok
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
         if (!this.running) {
             return;
         }
@@ -317,10 +370,10 @@ public class AsyncNodeManager {
             this.retryDeferredAfterSync = retry.batchLimited();
         }
         while (!regionalBatchLimited) {
-            RegionalSectionPublication publication = this.regionalSectionQueue.peek();
+            RegionalSectionPublication publication = this.peekRegionalSectionPublication();
             if (publication == null) break;
             if (!publication.current.getAsBoolean()) {
-                this.regionalSectionQueue.poll();
+                this.takeRegionalSectionPublication();
                 workDone++;
                 this.cancelRegionalSectionPublication(publication);
                 continue;
@@ -328,41 +381,36 @@ public class AsyncNodeManager {
             if (!hasGeometryCapacity()) break;
             if (!this.regionalSyncBatchHasRoom(publication)) {
                 regionalBatchLimited = true;
+                this.regionalBatchSyncSplits.incrementAndGet();
                 break;
             }
-            publication = this.regionalSectionQueue.poll();
-            if (publication == null) break;
+            publication = this.takeRegionalSectionPublication();
             workDone++;
             if (!this.processRegionalSectionPublication(publication)) {
                 this.deferredRegionalSectionPublications.addLast(publication);
             }
         }
 
-        if (this.workCounter.addAndGet(-workDone) < 0) {
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            }
-            //Due to synchronization "issues", wait a millis (give up this time slice)
-            if (this.workCounter.get() < 0) {
-                Logger.error("Work counter less than zero, hope it fixes itself...");
-            }
-        }
-
         if (workDone == 0 && !deferredAdvanced) {//Nothing happened, which is odd, but just return
             //Should probably log that nothing happened, at least once
-            if (topologyDeferred) LockSupport.parkNanos(10_000_000L);
+            if (topologyDeferred) {
+                long idleStart = System.nanoTime();
+                LockSupport.parkNanos(10_000_000L);
+                this.workerIdleNanos.addAndGet(System.nanoTime() - idleStart);
+                this.workPending.set(true);
+            }
             return;
         }
+        if (topologyDeferred) this.workPending.set(true);
         if (this.needsWaitForSync) {
             while (RESULT_HANDLE.get(this) != null && this.running) {
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
+                this.waitingForRenderSync = true;
+                if (RESULT_HANDLE.get(this) == null || !this.running) break;
+                long idleStart = System.nanoTime();
+                LockSupport.park();
+                this.workerIdleNanos.addAndGet(System.nanoTime() - idleStart);
             }
+            this.waitingForRenderSync = false;
         }
 
 
@@ -510,6 +558,7 @@ public class AsyncNodeManager {
             }
             if (!hasGeometryCapacity()) break;
             if (!this.regionalSyncBatchHasRoom(publication)) {
+                this.regionalBatchSyncSplits.incrementAndGet();
                 return new DeferredRetry(advanced, true);
             }
             this.deferredRegionalSectionPublications.removeFirst();
@@ -533,6 +582,28 @@ public class AsyncNodeManager {
     }
 
     private record DeferredRetry(boolean advanced, boolean batchLimited) {}
+
+    private RegionalSectionPublication peekRegionalSectionPublication() {
+        if (this.activeRegionalBatch == null) {
+            RegionalPublicationBatch batch = this.regionalBatchQueue.poll();
+            if (batch == null) return null;
+            this.activeRegionalBatch = batch;
+            this.activeRegionalBatchIndex = 0;
+            this.regionalBatchStartLatency.record(System.nanoTime() - batch.enqueuedNanos());
+        }
+        return this.activeRegionalBatch.publications()[this.activeRegionalBatchIndex];
+    }
+
+    private RegionalSectionPublication takeRegionalSectionPublication() {
+        RegionalSectionPublication publication = this.peekRegionalSectionPublication();
+        if (publication == null) return null;
+        if (++this.activeRegionalBatchIndex
+                == this.activeRegionalBatch.publications().length) {
+            this.activeRegionalBatch = null;
+            this.activeRegionalBatchIndex = 0;
+        }
+        return publication;
+    }
 
     /** Uploads one complete node, or retains it until its indexed parent path exists. */
     private boolean processRegionalSectionPublication(RegionalSectionPublication publication) {
@@ -598,6 +669,7 @@ public class AsyncNodeManager {
         if (results == null) {//There are no new results to process, return
             return;
         }
+        if (this.waitingForRenderSync) LockSupport.unpark(this.thread);
 
         //top level node add/remove
         if (!results.tlnDelta.isEmpty()) {
@@ -682,6 +754,9 @@ public class AsyncNodeManager {
             }
             this.queueGpuCompletion(new ArrayList<>(results.rendererTransactions),
                     new ArrayList<>(results.regionalSectionPublications));
+        }
+        if (!results.regionalSectionPublications.isEmpty()) {
+            this.recordRegionalRenderSync(results.regionalSectionPublications);
         }
 
         //Insert the result set into the cache
@@ -779,8 +854,11 @@ public class AsyncNodeManager {
     //==================================================================================================================
     //Incoming events
 
-    private final ConcurrentLinkedDeque<RegionalSectionPublication> regionalSectionQueue =
+    private final ConcurrentLinkedDeque<RegionalPublicationBatch> regionalBatchQueue =
             new ConcurrentLinkedDeque<>();
+    /** Worker-owned cursor into the one atomically published producer batch being drained. */
+    private RegionalPublicationBatch activeRegionalBatch;
+    private int activeRegionalBatchIndex;
     private final ConcurrentLinkedDeque<RendererTransaction> rendererTransactionQueue =
             new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RendererTransaction> coarsenQueue =
@@ -791,11 +869,29 @@ public class AsyncNodeManager {
         void recordGpuUploadSubmitted(long nowNanos);
     }
 
+    public record RegionalSectionSubmission(BuiltSection geometry, long previousRevision,
+                                            BooleanSupplier current, Runnable reserved,
+                                            RegionalPublicationTiming timing, Runnable success,
+                                            Runnable canceled,
+                                            Consumer<Throwable> failure) {
+        public RegionalSectionSubmission {
+            Objects.requireNonNull(geometry, "geometry");
+            Objects.requireNonNull(current, "current");
+            Objects.requireNonNull(reserved, "reserved");
+            Objects.requireNonNull(timing, "timing");
+            Objects.requireNonNull(success, "success");
+            Objects.requireNonNull(canceled, "canceled");
+            Objects.requireNonNull(failure, "failure");
+        }
+    }
+
     private record RegionalSectionPublication(BuiltSection geometry, long previousRevision,
                                              BooleanSupplier current, Runnable reserved,
                                              RegionalPublicationTiming timing, Runnable success,
                                              Runnable canceled,
                                              Consumer<Throwable> failure) {}
+    private record RegionalPublicationBatch(RegionalSectionPublication[] publications,
+                                            long enqueuedNanos) {}
 
     private enum RendererOperation {
         COMMIT, ROLLBACK, COMPLETE_ROLLBACK, FINALIZE, COARSEN, RELEASE_COARSEN
@@ -837,35 +933,34 @@ public class AsyncNodeManager {
                 () -> this.submitRendererTransaction(new RendererTransaction(revision,
                         Set.of(), RendererOperation.RELEASE_COARSEN, success, failure)),
                 failure);
-        if (!this.running) {
-            failure.accept(new IllegalStateException("Voxy renderer is not running"));
-            return;
+        synchronized (this.submissionLock) {
+            if (!this.running) {
+                failure.accept(new IllegalStateException("Voxy renderer is not running"));
+                return;
+            }
+            this.coarsenQueue.add(transaction);
         }
-        this.coarsenQueue.add(transaction);
-        this.addWork();
+        this.signalWork();
     }
 
     private void submitRendererTransaction(RendererTransaction transaction) {
-        if (!this.running) {
-            transaction.failure.accept(new IllegalStateException("Voxy renderer is not running"));
-            return;
+        synchronized (this.submissionLock) {
+            if (!this.running) {
+                transaction.failure.accept(
+                        new IllegalStateException("Voxy renderer is not running"));
+                return;
+            }
+            this.rendererTransactionQueue.add(transaction);
         }
-        this.rendererTransactionQueue.add(transaction);
-        this.addWork();
+        this.signalWork();
     }
 
     private final StampedLock tlnLock = new StampedLock();
     private final LongOpenHashSet tlnAdd = new LongOpenHashSet();
     private final LongOpenHashSet tlnRem = new LongOpenHashSet();
 
-    private void addWork() {
-        if (!this.running) {
-            if (this.uncaughtException != null) {
-                throw new RuntimeException(this.uncaughtException);//Propagate internal exception
-            }
-            throw new IllegalStateException("Not running");
-        }
-        if (this.workCounter.getAndIncrement() == 0) {
+    private void signalWork() {
+        if (this.workPending.compareAndSet(false, true)) {
             LockSupport.unpark(this.thread);
         }
     }
@@ -882,31 +977,117 @@ public class AsyncNodeManager {
         return Math.max(0, this.geometryCapacity - MIN_FREE_GEOMETRY_BYTES);
     }
 
-    /**
-     * Queues a complete regional section node for one indivisible upload and hierarchy swap.
-     * Ownership of {@code geometry} transfers immediately to this manager.
-     */
-    public void publishRegionalSection(BuiltSection geometry, long previousRevision,
-                                      BooleanSupplier current, Runnable reserved,
-                                      RegionalPublicationTiming timing, Runnable success,
-                                      Runnable canceled,
-                                      Consumer<Throwable> failure) {
-        Objects.requireNonNull(geometry, "geometry");
-        Objects.requireNonNull(current, "current");
-        Objects.requireNonNull(reserved, "reserved");
-        Objects.requireNonNull(timing, "timing");
-        Objects.requireNonNull(success, "success");
-        Objects.requireNonNull(canceled, "canceled");
-        Objects.requireNonNull(failure, "failure");
-        if (!this.running) {
-            geometry.free();
-            failure.accept(new IllegalStateException("Voxy renderer is not running"));
-            return;
+    /** Rechecks queued predicates after their owner retires or supersedes a publication. */
+    public void regionalPublicationStateChanged() {
+        if (this.running) this.signalWork();
+    }
+
+    public String regionalPublicationBatchSnapshot() {
+        return "rendererBatches=" + this.submittedRegionalBatches.get()
+                + '/' + this.submittedRegionalSections.get()
+                + '/' + this.maximumRegionalBatchSections.get()
+                + '/' + sectionBucketSnapshot(this.regionalBatchSectionBuckets)
+                + " rendererBatchSectionBuckets=1,2-4,5-16,17-64,65-256,>256"
+                + " rendererWakeups=" + this.managerWakeups.get()
+                + " rendererBatchStart=" + this.regionalBatchStartLatency.snapshot()
+                + " rendererBatchStartBuckets=<0.1ms,<0.5ms,<1ms,<4ms,<16ms,>=16ms"
+                + " rendererSyncs=" + this.regionalRenderSyncs.get()
+                + '/' + this.regionalRenderSyncPublications.get()
+                + '/' + this.regionalRenderSyncBytes.get()
+                + '/' + this.maximumRegionalRenderSyncPublications.get()
+                + '/' + this.maximumRegionalRenderSyncBytes.get()
+                + " rendererBatchSyncSplits=" + this.regionalBatchSyncSplits.get()
+                + " rendererWorkerCpuMs=" + this.workerCpuNanos.get() / 1_000_000L
+                + " rendererWorkerIdleMs=" + this.workerIdleNanos.get() / 1_000_000L;
+    }
+
+    private void recordSubmittedRegionalBatch(int sections) {
+        this.submittedRegionalBatches.incrementAndGet();
+        this.submittedRegionalSections.addAndGet(sections);
+        updateMaximum(this.maximumRegionalBatchSections, sections);
+        int bucket = 0;
+        while (bucket < BATCH_SECTION_BUCKET_LIMITS.length
+                && sections > BATCH_SECTION_BUCKET_LIMITS[bucket]) bucket++;
+        this.regionalBatchSectionBuckets.incrementAndGet(bucket);
+    }
+
+    private void recordRegionalRenderSync(List<RegionalSectionPublication> publications) {
+        long bytes = 0;
+        for (RegionalSectionPublication publication : publications) {
+            BuiltSection geometry = publication.geometry();
+            if (geometry.geometryBuffer != null) bytes += geometry.geometryBuffer.size;
         }
-        timing.recordRendererQueued(System.nanoTime());
-        this.regionalSectionQueue.add(new RegionalSectionPublication(geometry, previousRevision,
-                current, reserved, timing, success, canceled, failure));
-        this.addWork();
+        this.regionalRenderSyncs.incrementAndGet();
+        this.regionalRenderSyncPublications.addAndGet(publications.size());
+        this.regionalRenderSyncBytes.addAndGet(bytes);
+        updateMaximum(this.maximumRegionalRenderSyncPublications, publications.size());
+        updateMaximum(this.maximumRegionalRenderSyncBytes, bytes);
+    }
+
+    private static void updateMaximum(AtomicLong maximum, long value) {
+        long observed = maximum.get();
+        while (value > observed && !maximum.compareAndSet(observed, value)) {
+            observed = maximum.get();
+        }
+    }
+
+    private static String sectionBucketSnapshot(AtomicLongArray buckets) {
+        StringBuilder result = new StringBuilder();
+        for (int index = 0; index < buckets.length(); index++) {
+            if (index != 0) result.append(',');
+            result.append(buckets.get(index));
+        }
+        return result.toString();
+    }
+
+    /**
+     * Atomically publishes one complete producer batch. Ownership of every geometry allocation
+     * transfers together when the batch is appended; any thrown exception means none transferred.
+     */
+    public void publishRegionalSections(List<RegionalSectionSubmission> submissions) {
+        Objects.requireNonNull(submissions, "submissions");
+        if (submissions.isEmpty()) return;
+        if (submissions.size() > MAX_REGIONAL_BATCH_PUBLICATIONS) {
+            throw new IllegalArgumentException("regional publication batch exceeds its safety "
+                    + "ceiling: " + submissions.size());
+        }
+        RegionalSectionPublication[] publications =
+                new RegionalSectionPublication[submissions.size()];
+        for (int index = 0; index < publications.length; index++) {
+            RegionalSectionSubmission submission = Objects.requireNonNull(
+                    submissions.get(index), "submission");
+            BuiltSection geometry = submission.geometry();
+            long geometryBytes = geometry.geometryBuffer == null ? 0
+                    : geometry.geometryBuffer.size;
+            long stagedBytes = UploadStream.alignUp(geometryBytes,
+                    UploadStream.BASE_ALLOCATION_ALIGNEMENT)
+                    + UploadStream.alignUp(16, UploadStream.BASE_ALLOCATION_ALIGNEMENT);
+            if (stagedBytes > UploadStream.CAPACITY_BYTES) {
+                throw new IllegalArgumentException("one regional section exceeds the render "
+                        + "upload safety ceiling: " + geometryBytes + " bytes");
+            }
+            publications[index] = new RegionalSectionPublication(submission.geometry(),
+                    submission.previousRevision(), submission.current(), submission.reserved(),
+                    submission.timing(), submission.success(), submission.canceled(),
+                    submission.failure());
+        }
+        long rendererQueuedNanos = System.nanoTime();
+        synchronized (this.submissionLock) {
+            if (!this.running) {
+                if (this.uncaughtException != null) {
+                    throw new RuntimeException(this.uncaughtException);
+                }
+                throw new IllegalStateException("Voxy renderer is not running");
+            }
+            for (RegionalSectionPublication publication : publications) {
+                publication.timing().recordRendererQueued(rendererQueuedNanos);
+            }
+            long enqueuedNanos = System.nanoTime();
+            this.regionalBatchQueue.add(new RegionalPublicationBatch(publications,
+                    enqueuedNanos));
+            this.recordSubmittedRegionalBatch(publications.length);
+        }
+        this.signalWork();
     }
 
     public void addTopLevel(long section) {//Only called from render thread
@@ -919,9 +1100,7 @@ public class AsyncNodeManager {
             state -= 1;
         }
         if (state != 0) {
-            if (this.workCounter.getAndAdd(state) == 0) {
-                LockSupport.unpark(this.thread);
-            }
+            this.signalWork();
         }
         this.tlnLock.unlockWrite(stamp);
     }
@@ -936,9 +1115,7 @@ public class AsyncNodeManager {
             state -= 1;
         }
         if (state != 0) {
-            if (this.workCounter.getAndAdd(state) == 0) {
-                LockSupport.unpark(this.thread);
-            }
+            this.signalWork();
         }
         this.tlnLock.unlockWrite(stamp);
     }
@@ -950,10 +1127,12 @@ public class AsyncNodeManager {
     }
 
     public void stop() {
-        if (!this.running) {
-            throw new IllegalStateException();
+        synchronized (this.submissionLock) {
+            if (!this.running) {
+                throw new IllegalStateException();
+            }
+            this.running = false;
         }
-        this.running = false;
         LockSupport.unpark(this.thread);
         try {
             while (this.thread.isAlive()) {
@@ -964,11 +1143,22 @@ public class AsyncNodeManager {
             throw new RuntimeException(e);
         }
 
+        if (this.activeRegionalBatch != null) {
+            RegionalSectionPublication[] publications =
+                    this.activeRegionalBatch.publications();
+            while (this.activeRegionalBatchIndex < publications.length) {
+                this.failUnsubmittedPublication(
+                        publications[this.activeRegionalBatchIndex++]);
+            }
+            this.activeRegionalBatch = null;
+            this.activeRegionalBatchIndex = 0;
+        }
         while (true) {
-            RegionalSectionPublication publication = this.regionalSectionQueue.poll();
-            if (publication == null) break;
-            publication.geometry().free();
-            publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
+            RegionalPublicationBatch batch = this.regionalBatchQueue.poll();
+            if (batch == null) break;
+            for (RegionalSectionPublication publication : batch.publications()) {
+                this.failUnsubmittedPublication(publication);
+            }
         }
         while (!this.deferredRegionalSectionPublications.isEmpty()) {
             RegionalSectionPublication publication =
@@ -1033,6 +1223,37 @@ public class AsyncNodeManager {
 
         this.scatterWrite.free();
         this.multiMemcpy.free();
+    }
+
+    private void failUnsubmittedPublication(RegionalSectionPublication publication) {
+        publication.geometry().free();
+        publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
+    }
+
+    private static final class LatencyCounters {
+        private final long[] thresholds;
+        private final AtomicLong count = new AtomicLong();
+        private final AtomicLong maximumNanos = new AtomicLong();
+        private final AtomicLongArray buckets;
+
+        private LatencyCounters(long[] thresholds) {
+            this.thresholds = thresholds.clone();
+            this.buckets = new AtomicLongArray(thresholds.length + 1);
+        }
+
+        private void record(long nanos) {
+            if (nanos < 0) return;
+            this.count.incrementAndGet();
+            updateMaximum(this.maximumNanos, nanos);
+            int bucket = 0;
+            while (bucket < this.thresholds.length && nanos >= this.thresholds[bucket]) bucket++;
+            this.buckets.incrementAndGet(bucket);
+        }
+
+        private String snapshot() {
+            return this.count.get() + "/" + this.maximumNanos.get() / 1_000L + "us/"
+                    + sectionBucketSnapshot(this.buckets);
+        }
     }
 
     //Results object, which is to be synced between the render thread and worker thread

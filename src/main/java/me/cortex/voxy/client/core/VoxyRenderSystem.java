@@ -30,7 +30,9 @@ import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -76,23 +78,29 @@ public class VoxyRenderSystem {
         @Override void close();
     }
 
+    public record SectionSubmission(long position, BuiltSection geometry, boolean coverage,
+                                    long meshCompletedNanos,
+                                    Optional<SectionPublication> previous,
+                                    BooleanSupplier current, Runnable reserved) {
+        public SectionSubmission {
+            Objects.requireNonNull(geometry, "geometry");
+            Objects.requireNonNull(previous, "previous");
+            Objects.requireNonNull(current, "current");
+            Objects.requireNonNull(reserved, "reserved");
+        }
+    }
+
     public interface SectionPublisher {
-        SectionPublication publish(long position, BuiltSection geometry, boolean coverage,
-                                   long meshCompletedNanos,
-                                   Optional<SectionPublication> previous,
-                                   BooleanSupplier current, Runnable reserved);
+        List<SectionPublication> publishBatch(List<SectionSubmission> submissions);
         void coarsen(long parent, Runnable success, Consumer<Throwable> failure);
     }
 
     public SectionPublisher regionalSectionPublisher() {
         return new SectionPublisher() {
             @Override
-            public SectionPublication publish(long position, BuiltSection geometry,
-                                              boolean coverage, long meshCompletedNanos,
-                                              Optional<SectionPublication> previous,
-                                              BooleanSupplier current, Runnable reserved) {
-                return publishRegionalSection(position, geometry, coverage,
-                        meshCompletedNanos, previous, current, reserved);
+            public List<SectionPublication> publishBatch(
+                    List<SectionSubmission> submissions) {
+                return publishRegionalSections(submissions);
             }
 
             @Override
@@ -122,9 +130,12 @@ public class VoxyRenderSystem {
     }
 
     public String regionalPublicationLatencySnapshot() {
+        AsyncNodeManager nodes = this.nodeManager;
         return "publishLatencyBuckets=<1ms,<4ms,<16ms,<50ms,<200ms,>=200ms"
                 + " publishCoverage=" + publicationLatencyLane(0)
-                + " publishRefinement=" + publicationLatencyLane(1);
+                + " publishRefinement=" + publicationLatencyLane(1)
+                + (nodes == null ? " rendererBatches=STOPPED"
+                        : ' ' + nodes.regionalPublicationBatchSnapshot());
     }
 
     private String publicationLatencyLane(int lane) {
@@ -133,26 +144,58 @@ public class VoxyRenderSystem {
                 + ";gpuToActive:" + this.regionalPublicationLatencies[lane][2].snapshot();
     }
 
-    private SectionPublication publishRegionalSection(
-            long position, BuiltSection geometry, boolean coverage, long meshCompletedNanos,
-            Optional<SectionPublication> previous,
-            BooleanSupplier current, Runnable reserved) {
-        if (geometry.position != position) {
-            throw new IllegalArgumentException("regional geometry is bound to the wrong section");
+    private List<SectionPublication> publishRegionalSections(
+            List<SectionSubmission> submissions) {
+        Objects.requireNonNull(submissions, "submissions");
+        if (submissions.isEmpty()) return List.of();
+        ArrayList<AsyncNodeManager.RegionalSectionSubmission> rendererSubmissions =
+                new ArrayList<>(submissions.size());
+        ArrayList<SectionPublication> handles = new ArrayList<>(submissions.size());
+        for (SectionSubmission submission : submissions) {
+            Objects.requireNonNull(submission, "submission");
+            if (submission.geometry().position != submission.position()) {
+                throw new IllegalArgumentException(
+                        "regional geometry is bound to the wrong section");
+            }
+            RegionalSectionPublication previousPublication = submission.previous()
+                    .map(value -> requireRegionalSectionPublication(
+                            submission.position(), value))
+                    .orElse(null);
+            PreparedRegionalSection prepared = this.prepareRegionalSection(
+                    submission.position(), submission.geometry(), previousPublication, false,
+                    submission.coverage(), submission.meshCompletedNanos(),
+                    submission.current(), submission.reserved());
+            rendererSubmissions.add(prepared.submission());
+            handles.add(prepared.publication());
         }
-        RegionalSectionPublication previousPublication = previous
-                .map(value -> requireRegionalSectionPublication(position, value))
-                .orElse(null);
-        return queueRegionalSection(position, geometry, previousPublication, false, coverage,
-                meshCompletedNanos,
-                Objects.requireNonNull(current, "current"),
-                Objects.requireNonNull(reserved, "reserved"));
+        // Allocate the result before ownership transfers; returning after enqueue cannot fail.
+        List<SectionPublication> result = List.copyOf(handles);
+        this.nodeManager.publishRegionalSections(rendererSubmissions);
+        return result;
     }
 
     private RegionalSectionPublication queueRegionalSection(
             long position, BuiltSection geometry, RegionalSectionPublication previous,
             boolean removal, boolean coverage, long meshCompletedNanos,
             BooleanSupplier current, Runnable reserved) {
+        PreparedRegionalSection prepared = this.prepareRegionalSection(position, geometry,
+                previous, removal, coverage, meshCompletedNanos, current, reserved);
+        try {
+            this.nodeManager.publishRegionalSections(List.of(prepared.submission()));
+        } catch (RuntimeException | Error failure) {
+            prepared.submission().geometry().free();
+            prepared.publication().failAndRollback(failure);
+        }
+        return prepared.publication();
+    }
+
+    private PreparedRegionalSection prepareRegionalSection(
+            long position, BuiltSection geometry, RegionalSectionPublication previous,
+            boolean removal, boolean coverage, long meshCompletedNanos,
+            BooleanSupplier current, Runnable reserved) {
+        Objects.requireNonNull(geometry, "geometry");
+        Objects.requireNonNull(current, "current");
+        Objects.requireNonNull(reserved, "reserved");
         long revision = this.regionalSectionRevision.getAndIncrement();
         if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
@@ -160,8 +203,9 @@ public class VoxyRenderSystem {
         RegionalSectionPublication publication = new RegionalSectionPublication(
                 this.nodeManager, position, revision, removal, coverage, meshCompletedNanos);
         long previousRevision = previous == null ? -1 : previous.revision;
-        this.nodeManager.publishRegionalSection(queued, previousRevision, current, reserved,
-                publication, () ->
+        AsyncNodeManager.RegionalSectionSubmission submission =
+                new AsyncNodeManager.RegionalSectionSubmission(queued, previousRevision,
+                current, reserved, publication, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
                     publication.recordActivationFencePassed(System.nanoTime());
                     publication.activated.set(true);
@@ -170,8 +214,12 @@ public class VoxyRenderSystem {
                     publication.finishCloseIfRequested();
                 }, publication::failAndRollback), publication::cancelBeforeStaging,
                 publication::failAndRollback);
-        return publication;
+        return new PreparedRegionalSection(publication, submission);
     }
+
+    private record PreparedRegionalSection(
+            RegionalSectionPublication publication,
+            AsyncNodeManager.RegionalSectionSubmission submission) {}
 
     private void coarsenRegionalSubtree(long parent, Runnable success,
                                         Consumer<Throwable> failure) {
@@ -264,6 +312,7 @@ public class VoxyRenderSystem {
         @Override
         public void close() {
             this.closeRequested.set(true);
+            this.renderer.regionalPublicationStateChanged();
             finishCloseIfRequested();
         }
 

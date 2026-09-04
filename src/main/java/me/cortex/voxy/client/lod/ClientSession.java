@@ -1675,9 +1675,12 @@ final class ClientSession {
 
         void scheduleReadyPublications() {
             int remaining = this.readyPublicationQueue.size();
+            int availablePublications = MAX_STAGE_QUEUE - this.publicationQueue.size();
+            ArrayList<ReadyPublication> ready = new ArrayList<>(
+                    Math.min(remaining, Math.max(0, availablePublications)));
             while (remaining-- > 0) {
                 StageRef ref = this.readyPublicationQueue.pollFirst();
-                if (ref == null) return;
+                if (ref == null) break;
                 Demand demand = this.demands.get(ref.key);
                 if (!current(demand, ref.token, Phase.READY)
                         || demand.completedGeometry == null) continue;
@@ -1706,47 +1709,79 @@ final class ClientSession {
                     }
                 }
                 demand.budgetBlockedSinceNanos = 0;
-                this.publishReady(demand, ref.token);
+                if (ready.size() >= availablePublications) {
+                    this.readyPublicationQueue.addLast(ref);
+                    continue;
+                }
+                ready.add(new ReadyPublication(demand, ref.token));
             }
+            this.publishReadyBatch(ready);
         }
 
-        void publishReady(Demand demand, int token) {
-            BuiltSection geometry = demand.completedGeometry;
-            RenderAdmission admission = demand.renderAdmission;
+        void publishReadyBatch(List<ReadyPublication> ready) {
+            if (ready.isEmpty()) return;
             synchronized (this.publicationLock) {
-                if (!this.open.get() || !current(demand, token, Phase.READY)
-                        || geometry == null || demand.completedGeometry != geometry
-                        || admission == null || demand.renderAdmission != admission) {
-                    if (demand.completedGeometry == geometry && geometry != null) {
-                        this.discardCompletedGeometry(demand);
-                        this.releaseAdmission(demand, admission);
+                ArrayList<PreparedPublication> prepared = new ArrayList<>(ready.size());
+                ArrayList<VoxyRenderSystem.SectionSubmission> submissions =
+                        new ArrayList<>(ready.size());
+                for (ReadyPublication candidate : ready) {
+                    Demand demand = candidate.demand();
+                    int token = candidate.token();
+                    BuiltSection geometry = demand.completedGeometry;
+                    RenderAdmission admission = demand.renderAdmission;
+                    if (!this.open.get() || !current(demand, token, Phase.READY)
+                            || geometry == null || demand.completedGeometry != geometry
+                            || admission == null || demand.renderAdmission != admission) {
+                        if (demand.completedGeometry == geometry && geometry != null) {
+                            this.discardCompletedGeometry(demand);
+                            this.releaseAdmission(demand, admission);
+                        }
+                        continue;
                     }
-                    return;
-                }
-                if (this.publicationQueue.size() >= MAX_STAGE_QUEUE) {
-                    throw new IllegalStateException(
-                            "regional publication queue exceeded its safety bound");
-                }
-                VoxyRenderSystem.SectionPublication previous = demand.publication;
-                demand.completedGeometry = null;
-                demand.phase = Phase.PUBLISHING;
-                VoxyRenderSystem.SectionPublication publication = null;
-                try {
-                    publication = this.publisher.publish(demand.key, geometry, demand.coverage,
-                            demand.meshCompletedNanos, Optional.ofNullable(previous),
+                    VoxyRenderSystem.SectionPublication previous = demand.publication;
+                    PreparedPublication item = new PreparedPublication(demand, token, geometry,
+                            admission, previous);
+                    prepared.add(item);
+                    submissions.add(new VoxyRenderSystem.SectionSubmission(demand.key, geometry,
+                            demand.coverage, demand.meshCompletedNanos,
+                            Optional.ofNullable(previous),
                             () -> demand.token == token
                                     && demand.phase == Phase.PUBLISHING
                                     && demand.renderAdmission == admission
                                     && this.open.get(),
-                            () -> this.transferGeometryAccounting(demand, token));
-                    demand.publication = publication;
-                    this.publicationQueue.addLast(new PublicationRef(demand.key, token,
-                            admission));
+                            () -> this.transferGeometryAccounting(demand, token)));
+                }
+                if (prepared.isEmpty()) return;
+                if (prepared.size() > MAX_STAGE_QUEUE - this.publicationQueue.size()) {
+                    throw new IllegalStateException("regional publication batch exceeded its "
+                            + "safety bound");
+                }
+                for (PreparedPublication item : prepared) {
+                    item.demand().completedGeometry = null;
+                    item.demand().phase = Phase.PUBLISHING;
+                }
+                List<VoxyRenderSystem.SectionPublication> publications;
+                try {
+                    publications = this.publisher.publishBatch(submissions);
                 } catch (RuntimeException | Error failure) {
-                    if (publication == null) geometry.free(); else publication.close();
-                    this.releaseAllGeometryAccounting(demand, token);
-                    this.releaseAdmission(demand, admission);
+                    // publishBatch guarantees a throw occurs before ownership transfer. Restore
+                    // the complete owner-side batch so normal session teardown releases it once.
+                    for (PreparedPublication item : prepared) {
+                        Demand demand = item.demand();
+                        if (demand.phase == Phase.PUBLISHING
+                                && demand.completedGeometry == null
+                                && demand.publication == item.previous()) {
+                            demand.completedGeometry = item.geometry();
+                            demand.phase = Phase.READY;
+                        }
+                    }
                     throw failure;
+                }
+                for (int index = 0; index < prepared.size(); index++) {
+                    PreparedPublication item = prepared.get(index);
+                    item.demand().publication = publications.get(index);
+                    this.publicationQueue.addLast(new PublicationRef(item.demand().key,
+                            item.token(), item.admission()));
                 }
             }
         }
@@ -2064,6 +2099,10 @@ final class ClientSession {
 
     private record DemandEvent(boolean add, long key) {}
     private record StageRef(long key, int token) {}
+    private record ReadyPublication(Demand demand, int token) {}
+    private record PreparedPublication(Demand demand, int token, BuiltSection geometry,
+                                       RenderAdmission admission,
+                                       VoxyRenderSystem.SectionPublication previous) {}
     private record PublicationRef(long key, int token, RenderAdmission admission) {}
 
     private sealed interface Event permits CatalogReady, IndexReady, CacheResult, CacheCorrupt,
