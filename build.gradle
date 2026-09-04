@@ -76,6 +76,11 @@ sourceSets {
         compileClasspath += sourceSets.debug.output + sourceSets.debug.compileClasspath
         runtimeClasspath += output + compileClasspath
     }
+    schedulerTest {
+        java.srcDirs = ['src/schedulerTest/java']
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
 }
 
 configurations {
@@ -218,6 +223,13 @@ tasks.register('debugHarnessPythonTest', Exec) {
     commandLine 'python3', '-m', 'unittest', 'tools/test_run_live_client_test.py'
 }
 
+tasks.register('schedulerBehaviorTest', JavaExec) {
+    description = 'Run coalesced demand-table ownership and priority tests'
+    dependsOn tasks.named('schedulerTestClasses')
+    classpath = sourceSets.schedulerTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.client.lod.SectionDemandTableBehaviorTest')
+}
+
 tasks.register('verifyDebugHarnessArtifacts') {
     description = 'Prove test-control classes occur only in debug artifacts'
     dependsOn tasks.named('buildAll')
@@ -248,5 +260,6 @@ tasks.register('testLiveHarness') {
     group = 'verification'
     description = 'Run all offline live-client harness gates'
     dependsOn tasks.named('debugHarnessJavaTest'), tasks.named('debugHarnessPythonTest'),
+            tasks.named('schedulerBehaviorTest'),
             tasks.named('verifyDebugHarnessArtifacts')
 }
