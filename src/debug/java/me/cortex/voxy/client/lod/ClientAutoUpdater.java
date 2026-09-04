@@ -3,7 +3,6 @@ package me.cortex.voxy.client.lod;
 import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.Screenshot;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
@@ -25,6 +24,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.jar.JarFile;
@@ -39,25 +40,31 @@ final class ClientAutoUpdater {
     private static final String MINECRAFT_SERVER = "ssh.aerosmp.com:25586";
     private static final String REMOTE_DIAGNOSTICS =
             "/home/printer/Desktop/Creative/logs/client-upload";
+    private static final String REMOTE_SCREENSHOTS = "/home/printer/screenshots";
     private static final long POLL_SECONDS = 20;
-    private static final long SCREENSHOT_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
+    private static final int SCREENSHOT_QUEUE_CAPACITY = 256;
+    private static final int SCREENSHOT_UPLOAD_ATTEMPTS = 3;
+    private static final long SCREENSHOT_STABLE_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
+    private static final long SCREENSHOT_STABLE_INTERVAL_MILLIS = 200;
+    private static final int SCREENSHOT_STABLE_SAMPLES = 3;
     private static final Pattern DEBUG_JAR = Pattern.compile(
             "^ASMP_voxy-([0-9A-Za-z][0-9A-Za-z.-]*)\\+([0-9.]+)-neoforge-debug\\.jar$");
     private static final Pattern VERSION_TOKEN = Pattern.compile("[0-9]+|[A-Za-z]+");
     private static final AtomicBoolean STARTED = new AtomicBoolean();
+    private static final ArrayBlockingQueue<Path> SCREENSHOT_QUEUE =
+            new ArrayBlockingQueue<>(SCREENSHOT_QUEUE_CAPACITY);
     private static volatile boolean readyToConnect;
     private static volatile boolean restartPending;
     private static boolean restartDisconnectRequested;
     private static long nextConnectNanos;
-    private static long nextScreenshotNanos;
-    private static final AtomicBoolean SCREENSHOT_IN_FLIGHT = new AtomicBoolean();
-    private static final Object SCREENSHOT_LOCK = new Object();
-    private static volatile Path latestScreenshot;
+    private static boolean screenshotDirectoryReady;
 
     private ClientAutoUpdater() {}
 
     static void start() {
         if (!STARTED.compareAndSet(false, true)) return;
+        Thread.ofPlatform().daemon().name("Voxy screenshot uploader")
+                .start(ClientAutoUpdater::runScreenshotUploader);
         Thread.ofPlatform().daemon().name("Voxy debug auto-updater").start(() -> {
             while (true) {
                 try {
@@ -102,7 +109,6 @@ final class ClientAutoUpdater {
             minecraft.stop();
             return;
         }
-        captureScreenshot(minecraft);
         if (!readyToConnect) return;
         if (!minecraft.isGameLoadFinished() || minecraft.getConnection() != null
                 || minecraft.level != null || minecraft.screen == null
@@ -117,50 +123,155 @@ final class ClientAutoUpdater {
                 ServerAddress.parseString(MINECRAFT_SERVER), server, false, null);
     }
 
-    private static void captureScreenshot(Minecraft minecraft) {
-        if (!minecraft.isGameLoadFinished() || minecraft.level == null) return;
-        long now = System.nanoTime();
-        if (now < nextScreenshotNanos) return;
-        nextScreenshotNanos = now + SCREENSHOT_INTERVAL_NANOS;
-        if (!SCREENSHOT_IN_FLIGHT.compareAndSet(false, true)) return;
-
-        Path gameDirectory = minecraft.gameDirectory.toPath().toAbsolutePath();
-        String filename = "voxy-debug-auto-" + System.currentTimeMillis() + ".png";
-        Path captured = gameDirectory.resolve("screenshots").resolve(filename);
-        try {
-            Screenshot.grab(gameDirectory.toFile(), filename, minecraft.getMainRenderTarget(),
-                    result -> {
-                        try {
-                            if (!Files.isRegularFile(captured)) {
-                                ClientLodDebug.updaterEvent("state=SCREENSHOT_FAILED message="
-                                        + oneLine(result.getString()));
-                                return;
-                            }
-                            synchronized (SCREENSHOT_LOCK) {
-                                Path previous = latestScreenshot;
-                                latestScreenshot = captured;
-                                if (previous != null && !previous.equals(captured)) {
-                                    try {
-                                        Files.deleteIfExists(previous);
-                                    } catch (IOException failure) {
-                                        ClientLodDebug.updaterEvent(
-                                                "state=SCREENSHOT_CLEANUP_FAILED message="
-                                                        + oneLine(failure.getMessage()));
-                                    }
-                                }
-                            }
-                            ClientLodDebug.updaterEvent("state=SCREENSHOT_CAPTURED file="
-                                    + captured.getFileName());
-                        } finally {
-                            SCREENSHOT_IN_FLIGHT.set(false);
-                        }
-                    });
-        } catch (RuntimeException | Error failure) {
-            SCREENSHOT_IN_FLIGHT.set(false);
-            ClientLodDebug.updaterEvent("state=SCREENSHOT_FAILED type="
-                    + failure.getClass().getSimpleName() + " message="
-                    + oneLine(failure.getMessage()));
+    static void queueScreenshot(Path screenshot) {
+        Path absolute = screenshot.toAbsolutePath().normalize();
+        if (SCREENSHOT_QUEUE.offer(absolute)) {
+            ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_QUEUED file="
+                    + oneLine(screenshotName(absolute)) + " queued="
+                    + SCREENSHOT_QUEUE.size());
+        } else {
+            ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_FAILED reason=QUEUE_FULL file="
+                    + oneLine(screenshotName(absolute)));
         }
+    }
+
+    private static void runScreenshotUploader() {
+        while (true) {
+            Path screenshot;
+            try {
+                screenshot = SCREENSHOT_QUEUE.take();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            uploadScreenshot(screenshot);
+        }
+    }
+
+    private static void uploadScreenshot(Path screenshot) {
+        Exception lastFailure = null;
+        for (int attempt = 1; attempt <= SCREENSHOT_UPLOAD_ATTEMPTS; attempt++) {
+            String temporary = REMOTE_SCREENSHOTS + "/.voxy-upload-"
+                    + UUID.randomUUID() + ".part";
+            try {
+                waitForStableScreenshot(screenshot);
+                ensureScreenshotDirectory();
+                CommandResult upload = run(Duration.ofSeconds(90), scpExecutable(),
+                        "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                        screenshot.toString(), SSH_TARGET + ':' + temporary);
+                if (upload.exitCode != 0) {
+                    throw new IOException("scp failed (exit " + upload.exitCode + "): "
+                            + oneLine(upload.output));
+                }
+
+                String destination = REMOTE_SCREENSHOTS + '/'
+                        + screenshotName(screenshot);
+                String publish = "if test -e " + shellQuote(destination)
+                        + "; then cmp -s " + shellQuote(temporary) + ' '
+                        + shellQuote(destination) + " && rm -f -- "
+                        + shellQuote(temporary) + " || exit 73; else mv -- "
+                        + shellQuote(temporary) + ' ' + shellQuote(destination) + "; fi";
+                CommandResult rename = run(Duration.ofSeconds(15), sshExecutable(),
+                        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET,
+                        publish);
+                if (rename.exitCode != 0) {
+                    throw new IOException("remote publish failed (exit " + rename.exitCode
+                            + "): " + oneLine(rename.output));
+                }
+                ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOADED file="
+                        + oneLine(screenshotName(screenshot)) + " attempt=" + attempt);
+                return;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_FAILED reason=INTERRUPTED file="
+                        + oneLine(screenshotName(screenshot)));
+                return;
+            } catch (Exception failure) {
+                lastFailure = failure;
+                screenshotDirectoryReady = false;
+                removeRemoteTemporary(temporary);
+                if (attempt < SCREENSHOT_UPLOAD_ATTEMPTS) {
+                    ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_RETRY file="
+                            + oneLine(screenshotName(screenshot)) + " attempt="
+                            + attempt + " type=" + failure.getClass().getSimpleName()
+                            + " message=" + oneLine(failure.getMessage()));
+                    try {
+                        TimeUnit.MILLISECONDS.sleep(250L * attempt);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+        ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_FAILED file="
+                + oneLine(screenshotName(screenshot)) + " attempts="
+                + SCREENSHOT_UPLOAD_ATTEMPTS + " type="
+                + lastFailure.getClass().getSimpleName() + " message="
+                + oneLine(lastFailure.getMessage()));
+    }
+
+    private static void waitForStableScreenshot(Path screenshot)
+            throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + SCREENSHOT_STABLE_TIMEOUT_NANOS;
+        long previousSize = -1;
+        long previousModified = -1;
+        int stableSamples = 0;
+        IOException lastFailure = null;
+        while (System.nanoTime() < deadline) {
+            try {
+                if (Files.isRegularFile(screenshot)) {
+                    long size = Files.size(screenshot);
+                    long modified = Files.getLastModifiedTime(screenshot).toMillis();
+                    if (size > 0 && size == previousSize && modified == previousModified) {
+                        if (++stableSamples >= SCREENSHOT_STABLE_SAMPLES) return;
+                    } else {
+                        stableSamples = 0;
+                    }
+                    previousSize = size;
+                    previousModified = modified;
+                } else {
+                    stableSamples = 0;
+                }
+            } catch (IOException failure) {
+                lastFailure = failure;
+                stableSamples = 0;
+            }
+            TimeUnit.MILLISECONDS.sleep(SCREENSHOT_STABLE_INTERVAL_MILLIS);
+        }
+        throw new IOException("screenshot did not become stable: " + screenshot, lastFailure);
+    }
+
+    private static void ensureScreenshotDirectory()
+            throws IOException, InterruptedException {
+        if (screenshotDirectoryReady) return;
+        CommandResult mkdir = run(Duration.ofSeconds(15), sshExecutable(),
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET,
+                "mkdir -p -- " + shellQuote(REMOTE_SCREENSHOTS));
+        if (mkdir.exitCode != 0) {
+            throw new IOException("screenshot directory creation failed (exit "
+                    + mkdir.exitCode + "): " + oneLine(mkdir.output));
+        }
+        screenshotDirectoryReady = true;
+    }
+
+    private static void removeRemoteTemporary(String temporary) {
+        try {
+            run(Duration.ofSeconds(10), sshExecutable(), "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=5", SSH_TARGET,
+                    "rm -f -- " + shellQuote(temporary));
+        } catch (IOException | InterruptedException ignored) {
+            if (ignored instanceof InterruptedException) Thread.currentThread().interrupt();
+        }
+    }
+
+    private static String shellQuote(String value) {
+        return '\'' + value.replace("'", "'\\''") + '\'';
+    }
+
+    private static String screenshotName(Path screenshot) {
+        Path name = screenshot.getFileName();
+        return name == null ? "<invalid>" : name.toString();
     }
 
     private static boolean checkAndInstall() throws Exception {
@@ -266,23 +377,6 @@ final class ClientAutoUpdater {
                 staging.resolve("restart.log"), sources, snapshotStatus);
         snapshot(gameDirectory.resolve(".voxy-updater").resolve("relaunched-java.log"),
                 staging.resolve("relaunched-java.log"), sources, snapshotStatus);
-        try {
-            synchronized (SCREENSHOT_LOCK) {
-                Path screenshot = latestScreenshot;
-                if (screenshot == null || !Files.isRegularFile(screenshot)) {
-                    screenshot = SCREENSHOT_IN_FLIGHT.get() ? null
-                            : newestFile(gameDirectory.resolve("screenshots"));
-                }
-                if (screenshot != null) {
-                    snapshot(screenshot, staging.resolve("latest-screenshot"
-                            + extension(screenshot.getFileName().toString())), sources,
-                            snapshotStatus);
-                }
-            }
-        } catch (IOException failure) {
-            snapshotStatus.append("screenshots=FAILED:")
-                    .append(oneLine(failure.getMessage())).append('\n');
-        }
         Path status = staging.resolve("upload-status.txt");
         Files.writeString(status, snapshotStatus);
         sources.add(status.toString());
@@ -341,26 +435,6 @@ final class ClientAutoUpdater {
             status.append("voxy-client-debug.log=FAILED:")
                     .append(oneLine(failure.getMessage())).append('\n');
         }
-    }
-
-    private static Path newestFile(Path directory) throws IOException {
-        if (!Files.isDirectory(directory)) return null;
-        try (var files = Files.list(directory)) {
-            return files.filter(Files::isRegularFile).max(Comparator.comparingLong(path -> {
-                try {
-                    return Files.getLastModifiedTime(path).toMillis();
-                } catch (IOException ignored) {
-                    return Long.MIN_VALUE;
-                }
-            })).orElse(null);
-        }
-    }
-
-    private static String extension(String filename) {
-        int dot = filename.lastIndexOf('.');
-        if (dot < 0 || filename.length() - dot > 6) return ".png";
-        String extension = filename.substring(dot).toLowerCase(java.util.Locale.ROOT);
-        return extension.matches("\\.[a-z0-9]+") ? extension : ".png";
     }
 
     private static Path findCurrentJar(Path modsDirectory) throws IOException {

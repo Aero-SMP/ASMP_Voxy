@@ -2,7 +2,9 @@ package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.client.Minecraft;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.neoforge.client.event.RenderFrameEvent;
+import net.neoforged.neoforge.client.event.ScreenshotEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import org.lwjgl.system.MemoryStack;
 import org.slf4j.Logger;
@@ -60,6 +62,14 @@ public final class ClientLodDebug {
         if (initialized) return;
         initialized = true;
         NeoForge.EVENT_BUS.addListener(ClientLodDebug::forceFullSpeed);
+        NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, ScreenshotEvent.class,
+                ClientLodDebug::uploadScreenshot);
+    }
+
+    private static void uploadScreenshot(ScreenshotEvent event) {
+        if (!event.isCanceled()) {
+            ClientAutoUpdater.queueScreenshot(event.getScreenshotFile().toPath());
+        }
     }
 
     private static void forceFullSpeed(RenderFrameEvent.Pre event) {
