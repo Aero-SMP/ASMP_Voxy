@@ -565,6 +565,8 @@ public class AsyncNodeManager {
                         "regional section hierarchy root is no longer active");
             }
             transferred = true;
+            this.usedGeometryAmount = this.geometryManager.getGeometryUsedBytes();
+            publication.reserved.run();
             this.manager.commitStagedRoot(geometry.sourceRevision, Set.of(geometry.position));
             this.completedRegionalSectionPublications.add(publication);
         } catch (Throwable failure) {
@@ -779,7 +781,8 @@ public class AsyncNodeManager {
             new ConcurrentLinkedDeque<>();
 
     private record RegionalSectionPublication(BuiltSection geometry, long previousRevision,
-                                             BooleanSupplier current, Runnable success,
+                                             BooleanSupplier current, Runnable reserved,
+                                             Runnable success,
                                              Runnable canceled,
                                              Consumer<Throwable> failure) {}
 
@@ -869,11 +872,12 @@ public class AsyncNodeManager {
      * Ownership of {@code geometry} transfers immediately to this manager.
      */
     public void publishRegionalSection(BuiltSection geometry, long previousRevision,
-                                      BooleanSupplier current, Runnable success,
+                                      BooleanSupplier current, Runnable reserved, Runnable success,
                                       Runnable canceled,
                                       Consumer<Throwable> failure) {
         Objects.requireNonNull(geometry, "geometry");
         Objects.requireNonNull(current, "current");
+        Objects.requireNonNull(reserved, "reserved");
         Objects.requireNonNull(success, "success");
         Objects.requireNonNull(canceled, "canceled");
         Objects.requireNonNull(failure, "failure");
@@ -883,7 +887,7 @@ public class AsyncNodeManager {
             return;
         }
         this.regionalSectionQueue.add(new RegionalSectionPublication(geometry, previousRevision,
-                current, success, canceled, failure));
+                current, reserved, success, canceled, failure));
         this.addWork();
     }
 

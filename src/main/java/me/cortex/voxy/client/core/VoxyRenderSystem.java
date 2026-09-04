@@ -73,7 +73,7 @@ public class VoxyRenderSystem {
     public interface SectionPublisher {
         SectionPublication publish(long position, BuiltSection geometry,
                                    Optional<SectionPublication> previous,
-                                   BooleanSupplier current);
+                                   BooleanSupplier current, Runnable reserved);
         void coarsen(long parent, Runnable success, Consumer<Throwable> failure);
     }
 
@@ -82,8 +82,8 @@ public class VoxyRenderSystem {
             @Override
             public SectionPublication publish(long position, BuiltSection geometry,
                                               Optional<SectionPublication> previous,
-                                              BooleanSupplier current) {
-                return publishRegionalSection(position, geometry, previous, current);
+                                              BooleanSupplier current, Runnable reserved) {
+                return publishRegionalSection(position, geometry, previous, current, reserved);
             }
 
             @Override
@@ -109,7 +109,7 @@ public class VoxyRenderSystem {
 
     private SectionPublication publishRegionalSection(
             long position, BuiltSection geometry, Optional<SectionPublication> previous,
-            BooleanSupplier current) {
+            BooleanSupplier current, Runnable reserved) {
         if (geometry.position != position) {
             throw new IllegalArgumentException("regional geometry is bound to the wrong section");
         }
@@ -117,12 +117,13 @@ public class VoxyRenderSystem {
                 .map(value -> requireRegionalSectionPublication(position, value))
                 .orElse(null);
         return queueRegionalSection(position, geometry, previousPublication, false,
-                Objects.requireNonNull(current, "current"));
+                Objects.requireNonNull(current, "current"),
+                Objects.requireNonNull(reserved, "reserved"));
     }
 
     private RegionalSectionPublication queueRegionalSection(
             long position, BuiltSection geometry, RegionalSectionPublication previous,
-            boolean removal, BooleanSupplier current) {
+            boolean removal, BooleanSupplier current, Runnable reserved) {
         long revision = this.regionalSectionRevision.getAndIncrement();
         if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
@@ -130,7 +131,7 @@ public class VoxyRenderSystem {
         RegionalSectionPublication publication = new RegionalSectionPublication(
                 this.nodeManager, position, revision, removal);
         long previousRevision = previous == null ? -1 : previous.revision;
-        this.nodeManager.publishRegionalSection(queued, previousRevision, current, () ->
+        this.nodeManager.publishRegionalSection(queued, previousRevision, current, reserved, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
                     publication.activated.set(true);
                     if (previous != null) previous.markSafeToRelease();
@@ -213,7 +214,7 @@ public class VoxyRenderSystem {
             // Retirement removes this complete subtree. The old geometry remains active until
             // the zero-child replacement and every descendant retirement cross their fences.
             BuiltSection empty = BuiltSection.emptyWithChildren(this.position, (byte) 0);
-            queueRegionalSection(this.position, empty, this, true, () -> true);
+            queueRegionalSection(this.position, empty, this, true, () -> true, () -> {});
         }
 
         private void cancelBeforeStaging() {

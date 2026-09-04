@@ -97,7 +97,7 @@ final class ClientSession {
 
     static boolean detailPressure() {
         Session current = active;
-        return current != null && current.geometryAtTarget();
+        return current != null && current.geometryDeficitBytes() >= 0;
     }
 
     static void resetDemand() {
@@ -218,7 +218,7 @@ final class ClientSession {
         boolean receivedFromCache;
         RenderAdmission renderAdmission;
         BuiltSection completedGeometry;
-        long geometryBytes;
+        long geometryBytes, activeGeometryBytes;
         volatile int geometryAccountToken;
         final AtomicBoolean geometryAccounted = new AtomicBoolean();
         int latestRefinementEpoch = -1;
@@ -446,7 +446,6 @@ final class ClientSession {
         long activated;
         int activeCount;
         final AtomicLong completedGeometryBytes = new AtomicLong();
-        boolean detailCapacityRequired;
         volatile int detailAdmissionFloor;
         volatile Throwable failure;
 
@@ -683,11 +682,8 @@ final class ClientSession {
         }
 
         void drainDetailFrontier() {
-            long retainedBytes = this.renderer.regionalGeometryUsedBytes()
-                    + this.completedGeometryBytes.get();
-            if (retainedBytes < this.geometryTargetBytes() * 3L / 4L) {
-                this.detailAdmissionFloor = 0;
-            }
+            if (this.renderer.regionalGeometryUsedBytes() + this.completedGeometryBytes.get()
+                    < this.geometryTargetBytes() * 3L / 4L) this.detailAdmissionFloor = 0;
             // Coverage retains its independent reserve; detail consumes only the remaining
             // pipeline and the steady-state portion of the geometry arena.
             for (int bucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
@@ -710,8 +706,7 @@ final class ClientSession {
                         demand.latestRefinementEpoch = epoch;
                         continue;
                     }
-                    if (this.geometryAtTarget()) {
-                        this.detailCapacityRequired = true;
+                    if (this.geometryDeficitBytes() >= 0) {
                         this.frontier.offer(parent, action, bucket, epoch);
                         break;
                     }
@@ -733,18 +728,15 @@ final class ClientSession {
                 }
             }
 
-            boolean pressure = this.detailCapacityRequired || this.geometryAtTarget();
-            this.detailCapacityRequired = false;
-            if (!pressure) {
+            if (this.geometryDeficitBytes() < 0) {
                 this.discardRetentionActions();
                 return;
             }
             if (!this.coarseningRoots.isEmpty()) return;
-            int started = 0;
-            int lastBucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
-            for (int bucket = 0; bucket <= lastBucket && started < 64; bucket++) {
+            long required = Math.max(1, this.geometryDeficitBytes()), selected = 0;
+            for (int bucket = 0; bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT; bucket++) {
                 int remaining = this.frontier.size(bucket);
-                while (remaining-- > 0 && started < 64 && this.frontier.poll(bucket)) {
+                while (remaining-- > 0 && selected < required && this.frontier.poll(bucket)) {
                     long parent = this.frontier.key;
                     int action = this.frontier.action;
                     int epoch = this.frontier.epoch;
@@ -755,20 +747,14 @@ final class ClientSession {
                     Demand demand = this.demands.get(parent);
                     if (demand == null || demand.phase != Phase.ACTIVE
                             || this.overlapsCoarsening(parent)
-                            || !newerEpoch(epoch, demand.latestCoarseningEpoch)
-                            || !hasDetailDescendants(parent)) continue;
+                            || !newerEpoch(epoch, demand.latestCoarseningEpoch)) continue;
+                    long reclaimable = this.coarsen(parent);
+                    if (reclaimable == 0) continue;
                     demand.latestCoarseningEpoch = epoch;
-                    if (pressure) {
-                        this.detailAdmissionFloor = Math.max(this.detailAdmissionFloor,
-                                Math.min(HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT,
-                                        bucket + 1));
-                    }
-                    this.coarsen(parent);
-                    started++;
+                    this.detailAdmissionFloor = Math.max(this.detailAdmissionFloor, bucket + 1);
+                    selected += reclaimable;
                 }
-                // Reassess exact renderer usage after this lowest-priority batch crosses its
-                // fence instead of speculatively retiring successively more valuable buckets.
-                if (started != 0) break;
+                if (selected >= required) break;
             }
         }
 
@@ -785,32 +771,32 @@ final class ClientSession {
             }
         }
 
-        boolean hasDetailDescendants(long parent) {
+        long coarsen(long parent) {
             Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
-            if (owned == null) return false;
-            for (long key : owned) if (key != parent && contains(parent, key)) return true;
-            return false;
-        }
-
-        static boolean newerEpoch(int candidate, int previous) {
-            return previous == -1 || Integer.compareUnsigned(candidate, previous) > 0;
-        }
-
-        void coarsen(long parent) {
+            long bytes = 0;
+            if (owned != null) for (long key : owned) {
+                Demand child = this.demands.get(key);
+                if (key != parent && contains(parent, key) && child != null)
+                    bytes += child.activeGeometryBytes
+                            + (child.geometryAccounted.get() ? child.geometryBytes : 0);
+            }
+            if (bytes == 0) return 0;
             this.coarseningRoots.add(parent);
             synchronized (this.publicationLock) {
-                Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
-                if (owned != null) {
-                    for (long key : List.copyOf(owned)) {
-                        if (key != parent && contains(parent, key)) {
-                            this.retireDetailDemand(key);
-                        }
+                for (long key : List.copyOf(owned)) {
+                    if (key != parent && contains(parent, key)) {
+                        this.retireDetailDemand(key);
                     }
                 }
                 this.publisher.coarsen(parent,
                         () -> this.putEvent(new Coarsened(parent)),
                         failure -> this.putEvent(new CoarsenFailed(parent, failure)));
             }
+            return bytes;
+        }
+
+        static boolean newerEpoch(int candidate, int previous) {
+            return previous == -1 || Integer.compareUnsigned(candidate, previous) > 0;
         }
 
         void retireDetailDemand(long key) {
@@ -1395,7 +1381,8 @@ final class ClientSession {
                 throw new IllegalStateException("regional geometry was completed twice");
             }
             demand.completedGeometry = geometry;
-            demand.geometryBytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
+            demand.geometryBytes = geometry.geometryBuffer == null ? 0
+                    : (geometry.geometryBuffer.size + 1023L) & ~1023L;
             demand.geometryAccountToken = demand.token;
             this.completedGeometryBytes.addAndGet(demand.geometryBytes);
             demand.phase = Phase.READY;
@@ -1419,17 +1406,16 @@ final class ClientSession {
                 if (!current(demand, ref.token, Phase.READY)
                         || demand.completedGeometry == null) continue;
                 if (!demand.coverage && demand.geometryBytes > this.geometryTargetBytes()) {
-                    this.rejectOversizeDetail(demand);
+                    this.rejectDetailGroup(demand, true);
                     continue;
                 }
-                if (!demand.coverage && this.geometryWouldExceedTarget()) {
-                    this.detailCapacityRequired = true;
+                if (!demand.coverage && this.geometryDeficitBytes() > 0) {
                     long now = System.nanoTime();
                     if (demand.budgetBlockedSinceNanos == 0) {
                         demand.budgetBlockedSinceNanos = now;
                     } else if (now - demand.budgetBlockedSinceNanos
                             >= TimeUnit.SECONDS.toNanos(5) && this.coarseningRoots.isEmpty()) {
-                        this.rejectBudgetBlockedDetail(demand);
+                        this.rejectDetailGroup(demand, false);
                         continue;
                     }
                     this.readyPublicationQueue.addLast(ref);
@@ -1451,45 +1437,28 @@ final class ClientSession {
             }
         }
 
-        void rejectOversizeDetail(Demand demand) {
-            long bytes = demand.geometryBytes;
-            Logger.warn("Skipping regional detail group because one section requires " + bytes
-                    + " bytes but the detail target is " + this.geometryTargetBytes());
-            this.rejectDetailGroup(demand, true);
-        }
-
-        void rejectBudgetBlockedDetail(Demand demand) {
-            Logger.warn("Skipping regional detail group after no resident subtree could make "
-                    + demand.geometryBytes + " bytes fit within the geometry budget");
-            this.rejectDetailGroup(demand, false);
-        }
-
-        void rejectDetailGroup(Demand demand, boolean permanent) {
+        void rejectDetailGroup(Demand demand, boolean oversize) {
+            Logger.warn(oversize
+                    ? "Skipping regional detail section requiring " + demand.geometryBytes
+                            + " bytes; target is " + this.geometryTargetBytes()
+                    : "Skipping regional detail section after no subtree made its "
+                            + demand.geometryBytes + " bytes fit");
             long parent = parent(demand.key);
             Demand retained = this.demands.get(parent);
-            if (permanent && retained != null) retained.detailRejected = true;
-            this.discardCompletedGeometry(demand);
-            this.releaseAdmission(demand, demand.renderAdmission);
+            if (oversize && retained != null) retained.detailRejected = true;
             if (retained != null && retained.phase == Phase.ACTIVE
-                    && !this.overlapsCoarsening(parent) && this.hasDetailDescendants(parent)) {
-                this.coarsen(parent);
-            } else {
-                this.retireDetailDemand(demand.key);
-            }
+                    && !this.overlapsCoarsening(parent)
+                    && this.coarsen(parent) > 0) return;
+            this.retireDetailDemand(demand.key);
         }
 
         long geometryTargetBytes() {
             return this.renderer.regionalGeometryCapacityBytes() * 825L / 1_000L;
         }
 
-        boolean geometryAtTarget() {
+        long geometryDeficitBytes() {
             return this.renderer.regionalGeometryUsedBytes()
-                    + this.completedGeometryBytes.get() >= this.geometryTargetBytes();
-        }
-
-        boolean geometryWouldExceedTarget() {
-            return this.renderer.regionalGeometryUsedBytes()
-                    + this.completedGeometryBytes.get() > this.geometryTargetBytes();
+                    + this.completedGeometryBytes.get() - this.geometryTargetBytes();
         }
 
         void discardCompletedGeometry(Demand demand) {
@@ -1503,7 +1472,6 @@ final class ClientSession {
             if (demand.geometryAccountToken != token
                     || !demand.geometryAccounted.compareAndSet(true, false)) return;
             this.completedGeometryBytes.addAndGet(-demand.geometryBytes);
-            demand.geometryBytes = 0;
         }
 
         void acceptPublication(PublicationQueued result) throws IOException {
@@ -1548,6 +1516,7 @@ final class ClientSession {
                     continue;
                 }
                 demand.phase = Phase.ACTIVE;
+                demand.activeGeometryBytes = demand.geometryBytes;
                 this.activeCount++;
                 if (demand.coverage) this.missingCoverage.remove(demand.key);
                 demand.decoded = null;
@@ -1783,7 +1752,8 @@ final class ClientSession {
                         Optional.ofNullable(this.previous), () -> this.demand.token == this.token
                                 && this.demand.phase == Phase.PUBLISHING
                                 && this.demand.renderAdmission == this.admission
-                                && this.owner.open.get());
+                                && this.owner.open.get(),
+                        () -> this.owner.releaseGeometryAccounting(this.demand, this.token));
             }
             this.owner.putEvent(new PublicationQueued(this.owner, this.demand, this.demand.key,
                     this.token, publication, this.admission));
