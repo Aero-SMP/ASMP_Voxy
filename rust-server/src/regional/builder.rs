@@ -179,7 +179,13 @@ fn rebuild_changed_column(
         let mut loaded: [Option<Section>; 8] = std::array::from_fn(|_| None);
         for (slot, child) in keys.iter().copied().enumerate() {
             let horizontal = (child.x, child.z);
-            if !changed_children.contains_key(&horizontal) {
+            // Coarser vertical ranges are rounded outward. Their first or last parent can
+            // therefore name a child just beyond the shard's stored Y range. Full rebuilds
+            // naturally see that child as absent; incremental rebuilds must do the same instead
+            // of asking RegionFile to resolve an intentionally out-of-layout coordinate.
+            if !changed_children.contains_key(&horizontal)
+                && stored_y(layout, child.level, child.y)?
+            {
                 loaded[slot] =
                     previous
                         .read_section(SectionCoordinate::from(child))?
@@ -426,6 +432,10 @@ fn child_keys(parent: SectionKey) -> Result<[SectionKey; 8]> {
     Ok(output)
 }
 
+fn stored_y(layout: RegionLayout, level: u8, y: i32) -> Result<bool> {
+    Ok(layout.level_y_range(level)?.contains(&y))
+}
+
 fn verify_header(source: &AnvilWorld, header: &RegionHeader, operation: &str) -> Result<()> {
     let current = source
         .region_header(header.region_x, header.region_z)?
@@ -441,4 +451,31 @@ fn insert_frame(output: &mut RegionFileBuilder, section: &Section) -> Result<()>
         SectionCoordinate::from(section.key),
         SectionFrame::new(section.non_empty_children, section.cells.clone())?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_parent_edges_treat_vertical_padding_as_absent() {
+        let layout = RegionLayout::new(-2, 12, 5).unwrap();
+        let mut padding_children = 0;
+        for level in 1..layout.levels {
+            for y in layout.level_y_range(level).unwrap() {
+                let parent = SectionKey::new(level, -1, y, 2).unwrap();
+                for child in child_keys(parent).unwrap() {
+                    let stored = stored_y(layout, child.level, child.y).unwrap();
+                    if !stored {
+                        padding_children += 1;
+                        assert!(layout.index(-1, 2, SectionCoordinate::from(child)).is_err());
+                    }
+                }
+            }
+        }
+        assert!(
+            padding_children > 0,
+            "test layout must exercise rounded Y padding"
+        );
+    }
 }
