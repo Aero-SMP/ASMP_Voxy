@@ -1269,7 +1269,7 @@ final class ClientSession {
             demand.phase = Phase.NEW;
             if (demand.index.isEmpty(demand.ordinal)) {
                 demand.phase = Phase.DECODED;
-                this.enqueueStage(this.meshQueue, demand);
+                this.enqueueMesh(demand);
             } else {
                 demand.phase = Phase.CACHE;
                 this.enqueueStage(this.cacheQueue, demand);
@@ -1500,7 +1500,7 @@ final class ClientSession {
                         throw new IOException("unexpected empty regional section");
                     }
                     demand.phase = Phase.DECODED;
-                    this.enqueueStage(this.meshQueue, demand);
+                    this.enqueueMesh(demand);
                 }
                 case STALE -> {
                     long region = regionFor(demand.key);
@@ -1575,7 +1575,7 @@ final class ClientSession {
             demand.decoded = result.section;
             this.mesher.requestModels(result.section);
             demand.phase = Phase.DECODED;
-            this.enqueueStage(this.meshQueue, demand);
+            this.enqueueMesh(demand);
         }
 
         void scheduleMeshing() {
@@ -1598,8 +1598,8 @@ final class ClientSession {
                 RenderAdmission admission = this.tryRenderAdmission(demand);
                 if (admission == null) {
                     if (!empty) this.sectionTaskSlots.release();
-                    this.meshQueue.addLast(ref);
-                    continue;
+                    this.meshQueue.addFirst(ref);
+                    return;
                 }
                 demand.renderAdmission = admission;
                 if (empty) {
@@ -1866,7 +1866,8 @@ final class ClientSession {
                     && available <= this.renderAdmissionReserve())) return null;
             long reservation = demand.coverage || demand.index.isEmpty(demand.ordinal) ? 0
                     : this.detailGeometryEstimateBytes[SectionKey.level(demand.key)];
-            if (!demand.coverage && this.geometryDeficitBytes() + reservation > 0) return null;
+            if (!demand.coverage && reservation != 0
+                    && this.geometryDeficitBytes() + reservation > 0) return null;
             if (!this.renderAdmissionSlots.tryAcquire()) return null;
             this.meshingReservationBytes.addAndGet(reservation);
             RenderAdmission admission = new RenderAdmission(this, reservation);
@@ -1917,6 +1918,15 @@ final class ClientSession {
                 throw new IllegalStateException("regional stage queue exceeded its safety bound");
             }
             queue.addLast(new StageRef(demand.key, demand.token));
+        }
+
+        void enqueueMesh(Demand demand) {
+            if (this.meshQueue.size() >= MAX_STAGE_QUEUE) {
+                throw new IllegalStateException("regional stage queue exceeded its safety bound");
+            }
+            StageRef ref = new StageRef(demand.key, demand.token);
+            if (demand.coverage) this.meshQueue.addFirst(ref);
+            else this.meshQueue.addLast(ref);
         }
 
         void clearStageQueues() {
