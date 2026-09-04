@@ -134,6 +134,7 @@ public class AsyncNodeManager {
         this.geometryCapacity = geometryData.getGeometryCapacityBytes();
 
         this.maxNodeCount = maxNodeCount;
+        enableThreadCpuTiming();
 
         this.thread = new Thread(()->{
             try {
@@ -215,6 +216,17 @@ public class AsyncNodeManager {
                     ? THREAD_MX_BEAN.getCurrentThreadCpuTime() : -1;
         } catch (RuntimeException ignored) {
             return -1;
+        }
+    }
+
+    private static void enableThreadCpuTiming() {
+        try {
+            if (THREAD_MX_BEAN.isThreadCpuTimeSupported()
+                    && !THREAD_MX_BEAN.isThreadCpuTimeEnabled()) {
+                THREAD_MX_BEAN.setThreadCpuTimeEnabled(true);
+            }
+        } catch (RuntimeException ignored) {
+            // Unsupported or denied JVM diagnostics leave the aggregate at zero.
         }
     }
 
