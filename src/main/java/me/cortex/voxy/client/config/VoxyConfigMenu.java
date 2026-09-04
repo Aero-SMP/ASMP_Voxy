@@ -5,6 +5,7 @@ import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.client.iris.IrisUtil;
+import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPointForge;
 import net.caffeinemc.mods.sodium.api.config.ConfigState;
@@ -68,6 +69,8 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
         int[] geometryMemoryChoices = geometryMemoryChoices();
+        Logger.info("GPU Memory slider maximum is "
+                + geometryMemoryChoices[geometryMemoryChoices.length - 1] + " MiB");
         var geometryMemory = option(builder.createIntegerOption(GEOMETRY_MEMORY),
                 "voxy.config.general.geometry_memory",
                 () -> geometryMemoryIndex(effectiveConfiguredGeometryMemoryMib(), geometryMemoryChoices),

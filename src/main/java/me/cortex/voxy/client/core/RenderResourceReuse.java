@@ -131,7 +131,7 @@ public class RenderResourceReuse {
 
     public static long getSafeGeometryMemoryLimitBytes() {
         long limit = Math.min(Capabilities.INSTANCE.ssboMaxSize, MAX_ADDRESSABLE_GEOMETRY);
-        long totalVram = Capabilities.INSTANCE.totalDedicatedMemory;
+        long totalVram = roundReportedVram(Capabilities.INSTANCE.totalDedicatedMemory);
         if (totalVram > 0) {
             long safeVram = totalVram > VRAM_RESERVE
                     ? totalVram - VRAM_RESERVE
@@ -177,5 +177,15 @@ public class RenderResourceReuse {
     private static long alignDown(long bytes) {
         long alignment = Math.max(1024, Capabilities.INSTANCE.ssboBindingAlignment);
         return Math.max(alignment, bytes - bytes % alignment);
+    }
+
+    private static long roundReportedVram(long bytes) {
+        if (bytes <= 0) return bytes;
+        // Drivers commonly report a small firmware-reserved slice below the
+        // advertised capacity (for example 16,304 MiB on a 16 GiB card). Round
+        // that harmless discrepancy up so a nominal 16 GiB card still exposes
+        // the intended 12 GiB choice after the 4 GiB reserve.
+        long quantum = 256L * MIB;
+        return ((bytes + quantum - 1) / quantum) * quantum;
     }
 }
