@@ -156,6 +156,7 @@ public final class SectionMesher {
 
         int light = ModelQueries.faceUsesSelfLighting(own, face)
                 ? CatalogMapper.getLightId(cells[cell]) : neighborLight;
+        if (neighbor < 0) light |= 0x0f;
         light = (light & 15) | Math.max(light >>> 4,
                 (int) ModelQueries.lightEmission(own)) << 4;
         int biome = ModelQueries.isBiomeColoured(own)
