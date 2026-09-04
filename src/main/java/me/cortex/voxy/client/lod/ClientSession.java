@@ -35,8 +35,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -59,12 +57,7 @@ final class ClientSession {
     private static final int MAX_IN_FLIGHT_INDEXES = 128;
     private static final int MAX_SECTION_TASKS = 64;
     private static final int MAX_STAGE_QUEUE = 32_768;
-    private static final int MAX_RENDER_ADMISSIONS = 1_024;
-    private static final int COVERAGE_RENDER_RESERVE = 64;
     private static final int REQUEST_BATCH = 256;
-    private static final int MAX_DORMANT_EVICTIONS_PER_BATCH = 64;
-    private static final long MIN_DORMANT_EVICTION_BATCH_BYTES = 16L << 20;
-    private static final long INITIAL_DETAIL_GEOMETRY_ESTIMATE_BYTES = 64L << 10;
     private static final long RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     private static final Object LIFECYCLE = new Object();
@@ -85,7 +78,10 @@ final class ClientSession {
             if (!TOP_LEVEL.add(key)) return false;
         }
         Session current = active;
-        if (current != null) current.demandEvents.add(new DemandEvent(true, key));
+        if (current != null) {
+            current.inputs.offerTop(key, true);
+            current.signal();
+        }
         return true;
     }
 
@@ -93,7 +89,10 @@ final class ClientSession {
         requireTop(key);
         synchronized (TOP_LEVEL) { TOP_LEVEL.remove(key); }
         Session current = active;
-        if (current != null) current.demandEvents.add(new DemandEvent(false, key));
+        if (current != null) {
+            current.inputs.offerTop(key, false);
+            current.signal();
+        }
     }
 
     static void detailAction(long key, int action, int bucket, int epoch) {
@@ -241,7 +240,6 @@ final class ClientSession {
         int pendingOrdinal = -1;
         byte[] received;
         boolean receivedFromCache;
-        RenderAdmission renderAdmission;
         BuiltSection completedGeometry;
         long meshCompletedNanos;
         long geometryBytes, activeGeometryBytes;
@@ -254,8 +252,6 @@ final class ClientSession {
         boolean dormant;
         int dormantBucket;
         long lastSelectedSequence;
-        boolean detailRejected;
-        long budgetBlockedSinceNanos;
 
         Demand(long key) {
             this.key = key;
@@ -277,173 +273,6 @@ final class ClientSession {
         }
     }
 
-    /** One allocation-free, tagged handoff shared by both detail directions. */
-    private static final class DetailFrontier {
-        private static final int BUCKETS = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT;
-        private static final int CAPACITY = 32_768;
-        private static final int HASH_BUCKETS = 65_536;
-        private final long[] keys = new long[CAPACITY];
-        private final byte[] actions = new byte[CAPACITY];
-        private final byte[] buckets = new byte[CAPACITY];
-        private final int[] epochs = new int[CAPACITY];
-        private final int[] hashNext = new int[CAPACITY];
-        private final int[] priorityPrevious = new int[CAPACITY];
-        private final int[] priorityNext = new int[CAPACITY];
-        private final int[] freeNext = new int[CAPACITY];
-        private final int[] hashHeads = new int[HASH_BUCKETS];
-        private final int[] priorityHeads = new int[BUCKETS];
-        private final int[] priorityTails = new int[BUCKETS];
-        private final int[] prioritySizes = new int[BUCKETS];
-        private int nextUnused;
-        private int freeHead = -1;
-        private int total;
-        private long dropped;
-        long key;
-        int action;
-        int epoch;
-
-        DetailFrontier() { this.resetHeads(); }
-
-        synchronized boolean offer(long key, int action, int bucket, int epoch) {
-            if (action != HierarchicalOcclusionTraverser.ACTION_REFINE
-                    && action != HierarchicalOcclusionTraverser.ACTION_DORMANT
-                    && action != HierarchicalOcclusionTraverser.ACTION_WAKE) {
-                return false;
-            }
-            bucket = Math.max(0, Math.min(BUCKETS - 1, bucket));
-            int hash = hash(key);
-            for (int entry = this.hashHeads[hash]; entry != -1;
-                 entry = this.hashNext[entry]) {
-                if (this.keys[entry] != key) continue;
-                if (Integer.compareUnsigned(epoch, this.epochs[entry]) <= 0) return false;
-                int oldBucket = Byte.toUnsignedInt(this.buckets[entry]);
-                if (oldBucket != bucket) {
-                    this.unlinkPriority(entry, oldBucket);
-                    this.linkPriority(entry, bucket);
-                }
-                this.actions[entry] = (byte) action;
-                this.buckets[entry] = (byte) bucket;
-                this.epochs[entry] = epoch;
-                return true;
-            }
-            if (this.total == CAPACITY) {
-                this.dropped++;
-                return false;
-            }
-            int entry;
-            if (this.freeHead != -1) {
-                entry = this.freeHead;
-                this.freeHead = this.freeNext[entry];
-            } else {
-                entry = this.nextUnused++;
-            }
-            this.keys[entry] = key;
-            this.actions[entry] = (byte) action;
-            this.buckets[entry] = (byte) bucket;
-            this.epochs[entry] = epoch;
-            this.hashNext[entry] = this.hashHeads[hash];
-            this.hashHeads[hash] = entry;
-            this.linkPriority(entry, bucket);
-            this.total++;
-            return true;
-        }
-
-        synchronized boolean poll(int bucket) {
-            int entry = this.priorityHeads[bucket];
-            if (entry == -1) return false;
-            this.unlinkPriority(entry, bucket);
-            int hash = hash(this.keys[entry]);
-            int previous = -1;
-            for (int current = this.hashHeads[hash]; current != -1;
-                 current = this.hashNext[current]) {
-                if (current != entry) {
-                    previous = current;
-                    continue;
-                }
-                if (previous == -1) this.hashHeads[hash] = this.hashNext[current];
-                else this.hashNext[previous] = this.hashNext[current];
-                break;
-            }
-            this.key = this.keys[entry];
-            this.action = Byte.toUnsignedInt(this.actions[entry]);
-            this.epoch = this.epochs[entry];
-            this.freeNext[entry] = this.freeHead;
-            this.freeHead = entry;
-            this.total--;
-            return true;
-        }
-
-        private void linkPriority(int entry, int bucket) {
-            int tail = this.priorityTails[bucket];
-            this.priorityPrevious[entry] = tail;
-            this.priorityNext[entry] = -1;
-            if (tail == -1) this.priorityHeads[bucket] = entry;
-            else this.priorityNext[tail] = entry;
-            this.priorityTails[bucket] = entry;
-            this.prioritySizes[bucket]++;
-        }
-
-        private void unlinkPriority(int entry, int bucket) {
-            int previous = this.priorityPrevious[entry];
-            int next = this.priorityNext[entry];
-            if (previous == -1) this.priorityHeads[bucket] = next;
-            else this.priorityNext[previous] = next;
-            if (next == -1) this.priorityTails[bucket] = previous;
-            else this.priorityPrevious[next] = previous;
-            this.prioritySizes[bucket]--;
-        }
-
-        private static int hash(long key) {
-            long mixed = key ^ key >>> 33;
-            mixed *= 0xff51afd7ed558ccdl;
-            mixed ^= mixed >>> 33;
-            return (int) mixed & (HASH_BUCKETS - 1);
-        }
-
-        synchronized int size(int bucket) { return this.prioritySizes[bucket]; }
-        synchronized int size() { return this.total; }
-        synchronized long dropped() { return this.dropped; }
-        synchronized void clear() {
-            this.resetHeads();
-            java.util.Arrays.fill(this.prioritySizes, 0);
-            this.nextUnused = 0;
-            this.freeHead = -1;
-            this.total = 0;
-        }
-
-        private void resetHeads() {
-            java.util.Arrays.fill(this.hashHeads, -1);
-            java.util.Arrays.fill(this.priorityHeads, -1);
-            java.util.Arrays.fill(this.priorityTails, -1);
-        }
-    }
-
-    private static final class RenderAdmission {
-        private final Session owner;
-        private final long geometryReservationBytes;
-        private final AtomicBoolean released = new AtomicBoolean();
-        private final AtomicBoolean geometryReservationReleased = new AtomicBoolean();
-
-        private RenderAdmission(Session owner, long geometryReservationBytes) {
-            this.owner = owner;
-            this.geometryReservationBytes = geometryReservationBytes;
-        }
-
-        private void transferGeometryReservation() {
-            if (this.geometryReservationReleased.compareAndSet(false, true)) {
-                this.owner.meshingReservationBytes.addAndGet(-this.geometryReservationBytes);
-            }
-        }
-
-        private void release() {
-            if (!this.released.compareAndSet(false, true)) return;
-            this.transferGeometryReservation();
-            this.owner.renderAdmissions.remove(this);
-            this.owner.renderAdmissionSlots.release();
-            this.owner.signal();
-        }
-    }
-
     private static final class Session implements AutoCloseable {
         final long id;
         final String dimension;
@@ -453,13 +282,10 @@ final class ClientSession {
         final Thread thread;
         final AtomicBoolean open = new AtomicBoolean(true);
         final AtomicBoolean resetRequested = new AtomicBoolean();
-        final ConcurrentLinkedQueue<DemandEvent> demandEvents = new ConcurrentLinkedQueue<>();
-        final DetailFrontier frontier = new DetailFrontier();
+        final SectionDemandTable inputs;
         final ArrayBlockingQueue<Event> events = new ArrayBlockingQueue<>(MAX_EVENTS);
         final Semaphore wakeup = new Semaphore(0);
         final Semaphore sectionTaskSlots = new Semaphore(MAX_SECTION_TASKS);
-        final Semaphore renderAdmissionSlots = new Semaphore(MAX_RENDER_ADMISSIONS);
-        final Set<RenderAdmission> renderAdmissions = ConcurrentHashMap.newKeySet();
         final ExecutorService sectionWorkers;
         final RegionalSectionCodec codec = new RegionalSectionCodec();
 
@@ -527,12 +353,12 @@ final class ClientSession {
         volatile int cameraSectionZ;
         final AtomicLong completedGeometryBytes = new AtomicLong();
         final AtomicLong publishingGeometryBytes = new AtomicLong();
-        final AtomicLong meshingReservationBytes = new AtomicLong();
-        final long[] detailGeometryEstimateBytes = new long[SectionKey.MAX_LOD_LAYER + 1];
         volatile Throwable failure;
 
         Session(long id, String dimension, VoxyRenderSystem renderer) {
             this.id = id;
+            this.inputs = new SectionDemandTable(
+                    HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT, id);
             this.dimension = dimension;
             this.renderer = renderer;
             this.publisher = renderer.regionalSectionPublisher();
@@ -546,9 +372,7 @@ final class ClientSession {
             });
             this.thread = new Thread(this::run, "Voxy regional owner");
             this.thread.setDaemon(true);
-            java.util.Arrays.fill(this.detailGeometryEstimateBytes,
-                    INITIAL_DETAIL_GEOMETRY_ESTIMATE_BYTES);
-            for (long key : topSnapshot()) this.demandEvents.add(new DemandEvent(true, key));
+            for (long key : topSnapshot()) this.inputs.offerTop(key, true);
         }
 
         void start() { this.thread.start(); }
@@ -559,7 +383,11 @@ final class ClientSession {
         }
 
         void acceptDetailAction(long key, int action, int bucket, int epoch) {
-            if (this.frontier.offer(key, action, bucket, epoch)) this.signal();
+            if (action != HierarchicalOcclusionTraverser.ACTION_REFINE
+                    && action != HierarchicalOcclusionTraverser.ACTION_DORMANT
+                    && action != HierarchicalOcclusionTraverser.ACTION_WAKE) return;
+            this.inputs.offerDetail(key, action, bucket, epoch);
+            this.signal();
         }
 
         void run() {
@@ -795,83 +623,73 @@ final class ClientSession {
                 for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
                 this.dormantRoots.clear();
                 this.dormantGeometryBytes = 0;
-                this.frontier.clear();
+                this.inputs.clear();
                 this.clearStageQueues();
             }
-            DemandEvent event;
-            while ((event = this.demandEvents.poll()) != null) {
-                if (event.add) {
-                    this.addDemand(event.key);
+            this.inputs.drainTop((key, add) -> {
+                if (add) {
+                    this.addDemand(key);
                 } else {
-                    long top = event.key;
+                    long top = key;
                     Set<Long> owned = this.demandsByTop.get(top);
                     if (owned != null) {
-                        for (long key : List.copyOf(owned)) this.retireDemand(key);
+                        for (long ownedKey : List.copyOf(owned)) {
+                            this.retireDemand(ownedKey);
+                        }
                     }
                 }
-            }
+            });
             this.drainDetailFrontier();
         }
 
         void drainDetailFrontier() {
-            this.drainDormancyTransitions();
+            @SuppressWarnings("unchecked")
+            ArrayDeque<DetailEvent>[] buckets = new ArrayDeque[
+                    HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT];
+            for (int bucket = 0; bucket < buckets.length; bucket++) {
+                buckets[bucket] = new ArrayDeque<>();
+            }
+            this.inputs.drainDetail((key, update) -> buckets[update.bucket()].addLast(
+                    new DetailEvent(key, update.action(), update.epoch())));
+            for (int bucket = 0; bucket < buckets.length; bucket++) {
+                int retained = buckets[bucket].size();
+                while (retained-- > 0) {
+                    DetailEvent event = buckets[bucket].removeFirst();
+                    if (event.action == HierarchicalOcclusionTraverser.ACTION_DORMANT) {
+                        this.markDormant(event.key, bucket, event.epoch);
+                    } else if (event.action == HierarchicalOcclusionTraverser.ACTION_WAKE) {
+                        this.wakeDormant(event.key, event.epoch);
+                    } else {
+                        buckets[bucket].addLast(event);
+                    }
+                }
+            }
             this.evictDormant(this.dormantGeometryBytes - this.dormantCapBytes(), false);
             // Coverage retains its independent reserve; detail consumes only the remaining
             // pipeline and the steady-state portion of the geometry arena.
             for (int bucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
                  bucket >= 0; bucket--) {
-                int remaining = this.frontier.size(bucket);
-                while (remaining-- > 0 && this.frontier.poll(bucket)) {
-                    long parent = this.frontier.key;
-                    int action = this.frontier.action;
-                    int epoch = this.frontier.epoch;
-                    if (action != HierarchicalOcclusionTraverser.ACTION_REFINE) {
-                        this.frontier.offer(parent, action, bucket, epoch);
-                        continue;
-                    }
+                ArrayDeque<DetailEvent> pending = buckets[bucket];
+                while (!pending.isEmpty()) {
+                    DetailEvent event = pending.removeFirst();
+                    long parent = event.key;
+                    int epoch = event.epoch;
                     Demand demand = this.demands.get(parent);
                     if (demand == null || demand.phase != Phase.ACTIVE
                             || SectionKey.level(parent) == 0 || this.isCoarsening(parent)
-                            || demand.detailRejected
                             || !newerEpoch(epoch, demand.latestRefinementEpoch)) continue;
-                    if (this.geometryDeficitBytes() >= 0) {
-                        this.frontier.offer(parent, action, bucket, epoch);
-                        break;
-                    }
-                    if (!this.hasPipelineHeadroom(false)
-                            || !this.hasRenderAdmissionHeadroom(false)) {
-                        this.frontier.offer(parent, action, bucket, epoch);
-                        break;
-                    }
                     if (this.indexFor(parent) == null) {
                         this.ensureRegion(parent);
-                        this.frontier.offer(parent, action, bucket, epoch);
+                        this.inputs.offerDetail(parent,
+                                HierarchicalOcclusionTraverser.ACTION_REFINE, bucket, epoch);
                         continue;
                     }
                     if (!this.addChildren(parent)) {
-                        this.frontier.offer(parent, action, bucket, epoch);
+                        this.inputs.offerDetail(parent,
+                                HierarchicalOcclusionTraverser.ACTION_REFINE, bucket, epoch);
                         break;
                     }
                     demand.latestRefinementEpoch = epoch;
-                }
-            }
-        }
-
-        void drainDormancyTransitions() {
-            for (int bucket = 0;
-                 bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT; bucket++) {
-                int remaining = this.frontier.size(bucket);
-                while (remaining-- > 0 && this.frontier.poll(bucket)) {
-                    long key = this.frontier.key;
-                    int action = this.frontier.action;
-                    int epoch = this.frontier.epoch;
-                    if (action == HierarchicalOcclusionTraverser.ACTION_REFINE) {
-                        this.frontier.offer(key, action, bucket, epoch);
-                    } else if (action == HierarchicalOcclusionTraverser.ACTION_DORMANT) {
-                        this.markDormant(key, bucket, epoch);
-                    } else if (action == HierarchicalOcclusionTraverser.ACTION_WAKE) {
-                        this.wakeDormant(key, epoch);
-                    }
                 }
             }
         }
@@ -986,11 +804,8 @@ final class ClientSession {
 
         void evictDormant(long requiredBytes, boolean forAdmission) {
             if (requiredBytes <= 0 || this.dormantRoots.isEmpty()) return;
-            long target = Math.max(requiredBytes, MIN_DORMANT_EVICTION_BATCH_BYTES);
             long scheduled = 0;
-            int evictions = 0;
-            while (scheduled < target && evictions < MAX_DORMANT_EVICTIONS_PER_BATCH
-                    && !this.dormantRoots.isEmpty()) {
+            while (scheduled < requiredBytes && !this.dormantRoots.isEmpty()) {
                 DormantRoot root = this.selectDormantEviction();
                 if (root == null) break;
                 Demand demand = this.demands.get(root.key);
@@ -1009,7 +824,6 @@ final class ClientSession {
                 this.pendingDormantEvictions.put(root.key, bytes);
                 this.pendingDormantEvictionBytes += bytes;
                 scheduled += bytes;
-                evictions++;
                 if (forAdmission) this.admissionEvictions++;
                 else this.capEvictions++;
                 this.lastEvictionDistanceSquared = distance;
@@ -1133,7 +947,6 @@ final class ClientSession {
             this.releasePublishingGeometryAccounting(demand,
                     demand.publishingAccountToken);
             demand.token++;
-            this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
             demand.decoded = null;
             demand.pendingIndex = null;
@@ -1245,7 +1058,6 @@ final class ClientSession {
             this.releasePublishingGeometryAccounting(demand,
                     demand.publishingAccountToken);
             demand.token++;
-            this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
             demand.decoded = null;
             if (demand.phase == Phase.ACTIVE) this.activeCount--;
@@ -1304,7 +1116,6 @@ final class ClientSession {
                 if (demand.phase != Phase.ACTIVE) {
                     this.discardCompletedGeometry(demand);
                     demand.token++;
-                    this.releaseAdmission(demand, demand.renderAdmission);
                     demand.received = null;
                     demand.decoded = null;
                     demand.phase = Phase.WAITING;
@@ -1319,14 +1130,12 @@ final class ClientSession {
             this.pendingBindSet.remove(demand.key);
             this.discardCompletedGeometry(demand);
             demand.token++;
-            this.releaseAdmission(demand, demand.renderAdmission);
             if (demand.phase == Phase.ACTIVE) {
                 this.activeCount--;
                 if (demand.coverage) this.missingCoverage.add(demand.key);
             }
             demand.index = index;
             demand.ordinal = ordinal;
-            demand.detailRejected = false;
             demand.decoded = null;
             demand.received = null;
             if (demand.coverage) this.missingCoverage.add(demand.key);
@@ -1460,11 +1269,6 @@ final class ClientSession {
                     this.sectionTaskSlots.release();
                     continue;
                 }
-                if (!this.hasPipelineHeadroom(demand.coverage)) {
-                    this.sectionTaskSlots.release();
-                    this.cacheQueue.addLast(ref);
-                    continue;
-                }
                 this.cacheLookupsInFlight++;
                 this.lookupCache(demand);
             }
@@ -1472,16 +1276,10 @@ final class ClientSession {
 
         List<Demand> selectNetworkBatch() {
             List<Demand> result = new ArrayList<>(REQUEST_BATCH);
-            long available = MAX_IN_FLIGHT_BYTES - this.inFlightBytes;
-            if (available <= 0) return result;
             ArrayDeque<StageRef> queue = this.coverageNetworkQueue.isEmpty()
                     ? this.refinementNetworkQueue : this.coverageNetworkQueue;
-            boolean coverage = queue == this.coverageNetworkQueue;
-            int sectionHeadroom = this.pipelineHeadroom(coverage);
-            if (sectionHeadroom <= 0) return result;
-            long bytes = 0;
             RegionalProtocol.RegionIndex batchIndex = null;
-            while (result.size() < Math.min(REQUEST_BATCH, sectionHeadroom)) {
+            while (result.size() < REQUEST_BATCH) {
                 StageRef ref = queue.peekFirst();
                 if (ref == null) break;
                 Demand demand = this.demands.get(ref.key);
@@ -1490,16 +1288,9 @@ final class ClientSession {
                     continue;
                 }
                 if (batchIndex != null && demand.index != batchIndex) break;
-                long next = demand.index.compressedLength(demand.ordinal);
-                if (next > MAX_IN_FLIGHT_BYTES) {
-                    throw new IllegalStateException(
-                            "one indexed section exceeds the network byte ceiling");
-                }
-                if (bytes + next > available) break;
                 queue.removeFirst();
                 if (batchIndex == null) batchIndex = demand.index;
                 result.add(demand);
-                bytes += next;
             }
             return result;
         }
@@ -1593,11 +1384,6 @@ final class ClientSession {
                     this.sectionTaskSlots.release();
                     continue;
                 }
-                if (!this.hasRenderAdmissionHeadroom(demand.coverage)) {
-                    this.sectionTaskSlots.release();
-                    this.decodeQueue.addLast(ref);
-                    continue;
-                }
                 this.decodesInFlight++;
                 this.decode(demand);
             }
@@ -1647,7 +1433,6 @@ final class ClientSession {
         void scheduleMeshing() {
             int remaining = this.meshQueue.size();
             while (remaining-- > 0) {
-                if (this.renderAdmissionSlots.availablePermits() == 0) return;
                 StageRef ref = this.meshQueue.pollFirst();
                 if (ref == null) return;
                 Demand demand = this.demands.get(ref.key);
@@ -1661,15 +1446,8 @@ final class ClientSession {
                     this.meshQueue.addFirst(ref);
                     return;
                 }
-                RenderAdmission admission = this.tryRenderAdmission(demand);
-                if (admission == null) {
-                    if (!empty) this.sectionTaskSlots.release();
-                    this.meshQueue.addFirst(ref);
-                    return;
-                }
-                demand.renderAdmission = admission;
                 if (empty) {
-                    this.publishEmpty(demand, admission);
+                    this.publishEmpty(demand);
                     continue;
                 }
                 demand.phase = Phase.MESHING;
@@ -1679,10 +1457,9 @@ final class ClientSession {
                     this.sectionWorkers.execute(() -> {
                         try {
                             BuiltSection geometry = this.mesher.mesh(decoded, token + 1L);
-                            putEvent(new MeshedResult(key, token, geometry, admission,
+                            putEvent(new MeshedResult(key, token, geometry,
                                     System.nanoTime()));
                         } catch (Throwable failure) {
-                            admission.release();
                             putEvent(new WorkerFailed(failure));
                         } finally {
                             this.sectionTaskSlots.release();
@@ -1691,7 +1468,6 @@ final class ClientSession {
                     });
                 } catch (RuntimeException failure) {
                     this.sectionTaskSlots.release();
-                    this.releaseAdmission(demand, admission);
                     throw failure;
                 }
             }
@@ -1699,23 +1475,20 @@ final class ClientSession {
 
         void acceptMeshed(MeshedResult result) {
             Demand demand = this.demands.get(result.key);
-            if (!current(demand, result.token, Phase.MESHING)
-                    || demand.renderAdmission != result.admission) {
+            if (!current(demand, result.token, Phase.MESHING)) {
                 result.geometry.free();
-                result.admission.release();
                 return;
             }
             this.completeGeometry(demand, result.geometry, result.completedNanos);
         }
 
-        void publishEmpty(Demand demand, RenderAdmission admission) {
+        void publishEmpty(Demand demand) {
             BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.token + 1L,
                     (byte) demand.index.childMask(demand.ordinal));
             this.completeGeometry(demand, empty, System.nanoTime());
         }
 
         void completeGeometry(Demand demand, BuiltSection geometry, long completedNanos) {
-            demand.renderAdmission.transferGeometryReservation();
             if (!demand.geometryAccounted.compareAndSet(false, true)) {
                 geometry.free();
                 throw new IllegalStateException("regional geometry was completed twice");
@@ -1724,15 +1497,11 @@ final class ClientSession {
             demand.meshCompletedNanos = completedNanos;
             demand.geometryBytes = geometry.geometryBuffer == null ? 0
                     : (geometry.geometryBuffer.size + 1023L) & ~1023L;
-            int level = SectionKey.level(demand.key);
-            this.detailGeometryEstimateBytes[level] = Math.max(
-                    this.detailGeometryEstimateBytes[level], demand.geometryBytes);
             demand.geometryAccountToken = demand.token;
             this.completedGeometryBytes.addAndGet(demand.geometryBytes);
             demand.phase = Phase.READY;
             if (this.readyPublicationQueue.size() >= MAX_STAGE_QUEUE) {
                 this.discardCompletedGeometry(demand);
-                this.releaseAdmission(demand, demand.renderAdmission);
                 throw new IllegalStateException(
                         "regional ready-publication queue exceeded its safety bound");
             }
@@ -1743,44 +1512,13 @@ final class ClientSession {
 
         void scheduleReadyPublications() {
             int remaining = this.readyPublicationQueue.size();
-            int availablePublications = MAX_STAGE_QUEUE - this.publicationQueue.size();
-            ArrayList<ReadyPublication> ready = new ArrayList<>(
-                    Math.min(remaining, Math.max(0, availablePublications)));
+            ArrayList<ReadyPublication> ready = new ArrayList<>(remaining);
             while (remaining-- > 0) {
                 StageRef ref = this.readyPublicationQueue.pollFirst();
                 if (ref == null) break;
                 Demand demand = this.demands.get(ref.key);
                 if (!current(demand, ref.token, Phase.READY)
                         || demand.completedGeometry == null) continue;
-                if (!demand.coverage && demand.geometryBytes > this.geometryTargetBytes()) {
-                    this.rejectDetailGroup(demand, true);
-                    continue;
-                }
-                if (!demand.coverage && this.geometryDeficitBytes() > 0) {
-                    long now = System.nanoTime();
-                    if (demand.budgetBlockedSinceNanos == 0) {
-                        demand.budgetBlockedSinceNanos = now;
-                    } else if (now - demand.budgetBlockedSinceNanos
-                            >= TimeUnit.SECONDS.toNanos(5) && this.coarseningRoots.isEmpty()) {
-                        this.rejectDetailGroup(demand, false);
-                        continue;
-                    }
-                    this.readyPublicationQueue.addLast(ref);
-                    continue;
-                }
-                long physicalDeficit = this.physicalGeometryDeficitBytes();
-                if (physicalDeficit > 0) {
-                    this.evictDormant(physicalDeficit, true);
-                    if (this.physicalGeometryDeficitBytes() > 0) {
-                        this.readyPublicationQueue.addLast(ref);
-                        continue;
-                    }
-                }
-                demand.budgetBlockedSinceNanos = 0;
-                if (ready.size() >= availablePublications) {
-                    this.readyPublicationQueue.addLast(ref);
-                    continue;
-                }
                 ready.add(new ReadyPublication(demand, ref.token));
             }
             this.publishReadyBatch(ready);
@@ -1796,26 +1534,22 @@ final class ClientSession {
                     Demand demand = candidate.demand();
                     int token = candidate.token();
                     BuiltSection geometry = demand.completedGeometry;
-                    RenderAdmission admission = demand.renderAdmission;
                     if (!this.open.get() || !current(demand, token, Phase.READY)
-                            || geometry == null || demand.completedGeometry != geometry
-                            || admission == null || demand.renderAdmission != admission) {
+                            || geometry == null || demand.completedGeometry != geometry) {
                         if (demand.completedGeometry == geometry && geometry != null) {
                             this.discardCompletedGeometry(demand);
-                            this.releaseAdmission(demand, admission);
                         }
                         continue;
                     }
                     VoxyRenderSystem.SectionPublication previous = demand.publication;
                     PreparedPublication item = new PreparedPublication(demand, token, geometry,
-                            admission, previous);
+                            previous);
                     prepared.add(item);
                     submissions.add(new VoxyRenderSystem.SectionSubmission(demand.key, geometry,
                             demand.coverage, demand.meshCompletedNanos,
                             Optional.ofNullable(previous),
                             () -> demand.token == token
                                     && demand.phase == Phase.PUBLISHING
-                                    && demand.renderAdmission == admission
                                     && this.open.get(),
                             () -> this.transferGeometryAccounting(demand, token)));
                 }
@@ -1849,28 +1583,9 @@ final class ClientSession {
                     PreparedPublication item = prepared.get(index);
                     item.demand().publication = publications.get(index);
                     this.publicationQueue.addLast(new PublicationRef(item.demand().key,
-                            item.token(), item.admission()));
+                            item.token()));
                 }
             }
-        }
-
-        void rejectDetailGroup(Demand demand, boolean oversize) {
-            Logger.warn(oversize
-                    ? "Skipping regional detail section requiring " + demand.geometryBytes
-                            + " bytes; target is " + this.geometryTargetBytes()
-                    : "Skipping regional detail section after no subtree made its "
-                            + demand.geometryBytes + " bytes fit");
-            long parent = parent(demand.key);
-            Demand retained = this.demands.get(parent);
-            if (oversize && retained != null) retained.detailRejected = true;
-            if (retained != null && retained.phase == Phase.ACTIVE
-                    && !this.overlapsCoarsening(parent)
-                    && this.coarsen(parent) > 0) return;
-            this.retireDetailDemand(demand.key);
-        }
-
-        long geometryTargetBytes() {
-            return this.renderer.regionalGeometryCapacityBytes() * 825L / 1_000L;
         }
 
         long dormantCapBytes() {
@@ -1879,19 +1594,6 @@ final class ClientSession {
 
         long selectedGeometryBytes() {
             return Math.max(0, this.activeGeometryBytes - this.dormantGeometryBytes);
-        }
-
-        long geometryDeficitBytes() {
-            return this.selectedGeometryBytes()
-                    + this.completedGeometryBytes.get() + this.publishingGeometryBytes.get()
-                    + this.meshingReservationBytes.get()
-                    - this.geometryTargetBytes();
-        }
-
-        long physicalGeometryDeficitBytes() {
-            return this.renderer.regionalGeometryUsedBytes()
-                    + this.completedGeometryBytes.get() - this.pendingDormantEvictionBytes
-                    - this.renderer.regionalGeometryPublicationLimitBytes();
         }
 
         void discardCompletedGeometry(Demand demand) {
@@ -1942,15 +1644,12 @@ final class ClientSession {
                 if (ref == null) return;
                 Demand demand = this.demands.get(ref.key);
                 if (!current(demand, ref.token, Phase.PUBLISHING)
-                        || demand.publication == null
-                        || demand.renderAdmission != ref.admission) {
-                    ref.admission.release();
+                        || demand.publication == null) {
                     continue;
                 }
                 Optional<Throwable> failure = demand.publication.activationFailure();
                 if (failure.isPresent()) {
                     this.releaseAllGeometryAccounting(demand, ref.token);
-                    this.releaseAdmission(demand, ref.admission);
                     throw new IOException("regional renderer publication failed",
                             failure.orElseThrow());
                 }
@@ -1966,7 +1665,6 @@ final class ClientSession {
                 this.activated++;
                 this.uploadedSections++;
                 this.releaseAllGeometryAccounting(demand, ref.token);
-                this.releaseAdmission(demand, ref.admission);
                 if (demand.pendingIndex != null) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
                     int ordinal = demand.pendingOrdinal;
@@ -1974,55 +1672,6 @@ final class ClientSession {
                     this.bind(demand, index, ordinal);
                 }
             }
-        }
-
-        RenderAdmission tryRenderAdmission(Demand demand) {
-            int available = this.renderAdmissionSlots.availablePermits();
-            if (available == 0 || (!demand.coverage
-                    && available <= this.renderAdmissionReserve())) return null;
-            long reservation = demand.coverage || demand.index.isEmpty(demand.ordinal) ? 0
-                    : this.detailGeometryEstimateBytes[SectionKey.level(demand.key)];
-            if (!demand.coverage && reservation != 0
-                    && this.geometryDeficitBytes() + reservation > 0) return null;
-            if (!this.renderAdmissionSlots.tryAcquire()) return null;
-            this.meshingReservationBytes.addAndGet(reservation);
-            RenderAdmission admission = new RenderAdmission(this, reservation);
-            this.renderAdmissions.add(admission);
-            return admission;
-        }
-
-        boolean hasPipelineHeadroom(boolean coverage) {
-            return this.pipelineHeadroom(coverage) > 0;
-        }
-
-        boolean hasRenderAdmissionHeadroom(boolean coverage) {
-            int reserve = coverage ? 0 : this.renderAdmissionReserve();
-            return this.renderAdmissionSlots.availablePermits() > reserve;
-        }
-
-        int renderAdmissionReserve() {
-            for (long key : this.missingCoverage) {
-                if (!this.absentRegions.contains(regionFor(key))) {
-                    return COVERAGE_RENDER_RESERVE;
-                }
-            }
-            return 0;
-        }
-
-        int pipelineHeadroom(boolean coverage) {
-            int reserved = coverage ? 0 : this.renderAdmissionReserve();
-            int committed = this.inFlightSections + this.cacheLookupsInFlight
-                    + this.decodeQueue.size() + this.decodesInFlight + this.meshQueue.size();
-            return Math.max(0, this.renderAdmissionSlots.availablePermits()
-                    - reserved - committed);
-        }
-
-        void releaseAdmission(Demand demand, RenderAdmission admission) {
-            if (admission == null) return;
-            if (demand != null && demand.renderAdmission == admission) {
-                demand.renderAdmission = null;
-            }
-            admission.release();
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
@@ -2054,10 +1703,7 @@ final class ClientSession {
             this.decodeQueue.clear();
             this.meshQueue.clear();
             this.readyPublicationQueue.clear();
-            PublicationRef publication;
-            while ((publication = this.publicationQueue.pollFirst()) != null) {
-                publication.admission.release();
-            }
+            this.publicationQueue.clear();
             this.coverageBindQueue.clear();
             this.refinementBindQueue.clear();
             this.pendingBindSet.clear();
@@ -2091,9 +1737,8 @@ final class ClientSession {
                     + " active=" + this.activeCount + " regions=" + this.indexes.size()
                     + " coarsening=" + this.coarseningRoots.size()
                     + " batches=" + this.inFlightBatches + " inFlightBytes=" + this.inFlightBytes
-                    + " renderPending=" + this.renderAdmissions.size()
-                    + " detailFrontier=" + this.frontier.size()
-                    + " detailDropped=" + this.frontier.dropped()
+                    + " coalescedInputs=" + this.inputs.pendingInputCount()
+                    + " coalescedOverwritten=" + this.inputs.overwrittenInputCount()
                     + " coverageMissing=" + this.missingCoverage.size()
                     + " meshQueue=" + this.meshQueue.size()
                     + " readyQueue=" + this.readyPublicationQueue.size()
@@ -2109,8 +1754,6 @@ final class ClientSession {
                     + " dormantPendingFree=" + this.pendingDormantEvictionBytes
                     + " geometryCompleted=" + this.completedGeometryBytes.get()
                     + " geometryPublishing=" + this.publishingGeometryBytes.get()
-                    + " geometryMeshingReserved=" + this.meshingReservationBytes.get()
-                    + " geometryTarget=" + this.geometryTargetBytes()
                     + " dormancyTransitions=" + this.dormancyTransitions
                     + " wakes=" + this.wakes + " instantWakes=" + this.instantWakes
                     + " dormantCapEvictions=" + this.capEvictions
@@ -2145,15 +1788,12 @@ final class ClientSession {
             }
             Event event;
             while ((event = this.events.poll()) != null) discardEvent(event);
-            for (RenderAdmission admission : List.copyOf(this.renderAdmissions)) {
-                admission.release();
-            }
             this.demands.clear();
             this.demandsByRegion.clear();
             this.demandsByTop.clear();
             this.missingCoverage.clear();
             this.subscribedRegions.clear();
-            this.frontier.clear();
+            this.inputs.clear();
             this.coarseningRoots.clear();
             this.dormantRoots.clear();
             this.pendingDormantEvictions.clear();
@@ -2161,18 +1801,16 @@ final class ClientSession {
             this.dormantGeometryBytes = 0;
             this.pendingDormantEvictionBytes = 0;
             this.publishingGeometryBytes.set(0);
-            this.meshingReservationBytes.set(0);
             this.clearStageQueues();
         }
     }
 
-    private record DemandEvent(boolean add, long key) {}
+    private record DetailEvent(long key, int action, int epoch) {}
     private record StageRef(long key, int token) {}
     private record ReadyPublication(Demand demand, int token) {}
     private record PreparedPublication(Demand demand, int token, BuiltSection geometry,
-                                       RenderAdmission admission,
                                        VoxyRenderSystem.SectionPublication previous) {}
-    private record PublicationRef(long key, int token, RenderAdmission admission) {}
+    private record PublicationRef(long key, int token) {}
 
     private sealed interface Event permits CatalogReady, IndexReady, CacheResult, CacheCorrupt,
             SectionResult, DecodedResult, MeshedResult, Coarsened,
@@ -2187,7 +1825,7 @@ final class ClientSession {
     private record DecodedResult(long key, int token,
                                  RegionalSectionCodec.SectionData section) implements Event {}
     private record MeshedResult(long key, int token, BuiltSection geometry,
-                                RenderAdmission admission, long completedNanos) implements Event {}
+                                long completedNanos) implements Event {}
     private record Coarsened(long parent) implements Event {}
     private record CoarsenFailed(long parent, Throwable failure) implements Event {}
     private record BatchComplete(long reservedBytes, int sectionCount) implements Event {}
@@ -2216,7 +1854,6 @@ final class ClientSession {
     private static void discardEvent(Event event) {
         if (event instanceof MeshedResult meshed) {
             meshed.geometry.free();
-            meshed.admission.release();
         }
     }
 
