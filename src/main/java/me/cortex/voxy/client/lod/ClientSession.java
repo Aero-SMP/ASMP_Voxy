@@ -63,6 +63,7 @@ final class ClientSession {
     private static final int REQUEST_BATCH = 256;
     private static final int MAX_DORMANT_EVICTIONS_PER_BATCH = 64;
     private static final long MIN_DORMANT_EVICTION_BATCH_BYTES = 16L << 20;
+    private static final long INITIAL_DETAIL_GEOMETRY_ESTIMATE_BYTES = 64L << 10;
     private static final long RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     private static final Object LIFECYCLE = new Object();
@@ -397,12 +398,24 @@ final class ClientSession {
 
     private static final class RenderAdmission {
         private final Session owner;
+        private final long geometryReservationBytes;
         private final AtomicBoolean released = new AtomicBoolean();
+        private final AtomicBoolean geometryReservationReleased = new AtomicBoolean();
 
-        private RenderAdmission(Session owner) { this.owner = owner; }
+        private RenderAdmission(Session owner, long geometryReservationBytes) {
+            this.owner = owner;
+            this.geometryReservationBytes = geometryReservationBytes;
+        }
+
+        private void transferGeometryReservation() {
+            if (this.geometryReservationReleased.compareAndSet(false, true)) {
+                this.owner.meshingReservationBytes.addAndGet(-this.geometryReservationBytes);
+            }
+        }
 
         private void release() {
             if (!this.released.compareAndSet(false, true)) return;
+            this.transferGeometryReservation();
             this.owner.renderAdmissions.remove(this);
             this.owner.renderAdmissionSlots.release();
             this.owner.signal();
@@ -489,6 +502,8 @@ final class ClientSession {
         volatile int cameraSectionZ;
         final AtomicLong completedGeometryBytes = new AtomicLong();
         final AtomicLong publishingGeometryBytes = new AtomicLong();
+        final AtomicLong meshingReservationBytes = new AtomicLong();
+        final long[] detailGeometryEstimateBytes = new long[SectionKey.MAX_LOD_LAYER + 1];
         volatile Throwable failure;
 
         Session(long id, String dimension, VoxyRenderSystem renderer) {
@@ -506,6 +521,8 @@ final class ClientSession {
             });
             this.thread = new Thread(this::run, "Voxy regional owner");
             this.thread.setDaemon(true);
+            java.util.Arrays.fill(this.detailGeometryEstimateBytes,
+                    INITIAL_DETAIL_GEOMETRY_ESTIMATE_BYTES);
             for (long key : topSnapshot()) this.demandEvents.add(new DemandEvent(true, key));
         }
 
@@ -1631,6 +1648,7 @@ final class ClientSession {
         }
 
         void completeGeometry(Demand demand, BuiltSection geometry) {
+            demand.renderAdmission.transferGeometryReservation();
             if (!demand.geometryAccounted.compareAndSet(false, true)) {
                 geometry.free();
                 throw new IllegalStateException("regional geometry was completed twice");
@@ -1638,6 +1656,9 @@ final class ClientSession {
             demand.completedGeometry = geometry;
             demand.geometryBytes = geometry.geometryBuffer == null ? 0
                     : (geometry.geometryBuffer.size + 1023L) & ~1023L;
+            int level = SectionKey.level(demand.key);
+            this.detailGeometryEstimateBytes[level] = Math.max(
+                    this.detailGeometryEstimateBytes[level], demand.geometryBytes);
             demand.geometryAccountToken = demand.token;
             this.completedGeometryBytes.addAndGet(demand.geometryBytes);
             demand.phase = Phase.READY;
@@ -1730,6 +1751,7 @@ final class ClientSession {
         long geometryDeficitBytes() {
             return this.selectedGeometryBytes()
                     + this.completedGeometryBytes.get() + this.publishingGeometryBytes.get()
+                    + this.meshingReservationBytes.get()
                     - this.geometryTargetBytes();
         }
 
@@ -1842,8 +1864,12 @@ final class ClientSession {
             int available = this.renderAdmissionSlots.availablePermits();
             if (available == 0 || (!demand.coverage
                     && available <= this.renderAdmissionReserve())) return null;
+            long reservation = demand.coverage || demand.index.isEmpty(demand.ordinal) ? 0
+                    : this.detailGeometryEstimateBytes[SectionKey.level(demand.key)];
+            if (!demand.coverage && this.geometryDeficitBytes() + reservation > 0) return null;
             if (!this.renderAdmissionSlots.tryAcquire()) return null;
-            RenderAdmission admission = new RenderAdmission(this);
+            this.meshingReservationBytes.addAndGet(reservation);
+            RenderAdmission admission = new RenderAdmission(this, reservation);
             this.renderAdmissions.add(admission);
             return admission;
         }
@@ -1957,6 +1983,7 @@ final class ClientSession {
                     + " dormantPendingFree=" + this.pendingDormantEvictionBytes
                     + " geometryCompleted=" + this.completedGeometryBytes.get()
                     + " geometryPublishing=" + this.publishingGeometryBytes.get()
+                    + " geometryMeshingReserved=" + this.meshingReservationBytes.get()
                     + " geometryTarget=" + this.geometryTargetBytes()
                     + " dormancyTransitions=" + this.dormancyTransitions
                     + " wakes=" + this.wakes + " instantWakes=" + this.instantWakes
@@ -2007,6 +2034,7 @@ final class ClientSession {
             this.dormantGeometryBytes = 0;
             this.pendingDormantEvictionBytes = 0;
             this.publishingGeometryBytes.set(0);
+            this.meshingReservationBytes.set(0);
             this.clearStageQueues();
         }
     }
