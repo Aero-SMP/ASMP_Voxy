@@ -38,6 +38,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -74,9 +75,17 @@ public class VoxyRenderSystem {
     public interface SectionPublication extends AutoCloseable {
         boolean activationFencePassed();
         Optional<Throwable> activationFailure();
+        Optional<AllocationBlock> takeAllocationBlock();
         boolean retirementFencePassed();
         @Override void close();
     }
+
+    public enum AllocationStatus {
+        NO_CONTIGUOUS_GEOMETRY_SPACE, NO_SECTION_ID, TOPOLOGY_NOT_READY, IMPOSSIBLE, STALE
+    }
+
+    public record AllocationBlock(BuiltSection geometry, AllocationStatus status,
+                                  long requiredUnits, long largestFreeUnits) {}
 
     public record SectionSubmission(long position, BuiltSection geometry, boolean coverage,
                                     long meshCompletedNanos,
@@ -213,6 +222,9 @@ public class VoxyRenderSystem {
                     if (removal) publication.markSafeToRelease();
                     publication.finishCloseIfRequested();
                 }, publication::failAndRollback), publication::cancelBeforeStaging,
+                block -> publication.recordAllocationBlock(new AllocationBlock(block.geometry(),
+                        AllocationStatus.valueOf(block.status().name()), block.requiredUnits(),
+                        block.largestFreeUnits())),
                 publication::failAndRollback);
         return new PreparedRegionalSection(publication, submission);
     }
@@ -259,6 +271,7 @@ public class VoxyRenderSystem {
         private final AtomicBoolean closeRequested = new AtomicBoolean();
         private final AtomicBoolean removalQueued = new AtomicBoolean();
         private final AtomicBoolean failureRecoveryQueued = new AtomicBoolean();
+        private final AtomicReference<AllocationBlock> allocationBlock = new AtomicReference<>();
         private volatile Throwable failure;
 
         private RegionalSectionPublication(AsyncNodeManager renderer, long position,
@@ -302,6 +315,20 @@ public class VoxyRenderSystem {
         @Override
         public Optional<Throwable> activationFailure() {
             return Optional.ofNullable(this.failure);
+        }
+
+        @Override
+        public Optional<AllocationBlock> takeAllocationBlock() {
+            return Optional.ofNullable(this.allocationBlock.getAndSet(null));
+        }
+
+        private void recordAllocationBlock(AllocationBlock block) {
+            if (!this.allocationBlock.compareAndSet(null, block)) {
+                block.geometry().free();
+                this.failAndRollback(new IllegalStateException(
+                        "renderer returned one publication more than once"));
+            }
+            this.renderer.regionalPublicationStateChanged();
         }
 
         @Override

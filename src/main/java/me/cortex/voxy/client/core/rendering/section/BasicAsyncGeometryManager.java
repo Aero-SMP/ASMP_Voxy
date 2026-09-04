@@ -26,6 +26,13 @@ public class BasicAsyncGeometryManager {
     private long usedCapacity = 0;
     private long pendingUploadBytes = 0;
 
+    public enum AdmissionStatus {
+        ACCEPTED, NO_CONTIGUOUS_GEOMETRY_SPACE, NO_SECTION_ID, IMPOSSIBLE
+    }
+
+    public record Admission(AdmissionStatus status, int sectionId, long requiredUnits,
+                            long largestFreeUnits) {}
+
     public BasicAsyncGeometryManager(int maxSectionCount, long geometryCapacity) {
         this.allocationSet = new HierarchicalBitSet(maxSectionCount);
         if (geometryCapacity%GEOMETRY_ELEMENT_SIZE != 0)  throw new IllegalStateException();
@@ -33,7 +40,84 @@ public class BasicAsyncGeometryManager {
     }
 
     public int uploadSection(BuiltSection section) {
-        return this.uploadReplaceSection(-1, section);
+        Admission admission = this.tryUploadSection(section);
+        if (admission.status == AdmissionStatus.ACCEPTED) return admission.sectionId;
+        throw new GeometryAdmissionException(admission);
+    }
+
+    /** Performs the real section-id and best-fit geometry allocations without consuming input on failure. */
+    public Admission tryUploadSection(BuiltSection section) {
+        if (section.isEmpty()) {
+            throw new IllegalArgumentException("sectionData is empty, cannot upload nothing");
+        }
+        if ((section.geometryBuffer.size % GEOMETRY_ELEMENT_SIZE) != 0) {
+            throw new IllegalStateException("geometry is not element aligned");
+        }
+        int elements = Math.toIntExact(section.geometryBuffer.size / GEOMETRY_ELEMENT_SIZE);
+        int required = Math.toIntExact(requiredGeometryUnits(section.geometryBuffer.size));
+        long largest = this.allocationHeap.getLargestFreeSize();
+        if (Integer.toUnsignedLong(required) > this.allocationHeap.getLimit()) {
+            return new Admission(AdmissionStatus.IMPOSSIBLE, -1,
+                    Integer.toUnsignedLong(required), largest);
+        }
+        int newId = this.allocationSet.allocateNext();
+        if (newId == HierarchicalBitSet.SET_FULL) {
+            return new Admission(AdmissionStatus.NO_SECTION_ID, -1,
+                    Integer.toUnsignedLong(required), largest);
+        }
+        long rawAddress = this.allocationHeap.alloc(required);
+        if (rawAddress == AllocationArena.SIZE_LIMIT) {
+            if (!this.allocationSet.free(newId)) {
+                throw new IllegalStateException("failed geometry admission leaked its section id");
+            }
+            return new Admission(AdmissionStatus.NO_CONTIGUOUS_GEOMETRY_SPACE, -1,
+                    Integer.toUnsignedLong(required), largest);
+        }
+        int address = Math.toIntExact(rawAddress);
+        try {
+            if (newId > this.sectionMetadata.size()) {
+                throw new IllegalStateException("section ID allocator skipped metadata entries");
+            }
+            if (newId < this.sectionMetadata.size() && this.sectionMetadata.get(newId) != null) {
+                throw new IllegalStateException("section ID is already populated");
+            }
+            SectionMeta metadata = new SectionMeta(section.position, section.aabb, address,
+                    elements, section.offsets, section.childExistence);
+            if (newId == this.sectionMetadata.size()) this.sectionMetadata.add(metadata);
+            else this.sectionMetadata.set(newId, metadata);
+            this.usedCapacity += required;
+            if (this.heapUploads.put(address, section.geometryBuffer) != null) {
+                throw new IllegalStateException("geometry address is already uploading");
+            }
+            this.pendingUploadBytes += section.geometryBuffer.size;
+            this.heapRemoveUploads.remove(address);
+            this.invalidatedIds.add(newId);
+            return new Admission(AdmissionStatus.ACCEPTED, newId,
+                    Integer.toUnsignedLong(required), this.allocationHeap.getLargestFreeSize());
+        } catch (RuntimeException | Error failure) {
+            this.allocationHeap.free(address);
+            this.allocationSet.free(newId);
+            throw failure;
+        }
+    }
+
+    public static long requiredGeometryUnits(long geometryBytes) {
+        if (geometryBytes <= 0 || geometryBytes % GEOMETRY_ELEMENT_SIZE != 0) {
+            throw new IllegalArgumentException("geometry byte size is not element aligned");
+        }
+        long elements = geometryBytes / GEOMETRY_ELEMENT_SIZE;
+        return Math.addExact(elements, 127) & ~127L;
+    }
+
+    public static final class GeometryAdmissionException extends IllegalStateException {
+        private final Admission admission;
+        public GeometryAdmissionException(Admission admission) {
+            super("geometry admission failed: " + admission.status + " requiredUnits="
+                    + admission.requiredUnits + " largestFreeUnits="
+                    + admission.largestFreeUnits);
+            this.admission = admission;
+        }
+        public Admission admission() { return this.admission; }
     }
 
     public int uploadReplaceSection(int oldId, BuiltSection section) {

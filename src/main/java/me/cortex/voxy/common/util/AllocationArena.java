@@ -170,4 +170,11 @@ public class AllocationArena {
     public long getLimit() {
         return this.sizeLimit;
     }
+
+    /** Largest allocation which can succeed without moving an existing allocation. */
+    public long getLargestFreeSize() {
+        long largest = this.sizeLimit - this.totalSize;
+        if (!this.FREE.isEmpty()) largest = Math.max(largest, this.FREE.lastLong() >>> ADDR_BITS);
+        return largest;
+    }
 }

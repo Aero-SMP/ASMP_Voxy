@@ -841,6 +841,7 @@ final class ClientSession {
             demand.lastSelectedSequence = ++this.selectionSequence;
             if (!demand.dormant) {
                 demand.dormant = true;
+                demand.retention = SectionDemandTable.Retention.WARM;
                 this.dormancyTransitions++;
             }
             DormantRoot ancestor = this.dormantAncestor(key);
@@ -862,6 +863,7 @@ final class ClientSession {
             demand.lastSelectedSequence = ++this.selectionSequence;
             boolean transitioned = demand.dormant;
             demand.dormant = false;
+            demand.retention = SectionDemandTable.Retention.SELECTED;
             DormantRoot root = this.removeDormantRoot(key);
             if (transitioned) this.wakes++;
             if (root != null) {
@@ -1135,7 +1137,10 @@ final class ClientSession {
             this.demandsByTop.computeIfAbsent(topAncestor(key), ignored -> new LinkedHashSet<>())
                     .add(key);
             RegionalProtocol.RegionIndex index = this.indexFor(key);
-            if (index == null) this.ensureRegion(key);
+            if (index == null) {
+                demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
+                this.ensureRegion(key);
+            }
             else {
                 int ordinal = index.ordinal(key);
                 if (ordinal < 0 || !index.isPresent(ordinal)) this.retireDemand(key);
@@ -1260,6 +1265,7 @@ final class ClientSession {
 
         void queueBound(Demand demand) {
             demand.phase = Phase.NEW;
+            demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
             if (demand.index.isEmpty(demand.ordinal)) {
                 demand.phase = Phase.DECODED;
                 this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
@@ -1326,6 +1332,7 @@ final class ClientSession {
                         if (demand != null) {
                             demand.activeWorkerSlot = -1;
                             demand.phase = Phase.NETWORK;
+                            demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                             this.cacheReads++;
                             this.cacheMisses++;
                             this.demands.ready(demand, SectionDemandTable.ReadyKind.NETWORK);
@@ -1340,6 +1347,7 @@ final class ClientSession {
                             demand.activeWorkerSlot = -1;
                             demand.waitingModels = models.blocks();
                             demand.phase = Phase.WAITING;
+                            demand.candidate = SectionDemandTable.CandidateState.WAIT_MODELS;
                             this.waitingModels.add(demand.key);
                             this.recordWorkerSource(models.cacheHit(), models.compressedBytes(),
                                     false);
@@ -1529,7 +1537,10 @@ final class ClientSession {
                 }
                 return false;
             }
-            for (Demand demand : selected) demand.phase = Phase.REQUESTED;
+            for (Demand demand : selected) {
+                demand.phase = Phase.REQUESTED;
+                demand.candidate = SectionDemandTable.CandidateState.NETWORK_OWNED;
+            }
             this.inFlightBatches++;
             this.inFlightSections += selected.size();
             this.inFlightBytes += reservedBytes;
@@ -1667,6 +1678,8 @@ final class ClientSession {
                 for (PreparedPublication item : prepared) {
                     item.demand().completedGeometry = null;
                     item.demand().phase = Phase.PUBLISHING;
+                    this.demands.owned(item.demand(),
+                            SectionDemandTable.CandidateState.RENDERER_OWNED);
                 }
                 List<VoxyRenderSystem.SectionPublication> publications;
                 try {
@@ -1689,15 +1702,9 @@ final class ClientSession {
                 }
                 for (int index = 0; index < prepared.size(); index++) {
                     PreparedPublication item = prepared.get(index);
-                    WorkerSlot slot = item.demand().completedSlot;
-                    if (slot != null) {
-                        item.demand().completedSlot = null;
-                        item.demand().activeWorkerSlot = -1;
-                        slot.releaseCompletion();
-                    }
                     item.demand().publication = publications.get(index);
                     this.publicationQueue.addLast(new PublicationRef(item.demand().key,
-                            item.token()));
+                            item.token(), item.previous(), item.demand().completedSlot));
                 }
             }
         }
@@ -1763,25 +1770,65 @@ final class ClientSession {
                 Demand demand = this.demands.get(ref.key);
                 if (!current(demand, ref.token, Phase.PUBLISHING)
                         || demand.publication == null) {
+                    this.releaseRendererSlot(ref.slot);
+                    if (demand != null && demand.completedSlot == ref.slot) {
+                        demand.completedSlot = null;
+                        demand.activeWorkerSlot = -1;
+                    }
+                    continue;
+                }
+                Optional<VoxyRenderSystem.AllocationBlock> blocked =
+                        demand.publication.takeAllocationBlock();
+                if (blocked.isPresent()) {
+                    VoxyRenderSystem.AllocationBlock result = blocked.orElseThrow();
+                    demand.publication = ref.previous;
+                    demand.completedGeometry = result.geometry();
+                    demand.phase = Phase.READY;
+                    demand.candidate = SectionDemandTable.CandidateState.WORKER_OWNED;
+                    if (result.status() == VoxyRenderSystem.AllocationStatus.IMPOSSIBLE) {
+                        Logger.warn("Regional detail geometry cannot fit the configured arena: "
+                                + result.requiredUnits() * 8L + " bytes");
+                        if (demand.coverage) {
+                            this.discardCompletedGeometry(demand);
+                        } else {
+                            this.retireDetailDemand(demand.key);
+                        }
+                    } else {
+                        long requiredBytes = Math.max(1, result.requiredUnits()) * 8L;
+                        this.evictDormant(requiredBytes, true);
+                        this.demands.ready(demand, SectionDemandTable.ReadyKind.RENDERER);
+                    }
                     continue;
                 }
                 Optional<Throwable> failure = demand.publication.activationFailure();
                 if (failure.isPresent()) {
                     this.releaseAllGeometryAccounting(demand, ref.token);
-                    throw new IOException("regional renderer publication failed",
+                    Logger.warn("Regional renderer publication failed; retaining its fallback",
                             failure.orElseThrow());
+                    demand.publication = ref.previous;
+                    demand.completedSlot = null;
+                    demand.activeWorkerSlot = -1;
+                    this.releaseRendererSlot(ref.slot);
+                    demand.phase = Phase.CACHE;
+                    demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
+                    this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
+                    continue;
                 }
                 if (!demand.publication.activationFencePassed()) {
                     this.publicationQueue.addLast(ref);
                     continue;
                 }
                 demand.phase = Phase.ACTIVE;
+                demand.candidate = SectionDemandTable.CandidateState.NONE;
                 this.setActiveGeometryBytes(demand, demand.geometryBytes);
                 this.activeCount++;
                 if (demand.coverage) this.missingCoverage.remove(demand.key);
                 this.activated++;
                 this.uploadedSections++;
                 this.releaseAllGeometryAccounting(demand, ref.token);
+                demand.completedSlot = null;
+                demand.activeWorkerSlot = -1;
+                this.releaseRendererSlot(ref.slot);
                 if (demand.pendingIndex != null) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
                     int ordinal = demand.pendingOrdinal;
@@ -1789,6 +1836,10 @@ final class ClientSession {
                     this.bind(demand, index, ordinal);
                 }
             }
+        }
+
+        void releaseRendererSlot(WorkerSlot slot) {
+            if (slot != null && slot.completion() != null) slot.releaseCompletion();
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
@@ -1895,7 +1946,9 @@ final class ClientSession {
     private record ReadyPublication(Demand demand, int token) {}
     private record PreparedPublication(Demand demand, int token, BuiltSection geometry,
                                        VoxyRenderSystem.SectionPublication previous) {}
-    private record PublicationRef(long key, int token) {}
+    private record PublicationRef(long key, int token,
+                                  VoxyRenderSystem.SectionPublication previous,
+                                  Session.WorkerSlot slot) {}
 
     private sealed interface Event permits CatalogReady, Coarsened,
             CoarsenFailed, BatchComplete, WorkerFailed, SnapshotRequest {}

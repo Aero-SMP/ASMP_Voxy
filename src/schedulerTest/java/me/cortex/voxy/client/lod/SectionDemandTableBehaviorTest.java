@@ -1,5 +1,8 @@
 package me.cortex.voxy.client.lod;
 
+import me.cortex.voxy.client.core.rendering.section.BasicAsyncGeometryManager;
+import me.cortex.voxy.common.util.AllocationArena;
+
 import java.util.HashMap;
 import java.util.Map;
 
@@ -14,6 +17,8 @@ public final class SectionDemandTableBehaviorTest {
         coveragePrecedesFairRegionalRefinement();
         finalSectionReleasesRegion();
         staleTicketCannotMutateReplacement();
+        allocatorUsesExactOneKiBUnits();
+        allocatorReportsFragmentation();
         System.out.println("coalesced demand-table behavior tests passed");
     }
 
@@ -96,6 +101,31 @@ public final class SectionDemandTableBehaviorTest {
         SectionDemandTable.Demand replacement = table.adopt(demand(1, 2, 3, false, 0));
         replacement.regionGeneration = 5;
         check(!table.current(ticket), "stale ticket matched replacement demand");
+    }
+
+    private static void allocatorUsesExactOneKiBUnits() {
+        check(BasicAsyncGeometryManager.requiredGeometryUnits(8) == 128,
+                "small geometry did not round to one 1024-byte unit");
+        check(BasicAsyncGeometryManager.requiredGeometryUnits(1024) == 128,
+                "aligned geometry changed allocator units");
+        check(BasicAsyncGeometryManager.requiredGeometryUnits(1032) == 256,
+                "geometry did not round at the allocator boundary");
+    }
+
+    private static void allocatorReportsFragmentation() {
+        AllocationArena arena = new AllocationArena();
+        arena.setLimit(120);
+        long first = arena.alloc(30);
+        long middle = arena.alloc(30);
+        arena.alloc(30);
+        arena.alloc(30);
+        arena.free(middle);
+        arena.free(90);
+        check(arena.getLargestFreeSize() == 30,
+                "largest contiguous extent ignored fragmentation");
+        check(arena.alloc(40) == AllocationArena.SIZE_LIMIT,
+                "fragmented allocator admitted a non-contiguous request");
+        arena.free(first);
     }
 
     private static SectionDemandTable.Demand demand(long key, long region, long top,
