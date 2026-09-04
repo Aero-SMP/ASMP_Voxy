@@ -157,7 +157,7 @@ final class ClientAutoUpdater {
                 waitForStableScreenshot(screenshot);
                 ensureScreenshotDirectory();
                 CommandResult upload = run(Duration.ofSeconds(90), scpExecutable(),
-                        "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                        "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
                         screenshot.toString(), SSH_TARGET + ':' + temporary);
                 if (upload.exitCode != 0) {
                     throw new IOException("scp failed (exit " + upload.exitCode + "): "
@@ -171,8 +171,8 @@ final class ClientAutoUpdater {
                         + shellQuote(destination) + " && rm -f -- "
                         + shellQuote(temporary) + " || exit 73; else mv -- "
                         + shellQuote(temporary) + ' ' + shellQuote(destination) + "; fi";
-                CommandResult rename = run(Duration.ofSeconds(15), sshExecutable(),
-                        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET,
+                CommandResult rename = run(Duration.ofSeconds(45), sshExecutable(), "-n",
+                        "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", SSH_TARGET,
                         publish);
                 if (rename.exitCode != 0) {
                     throw new IOException("remote publish failed (exit " + rename.exitCode
@@ -245,8 +245,8 @@ final class ClientAutoUpdater {
     private static void ensureScreenshotDirectory()
             throws IOException, InterruptedException {
         if (screenshotDirectoryReady) return;
-        CommandResult mkdir = run(Duration.ofSeconds(15), sshExecutable(),
-                "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET,
+        CommandResult mkdir = run(Duration.ofSeconds(45), sshExecutable(), "-n",
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", SSH_TARGET,
                 "mkdir -p -- " + shellQuote(REMOTE_SCREENSHOTS));
         if (mkdir.exitCode != 0) {
             throw new IOException("screenshot directory creation failed (exit "
@@ -257,8 +257,8 @@ final class ClientAutoUpdater {
 
     private static void removeRemoteTemporary(String temporary) {
         try {
-            run(Duration.ofSeconds(10), sshExecutable(), "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=5", SSH_TARGET,
+            run(Duration.ofSeconds(45), sshExecutable(), "-n", "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=20", SSH_TARGET,
                     "rm -f -- " + shellQuote(temporary));
         } catch (IOException | InterruptedException ignored) {
             if (ignored instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -276,8 +276,8 @@ final class ClientAutoUpdater {
 
     private static boolean checkAndInstall() throws Exception {
         ClientLodDebug.updaterEvent("state=CHECKING target=" + SSH_TARGET);
-        CommandResult listing = run(Duration.ofSeconds(15), sshExecutable(),
-                "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET,
+        CommandResult listing = run(Duration.ofSeconds(45), sshExecutable(), "-n",
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", SSH_TARGET,
                 "LC_ALL=C find " + REMOTE_DIRECTORY
                         + " -maxdepth 1 -type f -printf '%f\\n' | sort");
         if (listing.exitCode != 0) {
@@ -323,7 +323,7 @@ final class ClientAutoUpdater {
 
         ClientLodDebug.updaterEvent("state=DOWNLOADING version=" + newest.version);
         CommandResult download = run(Duration.ofMinutes(3), scpExecutable(),
-                "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
                 SSH_TARGET + ':' + REMOTE_DIRECTORY + '/' + newest.filename,
                 staged.toString());
         if (download.exitCode != 0) {
@@ -381,8 +381,8 @@ final class ClientAutoUpdater {
         Files.writeString(status, snapshotStatus);
         sources.add(status.toString());
 
-        CommandResult mkdir = run(Duration.ofSeconds(15), sshExecutable(),
-                "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET,
+        CommandResult mkdir = run(Duration.ofSeconds(45), sshExecutable(), "-n",
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", SSH_TARGET,
                 "mkdir -p " + REMOTE_DIAGNOSTICS);
         if (mkdir.exitCode != 0) {
             throw new IOException("diagnostic directory creation failed (exit "
@@ -394,10 +394,10 @@ final class ClientAutoUpdater {
         command.add("-o");
         command.add("BatchMode=yes");
         command.add("-o");
-        command.add("ConnectTimeout=10");
+        command.add("ConnectTimeout=20");
         command.addAll(sources);
         command.add(SSH_TARGET + ':' + REMOTE_DIAGNOSTICS + '/');
-        CommandResult upload = run(Duration.ofSeconds(45), command.toArray(String[]::new));
+        CommandResult upload = run(Duration.ofSeconds(90), command.toArray(String[]::new));
         if (upload.exitCode != 0) {
             throw new IOException("diagnostic upload failed (exit " + upload.exitCode
                     + "): " + oneLine(upload.output));
