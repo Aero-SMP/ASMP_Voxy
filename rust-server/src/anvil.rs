@@ -177,6 +177,15 @@ impl AnvilWorld {
             let Some((x, z)) = parse_region_filename(&path) else {
                 continue;
             };
+            if !region_is_representable(x, z) {
+                continue;
+            }
+            // Pregenerators may leave tens of thousands of durable zero-byte placeholders.
+            // They contain no saved terrain and a later real header changes the file length,
+            // so they must not become regional build work.
+            if entry.metadata()?.len() == 0 {
+                continue;
+            }
             match read_region_header(&path, x, z) {
                 Ok(header) => out.valid.push(header),
                 Err(error) => out.failed.push(FailedRegion {
@@ -201,9 +210,18 @@ impl AnvilWorld {
     /// bounded regional transaction to the time required to enumerate every other region in a
     /// large, actively saving world.
     pub fn region_header(&self, region_x: i32, region_z: i32) -> Result<Option<RegionHeader>> {
+        if !region_is_representable(region_x, region_z) {
+            return Ok(None);
+        }
         let path = self
             .region_dir()
             .join(format!("r.{region_x}.{region_z}.mca"));
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() == 0 => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
         match read_region_header(&path, region_x, region_z) {
             Ok(header) => Ok(Some(header)),
             Err(error)
@@ -640,6 +658,14 @@ fn parse_region_filename(path: &Path) -> Option<(i32, i32)> {
     Some((parts[1].parse().ok()?, parts[2].parse().ok()?))
 }
 
+fn region_is_representable(region_x: i32, region_z: i32) -> bool {
+    // One Anvil region spans 32 level-zero Voxy sections. Every local coordinate must fit the
+    // signed 24-bit section-key fields.
+    const MIN_REGION: i32 = crate::key::COORD_MIN / 32;
+    const MAX_REGION: i32 = (crate::key::COORD_MAX - 31) / 32;
+    (MIN_REGION..=MAX_REGION).contains(&region_x) && (MIN_REGION..=MAX_REGION).contains(&region_z)
+}
+
 fn decompress(kind: u8, compressed: &[u8]) -> Result<Vec<u8>> {
     let reader: Box<dyn Read> = match kind {
         1 => Box::new(GzDecoder::new(compressed)),
@@ -888,4 +914,17 @@ fn nibble(data: Option<&[i8]>, index: usize, missing: u8) -> u8 {
         return missing;
     };
     ((byte as u8) >> ((index & 1) * 4)) & 15
+}
+
+#[cfg(test)]
+mod region_boundary_tests {
+    use super::region_is_representable;
+
+    #[test]
+    fn regional_source_ignores_unrepresentable_anvil_coordinates() {
+        assert!(region_is_representable(-262_144, -262_144));
+        assert!(region_is_representable(262_143, 262_143));
+        assert!(!region_is_representable(-262_145, 0));
+        assert!(!region_is_representable(262_144, 0));
+    }
 }
