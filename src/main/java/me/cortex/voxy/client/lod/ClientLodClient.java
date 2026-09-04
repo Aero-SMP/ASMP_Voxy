@@ -40,14 +40,13 @@ public final class ClientLodClient {
         ClientSession.sectionLeft(key);
     }
 
-    /** Accepts projected-size refinement requests from the renderer's normal hierarchy. */
-    public static void refinementRequested(long parent) {
-        ClientSession.refinementRequested(parent);
+    /** Accepts the final-HZB pass's scored residency action without allocating per action. */
+    public static void detailAction(long key, int action, int bucket, int epoch) {
+        ClientSession.detailAction(key, action, bucket, epoch);
     }
 
-    /** Collapses renderer-selected detail after the final HZB pass grace period. */
-    public static void coarseningRequested(long parent) {
-        ClientSession.coarseningRequested(parent);
+    public static boolean detailPressure() {
+        return ClientSession.detailPressure();
     }
 
     public static void resetDemand() {

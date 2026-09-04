@@ -1,7 +1,5 @@
 #import <voxy:lod/pos_util.glsl>
-layout(binding = NODE_DATA_BINDING, std430) restrict buffer NodeData {
-//Needs to be read and writeable for marking data,
-//(could do an evil violation, make this readonly, then have a writeonly varient, which means that writing might not be visible but will show up by the next frame)
+layout(binding = NODE_DATA_BINDING, std430) restrict readonly buffer NodeData {
 //Nodes are 16 bytes big (or 32 cant decide, 16 might _just_ be enough)
     uvec4[] nodes;
 };
@@ -58,10 +56,6 @@ bool childListIsEmpty(in UnpackedNode node) {
     return node.childPtr == EMPTY_QUEUE_ID;
 }
 
-bool hasRequested(in UnpackedNode node) {
-    return (node.flags&1u) != 0u;
-}
-
 bool isTerminal(in UnpackedNode node) {
     return (node.flags&2u) != 0u;
 }
@@ -84,11 +78,4 @@ uint getChildPtr(in UnpackedNode node) {
 
 uvec2 getRawPos(in UnpackedNode node) {
     return node.rawPos;
-}
-
-//-----------------------------------
-
-void markRequested(inout UnpackedNode node) {
-    node.flags |= 1u;
-    nodes[node.nodeId].z |= 1u<<24;
 }

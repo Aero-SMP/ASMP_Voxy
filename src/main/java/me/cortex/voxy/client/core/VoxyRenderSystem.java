@@ -97,6 +97,16 @@ public class VoxyRenderSystem {
         return new SectionMesher(this.modelService);
     }
 
+    public long regionalGeometryUsedBytes() {
+        AsyncNodeManager nodes = this.nodeManager;
+        return nodes == null ? 0 : nodes.geometryUsedBytes();
+    }
+
+    public long regionalGeometryCapacityBytes() {
+        AsyncNodeManager nodes = this.nodeManager;
+        return nodes == null ? 0 : nodes.geometryCapacityBytes();
+    }
+
     private SectionPublication publishRegionalSection(
             long position, BuiltSection geometry, Optional<SectionPublication> previous,
             BooleanSupplier current) {
@@ -290,8 +300,7 @@ public class VoxyRenderSystem {
                 this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData);
                 this.nodeCleaner = new NodeCleaner(this.nodeManager);
                 this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner);
-                this.traversal.setRefinementListener(ClientLodClient::refinementRequested);
-                this.traversal.setCoarseningListener(ClientLodClient::coarseningRequested);
+                this.traversal.setDetailActionListener(ClientLodClient::detailAction);
 
                 Arrays.stream(this.mapper.getBiomeEntries()).forEach(this.modelService::addBiome);
                 this.mapper.setBiomeCallback(this.modelService::addBiome);

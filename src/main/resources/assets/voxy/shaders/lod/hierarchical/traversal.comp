@@ -1,9 +1,11 @@
 #version 460 core
 
-//TODO: increase local size
 #define LOCAL_SIZE_MSK ((1<<LOCAL_SIZE_BITS)-1)
 #define LOCAL_SIZE (1<<LOCAL_SIZE_BITS)
-layout(local_size_x=LOCAL_SIZE) in;//, local_size_y=1
+layout(local_size_x=LOCAL_SIZE) in;
+
+#define ACTION_REFINE 0u
+#define ACTION_COARSEN_CANDIDATE 1u
 
 #import <voxy:lod/frustum.glsl>
 
@@ -12,24 +14,24 @@ layout(binding = SCENE_UNIFORM_BINDING, std140) uniform SceneUniform {
     ivec3 camSecPos;
     uint packedHizSize;
     vec3 camSubSecPos;
-    float minSSS;
+    float viewportArea;
     Frustum frustum;
     uint renderQueueMaxSize;
     uint frameId;
-    uint requestQueueSize;
+    uint actionEpoch;
     float renderDistance;
     uint finalPass;
     uint coarsenGraceFrames;
+    uint detailPressure;
 };
 
 #import <voxy:lod/hierarchical/queue.glsl>
 #import <voxy:lod/hierarchical/node.glsl>
 #import <voxy:lod/hierarchical/screenspace.glsl>
 
-layout(binding = REQUEST_QUEUE_BINDING, std430) restrict buffer requestQueueStruct {
-    uvec2 requestQueueIndex;
-    uvec2 refinementQueue[MAX_REQUEST_QUEUE_SIZE];
-    uvec2 coarseningQueue[MAX_COARSEN_QUEUE_SIZE];
+layout(binding = DETAIL_ACTION_BINDING, std430) restrict buffer detailActionBuffer {
+    uint actionCounts[DETAIL_BUCKET_COUNT];
+    uvec4 detailActions[DETAIL_BUCKET_COUNT * ACTIONS_PER_BUCKET];
 };
 
 layout(binding = RENDER_QUEUE_BINDING, std430) restrict buffer renderQueueStruct {
@@ -41,133 +43,99 @@ layout(binding = RENDER_TRACKER_BINDING, std430) restrict buffer renderTrackerAr
     uint[] lastRenderFrame;
 };
 
-void addRequest(inout UnpackedNode node) {
-    // The requested bit protects nodes from the cleaner, but it cannot be a permanent
-    // delivery acknowledgement: GPU readback is asynchronous and may be lost while the
-    // hierarchy is changing. Retry on a node-staggered lease until children arrive.
-    bool previouslyRequested = hasRequested(node);
-    bool retry = previouslyRequested && ((frameId + getId(node)) & 31u) == 0u;
-    if (!previouslyRequested || retry) {
-        if (requestQueueIndex.x < requestQueueSize) {//Soft limit
-            uint atomRes = atomicAdd(requestQueueIndex.x, 1);
-            if (atomRes < MAX_REQUEST_QUEUE_SIZE) {//Hard limit
-                //Mark node as having a request submitted to prevent duplicate submissions
-                refinementQueue[atomRes] = getRawPos(node);
-                markRequested(node);
-            }
-        }
-    }
+uint actionHash(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16);
 }
 
-void addCoarsening(in UnpackedNode node) {
-    uint slot = atomicAdd(requestQueueIndex.y, 1);
-    if (slot < MAX_COARSEN_QUEUE_SIZE) {
-        coarseningQueue[slot] = getRawPos(node);
+void addDetailAction(in UnpackedNode node, uint action, uint bucket) {
+    // Rotate overflow selection by node and frame instead of favoring traversal order forever.
+    uint mask = action == ACTION_REFINE ? 3u : 15u;
+    if ((actionHash(getId(node) ^ actionEpoch) & mask) != 0u) return;
+    bucket = min(bucket, DETAIL_BUCKET_COUNT - 1u);
+    uint slot = atomicAdd(actionCounts[bucket], 1u);
+    if (slot < ACTIONS_PER_BUCKET) {
+        uvec2 position = getRawPos(node);
+        detailActions[bucket * ACTIONS_PER_BUCKET + slot] =
+                uvec4(position.x, position.y, action, actionEpoch);
     }
 }
 
 void enqueueChildren(in UnpackedNode node) {
-    if (childListIsEmpty(node)) {//Occures in a very rare case/instance so just handle it gracefully
-        return;
-    }
-
+    if (childListIsEmpty(node)) return;
     uint children = getChildCount(node);
     pushNodesInit(children);
     uint ptr = getChildPtr(node);
-    for (int i = 0; i < children; i++) {
-        pushNode(ptr+i);
-    }
+    for (int i = 0; i < children; i++) pushNode(ptr+i);
 }
 
 void enqueueSelfForRender(in UnpackedNode node) {
-    if (renderQueueIndex < renderQueueMaxSize) {
-        if (!isEmptyMesh(node)) {
-            uint renderIndex = atomicAdd(renderQueueIndex, 1);
-            if (renderIndex < renderQueueMaxSize) {
-                renderQueue[renderIndex] = getMesh(node);
-            }
-        }
+    if (renderQueueIndex < renderQueueMaxSize && !isEmptyMesh(node)) {
+        uint renderIndex = atomicAdd(renderQueueIndex, 1);
+        if (renderIndex < renderQueueMaxSize) renderQueue[renderIndex] = getMesh(node);
     }
 }
-
 
 vec3 closestPointToCamera(in UnpackedNode node) {
     vec3 nPos = vec3(((node.pos<<node.lodLevel)-camSecPos)<<5)-camSubSecPos;
     float scale = 1<<(node.lodLevel+5);
-    return mix(mix(vec3(0), nPos, greaterThan(nPos, vec3(0))), nPos+scale, lessThan(nPos+scale, vec3(0)));
+    return mix(mix(vec3(0), nPos, greaterThan(nPos, vec3(0))), nPos+scale,
+            lessThan(nPos+scale, vec3(0)));
 }
 
 bool isWithinRenderDistance(in UnpackedNode node) {
     if (renderDistance<0.0f) return true;
     vec3 close = closestPointToCamera(node);
-    float xzDist = close.x*close.x+close.z*close.z;
-    return xzDist <= renderDistance;
+    return close.x*close.x+close.z*close.z <= renderDistance;
 }
 
+void addColdCoarsening(in UnpackedNode node, uint bucket) {
+    if (finalPass != 0u && detailPressure != 0u
+            && hasChildren(node) && !childListIsEmpty(node)
+            && frameId - lastRenderFrame[getId(node)] >= coarsenGraceFrames) {
+        addDetailAction(node, ACTION_COARSEN_CANDIDATE, bucket);
+    }
+}
 
 void traverse(in UnpackedNode node) {
-    //Compute screenspace
     setupScreenspace(node);
-
-    bool visible = !(outsideFrustum() || isCulledByHiz());
-    bool refinementRequired = visible && node.lodLevel != 0 && !isTerminal(node)
-            && shouldDecend();
-    if (finalPass != 0u) {
-        if (refinementRequired) {
-            lastRenderFrame[getId(node)] = frameId;
-        } else if (hasChildren(node) && !childListIsEmpty(node)
-                && frameId - lastRenderFrame[getId(node)] >= coarsenGraceFrames) {
-            addCoarsening(node);
-        }
+    if (outsideFrustum()) {
+        addColdCoarsening(node, 1u);
+        return;
+    }
+    if (isCulledByHiz()) {
+        addColdCoarsening(node, 2u);
+        return;
     }
 
-    if (visible) {
-        //It is visible, TODO: maybe do a more detailed hiz test? (or make it so that )
+    float score = projectedDetailScore();
+    uint bucket = detailScoreBucket(score);
+    if (finalPass != 0u) lastRenderFrame[getId(node)] = frameId;
 
-        //Only decend if not a root node
-        if (refinementRequired) {
-            if (hasChildren(node)) {
-                enqueueChildren(node);
-            } else {
-                addRequest(node);
-                //TODO: use self mesh (is error state if it doesnt have one since all leaf nodes should have a mesh)
-                // Basicly guarenteed to have a mesh, if it doesnt it is very very bad and incorect since its a violation of the graph properties
-                // that all leaf nodes must contain a mesh
-
-                // Keep the coarse node visible until the requested children are available.
-                // The node already passed render-distance, frustum and HiZ rejection above.
-                enqueueSelfForRender(node);
-            }
-        } else {
-            if (hasMesh(node)) {
-                enqueueSelfForRender(node);
-            } else {
-                //!! not ideal, we want to render this mesh but dont have it. If we havent sent a request
-                // then send a request for a mesh for this node.
-                addRequest(node);
-
-                //TODO: Decend into children? maybe add a bitflag saying is bad if the immediate children dont have meshes
-                if (node.lodLevel != 0) {
-                    enqueueChildren(node);
-                }
-            }
+    if (hasChildren(node) && !childListIsEmpty(node)) {
+        if (finalPass != 0u && detailPressure != 0u) {
+            addDetailAction(node, ACTION_COARSEN_CANDIDATE, max(3u, bucket));
         }
+        // Installed topology, rather than a pixel threshold, determines the rendered cut.
+        enqueueChildren(node);
+        return;
+    }
+
+    // A retained parent is the complete fallback until its child group becomes active.
+    if (hasMesh(node)) enqueueSelfForRender(node);
+    if (finalPass != 0u && node.lodLevel != 0u && !isTerminal(node) && score >= 1.0f) {
+        addDetailAction(node, ACTION_REFINE, bucket);
     }
 }
 
 void main() {
     uint nodeId = getCurrentNode();
-    if (nodeId != SENTINAL_OUT_OF_BOUNDS) {
-        //Fetch + decode node
-        UnpackedNode node;
-        unpackNode(node, nodeId);
-
-        //Check if were inside the render distastance before traversince
-        if (isWithinRenderDistance(node)) {
-            traverse(node);
-        } else if (finalPass != 0u && hasChildren(node) && !childListIsEmpty(node)
-                && frameId - lastRenderFrame[getId(node)] >= coarsenGraceFrames) {
-            addCoarsening(node);
-        }
-    }
+    if (nodeId == SENTINAL_OUT_OF_BOUNDS) return;
+    UnpackedNode node;
+    unpackNode(node, nodeId);
+    if (isWithinRenderDistance(node)) traverse(node);
+    else addColdCoarsening(node, 0u);
 }

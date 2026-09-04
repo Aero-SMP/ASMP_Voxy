@@ -12,13 +12,12 @@ import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
+import me.cortex.voxy.client.lod.ClientLodClient;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.Objects;
-import java.util.function.LongConsumer;
 
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL12.GL_UNPACK_IMAGE_HEIGHT;
@@ -31,8 +30,10 @@ import static org.lwjgl.opengl.GL45.*;
 
 // TODO: swap to persistent gpu threads instead of dispatching MAX_ITERATIONS of compute layers
 public class HierarchicalOcclusionTraverser {
-    public static final int MAX_REQUEST_QUEUE_SIZE = 50;
-    public static final int MAX_COARSEN_QUEUE_SIZE = 64;
+    public static final int DETAIL_BUCKET_COUNT = 32;
+    public static final int ACTIONS_PER_BUCKET = 256;
+    public static final int ACTION_REFINE = 0;
+    public static final int ACTION_COARSEN_CANDIDATE = 1;
     public static final int MAX_QUEUE_SIZE = 200_000;
 
 
@@ -42,10 +43,13 @@ public class HierarchicalOcclusionTraverser {
 
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
-    private LongConsumer refinementListener = ignored -> {};
-    private LongConsumer coarseningListener = ignored -> {};
+    @FunctionalInterface
+    public interface DetailActionListener {
+        void accept(long key, int action, int bucket, int epoch);
+    }
+    private DetailActionListener detailActionListener = (key, action, bucket, epoch) -> {};
 
-    private final GlBuffer requestBuffer;
+    private final GlBuffer detailActionBuffer;
 
     private final GlBuffer nodeBuffer;
     private final GlBuffer uniformBuffer = new GlBuffer(1024).zero();
@@ -61,7 +65,7 @@ public class HierarchicalOcclusionTraverser {
 
     private static int BINDING_COUNTER = 1;
     private static final int SCENE_UNIFORM_BINDING = BINDING_COUNTER++;
-    private static final int REQUEST_QUEUE_BINDING = BINDING_COUNTER++;
+    private static final int DETAIL_ACTION_BINDING = BINDING_COUNTER++;
     private static final int RENDER_QUEUE_BINDING = BINDING_COUNTER++;
     private static final int NODE_DATA_BINDING = BINDING_COUNTER++;
     private static final int NODE_QUEUE_INDEX_BINDING = BINDING_COUNTER++;
@@ -78,12 +82,13 @@ public class HierarchicalOcclusionTraverser {
     private long previousFrameNanos;
     private double averageFrameNanos = 16_666_667.0;
     private int coarsenGraceFrames = 120;
+    private int actionEpoch;
 
     public HierarchicalOcclusionTraverser(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner) {
         this.nodeCleaner = nodeCleaner;
         this.nodeManager = nodeManager;
-        this.requestBuffer = new GlBuffer(
-                (MAX_REQUEST_QUEUE_SIZE + MAX_COARSEN_QUEUE_SIZE) * 8L + 8).zero();
+        this.detailActionBuffer = new GlBuffer(DETAIL_BUCKET_COUNT * 4L
+                + DETAIL_BUCKET_COUNT * ACTIONS_PER_BUCKET * 16L).zero();
         this.nodeBuffer = new GlBuffer(nodeManager.maxNodeCount*16L).fill(-1);
 
 
@@ -107,13 +112,13 @@ public class HierarchicalOcclusionTraverser {
             .define("USE_ZERO_ONE_DEPTH")
             .define("MAX_ITERATIONS", MAX_ITERATIONS)
             .define("LOCAL_SIZE_BITS", LOCAL_WORK_SIZE_BITS)
-            .define("MAX_REQUEST_QUEUE_SIZE", MAX_REQUEST_QUEUE_SIZE)
-            .define("MAX_COARSEN_QUEUE_SIZE", MAX_COARSEN_QUEUE_SIZE)
+            .define("DETAIL_BUCKET_COUNT", DETAIL_BUCKET_COUNT)
+            .define("ACTIONS_PER_BUCKET", ACTIONS_PER_BUCKET)
 
             .define("HIZ_BINDING", 0)
 
             .define("SCENE_UNIFORM_BINDING", SCENE_UNIFORM_BINDING)
-            .define("REQUEST_QUEUE_BINDING", REQUEST_QUEUE_BINDING)
+            .define("DETAIL_ACTION_BINDING", DETAIL_ACTION_BINDING)
             .define("RENDER_QUEUE_BINDING", RENDER_QUEUE_BINDING)
             .define("NODE_DATA_BINDING", NODE_DATA_BINDING)
 
@@ -132,7 +137,7 @@ public class HierarchicalOcclusionTraverser {
 
         this.traversal
                 .ubo("SCENE_UNIFORM_BINDING", this.uniformBuffer)
-                .ssbo("REQUEST_QUEUE_BINDING", this.requestBuffer)
+                .ssbo("DETAIL_ACTION_BINDING", this.detailActionBuffer)
                 .ssbo("NODE_DATA_BINDING", this.nodeBuffer)
                 .ssbo("NODE_QUEUE_META_BINDING", this.queueMetaBuffer)
                 .ssbo("RENDER_TRACKER_BINDING", this.nodeCleaner.visibilityBuffer);
@@ -200,9 +205,7 @@ public class HierarchicalOcclusionTraverser {
         viewport.innerTranslation.getToAddress(ptr); ptr += 4*3;
 
 
-        final float screenspaceAreaDecreasingSize = VoxyConfig.CONFIG.subDivisionSize*VoxyConfig.CONFIG.subDivisionSize;
-        //Screen space size for descending
-        MemoryUtil.memPutFloat(ptr, (float) (screenspaceAreaDecreasingSize) /(viewport.width*viewport.height)); ptr += 4;
+        MemoryUtil.memPutFloat(ptr, (float) viewport.width * viewport.height); ptr += 4;
 
         setFrustum(viewport, ptr); ptr += 4*4*6;
 
@@ -211,8 +214,7 @@ public class HierarchicalOcclusionTraverser {
         //VisibilityId
         MemoryUtil.memPutInt(ptr, this.nodeCleaner.visibilityId); ptr += 4;
 
-        // These requests reserve hierarchy owners and directly request regional child sections.
-        MemoryUtil.memPutInt(ptr, MAX_REQUEST_QUEUE_SIZE); ptr += 4;
+        MemoryUtil.memPutInt(ptr, this.actionEpoch); ptr += 4;
 
         //Put the render distance here so that it can generate a correct circle, TODO: make it not top level section sized
         MemoryUtil.memPutFloat(ptr, (float) Math.pow(VoxyConfig.CONFIG.sectionRenderDistance*16*32,2));ptr += 4;
@@ -220,6 +222,8 @@ public class HierarchicalOcclusionTraverser {
         MemoryUtil.memPutInt(ptr, finalPass ? 1 : 0);
         ptr += 4;
         MemoryUtil.memPutInt(ptr, this.coarsenGraceFrames);
+        ptr += 4;
+        MemoryUtil.memPutInt(ptr, ClientLodClient.detailPressure() ? 1 : 0);
 
 
     }
@@ -252,6 +256,7 @@ public class HierarchicalOcclusionTraverser {
     }
 
     private void doTraversal(Viewport viewport, HiZBuffer hiZBuffer, boolean finalPass) {
+        if (finalPass) this.actionEpoch++;
         this.uploadUniform(viewport, hiZBuffer, finalPass);
 
         this.traversal.bind();
@@ -266,19 +271,16 @@ public class HierarchicalOcclusionTraverser {
         //Traverse
         this.traverseInternal();
 
-        this.downloadResetRequestQueue();
+        // Only the refined HZB pass may influence residency. The first pass is draw-only.
+        if (finalPass) this.downloadResetDetailActions();
 
         //Bind the hiz buffer
         glBindSampler(0, 0);
         glBindTextureUnit(0, 0);
     }
 
-    public void setRefinementListener(LongConsumer listener) {
-        this.refinementListener = Objects.requireNonNull(listener, "listener");
-    }
-
-    public void setCoarseningListener(LongConsumer listener) {
-        this.coarseningListener = Objects.requireNonNull(listener, "listener");
+    public void setDetailActionListener(DetailActionListener listener) {
+        this.detailActionListener = Objects.requireNonNull(listener, "listener");
     }
 
     private void traverseInternal() {
@@ -340,36 +342,27 @@ public class HierarchicalOcclusionTraverser {
     }
 
 
-    private void downloadResetRequestQueue() {
+    private void downloadResetDetailActions() {
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        DownloadStream.INSTANCE.download(this.requestBuffer, this::forwardDownloadResult);
-        nglClearNamedBufferSubData(this.requestBuffer.id, GL_R32UI, 0, 8,
+        DownloadStream.INSTANCE.download(this.detailActionBuffer, this::forwardDownloadResult);
+        nglClearNamedBufferSubData(this.detailActionBuffer.id, GL_R32UI, 0,
+                DETAIL_BUCKET_COUNT * 4L,
                 GL_RED_INTEGER, GL_UNSIGNED_INT, 0);
     }
 
     private void forwardDownloadResult(long ptr, long size) {
-        int refinementCount = (int) Math.min(
-                Integer.toUnsignedLong(MemoryUtil.memGetInt(ptr)), MAX_REQUEST_QUEUE_SIZE);
-        int coarseningCount = (int) Math.min(
-                Integer.toUnsignedLong(MemoryUtil.memGetInt(ptr + 4)), MAX_COARSEN_QUEUE_SIZE);
-        long refinementPtr = ptr + 8;
-        if (refinementCount != 0) {
-            for (int index = 0; index < refinementCount; index++) {
-                long address = refinementPtr + (long) index * 8;
+        long actions = ptr + DETAIL_BUCKET_COUNT * 4L;
+        for (int bucket = 0; bucket < DETAIL_BUCKET_COUNT; bucket++) {
+            int count = (int) Math.min(Integer.toUnsignedLong(
+                    MemoryUtil.memGetInt(ptr + bucket * 4L)), ACTIONS_PER_BUCKET);
+            for (int index = 0; index < count; index++) {
+                long address = actions + ((long) bucket * ACTIONS_PER_BUCKET + index) * 16L;
                 long position = (long) MemoryUtil.memGetInt(address) << 32
                         | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
-                this.refinementListener.accept(position);
+                int action = MemoryUtil.memGetInt(address + 8);
+                int epoch = MemoryUtil.memGetInt(address + 12);
+                this.detailActionListener.accept(position, action, bucket, epoch);
             }
-            MemoryUtil.memPutInt(ptr, refinementCount);
-            this.nodeManager.submitRequestBatch(new MemoryBuffer(refinementCount * 8L + 8)
-                    .cpyFrom(ptr));
-        }
-        long coarseningPtr = refinementPtr + MAX_REQUEST_QUEUE_SIZE * 8L;
-        for (int index = 0; index < coarseningCount; index++) {
-            long address = coarseningPtr + (long) index * 8;
-            long position = (long) MemoryUtil.memGetInt(address) << 32
-                    | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
-            this.coarseningListener.accept(position);
         }
     }
 
@@ -379,7 +372,7 @@ public class HierarchicalOcclusionTraverser {
 
     public void free() {
         if (this.traversal != null) this.traversal.free();
-        this.requestBuffer.free();
+        this.detailActionBuffer.free();
         this.nodeBuffer.free();
         this.uniformBuffer.free();
         this.queueMetaBuffer.free();

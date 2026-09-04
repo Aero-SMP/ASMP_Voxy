@@ -149,7 +149,17 @@ bool isCulledByHiz() {
 
 
 
-//Returns if we should decend into its children or not
-bool shouldDecend() {
-    return _screenSize > minSSS;
+// Approximate the visible error removed by one subdivision in physical pixels. The score is
+// continuous; policy is applied by the CPU frontier after quantization, never as a quality slider.
+float projectedDetailScore() {
+    float diameterPixels = sqrt(max(_screenSize * viewportArea, 0.0f));
+    vec2 center = (_minBB.xy + _maxBB.xy) * 0.5f;
+    float centerBias = 1.0f - clamp(length(center - vec2(0.5f)) * 1.41421356f, 0.0f, 1.0f);
+    return diameterPixels * 0.5f * mix(1.0f, 1.25f, centerBias);
+}
+
+uint detailScoreBucket(float score) {
+    // Two buckets per doubling spans sub-pixel through full-screen improvements without
+    // collapsing most nearby terrain into the top bucket.
+    return uint(clamp(floor(log2(max(score, 1.0f)) * 2.0f), 0.0f, 31.0f));
 }

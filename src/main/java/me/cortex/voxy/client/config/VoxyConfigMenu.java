@@ -57,14 +57,6 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 value -> CFG.enableRendering = value, RENDERING, IRIS_RELOAD)
                 .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
 
-        var subdivisionSize = option(builder.createIntegerOption(id("subdivsize")),
-                "voxy.config.general.subDivisionSize", () -> subDiv2ln(CFG.subDivisionSize),
-                value -> CFG.subDivisionSize = ln2subDiv(value))
-                .setRange(new Range(0, SUBDIV_IN_MAX, 1))
-                .setValueFormatter(value -> Component.literal(Integer.toString(Math.round(ln2subDiv(value)))))
-                .setImpact(OptionImpact.HIGH)
-                .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
-
         var renderDistance = option(builder.createIntegerOption(RENDER_DISTANCE),
                 "voxy.config.general.renderDistance", () -> Math.round(CFG.sectionRenderDistance * 16),
                 value -> CFG.sectionRenderDistance = (float) value / 16, RENDER_DISTANCE)
@@ -131,7 +123,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
-                .addOptionGroup(group(builder, subdivisionSize, renderDistance, geometryMemory))
+                .addOptionGroup(group(builder, renderDistance, geometryMemory))
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
                 .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));
@@ -206,19 +198,6 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
 
     private static ResourceLocation id(String path) {
         return ResourceLocation.fromNamespaceAndPath("voxy", path);
-    }
-
-    private static final int SUBDIV_IN_MAX = 100;
-    private static final double SUBDIV_MIN = 28;
-    private static final double SUBDIV_MAX = 256;
-    private static final double SUBDIV_CONST = Math.log(SUBDIV_MAX / SUBDIV_MIN) / Math.log(2);
-
-    private static float ln2subDiv(int value) {
-        return (float) (SUBDIV_MIN * Math.pow(2, SUBDIV_CONST * ((double) value / SUBDIV_IN_MAX)));
-    }
-
-    private static int subDiv2ln(float value) {
-        return (int) ((Math.log((double) value / SUBDIV_MIN) / Math.log(2) / SUBDIV_CONST) * SUBDIV_IN_MAX);
     }
 
     private static final int[] GEOMETRY_MEMORY_MIB = {0, 256, 512, 768, 1024, 1536, 2048, 3072, 4096};

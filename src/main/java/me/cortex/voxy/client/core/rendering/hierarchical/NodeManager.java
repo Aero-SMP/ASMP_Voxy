@@ -1081,7 +1081,7 @@ public class NodeManager {
     }
 
     //==================================================================================================================
-    public void processRequest(long pos) {
+    private void processRequest(long pos) {
         int state = this.activeSectionMap.get(pos);
         if (state == -1) return;
         int nodeType = state & NODE_TYPE_MSK;

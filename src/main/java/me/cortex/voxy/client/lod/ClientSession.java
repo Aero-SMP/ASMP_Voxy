@@ -4,6 +4,7 @@ import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.core.rendering.SectionKey;
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.building.SectionMesher;
 import me.cortex.voxy.common.Logger;
@@ -89,14 +90,14 @@ final class ClientSession {
         if (current != null) current.demandEvents.add(new DemandEvent(false, key));
     }
 
-    static void refinementRequested(long parent) {
+    static void detailAction(long key, int action, int bucket, int epoch) {
         Session current = active;
-        if (current != null) current.enqueueRefinement(parent);
+        if (current != null) current.acceptDetailAction(key, action, bucket, epoch);
     }
 
-    static void coarseningRequested(long parent) {
+    static boolean detailPressure() {
         Session current = active;
-        if (current != null) current.enqueueCoarsening(parent);
+        return current != null && current.geometryAtTarget();
     }
 
     static void resetDemand() {
@@ -199,7 +200,7 @@ final class ClientSession {
 
     private enum Phase {
         NEW, WAITING, CACHE, NETWORK, REQUESTED, RECEIVED, DECODING, DECODED, MESHING,
-        PUBLISHING, ACTIVE
+        READY, PUBLISHING, ACTIVE
     }
 
     private static final class Demand {
@@ -216,10 +217,158 @@ final class ClientSession {
         byte[] received;
         boolean receivedFromCache;
         RenderAdmission renderAdmission;
+        BuiltSection completedGeometry;
+        long geometryBytes;
+        volatile int geometryAccountToken;
+        final AtomicBoolean geometryAccounted = new AtomicBoolean();
+        int latestRefinementEpoch = -1;
+        int latestCoarseningEpoch = -1;
+        boolean detailRejected;
+        long budgetBlockedSinceNanos;
 
         Demand(long key) {
             this.key = key;
             this.coverage = SectionKey.level(key) == SectionKey.MAX_LOD_LAYER;
+        }
+    }
+
+    /** One allocation-free, tagged handoff shared by both detail directions. */
+    private static final class DetailFrontier {
+        private static final int BUCKETS = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT;
+        private static final int CAPACITY = 32_768;
+        private static final int HASH_BUCKETS = 65_536;
+        private final long[] keys = new long[CAPACITY];
+        private final byte[] actions = new byte[CAPACITY];
+        private final byte[] buckets = new byte[CAPACITY];
+        private final int[] epochs = new int[CAPACITY];
+        private final int[] hashNext = new int[CAPACITY];
+        private final int[] priorityPrevious = new int[CAPACITY];
+        private final int[] priorityNext = new int[CAPACITY];
+        private final int[] freeNext = new int[CAPACITY];
+        private final int[] hashHeads = new int[HASH_BUCKETS];
+        private final int[] priorityHeads = new int[BUCKETS];
+        private final int[] priorityTails = new int[BUCKETS];
+        private final int[] prioritySizes = new int[BUCKETS];
+        private int nextUnused;
+        private int freeHead = -1;
+        private int total;
+        private long dropped;
+        long key;
+        int action;
+        int epoch;
+
+        DetailFrontier() { this.resetHeads(); }
+
+        synchronized boolean offer(long key, int action, int bucket, int epoch) {
+            if (action != HierarchicalOcclusionTraverser.ACTION_REFINE
+                    && action != HierarchicalOcclusionTraverser.ACTION_COARSEN_CANDIDATE) {
+                return false;
+            }
+            bucket = Math.max(0, Math.min(BUCKETS - 1, bucket));
+            int hash = hash(key);
+            for (int entry = this.hashHeads[hash]; entry != -1;
+                 entry = this.hashNext[entry]) {
+                if (this.keys[entry] != key) continue;
+                if (Integer.compareUnsigned(epoch, this.epochs[entry]) <= 0) return false;
+                int oldBucket = Byte.toUnsignedInt(this.buckets[entry]);
+                if (oldBucket != bucket) {
+                    this.unlinkPriority(entry, oldBucket);
+                    this.linkPriority(entry, bucket);
+                }
+                this.actions[entry] = (byte) action;
+                this.buckets[entry] = (byte) bucket;
+                this.epochs[entry] = epoch;
+                return true;
+            }
+            if (this.total == CAPACITY) {
+                this.dropped++;
+                return false;
+            }
+            int entry;
+            if (this.freeHead != -1) {
+                entry = this.freeHead;
+                this.freeHead = this.freeNext[entry];
+            } else {
+                entry = this.nextUnused++;
+            }
+            this.keys[entry] = key;
+            this.actions[entry] = (byte) action;
+            this.buckets[entry] = (byte) bucket;
+            this.epochs[entry] = epoch;
+            this.hashNext[entry] = this.hashHeads[hash];
+            this.hashHeads[hash] = entry;
+            this.linkPriority(entry, bucket);
+            this.total++;
+            return true;
+        }
+
+        synchronized boolean poll(int bucket) {
+            int entry = this.priorityHeads[bucket];
+            if (entry == -1) return false;
+            this.unlinkPriority(entry, bucket);
+            int hash = hash(this.keys[entry]);
+            int previous = -1;
+            for (int current = this.hashHeads[hash]; current != -1;
+                 current = this.hashNext[current]) {
+                if (current != entry) {
+                    previous = current;
+                    continue;
+                }
+                if (previous == -1) this.hashHeads[hash] = this.hashNext[current];
+                else this.hashNext[previous] = this.hashNext[current];
+                break;
+            }
+            this.key = this.keys[entry];
+            this.action = Byte.toUnsignedInt(this.actions[entry]);
+            this.epoch = this.epochs[entry];
+            this.freeNext[entry] = this.freeHead;
+            this.freeHead = entry;
+            this.total--;
+            return true;
+        }
+
+        private void linkPriority(int entry, int bucket) {
+            int tail = this.priorityTails[bucket];
+            this.priorityPrevious[entry] = tail;
+            this.priorityNext[entry] = -1;
+            if (tail == -1) this.priorityHeads[bucket] = entry;
+            else this.priorityNext[tail] = entry;
+            this.priorityTails[bucket] = entry;
+            this.prioritySizes[bucket]++;
+        }
+
+        private void unlinkPriority(int entry, int bucket) {
+            int previous = this.priorityPrevious[entry];
+            int next = this.priorityNext[entry];
+            if (previous == -1) this.priorityHeads[bucket] = next;
+            else this.priorityNext[previous] = next;
+            if (next == -1) this.priorityTails[bucket] = previous;
+            else this.priorityPrevious[next] = previous;
+            this.prioritySizes[bucket]--;
+        }
+
+        private static int hash(long key) {
+            long mixed = key ^ key >>> 33;
+            mixed *= 0xff51afd7ed558ccdl;
+            mixed ^= mixed >>> 33;
+            return (int) mixed & (HASH_BUCKETS - 1);
+        }
+
+        synchronized int size(int bucket) { return this.prioritySizes[bucket]; }
+        synchronized int size() { return this.total; }
+        synchronized long dropped() { return this.dropped; }
+        synchronized void clear() {
+            this.resetHeads();
+            java.util.Arrays.fill(this.prioritySizes, 0);
+            this.nextUnused = 0;
+            this.freeHead = -1;
+            this.total = 0;
+        }
+
+        private void resetHeads() {
+            java.util.Arrays.fill(this.hashHeads, -1);
+            java.util.Arrays.fill(this.priorityHeads, -1);
+            java.util.Arrays.fill(this.priorityTails, -1);
         }
     }
 
@@ -247,10 +396,7 @@ final class ClientSession {
         final AtomicBoolean open = new AtomicBoolean(true);
         final AtomicBoolean resetRequested = new AtomicBoolean();
         final ConcurrentLinkedQueue<DemandEvent> demandEvents = new ConcurrentLinkedQueue<>();
-        final ConcurrentLinkedQueue<Long> refinementEvents = new ConcurrentLinkedQueue<>();
-        final Set<Long> queuedRefinements = ConcurrentHashMap.newKeySet();
-        final ConcurrentLinkedQueue<Long> coarseningEvents = new ConcurrentLinkedQueue<>();
-        final Set<Long> queuedCoarsenings = ConcurrentHashMap.newKeySet();
+        final DetailFrontier frontier = new DetailFrontier();
         final ArrayBlockingQueue<Event> events = new ArrayBlockingQueue<>(MAX_EVENTS);
         final Semaphore wakeup = new Semaphore(0);
         final Semaphore sectionTaskSlots = new Semaphore(MAX_SECTION_TASKS);
@@ -268,11 +414,8 @@ final class ClientSession {
         final Map<Long, LinkedHashSet<Long>> demandsByRegion = new HashMap<>();
         final Map<Long, LinkedHashSet<Long>> demandsByTop = new HashMap<>();
         final Set<Long> missingCoverage = new HashSet<>();
-        final Set<Long> deferredRefinements = new LinkedHashSet<>();
         final Set<Long> coarseningRoots = new HashSet<>();
         final Object publicationLock = new Object();
-        final ArrayDeque<Long> refinementAdmissionQueue = new ArrayDeque<>();
-        final Set<Long> refinementAdmissionSet = new HashSet<>();
         final ArrayDeque<Long> coverageBindQueue = new ArrayDeque<>();
         final ArrayDeque<Long> refinementBindQueue = new ArrayDeque<>();
         final Set<Long> pendingBindSet = new HashSet<>();
@@ -283,6 +426,7 @@ final class ClientSession {
         final ArrayDeque<StageRef> refinementNetworkQueue = new ArrayDeque<>();
         final ArrayDeque<StageRef> decodeQueue = new ArrayDeque<>();
         final ArrayDeque<StageRef> meshQueue = new ArrayDeque<>();
+        final ArrayDeque<StageRef> readyPublicationQueue = new ArrayDeque<>();
         final ArrayDeque<PublicationRef> publicationQueue = new ArrayDeque<>();
 
         RegionalQuicClient quic;
@@ -301,6 +445,9 @@ final class ClientSession {
         long receivedBytes;
         long activated;
         int activeCount;
+        final AtomicLong completedGeometryBytes = new AtomicLong();
+        boolean detailCapacityRequired;
+        volatile int detailAdmissionFloor;
         volatile Throwable failure;
 
         Session(long id, String dimension, VoxyRenderSystem renderer) {
@@ -322,6 +469,12 @@ final class ClientSession {
         }
 
         void start() { this.thread.start(); }
+
+        void acceptDetailAction(long key, int action, int bucket, int epoch) {
+            if (action == HierarchicalOcclusionTraverser.ACTION_REFINE
+                    && bucket < this.detailAdmissionFloor) return;
+            if (this.frontier.offer(key, action, bucket, epoch)) this.signal();
+        }
 
         void run() {
             try {
@@ -511,9 +664,7 @@ final class ClientSession {
         void drainDemand() {
             if (this.resetRequested.getAndSet(false)) {
                 for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
-                this.deferredRefinements.clear();
-                this.refinementEvents.clear();
-                this.queuedRefinements.clear();
+                this.frontier.clear();
                 this.clearStageQueues();
             }
             DemandEvent event;
@@ -526,41 +677,123 @@ final class ClientSession {
                     if (owned != null) {
                         for (long key : List.copyOf(owned)) this.retireDemand(key);
                     }
-                    this.deferredRefinements.removeIf(parent -> topAncestor(parent) == top);
                 }
             }
-            Long coarsening;
-            while ((coarsening = this.coarseningEvents.poll()) != null) {
-                if (!hasTop(topAncestor(coarsening)) || !this.demands.containsKey(coarsening)
-                        || this.overlapsCoarsening(coarsening)) {
-                    this.queuedCoarsenings.remove(coarsening);
-                    continue;
-                }
-                this.coarsen(coarsening);
+            this.drainDetailFrontier();
+        }
+
+        void drainDetailFrontier() {
+            long retainedBytes = this.renderer.regionalGeometryUsedBytes()
+                    + this.completedGeometryBytes.get();
+            if (retainedBytes < this.geometryTargetBytes() * 3L / 4L) {
+                this.detailAdmissionFloor = 0;
             }
-            Long parent;
-            while ((parent = this.refinementEvents.poll()) != null) {
-                this.queuedRefinements.remove(parent);
-                if (!hasTop(topAncestor(parent))) continue;
-                if (this.isCoarsening(parent)) continue;
-                if (this.deferredRefinements.contains(parent)
-                        || this.refinementAdmissionSet.contains(parent)) continue;
-                if (this.indexFor(parent) == null) this.deferredRefinements.add(parent);
-                else if (!this.addChildren(parent)) this.deferRefinementAdmission(parent);
+            // Coverage retains its independent reserve; detail consumes only the remaining
+            // pipeline and the steady-state portion of the geometry arena.
+            for (int bucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
+                 bucket >= 0; bucket--) {
+                int remaining = this.frontier.size(bucket);
+                while (remaining-- > 0 && this.frontier.poll(bucket)) {
+                    long parent = this.frontier.key;
+                    int action = this.frontier.action;
+                    int epoch = this.frontier.epoch;
+                    if (action != HierarchicalOcclusionTraverser.ACTION_REFINE) {
+                        this.frontier.offer(parent, action, bucket, epoch);
+                        continue;
+                    }
+                    Demand demand = this.demands.get(parent);
+                    if (demand == null || demand.phase != Phase.ACTIVE
+                            || SectionKey.level(parent) == 0 || this.isCoarsening(parent)
+                            || demand.detailRejected
+                            || !newerEpoch(epoch, demand.latestRefinementEpoch)) continue;
+                    if (bucket < this.detailAdmissionFloor) {
+                        demand.latestRefinementEpoch = epoch;
+                        continue;
+                    }
+                    if (this.geometryAtTarget()) {
+                        this.detailCapacityRequired = true;
+                        this.frontier.offer(parent, action, bucket, epoch);
+                        break;
+                    }
+                    if (!this.hasPipelineHeadroom(false)
+                            || !this.hasRenderAdmissionHeadroom(false)) {
+                        this.frontier.offer(parent, action, bucket, epoch);
+                        break;
+                    }
+                    if (this.indexFor(parent) == null) {
+                        this.ensureRegion(parent);
+                        this.frontier.offer(parent, action, bucket, epoch);
+                        continue;
+                    }
+                    if (!this.addChildren(parent)) {
+                        this.frontier.offer(parent, action, bucket, epoch);
+                        break;
+                    }
+                    demand.latestRefinementEpoch = epoch;
+                }
+            }
+
+            boolean pressure = this.detailCapacityRequired || this.geometryAtTarget();
+            this.detailCapacityRequired = false;
+            if (!pressure) {
+                this.discardRetentionActions();
+                return;
+            }
+            if (!this.coarseningRoots.isEmpty()) return;
+            int started = 0;
+            int lastBucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
+            for (int bucket = 0; bucket <= lastBucket && started < 64; bucket++) {
+                int remaining = this.frontier.size(bucket);
+                while (remaining-- > 0 && started < 64 && this.frontier.poll(bucket)) {
+                    long parent = this.frontier.key;
+                    int action = this.frontier.action;
+                    int epoch = this.frontier.epoch;
+                    if (action != HierarchicalOcclusionTraverser.ACTION_COARSEN_CANDIDATE) {
+                        this.frontier.offer(parent, action, bucket, epoch);
+                        continue;
+                    }
+                    Demand demand = this.demands.get(parent);
+                    if (demand == null || demand.phase != Phase.ACTIVE
+                            || this.overlapsCoarsening(parent)
+                            || !newerEpoch(epoch, demand.latestCoarseningEpoch)
+                            || !hasDetailDescendants(parent)) continue;
+                    demand.latestCoarseningEpoch = epoch;
+                    if (pressure) {
+                        this.detailAdmissionFloor = Math.max(this.detailAdmissionFloor,
+                                Math.min(HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT,
+                                        bucket + 1));
+                    }
+                    this.coarsen(parent);
+                    started++;
+                }
+                // Reassess exact renderer usage after this lowest-priority batch crosses its
+                // fence instead of speculatively retiring successively more valuable buckets.
+                if (started != 0) break;
             }
         }
 
-        void enqueueRefinement(long parent) {
-            if (this.queuedRefinements.add(parent)) {
-                this.refinementEvents.add(parent);
+        void discardRetentionActions() {
+            for (int bucket = 0;
+                 bucket < HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT; bucket++) {
+                int remaining = this.frontier.size(bucket);
+                while (remaining-- > 0 && this.frontier.poll(bucket)) {
+                    if (this.frontier.action == HierarchicalOcclusionTraverser.ACTION_REFINE) {
+                        this.frontier.offer(this.frontier.key, this.frontier.action, bucket,
+                                this.frontier.epoch);
+                    }
+                }
             }
         }
 
-        void enqueueCoarsening(long parent) {
-            if (this.queuedCoarsenings.add(parent)) {
-                this.coarseningEvents.add(parent);
-                this.signal();
-            }
+        boolean hasDetailDescendants(long parent) {
+            Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
+            if (owned == null) return false;
+            for (long key : owned) if (key != parent && contains(parent, key)) return true;
+            return false;
+        }
+
+        static boolean newerEpoch(int candidate, int previous) {
+            return previous == -1 || Integer.compareUnsigned(candidate, previous) > 0;
         }
 
         void coarsen(long parent) {
@@ -574,7 +807,6 @@ final class ClientSession {
                         }
                     }
                 }
-                this.removeRefinementsBelow(parent);
                 this.publisher.coarsen(parent,
                         () -> this.putEvent(new Coarsened(parent)),
                         failure -> this.putEvent(new CoarsenFailed(parent, failure)));
@@ -584,6 +816,7 @@ final class ClientSession {
         void retireDetailDemand(long key) {
             Demand demand = this.demands.remove(key);
             if (demand == null || demand.coverage) return;
+            this.discardCompletedGeometry(demand);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
@@ -598,14 +831,6 @@ final class ClientSession {
             removeOwned(this.demandsByTop, topAncestor(key), key);
             this.pendingBindSet.remove(key);
             if (!this.demandsByRegion.containsKey(region)) this.releaseRegion(region);
-        }
-
-        void removeRefinementsBelow(long parent) {
-            this.deferredRefinements.removeIf(key -> contains(parent, key));
-            this.refinementAdmissionQueue.removeIf(key -> contains(parent, key));
-            this.refinementAdmissionSet.removeIf(key -> contains(parent, key));
-            this.refinementEvents.removeIf(key -> contains(parent, key));
-            this.queuedRefinements.removeIf(key -> contains(parent, key));
         }
 
         boolean isCoarsening(long key) {
@@ -624,7 +849,6 @@ final class ClientSession {
 
         void finishCoarsening(long parent) {
             this.coarseningRoots.remove(parent);
-            this.queuedCoarsenings.remove(parent);
         }
 
         void addDemand(long key) {
@@ -683,13 +907,6 @@ final class ClientSession {
                 if (ordinal < 0 || !index.isPresent(ordinal)) this.retireDemand(demand.key);
                 else this.bind(demand, index, ordinal);
             }
-            var deferred = this.deferredRefinements.iterator();
-            while (deferred.hasNext()) {
-                long parent = deferred.next();
-                if (regionFor(parent) != region) continue;
-                deferred.remove();
-                if (!this.addChildren(parent)) this.deferRefinementAdmission(parent);
-            }
         }
 
         void retireRegion(long region) {
@@ -701,6 +918,7 @@ final class ClientSession {
         void retireDemand(long key) {
             Demand demand = this.demands.get(key);
             if (demand == null) return;
+            this.discardCompletedGeometry(demand);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
             demand.received = null;
@@ -743,7 +961,7 @@ final class ClientSession {
 
         void bind(Demand demand, RegionalProtocol.RegionIndex index, int ordinal) {
             if (ordinal < 0 || !index.isPresent(ordinal)) return;
-            if (demand.phase == Phase.PUBLISHING) {
+            if (demand.phase == Phase.READY || demand.phase == Phase.PUBLISHING) {
                 demand.pendingIndex = index;
                 demand.pendingOrdinal = ordinal;
                 return;
@@ -758,6 +976,7 @@ final class ClientSession {
             }
             if (!index.isEmpty(ordinal) && this.cacheQueue.size() >= MAX_STAGE_QUEUE) {
                 if (demand.phase != Phase.ACTIVE) {
+                    this.discardCompletedGeometry(demand);
                     demand.token++;
                     this.releaseAdmission(demand, demand.renderAdmission);
                     demand.received = null;
@@ -772,6 +991,7 @@ final class ClientSession {
             demand.pendingIndex = null;
             demand.pendingOrdinal = -1;
             this.pendingBindSet.remove(demand.key);
+            this.discardCompletedGeometry(demand);
             demand.token++;
             this.releaseAdmission(demand, demand.renderAdmission);
             if (demand.phase == Phase.ACTIVE) {
@@ -780,6 +1000,7 @@ final class ClientSession {
             }
             demand.index = index;
             demand.ordinal = ordinal;
+            demand.detailRejected = false;
             demand.decoded = null;
             demand.received = null;
             if (demand.coverage) this.missingCoverage.add(demand.key);
@@ -797,12 +1018,12 @@ final class ClientSession {
             }
         }
 
-        void processStages() throws IOException {
+        void processStages() throws Exception {
+            this.scheduleReadyPublications();
             this.scheduleMeshing();
             this.scheduleDecoding();
             this.scheduleCache();
             this.admitPendingBinds();
-            this.admitDeferredRefinements();
             while (this.inFlightBatches < MAX_IN_FLIGHT_BATCHES) {
                 List<Demand> selected = this.selectNetworkBatch();
                 if (selected.isEmpty()) break;
@@ -832,33 +1053,6 @@ final class ClientSession {
             if (!this.pendingBindSet.add(demand.key)) return;
             (demand.coverage ? this.coverageBindQueue : this.refinementBindQueue)
                     .addLast(demand.key);
-        }
-
-        void admitDeferredRefinements() {
-            while (true) {
-                Long parent = this.refinementAdmissionQueue.peekFirst();
-                if (parent == null) return;
-                if (!hasTop(topAncestor(parent))) {
-                    this.refinementAdmissionQueue.removeFirst();
-                    this.refinementAdmissionSet.remove(parent);
-                    continue;
-                }
-                if (this.indexFor(parent) == null) {
-                    this.refinementAdmissionQueue.removeFirst();
-                    this.refinementAdmissionSet.remove(parent);
-                    this.deferredRefinements.add(parent);
-                    continue;
-                }
-                if (!this.addChildren(parent)) return;
-                this.refinementAdmissionQueue.removeFirst();
-                this.refinementAdmissionSet.remove(parent);
-            }
-        }
-
-        void deferRefinementAdmission(long parent) {
-            if (this.refinementAdmissionSet.add(parent)) {
-                this.refinementAdmissionQueue.addLast(parent);
-            }
         }
 
         void ensureRegion(long key) { this.queueRegion(regionFor(key)); }
@@ -1178,7 +1372,7 @@ final class ClientSession {
             }
         }
 
-        void acceptMeshed(MeshedResult result) throws InterruptedException {
+        void acceptMeshed(MeshedResult result) {
             Demand demand = this.demands.get(result.key);
             if (!current(demand, result.token, Phase.MESHING)
                     || demand.renderAdmission != result.admission) {
@@ -1186,37 +1380,138 @@ final class ClientSession {
                 result.admission.release();
                 return;
             }
-            demand.phase = Phase.PUBLISHING;
-            try {
-                enqueueMain(new PublishTask(this, demand, result.token, result.geometry,
-                        demand.publication, result.admission));
-            } catch (InterruptedException interrupted) {
-                result.geometry.free();
-                this.releaseAdmission(demand, result.admission);
-                throw interrupted;
-            }
+            this.completeGeometry(demand, result.geometry);
         }
 
         void publishEmpty(Demand demand, RenderAdmission admission) {
-            demand.phase = Phase.PUBLISHING;
             BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.token + 1L,
                     (byte) demand.index.childMask(demand.ordinal));
-            try {
-                enqueueMain(new PublishTask(this, demand, demand.token, empty,
-                        demand.publication, admission));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                empty.free();
-                this.releaseAdmission(demand, admission);
-                this.fail(interrupted);
+            this.completeGeometry(demand, empty);
+        }
+
+        void completeGeometry(Demand demand, BuiltSection geometry) {
+            if (!demand.geometryAccounted.compareAndSet(false, true)) {
+                geometry.free();
+                throw new IllegalStateException("regional geometry was completed twice");
             }
+            demand.completedGeometry = geometry;
+            demand.geometryBytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
+            demand.geometryAccountToken = demand.token;
+            this.completedGeometryBytes.addAndGet(demand.geometryBytes);
+            demand.phase = Phase.READY;
+            if (this.readyPublicationQueue.size() >= MAX_STAGE_QUEUE) {
+                this.discardCompletedGeometry(demand);
+                this.releaseAdmission(demand, demand.renderAdmission);
+                throw new IllegalStateException(
+                        "regional ready-publication queue exceeded its safety bound");
+            }
+            StageRef ref = new StageRef(demand.key, demand.token);
+            if (demand.coverage) this.readyPublicationQueue.addFirst(ref);
+            else this.readyPublicationQueue.addLast(ref);
+        }
+
+        void scheduleReadyPublications() throws InterruptedException {
+            int remaining = this.readyPublicationQueue.size();
+            while (remaining-- > 0) {
+                StageRef ref = this.readyPublicationQueue.pollFirst();
+                if (ref == null) return;
+                Demand demand = this.demands.get(ref.key);
+                if (!current(demand, ref.token, Phase.READY)
+                        || demand.completedGeometry == null) continue;
+                if (!demand.coverage && demand.geometryBytes > this.geometryTargetBytes()) {
+                    this.rejectOversizeDetail(demand);
+                    continue;
+                }
+                if (!demand.coverage && this.geometryWouldExceedTarget()) {
+                    this.detailCapacityRequired = true;
+                    long now = System.nanoTime();
+                    if (demand.budgetBlockedSinceNanos == 0) {
+                        demand.budgetBlockedSinceNanos = now;
+                    } else if (now - demand.budgetBlockedSinceNanos
+                            >= TimeUnit.SECONDS.toNanos(5) && this.coarseningRoots.isEmpty()) {
+                        this.rejectBudgetBlockedDetail(demand);
+                        continue;
+                    }
+                    this.readyPublicationQueue.addLast(ref);
+                    continue;
+                }
+                demand.budgetBlockedSinceNanos = 0;
+                BuiltSection geometry = demand.completedGeometry;
+                demand.completedGeometry = null;
+                demand.phase = Phase.PUBLISHING;
+                try {
+                    enqueueMain(new PublishTask(this, demand, ref.token, geometry,
+                            demand.publication, demand.renderAdmission));
+                } catch (InterruptedException interrupted) {
+                    geometry.free();
+                    this.releaseGeometryAccounting(demand, ref.token);
+                    this.releaseAdmission(demand, demand.renderAdmission);
+                    throw interrupted;
+                }
+            }
+        }
+
+        void rejectOversizeDetail(Demand demand) {
+            long bytes = demand.geometryBytes;
+            Logger.warn("Skipping regional detail group because one section requires " + bytes
+                    + " bytes but the detail target is " + this.geometryTargetBytes());
+            this.rejectDetailGroup(demand, true);
+        }
+
+        void rejectBudgetBlockedDetail(Demand demand) {
+            Logger.warn("Skipping regional detail group after no resident subtree could make "
+                    + demand.geometryBytes + " bytes fit within the geometry budget");
+            this.rejectDetailGroup(demand, false);
+        }
+
+        void rejectDetailGroup(Demand demand, boolean permanent) {
+            long parent = parent(demand.key);
+            Demand retained = this.demands.get(parent);
+            if (permanent && retained != null) retained.detailRejected = true;
+            this.discardCompletedGeometry(demand);
+            this.releaseAdmission(demand, demand.renderAdmission);
+            if (retained != null && retained.phase == Phase.ACTIVE
+                    && !this.overlapsCoarsening(parent) && this.hasDetailDescendants(parent)) {
+                this.coarsen(parent);
+            } else {
+                this.retireDetailDemand(demand.key);
+            }
+        }
+
+        long geometryTargetBytes() {
+            return this.renderer.regionalGeometryCapacityBytes() * 825L / 1_000L;
+        }
+
+        boolean geometryAtTarget() {
+            return this.renderer.regionalGeometryUsedBytes()
+                    + this.completedGeometryBytes.get() >= this.geometryTargetBytes();
+        }
+
+        boolean geometryWouldExceedTarget() {
+            return this.renderer.regionalGeometryUsedBytes()
+                    + this.completedGeometryBytes.get() > this.geometryTargetBytes();
+        }
+
+        void discardCompletedGeometry(Demand demand) {
+            BuiltSection geometry = demand.completedGeometry;
+            demand.completedGeometry = null;
+            if (geometry != null) geometry.free();
+            this.releaseGeometryAccounting(demand, demand.geometryAccountToken);
+        }
+
+        void releaseGeometryAccounting(Demand demand, int token) {
+            if (demand.geometryAccountToken != token
+                    || !demand.geometryAccounted.compareAndSet(true, false)) return;
+            this.completedGeometryBytes.addAndGet(-demand.geometryBytes);
+            demand.geometryBytes = 0;
         }
 
         void acceptPublication(PublicationQueued result) throws IOException {
             Demand demand = this.demands.get(result.key);
-            if (!current(demand, result.token, Phase.PUBLISHING)
+            if (demand != result.demand || !current(demand, result.token, Phase.PUBLISHING)
                     || demand.renderAdmission != result.admission) {
                 if (!this.isCoarsening(result.key)) result.publication.close();
+                this.releaseGeometryAccounting(result.demand, result.token);
                 result.admission.release();
                 return;
             }
@@ -1243,6 +1538,7 @@ final class ClientSession {
                 }
                 Optional<Throwable> failure = demand.publication.activationFailure();
                 if (failure.isPresent()) {
+                    this.releaseGeometryAccounting(demand, ref.token);
                     this.releaseAdmission(demand, ref.admission);
                     throw new IOException("regional renderer publication failed",
                             failure.orElseThrow());
@@ -1256,6 +1552,7 @@ final class ClientSession {
                 if (demand.coverage) this.missingCoverage.remove(demand.key);
                 demand.decoded = null;
                 this.activated++;
+                this.releaseGeometryAccounting(demand, ref.token);
                 this.releaseAdmission(demand, ref.admission);
                 if (demand.pendingIndex != null) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
@@ -1329,12 +1626,11 @@ final class ClientSession {
             this.refinementNetworkQueue.clear();
             this.decodeQueue.clear();
             this.meshQueue.clear();
+            this.readyPublicationQueue.clear();
             PublicationRef publication;
             while ((publication = this.publicationQueue.pollFirst()) != null) {
                 publication.admission.release();
             }
-            this.refinementAdmissionQueue.clear();
-            this.refinementAdmissionSet.clear();
             this.coverageBindQueue.clear();
             this.refinementBindQueue.clear();
             this.pendingBindSet.clear();
@@ -1369,9 +1665,16 @@ final class ClientSession {
                     + " coarsening=" + this.coarseningRoots.size()
                     + " batches=" + this.inFlightBatches + " inFlightBytes=" + this.inFlightBytes
                     + " renderPending=" + this.renderAdmissions.size()
+                    + " detailFrontier=" + this.frontier.size()
+                    + " detailFloor=" + this.detailAdmissionFloor
+                    + " detailDropped=" + this.frontier.dropped()
                     + " coverageMissing=" + this.missingCoverage.size()
                     + " meshQueue=" + this.meshQueue.size()
+                    + " readyQueue=" + this.readyPublicationQueue.size()
                     + " publishQueue=" + this.publicationQueue.size()
+                    + " geometryUsed=" + this.renderer.regionalGeometryUsedBytes()
+                    + " geometryCompleted=" + this.completedGeometryBytes.get()
+                    + " geometryTarget=" + this.geometryTargetBytes()
                     + " received=" + this.receivedBytes
                     + " failure=" + String.valueOf(this.failure);
         }
@@ -1391,6 +1694,7 @@ final class ClientSession {
             this.codec.close();
             if (this.cache != null) this.cache.close();
             for (Demand demand : this.demands.values()) {
+                this.discardCompletedGeometry(demand);
                 if (demand.publication != null) demand.publication.close();
             }
             Event event;
@@ -1403,12 +1707,8 @@ final class ClientSession {
             this.demandsByTop.clear();
             this.missingCoverage.clear();
             this.subscribedRegions.clear();
-            this.refinementEvents.clear();
-            this.queuedRefinements.clear();
-            this.coarseningEvents.clear();
-            this.queuedCoarsenings.clear();
+            this.frontier.clear();
             this.coarseningRoots.clear();
-            this.deferredRefinements.clear();
             this.clearStageQueues();
         }
     }
@@ -1431,7 +1731,7 @@ final class ClientSession {
                                  RegionalSectionCodec.SectionData section) implements Event {}
     private record MeshedResult(long key, int token, BuiltSection geometry,
                                 RenderAdmission admission) implements Event {}
-    private record PublicationQueued(long key, int token,
+    private record PublicationQueued(Session owner, Demand demand, long key, int token,
                                      VoxyRenderSystem.SectionPublication publication,
                                      RenderAdmission admission)
             implements Event {}
@@ -1475,6 +1775,7 @@ final class ClientSession {
                         || this.demand.phase != Phase.PUBLISHING
                         || this.demand.renderAdmission != this.admission) {
                     this.geometry.free();
+                    this.owner.releaseGeometryAccounting(this.demand, this.token);
                     this.admission.release();
                     return;
                 }
@@ -1484,11 +1785,12 @@ final class ClientSession {
                                 && this.demand.renderAdmission == this.admission
                                 && this.owner.open.get());
             }
-            this.owner.putEvent(new PublicationQueued(this.demand.key, this.token, publication,
-                    this.admission));
+            this.owner.putEvent(new PublicationQueued(this.owner, this.demand, this.demand.key,
+                    this.token, publication, this.admission));
         }
         @Override public void cancel() {
             this.geometry.free();
+            this.owner.releaseGeometryAccounting(this.demand, this.token);
             this.admission.release();
         }
     }
@@ -1499,6 +1801,7 @@ final class ClientSession {
             meshed.admission.release();
         } else if (event instanceof PublicationQueued queued) {
             queued.publication.close();
+            queued.owner.releaseGeometryAccounting(queued.demand, queued.token);
             queued.admission.release();
         }
     }
@@ -1537,6 +1840,12 @@ final class ClientSession {
         return SectionKey.pack(level, SectionKey.x(parent) * 2 + (child & 1),
                 SectionKey.y(parent) * 2 + (child >>> 2 & 1),
                 SectionKey.z(parent) * 2 + (child >>> 1 & 1));
+    }
+
+    private static long parent(long child) {
+        int level = SectionKey.level(child) + 1;
+        return SectionKey.pack(level, SectionKey.x(child) >> 1,
+                SectionKey.y(child) >> 1, SectionKey.z(child) >> 1);
     }
 
     private static boolean contains(long ancestor, long descendant) {

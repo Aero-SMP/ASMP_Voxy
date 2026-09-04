@@ -278,26 +278,6 @@ public class AsyncNodeManager {
             }
         }
 
-        while (true) {//Process all request batches
-            var job = this.requestBatchQueue.poll();
-            if (job == null)
-                break;
-            workDone++;
-            long ptr = job.address;
-            int count = MemoryUtil.memGetInt(ptr);
-            ptr += 8;//Its 8 to keep alignment
-            if (job.size < count * 8L + 8) {
-                throw new IllegalStateException();
-            }
-            for (int i = 0; i < count; i++) {
-                long pos = ((long) MemoryUtil.memGetInt(ptr)) << 32; ptr += 4;
-                pos |= Integer.toUnsignedLong(MemoryUtil.memGetInt(ptr)); ptr += 4;
-                this.manager.processRequest(pos);
-            }
-            job.free();
-            hierarchyAdvanced = true;
-        }
-
         // Coarsening frees geometry and must not wait behind publications which may require that
         // capacity. Its release transaction still crosses the normal GPU fence before storage is
         // reclaimed.
@@ -787,11 +767,10 @@ public class AsyncNodeManager {
         return this.currentMaxNodeId;
     }
 
-    private long usedGeometryAmount = 0;
+    private volatile long usedGeometryAmount = 0;
     //==================================================================================================================
     //Incoming events
 
-    private final ConcurrentLinkedDeque<MemoryBuffer> requestBatchQueue = new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RegionalSectionPublication> regionalSectionQueue =
             new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RendererTransaction> rendererTransactionQueue =
@@ -877,9 +856,12 @@ public class AsyncNodeManager {
         }
     }
 
-    public void submitRequestBatch(MemoryBuffer batch) {//Only called from render thread
-        this.requestBatchQueue.add(batch);
-        this.addWork();
+    public long geometryUsedBytes() {
+        return this.usedGeometryAmount;
+    }
+
+    public long geometryCapacityBytes() {
+        return this.geometryCapacity;
     }
 
     /**
@@ -958,12 +940,6 @@ public class AsyncNodeManager {
             }
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
-        }
-
-        while (true) {
-            var buffer = this.requestBatchQueue.poll();
-            if (buffer == null) break;
-            buffer.free();
         }
 
         while (true) {
