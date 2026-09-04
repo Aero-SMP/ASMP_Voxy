@@ -10,6 +10,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -37,9 +38,9 @@ final class ClientUpdateRestart {
             append(restartLog, "helper-start oldPid=" + oldPid);
             List<String> command = stabilizeLaunchFiles(
                     readCommand(commandFile), commandFile.getParent(), gameDirectory);
-            List<String> prismCommand = prismLauncherCommand(oldPid, command, gameDirectory);
-            boolean launcherDispatch = prismCommand != null;
-            if (launcherDispatch) command = prismCommand;
+            PrismLaunch prism = prismLauncherCommand(oldPid, command, gameDirectory);
+            boolean launcherDispatch = prism != null;
+            if (launcherDispatch) command = prism.command;
             Files.delete(commandFile);
             append(restartLog, "command-ready arguments=" + command.size()
                     + " launcherDispatch=" + launcherDispatch);
@@ -54,16 +55,16 @@ final class ClientUpdateRestart {
                     .start();
             append(restartLog, "new-process-started pid=" + launched.pid()
                     + " launcherDispatch=" + launcherDispatch);
-            try {
-                int exitCode = launched.onExit().get(45, TimeUnit.SECONDS).exitValue();
-                if (launcherDispatch && exitCode == 0) {
-                    append(restartLog, "launcher-dispatch-complete");
-                    return;
+            if (launcherDispatch) {
+                awaitPrismMinecraft(prism, launched, restartLog);
+            } else {
+                try {
+                    int exitCode = launched.onExit().get(45, TimeUnit.SECONDS).exitValue();
+                    throw new IOException("restarted Java process exited during startup: "
+                            + exitCode);
+                } catch (TimeoutException running) {
+                    append(restartLog, "new-process-alive-after-45-seconds");
                 }
-                throw new IOException("restarted Java process exited during startup: "
-                        + exitCode);
-            } catch (TimeoutException running) {
-                append(restartLog, "new-process-alive-after-45-seconds");
             }
         } catch (Throwable failure) {
             append(restartLog, "restart-failed type=" + failure.getClass().getName()
@@ -105,8 +106,8 @@ final class ClientUpdateRestart {
         return stable;
     }
 
-    private static List<String> prismLauncherCommand(long oldPid, List<String> command,
-                                                     Path gameDirectory) {
+    private static PrismLaunch prismLauncherCommand(long oldPid, List<String> command,
+                                                    Path gameDirectory) {
         if (!command.contains("org.prismlauncher.EntryPoint")) return null;
         String instance = prismInstanceId(gameDirectory);
         ProcessHandle process = ProcessHandle.of(oldPid).orElse(null);
@@ -121,11 +122,55 @@ final class ClientUpdateRestart {
                 Path name = path.getFileName();
                 if (name != null && name.toString().toLowerCase(java.util.Locale.ROOT)
                         .contains("prismlauncher")) {
-                    return List.of(path.toString(), "--launch", instance);
+                    HashSet<Long> existing = new HashSet<>();
+                    existing.add(process.pid());
+                    process.descendants().forEach(child -> existing.add(child.pid()));
+                    return new PrismLaunch(
+                            List.of(path.toString(), "--launch", instance), process, existing);
                 }
             } catch (RuntimeException ignored) {}
         }
         return null;
+    }
+
+    private static void awaitPrismMinecraft(PrismLaunch prism, Process dispatch,
+                                            Path restartLog)
+            throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        boolean dispatchComplete = false;
+        while (System.nanoTime() < deadline) {
+            if (!dispatch.isAlive() && !dispatchComplete) {
+                int exitCode = dispatch.exitValue();
+                if (exitCode != 0) {
+                    throw new IOException("Prism launcher dispatch failed: " + exitCode);
+                }
+                dispatchComplete = true;
+                append(restartLog, "launcher-dispatch-complete");
+            }
+            ProcessHandle minecraft = prism.launcher.descendants()
+                    .filter(process -> !prism.existingDescendants.contains(process.pid()))
+                    .filter(ClientUpdateRestart::isJavaProcess)
+                    .findFirst().orElse(null);
+            if (minecraft != null) {
+                append(restartLog, "prism-minecraft-started pid=" + minecraft.pid());
+                return;
+            }
+            Thread.sleep(250);
+        }
+        throw new IOException("Prism accepted the launch request but Minecraft did not start");
+    }
+
+    private static boolean isJavaProcess(ProcessHandle process) {
+        String command = process.info().command().orElse("");
+        try {
+            Path name = Path.of(command).getFileName();
+            if (name == null) return false;
+            String executable = name.toString().toLowerCase(java.util.Locale.ROOT);
+            return executable.equals("java") || executable.equals("java.exe")
+                    || executable.equals("javaw") || executable.equals("javaw.exe");
+        } catch (RuntimeException malformed) {
+            return false;
+        }
     }
 
     private static String prismInstanceId(Path gameDirectory) {
@@ -299,4 +344,7 @@ final class ClientUpdateRestart {
     private static boolean isWindows() {
         return java.io.File.separatorChar == '\\';
     }
+
+    private record PrismLaunch(List<String> command, ProcessHandle launcher,
+                               Set<Long> existingDescendants) {}
 }
