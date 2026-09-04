@@ -1518,8 +1518,8 @@ final class ClientSession {
                     case WorkerGeometry geometry -> {
                         Demand demand = this.currentWorkerDemand(geometry.ticket(), worker);
                         if (demand == null) {
-                            geometry.geometry().free();
                             worker.disownCompletion(geometry);
+                            geometry.geometry().free();
                             this.finishStaleWorker(geometry.ticket(), worker);
                             worker.releaseCompletion();
                             continue;
