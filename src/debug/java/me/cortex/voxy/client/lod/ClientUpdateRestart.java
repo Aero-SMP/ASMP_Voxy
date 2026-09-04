@@ -100,8 +100,14 @@ final class ClientUpdateRestart {
                                                   Path gameDirectory)
             throws IOException {
         int option = command.indexOf("--gameDir");
-        if (option < 0 || option + 1 >= command.size()) {
-            throw new IOException("Minecraft launch command omitted --gameDir");
+        // PrismLauncher commonly puts every Minecraft argument, including
+        // --gameDir, in an @argument file. stabilizeLaunchFiles() has already
+        // copied that file to updater-owned storage, and this exact command is
+        // known to have launched the running game. Only rewrite an explicit
+        // top-level option; its absence is therefore valid.
+        if (option < 0) return;
+        if (option + 1 >= command.size()) {
+            throw new IOException("Minecraft launch command has no --gameDir value");
         }
         int end = option + 2;
         while (end < command.size() && !command.get(end).startsWith("--")) end++;

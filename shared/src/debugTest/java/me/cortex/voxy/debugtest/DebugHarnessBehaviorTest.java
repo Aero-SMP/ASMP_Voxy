@@ -4,6 +4,11 @@ import io.netty.buffer.Unpooled;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 /** Dependency-free executable assertions for debug-only protocol and ownership primitives. */
@@ -17,6 +22,8 @@ public final class DebugHarnessBehaviorTest {
         yawWrapsAtTheSignedBoundary();
         cameraRequiresTwoConsecutiveFrames();
         latestSampleIsConstantSizeAndRejectsStaleCompletion();
+        prismArgumentFileLaunchIsAccepted();
+        explicitGameDirectoryIsCanonicalized();
         System.out.println("debug harness Java behavior tests passed");
     }
 
@@ -91,6 +98,39 @@ public final class DebugHarnessBehaviorTest {
         mailbox.clear();
         check(mailbox.complete(stale) == null, "stale completion mutated a new generation");
         check(mailbox.isIdle(), "cleared mailbox retained ownership");
+    }
+
+    private static void prismArgumentFileLaunchIsAccepted() {
+        ArrayList<String> command = new ArrayList<>(List.of("java", "@launch-arguments.txt"));
+        invokeGameDirectoryCanonicalization(command, Path.of("canonical-game"));
+        check(command.equals(List.of("java", "@launch-arguments.txt")),
+                "Prism argument-file launch was changed or rejected");
+    }
+
+    private static void explicitGameDirectoryIsCanonicalized() {
+        ArrayList<String> command = new ArrayList<>(List.of(
+                "java", "Main", "--gameDir", "old", "split-path", "--username", "test"));
+        invokeGameDirectoryCanonicalization(command, Path.of("canonical-game"));
+        check(command.equals(List.of(
+                        "java", "Main", "--gameDir", Path.of("canonical-game").toString(),
+                        "--username", "test")),
+                "explicit game directory was not canonicalized");
+    }
+
+    private static void invokeGameDirectoryCanonicalization(ArrayList<String> command,
+                                                            Path gameDirectory) {
+        try {
+            Class<?> helper = Class.forName(
+                    "me.cortex.voxy.client.lod.ClientUpdateRestart");
+            Method method = helper.getDeclaredMethod(
+                    "canonicalizeGameDirectory", ArrayList.class, Path.class);
+            method.setAccessible(true);
+            method.invoke(null, command, gameDirectory);
+        } catch (InvocationTargetException failure) {
+            throw new AssertionError("restart command was rejected", failure.getCause());
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("restart helper test could not run", failure);
+        }
     }
 
     private static RegistryFriendlyByteBuf buffer() {
