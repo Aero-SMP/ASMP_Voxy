@@ -11,7 +11,7 @@ public record DebugTestSnapshot(
         double playerX, double playerY, double playerZ,
         float playerYaw, float playerPitch,
         double cameraX, double cameraY, double cameraZ,
-        float cameraYaw, float cameraPitch,
+        float cameraYaw, float cameraPitch, boolean firstPerson,
         long sessionGeneration, long connectionEpoch,
         long rootGeneration, long publicationGeneration,
         int failureCode, long retryNanos,
@@ -30,6 +30,13 @@ public record DebugTestSnapshot(
     public static final long GEOMETRY_RETENTION_PRESENT = 1L << 2;
     public static final long GPU_COUNTERS_PRESENT = 1L << 3;
 
+    public static DebugTestSnapshot empty() {
+        return new DebugTestSnapshot(0, 0, 0, "", 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
     static DebugTestSnapshot decode(RegistryFriendlyByteBuf input) {
         long presence = input.readVarLong();
         long monotonicNanos = input.readVarLong();
@@ -41,6 +48,7 @@ public record DebugTestSnapshot(
         double cameraX = input.readDouble(), cameraY = input.readDouble();
         double cameraZ = input.readDouble();
         float cameraYaw = input.readFloat(), cameraPitch = input.readFloat();
+        boolean firstPerson = input.readBoolean();
         long sessionGeneration = input.readVarLong(), connectionEpoch = input.readVarLong();
         long rootGeneration = input.readVarLong(), publicationGeneration = input.readVarLong();
         int failureCode = input.readVarInt();
@@ -52,6 +60,7 @@ public record DebugTestSnapshot(
         return new DebugTestSnapshot(presence, monotonicNanos, renderedFrame, dimension,
                 playerX, playerY, playerZ, playerYaw, playerPitch,
                 cameraX, cameraY, cameraZ, cameraYaw, cameraPitch,
+                firstPerson,
                 sessionGeneration, connectionEpoch, rootGeneration, publicationGeneration,
                 failureCode, retryNanos, counters[0], counters[1], counters[2], counters[3],
                 counters[4], counters[5], counters[6], counters[7], counters[8], counters[9],
@@ -71,6 +80,7 @@ public record DebugTestSnapshot(
         output.writeFloat(this.playerPitch); output.writeDouble(this.cameraX);
         output.writeDouble(this.cameraY); output.writeDouble(this.cameraZ);
         output.writeFloat(this.cameraYaw); output.writeFloat(this.cameraPitch);
+        output.writeBoolean(this.firstPerson);
         output.writeVarLong(this.sessionGeneration); output.writeVarLong(this.connectionEpoch);
         output.writeVarLong(this.rootGeneration); output.writeVarLong(this.publicationGeneration);
         output.writeVarInt(this.failureCode); output.writeVarLong(this.retryNanos);

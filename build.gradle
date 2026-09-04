@@ -71,6 +71,11 @@ sourceSets {
         java.srcDirs = ['src/debug/java', 'shared/src/debug/java']
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
+    debugHarnessTest {
+        java.srcDirs = ['shared/src/debugTest/java']
+        compileClasspath += sourceSets.debug.output + sourceSets.debug.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
 }
 
 configurations {
@@ -199,4 +204,49 @@ tasks.register('buildAll') {
     group = 'build'
     description = 'Assemble normal/debug clients and normal/debug bundled server JARs'
     dependsOn tasks.named('jar'), tasks.named('debugJar'), ':server:jar', ':server:debugJar'
+}
+
+tasks.register('debugHarnessJavaTest', JavaExec) {
+    description = 'Run fixed-codec and bounded debug-harness ownership tests'
+    dependsOn tasks.named('debugHarnessTestClasses')
+    classpath = sourceSets.debugHarnessTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.debugtest.DebugHarnessBehaviorTest')
+}
+
+tasks.register('debugHarnessPythonTest', Exec) {
+    description = 'Run declarative live-test runner behavior tests'
+    commandLine 'python3', '-m', 'unittest', 'tools/test_run_live_client_test.py'
+}
+
+tasks.register('verifyDebugHarnessArtifacts') {
+    description = 'Prove test-control classes occur only in debug artifacts'
+    dependsOn tasks.named('buildAll')
+    doLast {
+        def forbiddenPrefix = 'me/cortex/voxy/debugtest/'
+        def clientNormal = tasks.named('jar', Jar).get().archiveFile.get().asFile
+        def clientDebug = tasks.named('debugJar', Jar).get().archiveFile.get().asFile
+        def serverNormal = project(':server').tasks.named('jar', Jar).get().archiveFile.get().asFile
+        def serverDebug = project(':server').tasks.named('debugJar', Jar).get().archiveFile.get().asFile
+        [clientNormal, serverNormal].each { artifact ->
+            def leaked = zipTree(artifact).matching { include forbiddenPrefix + '**' }.files
+            if (!leaked.empty) throw new GradleException("debug-test protocol leaked into ${artifact}")
+        }
+        [clientDebug, serverDebug].each { artifact ->
+            def protocol = zipTree(artifact).matching { include forbiddenPrefix + '**' }.files
+            if (protocol.empty) throw new GradleException("debug-test protocol missing from ${artifact}")
+        }
+        if (!zipTree(clientDebug).matching {
+            include 'me/cortex/voxy/client/lod/LiveClientTestHarness.class'
+        }.files.size()) throw new GradleException('debug client harness class is missing')
+        if (!zipTree(serverDebug).matching {
+            include 'me/cortex/voxy/server/LiveServerTestHarness.class'
+        }.files.size()) throw new GradleException('debug server harness class is missing')
+    }
+}
+
+tasks.register('testLiveHarness') {
+    group = 'verification'
+    description = 'Run all offline live-client harness gates'
+    dependsOn tasks.named('debugHarnessJavaTest'), tasks.named('debugHarnessPythonTest'),
+            tasks.named('verifyDebugHarnessArtifacts')
 }

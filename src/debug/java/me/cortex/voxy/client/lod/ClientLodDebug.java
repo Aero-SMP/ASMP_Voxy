@@ -62,14 +62,19 @@ public final class ClientLodDebug {
     static void init(IEventBus modBus) {
         if (initialized) return;
         initialized = true;
+        LiveClientTestHarness.register(modBus);
         NeoForge.EVENT_BUS.addListener(ClientLodDebug::forceFullSpeed);
+        NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, RenderFrameEvent.Post.class,
+                LiveClientTestHarness::renderFrame);
         NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, ScreenshotEvent.class,
                 ClientLodDebug::uploadScreenshot);
     }
 
     private static void uploadScreenshot(ScreenshotEvent event) {
         if (!event.isCanceled()) {
-            ClientAutoUpdater.queueScreenshot(event.getScreenshotFile().toPath());
+            if (!LiveClientTestHarness.claimScreenshot(event.getScreenshotFile().toPath())) {
+                ClientAutoUpdater.queueScreenshot(event.getScreenshotFile().toPath());
+            }
         }
     }
 
@@ -105,6 +110,7 @@ public final class ClientLodDebug {
 
     static void tick() {
         ClientAutoUpdater.tick();
+        LiveClientTestHarness.tick();
         long now = System.nanoTime();
         if (now < nextSampleNanos) return;
         nextSampleNanos = now + SAMPLE_INTERVAL_NANOS;
@@ -152,6 +158,17 @@ public final class ClientLodDebug {
                 + " selected=" + conservativeSelected + '/' + refinedSelected
                 + " draws=" + conservativeDraws + '/' + refinedDraws;
     }
+
+    static RenderCounters renderCounters() {
+        return new RenderCounters(renderFrame, geometrySections,
+                conservativeSelected, refinedSelected, conservativeDraws, refinedDraws,
+                Math.max(0, System.nanoTime() - nextRenderSampleNanos
+                        + SAMPLE_INTERVAL_NANOS));
+    }
+
+    record RenderCounters(int frame, int geometrySections, int conservativeSelected,
+                          int refinedSelected, int conservativeDraws, int refinedDraws,
+                          long ageNanos) {}
 
     private static void initializeLog(String version) {
         try {

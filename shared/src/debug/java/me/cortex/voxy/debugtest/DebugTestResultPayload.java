@@ -16,6 +16,10 @@ public record DebugTestResultPayload(
         long firstFrame,
         long lastFrame,
         long coalescedSamples,
+        long buildIdentity0,
+        long buildIdentity1,
+        long buildIdentity2,
+        long buildIdentity3,
         DebugTestSnapshot snapshot) implements CustomPacketPayload {
     public static final Type<DebugTestResultPayload> TYPE = new Type<>(
             DebugTestProtocol.RESULT_ID);
@@ -32,6 +36,7 @@ public record DebugTestResultPayload(
                             input.readUUID(), input.readVarLong(), input.readVarLong(),
                             DebugTestProtocol.Failure.fromWire(input.readUnsignedByte()),
                             input.readVarLong(), input.readVarLong(), input.readVarLong(),
+                            input.readLong(), input.readLong(), input.readLong(), input.readLong(),
                             DebugTestSnapshot.decode(input));
                 }
 
@@ -47,6 +52,10 @@ public record DebugTestResultPayload(
                     output.writeVarLong(payload.firstFrame);
                     output.writeVarLong(payload.lastFrame);
                     output.writeVarLong(payload.coalescedSamples);
+                    output.writeLong(payload.buildIdentity0);
+                    output.writeLong(payload.buildIdentity1);
+                    output.writeLong(payload.buildIdentity2);
+                    output.writeLong(payload.buildIdentity3);
                     payload.snapshot.encode(output);
                 }
             };

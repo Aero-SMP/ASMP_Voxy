@@ -1,0 +1,11 @@
+{
+  "name": "stable-view-loading",
+  "initial_pose": {"dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 0.0, "pitch": 0.0, "timeout_ms": 15000},
+  "steps": [
+    {"op": "trace", "duration_ms": 30000, "cadence_ms": 250},
+    {"op": "wait_until", "field": "coverageMissing", "comparison": "==", "value": 0, "timeout_ms": 120000, "cadence_ms": 250},
+    {"op": "checkpoint", "name": "settled"},
+    {"op": "assert", "field": "active", "comparison": ">", "value": 0},
+    {"op": "assert", "mode": "absence_of_failure"}
+  ]
+}

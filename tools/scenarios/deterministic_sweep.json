@@ -1,0 +1,14 @@
+{
+  "name": "deterministic-sweep",
+  "initial_pose": {"dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 0.0, "pitch": 0.0},
+  "steps": [
+    {"op": "checkpoint", "name": "before"},
+    {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 45.0, "pitch": -20.0},
+    {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 135.0, "pitch": 20.0},
+    {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 225.0, "pitch": -20.0},
+    {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 315.0, "pitch": 20.0},
+    {"op": "trace", "duration_ms": 10000, "cadence_ms": 200},
+    {"op": "checkpoint", "name": "after"},
+    {"op": "assert", "mode": "absence_of_failure"}
+  ]
+}

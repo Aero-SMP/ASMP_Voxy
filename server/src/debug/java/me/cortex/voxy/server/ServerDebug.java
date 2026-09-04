@@ -16,6 +16,7 @@ final class ServerDebug {
         String version = VoxyServer.class.getPackage().getImplementationVersion();
         LOGGER.info("Voxy version {} role=server debug=true",
                 version == null ? "<UNKNOWN>" : version);
+        LiveServerTestHarness.register(modBus);
     }
 
     static void rustStarting() {

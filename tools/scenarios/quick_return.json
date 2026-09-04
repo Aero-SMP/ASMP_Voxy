@@ -1,0 +1,14 @@
+{
+  "name": "quick-return",
+  "initial_pose": {"dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 0.0, "pitch": 0.0},
+  "steps": [
+    {"op": "wait_until", "field": "coverageMissing", "comparison": "==", "value": 0, "timeout_ms": 120000},
+    {"op": "checkpoint", "name": "a_before"},
+    {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 180.0, "pitch": 0.0},
+    {"op": "hold", "duration_ms": 5000, "cadence_ms": 200},
+    {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 0.0, "pitch": 0.0},
+    {"op": "hold", "duration_ms": 5000, "cadence_ms": 200},
+    {"op": "checkpoint", "name": "a_return"},
+    {"op": "assert", "mode": "absence_of_failure"}
+  ]
+}

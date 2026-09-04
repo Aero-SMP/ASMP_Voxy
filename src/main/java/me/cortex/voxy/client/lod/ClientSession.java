@@ -43,6 +43,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 /**
  * Current regional client. Every entry is one spatial section and moves monotonically through
@@ -112,6 +113,28 @@ final class ClientSession {
         Session current = active;
         return current == null ? "regional=DISCONNECTED" : current.snapshot();
     }
+
+    /** Debug harness handoff. The real owner thread creates the observation without blocking. */
+    static boolean requestDebugSnapshot(Consumer<PipelineSnapshot> receiver) {
+        Objects.requireNonNull(receiver, "snapshot receiver");
+        Session current = active;
+        if (current == null || !current.open.get()) return false;
+        boolean accepted = current.events.offer(new SnapshotRequest(receiver));
+        if (accepted) current.signal();
+        return accepted;
+    }
+
+    record PipelineSnapshot(
+            long sessionGeneration, long connectionEpoch, long rootGeneration,
+            boolean failed, long retryNanos, long coverageMissing, long requested,
+            long downloading, long cacheReading, long decoding, long meshing,
+            long ready, long publishing, long active, long networkBytes,
+            long completedBatches, long cacheHits, long cacheMisses, long cacheReads,
+            long cacheBytes, long decodedTotal, long meshedTotal, long uploadedTotal,
+            long activatedTotal, long retiredTotal, long selectedBytes,
+            long warmBytes, long coldBytes, long pendingRetirementBytes,
+            long physicalGeometryBytes, long rendererTargetBytes,
+            long rendererAllocatedBytes) {}
 
     static void tick() {
         Minecraft minecraft = Minecraft.getInstance();
@@ -482,6 +505,9 @@ final class ClientSession {
         long requestEpoch = 1;
         long receivedBytes;
         long activated;
+        long completedBatches;
+        long cacheHits, cacheMisses, cacheReads, cacheBytes;
+        long decodedSections, meshedSections, uploadedSections, retiredSections;
         long activeGeometryBytes;
         long dormantGeometryBytes;
         long pendingDormantEvictionBytes;
@@ -690,6 +716,12 @@ final class ClientSession {
                     case CacheResult result -> {
                         this.cacheLookupsInFlight = Math.max(0,
                                 this.cacheLookupsInFlight - 1);
+                        this.cacheReads++;
+                        if (result.compressed == null) this.cacheMisses++;
+                        else {
+                            this.cacheHits++;
+                            this.cacheBytes += result.compressed.length;
+                        }
                         this.acceptCache(result);
                     }
                     case CacheCorrupt corrupt -> {
@@ -699,15 +731,20 @@ final class ClientSession {
                     case SectionResult result -> this.acceptSection(result.reply);
                     case DecodedResult result -> {
                         this.decodesInFlight = Math.max(0, this.decodesInFlight - 1);
+                        this.decodedSections++;
                         this.acceptDecoded(result);
                     }
-                    case MeshedResult result -> this.acceptMeshed(result);
+                    case MeshedResult result -> {
+                        this.meshedSections++;
+                        this.acceptMeshed(result);
+                    }
                     case Coarsened result -> this.finishCoarsening(result.parent, true);
                     case CoarsenFailed failed -> {
                         this.finishCoarsening(failed.parent, false);
                         throw new IOException("regional subtree coarsening failed", failed.failure);
                     }
                     case BatchComplete complete -> {
+                        this.completedBatches++;
                         this.inFlightBatches = Math.max(0, this.inFlightBatches - 1);
                         this.inFlightSections = Math.max(0,
                                 this.inFlightSections - complete.sectionCount);
@@ -716,8 +753,41 @@ final class ClientSession {
                     }
                     case WorkerFailed failed -> throw new IOException(
                             "regional section worker failed", failed.failure);
+                    case SnapshotRequest request -> request.receiver.accept(this.pipelineSnapshot());
                 }
             }
+        }
+
+        PipelineSnapshot pipelineSnapshot() {
+            long downloading = 0, cacheReading = 0, decoding = 0, meshing = 0;
+            long ready = 0, publishing = 0;
+            for (Demand demand : this.demands.values()) {
+                switch (demand.phase) {
+                    case NETWORK, REQUESTED, RECEIVED -> downloading++;
+                    case CACHE -> cacheReading++;
+                    case DECODING, DECODED -> decoding++;
+                    case MESHING -> meshing++;
+                    case READY -> ready++;
+                    case PUBLISHING -> publishing++;
+                    default -> {}
+                }
+            }
+            long newestRoot = 0;
+            for (long generation : this.regionGenerations.values()) {
+                newestRoot = Math.max(newestRoot, generation);
+            }
+            long retry = Math.max(0, retryAfter - System.nanoTime());
+            return new PipelineSnapshot(this.id, this.requestEpoch, newestRoot,
+                    this.failure != null, retry, this.missingCoverage.size(), this.demands.size(),
+                    downloading, cacheReading, decoding, meshing, ready, publishing,
+                    this.activeCount, this.receivedBytes, this.completedBatches,
+                    this.cacheHits, this.cacheMisses, this.cacheReads, this.cacheBytes,
+                    this.decodedSections, this.meshedSections, this.uploadedSections,
+                    this.activated, this.retiredSections, this.selectedGeometryBytes(),
+                    this.dormantGeometryBytes, 0, this.pendingDormantEvictionBytes,
+                    this.renderer.regionalGeometryUsedBytes(),
+                    this.renderer.regionalGeometryPublicationLimitBytes(),
+                    this.renderer.regionalGeometryUsedBytes());
         }
 
         void drainDemand() {
@@ -1896,6 +1966,7 @@ final class ClientSession {
                 if (demand.coverage) this.missingCoverage.remove(demand.key);
                 demand.decoded = null;
                 this.activated++;
+                this.uploadedSections++;
                 this.releaseAllGeometryAccounting(demand, ref.token);
                 this.releaseAdmission(demand, ref.admission);
                 if (demand.pendingIndex != null) {
@@ -2107,7 +2178,7 @@ final class ClientSession {
 
     private sealed interface Event permits CatalogReady, IndexReady, CacheResult, CacheCorrupt,
             SectionResult, DecodedResult, MeshedResult, Coarsened,
-            CoarsenFailed, BatchComplete, WorkerFailed {}
+            CoarsenFailed, BatchComplete, WorkerFailed, SnapshotRequest {}
     private record CatalogReady(RegionalProtocol.Hash32 fingerprint,
                                 RegionalSectionCodec.Mappings mappings) implements Event {}
     private record IndexReady(RegionalProtocol.RegionMessage message,
@@ -2123,6 +2194,7 @@ final class ClientSession {
     private record CoarsenFailed(long parent, Throwable failure) implements Event {}
     private record BatchComplete(long reservedBytes, int sectionCount) implements Event {}
     private record WorkerFailed(Throwable failure) implements Event {}
+    private record SnapshotRequest(Consumer<PipelineSnapshot> receiver) implements Event {}
 
     private record CatalogTask(Session owner, CatalogCodec.Catalog catalog,
                                RegionalProtocol.Hash32 fingerprint) {

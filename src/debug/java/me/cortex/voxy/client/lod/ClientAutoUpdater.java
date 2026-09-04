@@ -29,6 +29,7 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.jar.JarFile;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -54,7 +55,7 @@ final class ClientAutoUpdater {
             "^ASMP_voxy-([0-9A-Za-z][0-9A-Za-z.-]*)\\+([0-9.]+)-neoforge-debug\\.jar$");
     private static final Pattern VERSION_TOKEN = Pattern.compile("[0-9]+|[A-Za-z]+");
     private static final AtomicBoolean STARTED = new AtomicBoolean();
-    private static final ArrayBlockingQueue<Path> SCREENSHOT_QUEUE =
+    private static final ArrayBlockingQueue<ScreenshotUpload> SCREENSHOT_QUEUE =
             new ArrayBlockingQueue<>(SCREENSHOT_QUEUE_CAPACITY);
     private static volatile boolean readyToConnect;
     private static volatile boolean restartPending;
@@ -150,31 +151,38 @@ final class ClientAutoUpdater {
     }
 
     static void queueScreenshot(Path screenshot) {
+        queueScreenshot(screenshot, ignored -> {});
+    }
+
+    static void queueScreenshot(Path screenshot, Consumer<Boolean> completion) {
         Path absolute = screenshot.toAbsolutePath().normalize();
-        if (SCREENSHOT_QUEUE.offer(absolute)) {
+        ScreenshotUpload upload = new ScreenshotUpload(absolute, completion);
+        if (SCREENSHOT_QUEUE.offer(upload)) {
             ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_QUEUED file="
                     + oneLine(screenshotName(absolute)) + " queued="
                     + SCREENSHOT_QUEUE.size());
         } else {
             ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_FAILED reason=QUEUE_FULL file="
                     + oneLine(screenshotName(absolute)));
+            completion.accept(false);
         }
     }
 
     private static void runScreenshotUploader() {
         while (true) {
-            Path screenshot;
+            ScreenshotUpload upload;
             try {
-                screenshot = SCREENSHOT_QUEUE.take();
+                upload = SCREENSHOT_QUEUE.take();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return;
             }
-            uploadScreenshot(screenshot);
+            uploadScreenshot(upload);
         }
     }
 
-    private static void uploadScreenshot(Path screenshot) {
+    private static void uploadScreenshot(ScreenshotUpload upload) {
+        Path screenshot = upload.path();
         Exception lastFailure = null;
         for (int attempt = 1; attempt <= SCREENSHOT_UPLOAD_ATTEMPTS; attempt++) {
             String temporary = REMOTE_SCREENSHOTS + "/.voxy-upload-"
@@ -182,12 +190,12 @@ final class ClientAutoUpdater {
             try {
                 waitForStableScreenshot(screenshot);
                 ensureScreenshotDirectory();
-                CommandResult upload = run(Duration.ofSeconds(90), scpExecutable(),
+                CommandResult transfer = run(Duration.ofSeconds(90), scpExecutable(),
                         "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
                         screenshot.toString(), SSH_TARGET + ':' + temporary);
-                if (upload.exitCode != 0) {
-                    throw new IOException("scp failed (exit " + upload.exitCode + "): "
-                            + oneLine(upload.output));
+                if (transfer.exitCode != 0) {
+                    throw new IOException("scp failed (exit " + transfer.exitCode + "): "
+                            + oneLine(transfer.output));
                 }
 
                 String destination = REMOTE_SCREENSHOTS + '/'
@@ -207,11 +215,13 @@ final class ClientAutoUpdater {
                 ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOADED file="
                         + oneLine(screenshotName(screenshot)) + " attempt=" + attempt);
                 cleanupAutomaticScreenshot(screenshot);
+                upload.completion().accept(true);
                 return;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 ClientLodDebug.updaterEvent("state=SCREENSHOT_UPLOAD_FAILED reason=INTERRUPTED file="
                         + oneLine(screenshotName(screenshot)));
+                upload.completion().accept(false);
                 return;
             } catch (Exception failure) {
                 lastFailure = failure;
@@ -236,6 +246,13 @@ final class ClientAutoUpdater {
                 + SCREENSHOT_UPLOAD_ATTEMPTS + " type="
                 + lastFailure.getClass().getSimpleName() + " message="
                 + oneLine(lastFailure.getMessage()));
+        upload.completion().accept(false);
+    }
+
+    private record ScreenshotUpload(Path path, Consumer<Boolean> completion) {
+        private ScreenshotUpload {
+            if (path == null || completion == null) throw new NullPointerException();
+        }
     }
 
     private static void cleanupAutomaticScreenshot(Path screenshot) {
