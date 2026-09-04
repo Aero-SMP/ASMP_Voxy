@@ -754,7 +754,10 @@ final class ClientSession {
                     this.detailAdmissionFloor = Math.max(this.detailAdmissionFloor, bucket + 1);
                     selected += reclaimable;
                 }
-                if (selected >= required) break;
+                // Do not speculate into a more valuable bucket using pre-fence byte estimates.
+                // Let the selected lowest-value subtrees cross their renderer fences, then use
+                // the authoritative arena usage to decide whether another bucket is necessary.
+                if (selected != 0) break;
             }
         }
 
