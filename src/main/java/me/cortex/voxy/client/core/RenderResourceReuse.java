@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core;
 
 import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.config.GeometryMemoryOptions;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
@@ -108,25 +109,22 @@ public class RenderResourceReuse {
 
     public static long getGeometryBufferSize() {
         int requestedMib = VoxyConfig.CONFIG.geometryMemoryMib;
-        if (requestedMib > 0) {
-            long requested = requestedMib * MIB;
-            long limit = getSafeGeometryMemoryLimitBytes();
-            if (Capabilities.INSTANCE.canQueryGpuMemory) {
-                long free = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
-                long safeAvailable = free - (1536L * MIB);
-                if (safeAvailable <= 0) safeAvailable = Math.max(64L * MIB, free / 2);
-                limit = Math.min(limit, safeAvailable);
-            }
-            long alignment = Math.max(1024, Capabilities.INSTANCE.ssboBindingAlignment);
-            long capacity = Math.max(alignment, Math.min(requested, limit));
-            capacity -= capacity % alignment;
-            if (capacity != requested) {
-                Logger.warn("Clamped requested geometry buffer from " + requested + " to " + capacity + " bytes");
-            }
-            return capacity;
+        long limit = getSafeGeometryMemoryLimitBytes();
+        if (requestedMib <= 0) requestedMib = GeometryMemoryOptions.maximum(limit);
+        long requested = requestedMib * MIB;
+        if (Capabilities.INSTANCE.canQueryGpuMemory) {
+            long free = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
+            long safeAvailable = free - (1536L * MIB);
+            if (safeAvailable <= 0) safeAvailable = Math.max(64L * MIB, free / 2);
+            limit = Math.min(limit, safeAvailable);
         }
-
-        return getAutomaticGeometryBufferSize();
+        long alignment = Math.max(1024, Capabilities.INSTANCE.ssboBindingAlignment);
+        long capacity = Math.max(alignment, Math.min(requested, limit));
+        capacity -= capacity % alignment;
+        if (capacity != requested) {
+            Logger.warn("Clamped requested geometry buffer from " + requested + " to " + capacity + " bytes");
+        }
+        return capacity;
     }
 
     public static long getSafeGeometryMemoryLimitBytes() {
@@ -140,38 +138,6 @@ public class RenderResourceReuse {
         }
         return alignDown(Math.max(Math.min(MINIMUM_GEOMETRY_CAPACITY,
                 Math.min(Capabilities.INSTANCE.ssboMaxSize, MAX_ADDRESSABLE_GEOMETRY)), limit));
-    }
-
-    public static long getAutomaticGeometryBufferSize() {
-        long geometryCapacity = Math.min((1L<<(64-Long.numberOfLeadingZeros(Capabilities.INSTANCE.ssboMaxSize-1)))<<1, 1L<<32)-1024/*(1L<<32)-1024*/;
-        if (Capabilities.INSTANCE.isIntel) {
-            geometryCapacity = Math.max(geometryCapacity, 1L<<30);//intel moment, force min 1gb
-        }
-        if (Capabilities.INSTANCE.isNvidia && Capabilities.INSTANCE.isLinux) {
-            geometryCapacity = Math.min(geometryCapacity, 2000L*1024L*1024L);//nvidia linux moment, force max 2gb heap
-        }
-
-        geometryCapacity = Math.max(512*1024*1024, geometryCapacity);//min of 512 mb
-
-        // Sparse buffers reserve virtual address space and commit pages on demand. A non-sparse
-        // buffer is physical VRAM immediately, so reserving the same 4 GiB would waste memory and
-        // can terminate the client before Voxy has uploaded meaningful geometry.
-        boolean allocateSparseInitially = Capabilities.INSTANCE.isNvidia
-                && Capabilities.INSTANCE.isWindows && Capabilities.INSTANCE.sparseBuffer;
-        if (!allocateSparseInitially) {
-            geometryCapacity = Math.min(geometryCapacity, 512L*1024L*1024L);
-        }
-
-        //Limit to available dedicated memory if possible
-        if (Capabilities.INSTANCE.canQueryGpuMemory) {
-            //512mb less than avalible,
-            long limit = Capabilities.INSTANCE.getFreeDedicatedGpuMemory() - (long)(1.5*1024*1024*1024);//1.5gb vram buffer
-            // Give a minimum of 512 mb requirement
-            limit = Math.max(512*1024*1024, limit);
-
-            geometryCapacity = Math.min(geometryCapacity, limit);
-        }
-        return alignDown(Math.min(geometryCapacity, getSafeGeometryMemoryLimitBytes()));
     }
 
     private static long alignDown(long bytes) {

@@ -22,7 +22,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 
-import java.util.Arrays;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -68,7 +67,8 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setImpact(OptionImpact.MEDIUM)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
-        int[] geometryMemoryChoices = geometryMemoryChoices();
+        int[] geometryMemoryChoices = GeometryMemoryOptions.available(
+                RenderResourceReuse.getSafeGeometryMemoryLimitBytes());
         Logger.info("GPU Memory slider maximum is "
                 + geometryMemoryChoices[geometryMemoryChoices.length - 1] + " MiB");
         var geometryMemory = option(builder.createIntegerOption(GEOMETRY_MEMORY),
@@ -207,28 +207,9 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         return ResourceLocation.fromNamespaceAndPath("voxy", path);
     }
 
-    private static final int[] GEOMETRY_MEMORY_MIB = {
-            256, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192,
-            12 * 1024, 16 * 1024, 20 * 1024, 24 * 1024, 28 * 1024
-    };
-
-    private static int[] geometryMemoryChoices() {
-        long maximumBytes = RenderResourceReuse.getSafeGeometryMemoryLimitBytes();
-        long maximumMib = (maximumBytes + 1024L * 1024L - 1) / (1024L * 1024L);
-        int count = 0;
-        for (int mib : GEOMETRY_MEMORY_MIB) {
-            if (mib <= maximumMib) count++;
-        }
-        // All supported GPUs should admit 256 MiB. Retaining one clamped entry is
-        // safer than constructing an invalid zero-length slider on a broken driver.
-        if (count == 0) count = 1;
-        return Arrays.copyOf(GEOMETRY_MEMORY_MIB, count);
-    }
-
     private static int effectiveConfiguredGeometryMemoryMib() {
         if (CFG.geometryMemoryMib > 0) return CFG.geometryMemoryMib;
-        long automaticBytes = RenderResourceReuse.getAutomaticGeometryBufferSize();
-        return (int) Math.max(1, automaticBytes / (1024L * 1024L));
+        return GeometryMemoryOptions.maximum(RenderResourceReuse.getSafeGeometryMemoryLimitBytes());
     }
 
     private static int geometryMemoryIndex(int configuredMib, int[] choices) {
