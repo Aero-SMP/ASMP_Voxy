@@ -37,8 +37,9 @@ const SERVICE_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 // This stream carries bulk region indexes as well as controls. Strict precedence
 // over terrain starves downloads during a large cold-cache discovery sweep. Let
-// Quinn fairly interleave metadata and detail; hole-filling coverage goes first.
-const CONTROL_STREAM_PRIORITY: i32 = 1;
+// Quinn fairly interleave metadata and coverage; refinement remains below both.
+// Making coverage strictly higher can instead starve a control write on reconnect.
+const CONTROL_STREAM_PRIORITY: i32 = 2;
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const SECTION_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 // Fixed unauthenticated-protocol admission bounds. These limit task/handshake amplification;
@@ -306,8 +307,8 @@ async fn serve_section_lane(
         .await
         .context("regional section-lane priority timeout")??;
     send.set_priority(match lane {
-        crate::regional::wire::PriorityLane::Coverage => CONTROL_STREAM_PRIORITY + 1,
-        crate::regional::wire::PriorityLane::Refinement => CONTROL_STREAM_PRIORITY,
+        crate::regional::wire::PriorityLane::Coverage => CONTROL_STREAM_PRIORITY,
+        crate::regional::wire::PriorityLane::Refinement => CONTROL_STREAM_PRIORITY - 1,
     })?;
     while let Some(request) = read_request_batch(&mut recv).await? {
         let responder = responder.clone();
@@ -513,7 +514,7 @@ mod priority_tests {
             let (mut metadata, _metadata_input) = connection.accept_bi().await?;
             let (mut terrain, _terrain_input) = connection.accept_bi().await?;
             metadata.set_priority(CONTROL_STREAM_PRIORITY)?;
-            terrain.set_priority(CONTROL_STREAM_PRIORITY + 1)?;
+            terrain.set_priority(CONTROL_STREAM_PRIORITY)?;
             let metadata_body = vec![0; 32 * 1024];
             let terrain_body = vec![7; 32 * 1024];
             tokio::try_join!(
