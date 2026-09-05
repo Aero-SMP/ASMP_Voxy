@@ -26,23 +26,42 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
         return Optional.ofNullable(this.outcome.claim());
     }
 
-    public synchronized void completeUpload(VoxyRenderSystem.UploadOutcome result) {
-        if (this.status != null) return;
-        this.status = result.status();
-        if (this.status != VoxyRenderSystem.UploadStatus.ACTIVATED) this.retired = true;
+    public void completeUpload(VoxyRenderSystem.UploadOutcome result) {
+        boolean retire;
+        synchronized (this) {
+            if (this.status != null) return;
+            this.status = result.status();
+            if (this.status != VoxyRenderSystem.UploadStatus.ACTIVATED) this.retired = true;
+            retire = this.claimRetirement();
+        }
         this.outcome.complete(result);
-        this.retireIfReady();
+        if (retire) this.requestRetirement();
         this.stateChanged();
     }
 
-    public synchronized void markRetired() {
-        this.retired = true;
+    public void markRetired() {
+        synchronized (this) { this.retired = true; }
         this.stateChanged();
     }
 
-    @Override public synchronized void close() {
-        this.closed = true;
-        this.retireIfReady();
+    @Override public void close() {
+        boolean retire;
+        synchronized (this) {
+            this.closed = true;
+            retire = this.claimRetirement();
+        }
+        // Renderer submission takes its own lock and can inspect other publications. Never
+        // call it while holding this publication's monitor (including failure callbacks).
+        if (retire) this.requestRetirement();
+        this.stateChanged();
+    }
+
+    /** Terminal ownership when the entire renderer is being destroyed, not a reusable slot.
+     * Normal live-renderer retirement still requires its actual GPU fence. */
+    public void rendererStopped() {
+        synchronized (this) { this.closed = true; this.retired = true; }
+        this.completeUpload(new VoxyRenderSystem.UploadOutcome(
+                VoxyRenderSystem.UploadStatus.CANCELLED, null, null));
         this.stateChanged();
     }
 
@@ -51,10 +70,10 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
         this.outcome.abandon(resolved);
     }
 
-    private void retireIfReady() {
+    private boolean claimRetirement() {
         if (!this.closed || this.retired || this.retirementRequested
-                || this.status != VoxyRenderSystem.UploadStatus.ACTIVATED) return;
+                || this.status != VoxyRenderSystem.UploadStatus.ACTIVATED) return false;
         this.retirementRequested = true;
-        this.requestRetirement();
+        return true;
     }
 }

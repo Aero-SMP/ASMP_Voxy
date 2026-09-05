@@ -22,6 +22,7 @@ public final class SectionDemandTableBehaviorTest {
         RegionalSectionCodecBehaviorTest.run();
         RegionalControlFlowBehaviorTest.run();
         CacheStartupBehaviorTest.run();
+        me.cortex.voxy.client.core.rendering.hierarchical.PublicationShutdownBehaviorTest.run();
         PublicationRepairBehaviorTest.run();
         me.cortex.voxy.client.core.ShaderReloadBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.building.BoundaryWaterMesherBehaviorTest.run();

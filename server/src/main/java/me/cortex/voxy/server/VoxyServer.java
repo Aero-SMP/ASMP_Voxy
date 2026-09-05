@@ -8,6 +8,7 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.server.ServerStartingEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.registration.HandlerThread;
 
@@ -29,6 +30,7 @@ public final class VoxyServer {
         modBus.addListener(VoxyServer::registerPayload);
         NeoForge.EVENT_BUS.addListener(VoxyServer::serverStarting);
         NeoForge.EVENT_BUS.addListener(VoxyServer::serverStopping);
+        NeoForge.EVENT_BUS.addListener(VoxyServer::serverStopped);
     }
 
     private static void serverStarting(ServerStartingEvent event) {
@@ -38,6 +40,13 @@ public final class VoxyServer {
     }
 
     private static void serverStopping(ServerStoppingEvent event) {
+        accepting = false;
+        RustBackend.stop();
+    }
+
+    private static void serverStopped(ServerStoppedEvent event) {
+        // NeoForge skips ServerStoppingEvent when the tick loop throws, but always posts
+        // ServerStoppedEvent from finally. Do not keep serving/restarting Rust after a crash.
         accepting = false;
         RustBackend.stop();
     }

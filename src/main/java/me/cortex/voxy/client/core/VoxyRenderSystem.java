@@ -487,13 +487,18 @@ public class VoxyRenderSystem {
         }
 
         @Override protected void requestRetirement() {
+            if (this.renderer.isStopping()) { this.rendererStopped(); return; }
             long retirementRevision = regionalSectionRevision.getAndIncrement();
             this.renderer.retirePublication(retirementRevision, this.revision, this.position,
-                    this::markRetired, failure -> this.renderer.rollbackStagedRoot(
+                    this::markRetired, failure -> {
+                        if (this.renderer.isStopping()) { this.rendererStopped(); return; }
+                        this.renderer.rollbackStagedRoot(
                             retirementRevision, this::markRetired, rollback -> {
+                                if (this.renderer.isStopping()) { this.rendererStopped(); return; }
                                 failure.addSuppressed(rollback);
                                 Logger.error("Regional retirement rollback failed", failure);
-                            }));
+                            });
+                    });
         }
 
         private void cancelBeforeStaging() {
@@ -507,6 +512,7 @@ public class VoxyRenderSystem {
          */
         private void failAndRollback(Throwable primary) {
             Objects.requireNonNull(primary, "primary");
+            if (this.renderer.isStopping()) { this.rendererStopped(); return; }
             if (!this.failureRecoveryQueued.compareAndSet(false, true)) return;
             this.renderer.rollbackStagedRoot(this.revision,
                     () -> this.recordFailure(primary, null),
@@ -514,6 +520,7 @@ public class VoxyRenderSystem {
         }
 
         private void recordFailure(Throwable primary, Throwable rollback) {
+            if (this.renderer.isStopping()) { this.rendererStopped(); return; }
             if (rollback != null && rollback != primary) primary.addSuppressed(rollback);
             this.completeUpload(new UploadOutcome(UploadStatus.FAILED, null, primary));
         }

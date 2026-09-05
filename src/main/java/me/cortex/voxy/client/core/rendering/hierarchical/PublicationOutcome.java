@@ -13,15 +13,20 @@ public final class PublicationOutcome<T> {
 
     public PublicationOutcome(Consumer<T> dispose) { this.dispose = dispose; }
 
-    public synchronized void complete(T result) {
+    public void complete(T result) {
         Objects.requireNonNull(result);
-        if (this.completed) return;
-        this.completed = true;
-        if (this.abandoned != null) {
-            this.dispose.accept(result);
-            this.claimed = true;
-            this.abandoned.run();
-        } else this.result = result;
+        Runnable resolved;
+        synchronized (this) {
+            if (this.completed) return;
+            this.completed = true;
+            resolved = this.abandoned;
+            if (resolved != null) this.claimed = true;
+            else this.result = result;
+        }
+        if (resolved != null) {
+            try { this.dispose.accept(result); }
+            finally { resolved.run(); }
+        }
     }
 
     public synchronized T claim() {
@@ -32,16 +37,22 @@ public final class PublicationOutcome<T> {
         return value;
     }
 
-    public synchronized void abandon(Runnable resolved) {
-        if (this.abandoned != null) return;
-        this.abandoned = Objects.requireNonNull(resolved);
-        if (this.completed) {
-            if (!this.claimed) {
-                this.dispose.accept(this.result);
+    public void abandon(Runnable resolved) {
+        T discarded = null;
+        boolean completed;
+        synchronized (this) {
+            if (this.abandoned != null) return;
+            this.abandoned = Objects.requireNonNull(resolved);
+            completed = this.completed;
+            if (completed && !this.claimed) {
+                discarded = this.result;
                 this.result = null;
                 this.claimed = true;
             }
-            resolved.run();
+        }
+        if (completed) {
+            try { if (discarded != null) this.dispose.accept(discarded); }
+            finally { resolved.run(); }
         }
     }
 }

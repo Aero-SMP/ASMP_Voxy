@@ -1185,7 +1185,9 @@ public class AsyncNodeManager {
         this.thread.start();
     }
 
-    private boolean stopping;
+    private volatile boolean stopping;
+
+    public boolean isStopping() { return this.stopping; }
 
     public void stop() {
         synchronized (this.submissionLock) {

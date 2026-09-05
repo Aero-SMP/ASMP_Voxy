@@ -22,6 +22,24 @@ sourceSets {
         java.srcDirs = ['src/debug/java', rootProject.file('shared/src/debug/java')]
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
+    lifecycleTest {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+}
+
+tasks.register('serverLifecycleTest', JavaExec) {
+    dependsOn tasks.named('lifecycleTestClasses')
+    classpath = sourceSets.lifecycleTest.runtimeClasspath
+    mainClass = 'me.cortex.voxy.server.ServerLifecycleBehaviorTest'
+    workingDir = layout.buildDirectory.dir('lifecycle-test').get().asFile
+    doFirst {
+        workingDir.mkdirs()
+        copy {
+            from 'src/lifecycleTest/resources/voxy-rust.toml'
+            into workingDir
+        }
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
