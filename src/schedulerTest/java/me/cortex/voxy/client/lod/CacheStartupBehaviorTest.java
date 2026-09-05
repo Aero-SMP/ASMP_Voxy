@@ -27,6 +27,7 @@ final class CacheStartupBehaviorTest {
         overlappingShardOwners();
         trimmedShardsReopen();
         CacheInventoryBehaviorTest.run();
+        RuntimeCachePressureBehaviorTest.run();
         localActivationAndValidation();
         cachedRefinementWhileHeld();
         missesDoNotSpin();

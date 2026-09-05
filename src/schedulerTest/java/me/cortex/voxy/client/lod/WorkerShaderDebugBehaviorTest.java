@@ -20,6 +20,7 @@ public final class WorkerShaderDebugBehaviorTest {
         Field started = updater.getDeclaredField("STARTED"); started.setAccessible(true);
         ((AtomicBoolean) started.get(null)).set(true);
         stageAccountingAndCpuUnavailable();
+        DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
         HarnessTerminalBehaviorTest.run();

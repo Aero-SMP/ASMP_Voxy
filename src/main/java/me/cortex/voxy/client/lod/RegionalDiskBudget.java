@@ -18,14 +18,16 @@ final class RegionalDiskBudget {
     private static final Map<Path, WeakReference<RegionalDiskBudget>> OPEN = new HashMap<>();
     final Path root;
     final long limit;
-    long bytes = -1;
+    // Volatile for approximate telemetry only; all accounting mutations require this monitor.
+    volatile long bytes = -1;
     volatile long eviction;
     enum InventoryState { NEW, SCANNING, CLEANING, READY, FAILED, CLOSED }
     private volatile InventoryState state = InventoryState.NEW;
     private volatile String inventoryFailure;
     private volatile long inventoryNanos;
     private volatile long inventoryStarted;
-    private long skippedWrites;
+    // Counts failed writability checks, not unique lost writes. Mutated under this monitor.
+    private volatile long skippedWrites;
     private int owners;
     private volatile Thread maintenance;
     private FileChannel ownershipChannel;
@@ -98,11 +100,17 @@ final class RegionalDiskBudget {
         this.skippedWrites++;
         return false;
     }
-    synchronized String snapshot() {
-        return " cacheInventory=" + this.state + " cacheDiskBytes=" + (ready() ? this.bytes : -1)
+    /** Best-effort telemetry, not an atomic accounting snapshot or permission to write/evict. */
+    String snapshot() {
+        var observedState = this.state;
+        long observedBytes = this.bytes, skipped = this.skippedWrites;
+        long elapsed = this.inventoryNanos, started = this.inventoryStarted;
+        var running = this.maintenance;
+        String failure = this.inventoryFailure;
+        return " cacheInventory=" + observedState + " cacheDiskBytes=" + (observedState == InventoryState.READY ? observedBytes : -1)
                 + " cacheDiskLimit=" + this.limit + " cacheInventoryNs="
-                + (this.maintenance == null ? this.inventoryNanos : Math.max(0, System.nanoTime() - this.inventoryStarted))
-                + " cacheSkippedWrites=" + this.skippedWrites + " cacheInventoryFailure=" + this.inventoryFailure;
+                + (running == null ? elapsed : Math.max(0, System.nanoTime() - started))
+                + " cacheSkippedWrites=" + skipped + " cacheInventoryFailure=" + failure;
     }
 
     // A single lifecycle-owned job. No budget monitor is held during either directory walk
@@ -243,18 +251,29 @@ final class RegionalDiskBudget {
         if (added < 0 || added > this.limit) return false;
         if (this.bytes + added <= this.limit) return true;
         // Only pressure scans the directory; section hits never scan it.
+        var candidates = new ArrayList<EvictionCandidate>();
         try (var files = Files.walk(this.root)) {
-            for (Path candidate : files.filter(RegionalDiskBudget::managed)
-                    .filter(path -> !protectedPaths.contains(path))
-                    .sorted(Comparator.comparingLong(RegionalDiskBudget::modified)).toList()) {
-                if (candidate.toString().endsWith(".vxcat")
-                        && this.catalogReferences.containsKey(candidate)) continue;
-                this.delete(candidate);
-                if (this.bytes + added <= this.limit) return true;
+            for (var iterator = files.iterator(); iterator.hasNext();) {
+                Path path = iterator.next();
+                if (protectedPaths.contains(path) || !managedName(path)) continue;
+                try {
+                    var attributes = Files.readAttributes(path, BasicFileAttributes.class);
+                    if (attributes.isRegularFile())
+                        candidates.add(new EvictionCandidate(path, attributes.lastModifiedTime().toMillis()));
+                } catch (IOException unknown) { /* Unclassified files are not eviction candidates. */ }
             }
+        }
+        candidates.sort(Comparator.comparingLong(EvictionCandidate::modified));
+        for (var candidate : candidates) {
+            Path path = candidate.path();
+            if (path.toString().endsWith(".vxcat") && this.catalogReferences.containsKey(path)) continue;
+            this.delete(path);
+            if (this.bytes + added <= this.limit) return true;
         }
         return this.bytes + added <= this.limit;
     }
+
+    private record EvictionCandidate(Path path, long modified) {}
 
     void reference(Path descriptor, Path catalog) throws IOException {
         if (catalog == null) {
@@ -301,14 +320,6 @@ final class RegionalDiskBudget {
 
     static long size(Path path) {
         try { return Files.size(path); } catch (IOException missing) { return 0; }
-    }
-    private static long modified(Path path) {
-        try { return Files.getLastModifiedTime(path).toMillis(); }
-        catch (IOException missing) { return Long.MIN_VALUE; }
-    }
-    private static boolean managed(Path path) {
-        if (!Files.isRegularFile(path)) return false;
-        return managedName(path);
     }
     private static boolean inventoryFile(Path path) {
         if (!managedName(path)) return false;

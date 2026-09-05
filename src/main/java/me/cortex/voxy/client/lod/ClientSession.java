@@ -1819,7 +1819,8 @@ final class ClientSession {
         }
 
         void saveRegion(SectionDemandTable.RegionDemand state, RegionalProtocol.RegionMessage message) {
-            if (this.metadata == null || !this.metadata.budget.writable()) return;
+            // Scheduling hint only; the metadata worker rechecks writability and task validity.
+            if (this.metadata == null || !this.metadata.budget.ready()) return;
             long view = this.viewRevision, revision = state.metadataRevision;
             this.metadataWrites.put(state.key, new SaveMetadataTask(view, state.key, this.worldIdentity,
                     message, this.metadata.budget.stamp(),

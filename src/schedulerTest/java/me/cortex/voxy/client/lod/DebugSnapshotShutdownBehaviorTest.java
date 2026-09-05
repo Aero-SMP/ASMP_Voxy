@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.*;
 final class DebugSnapshotShutdownBehaviorTest {
     static void run() throws Exception {
         ownerPublishesImmutableSamples();
+        cacheMonitorDoesNotBlockOwner();
         for (boolean stopFirst : new boolean[]{false, true}) publisherSurvivesTeardown(stopFirst);
         sectionCallbacksKeepIdentityAndOwner();
         normalFacadeDoesNothing();
@@ -45,6 +46,22 @@ final class DebugSnapshotShutdownBehaviorTest {
         int retirements;
         @Override protected void requestRetirement() { retirements++; markRetired(); }
         @Override protected void stateChanged() {}
+    }
+
+    static void cacheMonitorDoesNotBlockOwner() throws Exception {
+        var root = Files.createTempDirectory("voxy-debug-cache-monitor-");
+        try (var store = new RegionalMetadataStore(root)) {
+            CacheStartupBehaviorTest.awaitInventory(store.budget);
+            Renderer renderer = allocate(Renderer.class); renderer.captures = new AtomicInteger();
+            var session = new ClientSession.Session(106, "test", renderer, null, null, 0);
+            session.metadata = store;
+            RuntimeCachePressureBehaviorTest.whileBudgetHeld(store.budget, () -> {
+                RuntimeCachePressureBehaviorTest.setOwner(session);
+                SessionDebugTelemetry.capture(session, System.nanoTime(), false);
+                check(SessionDebugTelemetry.latest(session).text().contains("cacheInventory=READY cacheDiskBytes=0"),
+                        "owner capture did not observe cache without its monitor");
+            });
+        } finally { CacheStartupBehaviorTest.cleanup(root); }
     }
 
     private static void ownerPublishesImmutableSamples() throws Exception {
