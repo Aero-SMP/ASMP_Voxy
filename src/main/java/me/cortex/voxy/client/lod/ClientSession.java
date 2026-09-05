@@ -1244,10 +1244,11 @@ final class ClientSession {
         }
 
         boolean isCoarsening(long key) {
-            for (long root : this.coarseningRoots) {
-                if (contains(root, key)) return true;
+            while (true) {
+                if (this.coarseningRoots.contains(key)) return true;
+                if (SectionKey.level(key) == SectionKey.MAX_LOD_LAYER) return false;
+                key = parent(key);
             }
-            return false;
         }
 
         boolean overlapsCoarsening(long key) {

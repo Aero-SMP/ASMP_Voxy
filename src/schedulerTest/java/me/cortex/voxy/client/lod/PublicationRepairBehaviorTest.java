@@ -35,6 +35,7 @@ public final class PublicationRepairBehaviorTest {
         repeatedCompletionIsIdempotent();
         dormancyRetirementDoesNotInvalidateBlockedSweep();
         dormancyEpochsAndQuickWake();
+        coarseningAncestorLookup();
         measureDormancyBurstAllocation();
         System.out.println("publication ownership and priority behavior tests passed");
     }
@@ -100,6 +101,77 @@ public final class PublicationRepairBehaviorTest {
 
     private static ClientSession.Session session(Publisher publisher, int workers) {
         return new ClientSession.Session(70, "minecraft:overworld", null, publisher, null, workers);
+    }
+
+    private static void coarseningAncestorLookup() {
+        ClientSession.Session s = session(new Publisher(), 1);
+        try {
+            int max = SectionKey.MAX_LOD_LAYER;
+            for (int[] coordinates : new int[][]{{23, 11, 45}, {-23, -11, -45},
+                    {-1, -1, -1}, {-8388608, -128, 8388607}, {8388607, 127, -8388608}}) {
+                for (int level = 0; level <= max; level++) {
+                    long key = SectionKey.pack(level, coordinates[0], coordinates[1], coordinates[2]);
+                    check(!s.isCoarsening(key), "empty coarsening roots matched");
+                    for (int ancestorLevel = level; ancestorLevel <= max; ancestorLevel++) {
+                        int shift = ancestorLevel - level;
+                        long ancestor = SectionKey.pack(ancestorLevel, SectionKey.x(key) >> shift,
+                                SectionKey.y(key) >> shift, SectionKey.z(key) >> shift);
+                        s.coarseningRoots.add(ancestor);
+                        check(s.isCoarsening(key) && s.overlapsCoarsening(key),
+                                "exact/ancestor coarsening root missed at level " + ancestorLevel);
+                        s.coarseningRoots.remove(ancestor);
+                        check(!s.isCoarsening(key), "removed root still matched");
+                    }
+                    // Toggle a low coordinate bit: distinct sibling, including across negative coordinates.
+                    long sibling = SectionKey.pack(level, SectionKey.x(key) ^ 1,
+                            SectionKey.y(key), SectionKey.z(key));
+                    s.coarseningRoots.add(sibling);
+                    check(!s.isCoarsening(key) && !s.overlapsCoarsening(key), "sibling root matched");
+                    s.coarseningRoots.clear();
+                }
+            }
+            for (int level = 1; level <= max; level++) {
+                long key = SectionKey.pack(level, -3, -2, -5);
+                long descendant = SectionKey.pack(level - 1, -5, -3, -9);
+                s.coarseningRoots.add(descendant);
+                check(!s.isCoarsening(key) && s.overlapsCoarsening(key),
+                        "descendant-only root must overlap without coarsening its ancestor");
+                s.coarseningRoots.clear();
+            }
+
+            Random random = new Random(0x43a9ce17L);
+            int comparisons = 0;
+            for (int count : new int[]{0, 1, 32, 2048}) {
+                s.coarseningRoots.clear();
+                while (s.coarseningRoots.size() < count) s.coarseningRoots.add(randomCoarseningKey(random));
+                List<Long> queries = new ArrayList<>(s.coarseningRoots); // Force exact matches too.
+                for (int i = 0; i < 2000; i++) queries.add(randomCoarseningKey(random));
+                for (long key : queries) {
+                    boolean expected = false, overlap = false;
+                    for (long root : s.coarseningRoots) {
+                        expected |= oldCoarseningContains(root, key);
+                        overlap |= oldCoarseningContains(root, key) || oldCoarseningContains(key, root);
+                    }
+                    check(s.isCoarsening(key) == expected, "ancestor lookup disagrees with old scan");
+                    check(s.overlapsCoarsening(key) == overlap, "overlap semantics changed");
+                    comparisons++;
+                }
+            }
+            System.out.println("coarsening ancestor lookup: " + comparisons + " seeded scan comparisons passed");
+        } finally { s.release(); }
+    }
+
+    private static long randomCoarseningKey(Random random) {
+        return SectionKey.pack(random.nextInt(SectionKey.MAX_LOD_LAYER + 1),
+                random.nextInt(64) - 32, random.nextInt(64) - 32, random.nextInt(64) - 32);
+    }
+
+    /** The previous production containment predicate, kept only as a differential oracle. */
+    private static boolean oldCoarseningContains(long ancestor, long descendant) {
+        int shift = SectionKey.level(ancestor) - SectionKey.level(descendant);
+        return shift >= 0 && SectionKey.x(ancestor) == SectionKey.x(descendant) >> shift
+                && SectionKey.y(ancestor) == SectionKey.y(descendant) >> shift
+                && SectionKey.z(ancestor) == SectionKey.z(descendant) >> shift;
     }
 
     private static ClientSession.Demand ready(ClientSession.Session session, long key,
