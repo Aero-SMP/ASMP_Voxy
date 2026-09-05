@@ -11,7 +11,7 @@ from tools import run_live_client_test as runner
 
 class ScenarioValidationTest(unittest.TestCase):
     def test_zoom_controls_are_narrow_and_dispatched(self) -> None:
-        for name in ("zoom_in", "zoom_out"):
+        for name in ("zoom_in", "zoom_out", "zoom_max"):
             runner.validate_scenario({"steps": [{"op": name}]})
             with self.assertRaises(runner.ScenarioError):
                 runner.validate_scenario({"steps": [{"op": name, "command": "arbitrary"}]})

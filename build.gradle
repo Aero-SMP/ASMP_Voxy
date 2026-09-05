@@ -84,6 +84,10 @@ sourceSets {
 }
 
 configurations {
+    okZoomer {
+        canBeConsumed = false
+        transitive = false
+    }
     clientEmbedded {
         canBeConsumed = false
         canBeResolved = true
@@ -120,6 +124,12 @@ tasks.named('processResources') {
 }
 
 dependencies {
+    // Optional integration only; neither Ok Zoomer nor its bundled config library is shipped.
+    okZoomer 'maven.modrinth:ok-zoomer:10.0.0-beta.13+neo'
+    compileOnly files(configurations.okZoomer)
+    compileOnly files({ zipTree(configurations.okZoomer.singleFile).matching {
+        include 'META-INF/jarjar/impl-*.jar'
+    }.files })
     // Scheduler ownership tests exercise real native allocations outside a Minecraft launch.
     schedulerTestRuntimeOnly 'org.lwjgl:lwjgl:3.3.3:natives-linux'
     schedulerTestRuntimeOnly 'org.lwjgl:lwjgl-zstd:3.3.3:natives-linux'
@@ -269,6 +279,16 @@ tasks.register('verifyDebugHarnessArtifacts') {
         def clientDebug = tasks.named('debugJar', Jar).get().archiveFile.get().asFile
         def serverNormal = project(':server').tasks.named('jar', Jar).get().archiveFile.get().asFile
         def serverDebug = project(':server').tasks.named('debugJar', Jar).get().archiveFile.get().asFile
+        [clientNormal, clientDebug].each { artifact ->
+            if (zipTree(artifact).matching { include '**/okzoomer/MixinZoomUtils.class' }.files.empty
+                    || !zipTree(artifact).matching { include 'client.voxy.mixins.json' }
+                        .singleFile.text.contains('okzoomer.MixinZoomUtils')) {
+                throw new GradleException("production zoom limit mixin missing from ${artifact}")
+            }
+            if (!zipTree(artifact).matching { include 'page/langeweile/**', 'org/quiltmc/**' }.files.empty) {
+                throw new GradleException("compile-only zoom dependency bundled in ${artifact}")
+            }
+        }
         [clientNormal, serverNormal].each { artifact ->
             def leaked = zipTree(artifact).matching {
                 include forbiddenPrefix + '**'

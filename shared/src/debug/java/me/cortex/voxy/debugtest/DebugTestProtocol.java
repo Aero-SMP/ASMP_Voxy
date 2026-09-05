@@ -18,7 +18,7 @@ public final class DebugTestProtocol {
         BEGIN_RUN(1), EXPECT_POSE(2), START_TRACE(3), CAPTURE_CHECKPOINT(4),
         CAPTURE_SCREENSHOT(5), END_RUN(6), ABORT_RUN(7), RECONNECT_QUIC(8),
         SHADER_RELOAD(9), SHADERS_ON(10), SHADERS_OFF(11), SHADER_RELOAD_ALL_CHANGED(12), SHADER_OPTION(13),
-        HOLD_QUIC(14), RESUME_QUIC(15), ZOOM_IN(16), ZOOM_OUT(17);
+        HOLD_QUIC(14), RESUME_QUIC(15), ZOOM_IN(16), ZOOM_OUT(17), ZOOM_MAX(18);
 
         private final int wireId;
         CommandKind(int wireId) { this.wireId = wireId; }

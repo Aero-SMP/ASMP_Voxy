@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert", "reconnect_quic", "hold_quic", "resume_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option", "zoom_in", "zoom_out"}
+VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert", "reconnect_quic", "hold_quic", "resume_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option", "zoom_in", "zoom_out", "zoom_max"}
 COMPARISONS = {"==", "!=", "<", "<=", ">", ">="}
 RESULT_KINDS = {
     "pose": "POSE_REACHED",
@@ -107,6 +107,7 @@ def validate_scenario(scenario: Any) -> None:
             "resume_quic": {"op"},
             "zoom_in": {"op"},
             "zoom_out": {"op"},
+            "zoom_max": {"op"},
             "shader_reload": {"op"},
             "shaders_on": {"op"},
             "shaders_off": {"op"},
@@ -303,7 +304,7 @@ class ScenarioRun:
 
     def execute_step(self, operation: dict[str, Any], index: int) -> None:
         kind = operation["op"]
-        if kind in {"reconnect_quic", "hold_quic", "resume_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option", "zoom_in", "zoom_out"}:
+        if kind in {"reconnect_quic", "hold_quic", "resume_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option", "zoom_in", "zoom_out", "zoom_max"}:
             self.step += 1
             option_args = f" {operation['option']} {operation['value']}" if kind == "shader_option" else ""
             self.command_and_wait(f"voxytest {kind} {self.run_id} {self.step}{option_args}",

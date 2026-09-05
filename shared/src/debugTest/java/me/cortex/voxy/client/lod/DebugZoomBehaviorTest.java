@@ -30,6 +30,10 @@ public final class DebugZoomBehaviorTest {
         check(!DebugZoomControl.zoomSignal(true), "old cleanup erased successor override");
         rejected(() -> first.select(true), "expired controller mutated successor");
         try {
+            int[] restored = {0};
+            Field scrollRestore = DebugZoomControl.class.getDeclaredField("restoreScroll");
+            scrollRestore.setAccessible(true);
+            scrollRestore.set(next, (Runnable) () -> restored[0]++);
             var run = new LiveClientTestHarness.Run(UUID.randomUUID(), 1, null);
             run.zoomControl = next; run.zoomPending = true;
             Field field = LiveClientTestHarness.class.getDeclaredField("run"); field.setAccessible(true); field.set(null, run);
@@ -43,6 +47,8 @@ public final class DebugZoomBehaviorTest {
                     });
             check(run.zoomControl == null && !run.zoomPending && DebugZoomControl.zoomSignal(true),
                     "terminal delivery failure left zoom held");
+            next.close();
+            check(restored[0] == 1, "maximum scroll state was not restored exactly once");
             // The same cleanup used by normal END_RUN must also be idempotent.
             var ending = new LiveClientTestHarness.Run(UUID.randomUUID(), 2, null);
             ending.zoomControl = DebugZoomControl.begin(); ending.zoomControl.select(false);

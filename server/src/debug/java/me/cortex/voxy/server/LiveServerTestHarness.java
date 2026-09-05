@@ -127,6 +127,8 @@ final class LiveServerTestHarness {
                 simple(source, run, step, DebugTestProtocol.CommandKind.ZOOM_IN)));
         root.then(singleStep("zoom_out", (source, run, step) ->
                 simple(source, run, step, DebugTestProtocol.CommandKind.ZOOM_OUT)));
+        root.then(singleStep("zoom_max", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.ZOOM_MAX)));
         root.then(singleStep("hold_quic", (source, run, step) ->
                 simple(source, run, step, DebugTestProtocol.CommandKind.HOLD_QUIC)));
         root.then(singleStep("resume_quic", (source, run, step) ->
@@ -374,7 +376,7 @@ final class LiveServerTestHarness {
             case BEGIN_RUN -> result == DebugTestProtocol.ResultKind.CLIENT_READY;
             case EXPECT_POSE -> result == DebugTestProtocol.ResultKind.POSE_REACHED
                     || result == DebugTestProtocol.ResultKind.POSE_FAILED;
-            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC, HOLD_QUIC, RESUME_QUIC, SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION, ZOOM_IN, ZOOM_OUT ->
+            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC, HOLD_QUIC, RESUME_QUIC, SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION, ZOOM_IN, ZOOM_OUT, ZOOM_MAX ->
                     result == DebugTestProtocol.ResultKind.CHECKPOINT_RESULT;
             case CAPTURE_SCREENSHOT -> result == DebugTestProtocol.ResultKind.SCREENSHOT_RESULT;
             case END_RUN -> result == DebugTestProtocol.ResultKind.RUN_COMPLETE;

@@ -1,0 +1,22 @@
+{
+  "name":"ok-zoomer-tenfold-maximum",
+  "steps":[
+    {"op":"zoom_out"},
+    {"op":"trace","duration_ms":2000,"cadence_ms":250},
+    {"op":"checkpoint","name":"normal"},
+    {"op":"zoom_max"},
+    {"op":"trace","duration_ms":8000,"cadence_ms":250},
+    {"op":"checkpoint","name":"maximum"},
+    {"op":"assert","field":"zoomActive","comparison":"==","value":true},
+    {"op":"assert","mode":"delta","field":"worldFov","from":"normal","to":"maximum","comparison":"<","value":0},
+    {"op":"assert","field":"worldFov","comparison":"<","value":1},
+    {"op":"assert","field":"gpuDraws","comparison":">","value":0},
+    {"op":"screenshot"},
+    {"op":"zoom_out"},
+    {"op":"trace","duration_ms":3000,"cadence_ms":250},
+    {"op":"checkpoint","name":"restored"},
+    {"op":"assert","mode":"delta","field":"worldFov","from":"normal","to":"restored","comparison":"==","value":0},
+    {"op":"assert","mode":"delta","field":"sessionGeneration","from":"normal","to":"restored","comparison":"==","value":0},
+    {"op":"assert","mode":"absence_of_failure"}
+  ]
+}

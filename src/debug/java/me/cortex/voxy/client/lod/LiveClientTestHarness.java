@@ -211,13 +211,19 @@ final class LiveClientTestHarness {
         active.stepId = command.stepId();
         active.command = command.kind();
         switch (command.kind()) {
-            case ZOOM_IN, ZOOM_OUT -> {
+            case ZOOM_IN, ZOOM_OUT, ZOOM_MAX -> {
                 if (!DebugZoomControl.available() || DebugZoomControl.worldFov() <= 0) {
                     sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
                     break;
                 }
                 if (active.zoomControl == null) active.zoomControl = DebugZoomControl.begin();
-                active.zoomControl.select(command.kind() == DebugTestProtocol.CommandKind.ZOOM_IN);
+                try {
+                    if (command.kind() == DebugTestProtocol.CommandKind.ZOOM_MAX) active.zoomControl.maximum();
+                    active.zoomControl.select(command.kind() != DebugTestProtocol.CommandKind.ZOOM_OUT);
+                } catch (RuntimeException failure) {
+                    failRun(DebugTestProtocol.Failure.INTERNAL);
+                    break;
+                }
                 active.zoomDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
                 active.zoomPending = true;
             }

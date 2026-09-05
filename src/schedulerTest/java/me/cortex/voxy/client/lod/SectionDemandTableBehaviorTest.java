@@ -30,6 +30,7 @@ public final class SectionDemandTableBehaviorTest {
         RegionalSectionCodecBehaviorTest.run();
         RegionalControlFlowBehaviorTest.run();
         CacheStartupBehaviorTest.run();
+        ZoomRangeBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationShutdownBehaviorTest.run();
         PublicationRepairBehaviorTest.run();
         me.cortex.voxy.client.core.ShaderReloadBehaviorTest.run();
