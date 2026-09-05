@@ -6,6 +6,7 @@ import me.cortex.voxy.client.core.rendering.SectionKey;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager.PublicationProgress;
 import me.cortex.voxy.client.core.rendering.hierarchical.PublicationHandoff;
+import me.cortex.voxy.client.core.rendering.hierarchical.PublicationOutcome;
 import me.cortex.voxy.client.core.rendering.hierarchical.SectionPublicationState;
 import me.cortex.voxy.common.util.MemoryBuffer;
 
@@ -31,6 +32,7 @@ public final class PublicationRepairBehaviorTest {
         emptyDemandStillNeedsRealSlot();
         prerequisiteReclaimsOnlyWorkerOwnedDependent();
         randomizedOwnershipInterleavings();
+        repeatedCompletionIsIdempotent();
         System.out.println("publication ownership and priority behavior tests passed");
     }
 
@@ -324,5 +326,20 @@ public final class PublicationRepairBehaviorTest {
 
     private static void check(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
+    }
+
+    private static void repeatedCompletionIsIdempotent() {
+        for (boolean abandonFirst : new boolean[]{false, true}) {
+            CountedBuffer buffer = new CountedBuffer();
+            PublicationOutcome<CountedBuffer> outcome = new PublicationOutcome<>(CountedBuffer::free);
+            AtomicInteger resolved = new AtomicInteger();
+            if (abandonFirst) outcome.abandon(resolved::incrementAndGet);
+            outcome.complete(buffer);
+            outcome.complete(buffer);
+            outcome.abandon(resolved::incrementAndGet);
+            outcome.complete(buffer);
+            check(buffer.frees == 1 && resolved.get() == 1 && outcome.claim() == null,
+                    "duplicate completion changed terminal ownership");
+        }
     }
 }
