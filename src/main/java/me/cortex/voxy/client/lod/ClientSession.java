@@ -103,6 +103,8 @@ final class ClientSession {
         return current == null ? "regional=DISCONNECTED" : ClientLodDebug.sessionSnapshot(current);
     }
 
+    static long debugSessionIdentity() { Session current = active; return current == null ? 0 : current.id; }
+
     /** Debug harness handoff. The real owner thread creates the observation without blocking. */
     static boolean requestDebugSnapshot(Consumer<PipelineSnapshot> receiver) {
         Objects.requireNonNull(receiver, "snapshot receiver");
@@ -379,17 +381,17 @@ final class ClientSession {
             void transferred() { if (this.released.compareAndSet(false, true)) this.transferred.release(); }
         }
 
-        private enum WorkerSource { CACHE, NETWORK }
+        enum WorkerSource { CACHE, NETWORK }
         sealed interface WorkerTask permits SectionWorkerTask, IndexWorkerTask, EmptyWorkerTask,
                 BootstrapTask, OpenWorldTask, LoadMetadataTask, SaveMetadataTask, CatalogWorkerTask, AssociationTask, ProbeCatalogTask {}
         record EmptyWorkerTask(SectionDemandTable.Ticket ticket, byte children)
                 implements WorkerTask {}
-        private record SectionWorkerTask(SectionDemandTable.Ticket ticket,
+        record SectionWorkerTask(SectionDemandTable.Ticket ticket,
                                          RegionalProtocol.RegionIndex index, int ordinal,
                                          WorkerSource source, byte[] compressed,
                                          RegionalSectionCodec.Mappings mappings, RegionalCache cache)
                 implements WorkerTask {}
-        private record IndexWorkerTask(long session, long connection, long view, long revision, long region, long generation,
+        record IndexWorkerTask(long session, long connection, long view, long revision, long region, long generation,
                                        int slot, RegionalProtocol.RegionMessage message)
                 implements WorkerTask {}
         sealed interface WorkerResult permits WorkerMiss, WorkerModels,
@@ -435,6 +437,7 @@ final class ClientSession {
         final class WorkerSlot {
             final int index;
             final Thread workerThread;
+            final Object debugWork;
             final RegionalSectionCodec codec = new RegionalSectionCodec();
             final WorkerResource<WorkerResult> resource;
             private WorkerTask task;
@@ -447,6 +450,7 @@ final class ClientSession {
                 this.resource = new WorkerResource<>(index, Session::freeWorkerResult);
                 this.workerThread = new Thread(this::run, "Voxy regional section worker-" + index);
                 this.workerThread.setDaemon(true);
+                this.debugWork = ClientLodDebug.workerCreated(Session.this, index, this.workerThread);
             }
 
             void start() { this.workerThread.start(); }
@@ -488,6 +492,7 @@ final class ClientSession {
                             this.task = null;
                         }
                         WorkerResult completion;
+                        ClientLodDebug.workerBegin(this.debugWork, claimed, lease);
                         try {
                             completion = switch (claimed) {
                                 case SectionWorkerTask section -> this.section(section);
@@ -539,9 +544,15 @@ final class ClientSession {
                                 }
                             };
                         } catch (Throwable failure) {
+                            ClientLodDebug.workerOutcome(this.debugWork, "FAILURE", 0);
                             completion = new WorkerFailure(claimed, this.index, failure);
                         }
-                        this.resource.complete(lease, completion);
+                        try {
+                            ClientLodDebug.workerStage(this.debugWork, "RESULT_READY");
+                            this.resource.complete(lease, completion);
+                        } finally {
+                            ClientLodDebug.workerEnd(this.debugWork);
+                        }
                         signal();
                     }
                 } finally {
@@ -553,36 +564,55 @@ final class ClientSession {
                 byte[] compressed = task.compressed();
                 boolean cacheHit = task.source() == WorkerSource.CACHE;
                 if (cacheHit) {
+                    ClientLodDebug.workerStage(this.debugWork, "CACHE_READ");
                     try { compressed = task.cache() == null ? null : task.cache().get(task.index(), task.ordinal()); }
                     catch (IOException ignored) { compressed = null; }
-                    if (compressed == null) return new WorkerMiss(task.ticket(), false);
+                    if (compressed == null) {
+                        ClientLodDebug.workerOutcome(this.debugWork, "CACHE_MISS", 0);
+                        return new WorkerMiss(task.ticket(), false);
+                    }
+                    ClientLodDebug.workerOutcome(this.debugWork, "CACHE_HIT", 0);
                 }
                 try {
+                    ClientLodDebug.workerOutcome(this.debugWork, "COMPRESSED_BYTES", compressed.length);
+                    ClientLodDebug.workerStage(this.debugWork, "DECOMPRESS");
                     byte[] canonical = this.codec.decompress(compressed,
                             task.index().canonicalLength(task.ordinal()));
+                    ClientLodDebug.workerOutcome(this.debugWork, "CANONICAL_BYTES", canonical.length);
+                    ClientLodDebug.workerStage(this.debugWork, "DECODE_VALIDATE");
                     RegionalSectionCodec.SectionData section = this.codec.decode(
                             task.ticket().key(), task.index().childMask(task.ordinal()), canonical,
                             task.index().sectionFingerprint(task.ordinal()), task.mappings());
+                    ClientLodDebug.workerStage(this.debugWork, "REQUEST_MODELS");
                     mesher.requestModels(section);
                     if (!cacheHit) {
+                        ClientLodDebug.workerStage(this.debugWork, "CACHE_WRITE");
                         try { if (task.cache() != null) task.cache().put(task.index(), task.ordinal(), compressed); }
                         catch (IOException ignored) { }
                     }
+                    ClientLodDebug.workerStage(this.debugWork, "CHECK_MODELS");
                     if (!mesher.modelsReady(section)) {
+                        ClientLodDebug.workerOutcome(this.debugWork, "MODEL_WAIT", 0);
                         return new WorkerModels(task.ticket(), section.usedBlocks().clone(),
                                 cacheHit, compressed.length);
                     }
+                    ClientLodDebug.workerStage(this.debugWork, "MESH");
                     BuiltSection geometry = mesher.mesh(section, task.ticket().demandRevision());
+                    ClientLodDebug.workerOutcome(this.debugWork, "MESH_BYTES",
+                            geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size);
                     return new WorkerGeometry(task.ticket(), geometry, System.nanoTime(), cacheHit,
                             compressed.length);
                 } catch (Throwable failure) {
                     if (!cacheHit) throw failure;
+                    ClientLodDebug.workerOutcome(this.debugWork, "CACHE_CORRUPT", 0);
+                    ClientLodDebug.workerStage(this.debugWork, "CACHE_QUARANTINE");
                     if (task.cache() != null) task.cache().quarantine(task.index(), task.ordinal());
                     return new WorkerMiss(task.ticket(), true);
                 }
             }
 
             private WorkerResult index(IndexWorkerTask task) throws Exception {
+                ClientLodDebug.workerStage(this.debugWork, "INDEX_DECODE");
                 return new WorkerIndex(task, this.decodeIndex(task.message()));
             }
 
@@ -625,6 +655,7 @@ final class ClientSession {
             }
 
             synchronized void close() {
+                ClientLodDebug.workerClosing(this.debugWork);
                 this.resource.close();
                 this.task = null;
                 this.notifyAll();

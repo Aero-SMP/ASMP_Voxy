@@ -155,6 +155,8 @@ public class VoxyRenderSystem {
                         ? net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings.INSTANCE.getBlockTypeIds()
                         : java.util.Map.of();
                 if (renderTypes == null) renderTypes = java.util.Map.of();
+                me.cortex.voxy.client.lod.ClientLodDebug.shaderClassification(VoxyRenderSystem.this,
+                        modelService.factory, modelRenderTypes, renderTypes, this.preparedPipeline);
                 if (modelRenderTypes != null && !modelRenderTypes.equals(renderTypes)) {
                     throw new ShaderReloadCoordinator.Incompatible("Shader block render classification changed");
                 }
@@ -187,6 +189,7 @@ public class VoxyRenderSystem {
             historyInvalidations++;
             IrisUtil.CAPTURED_VIEWPORT_PARAMETERS = null;
             pipeline = this.preparedPipeline;
+            me.cortex.voxy.client.lod.ClientLodDebug.shaderEnd(VoxyRenderSystem.this, "RETAINED", "compatible");
             Logger.info("Voxy shader resources ready: renderer=" + rendererIdentity + " generation="
                     + shaderReload.generation() + " pipeline=" + pipeline.getClass().getSimpleName());
         }
@@ -205,6 +208,8 @@ public class VoxyRenderSystem {
         this.shaderReload = new ShaderReloadCoordinator<>(new ShaderReloadCoordinator.Owner<ShaderGroup>() {
             @Override public boolean current() { return currentShaderOwner(); }
             @Override public void suspend() {
+                me.cortex.voxy.client.lod.ClientLodDebug.shaderBegin(VoxyRenderSystem.this, pipeline,
+                        modelResourceGeneration, RESOURCE_GENERATION.get());
                 // Deliver committed selection actions in order before changing shader interpretation.
                 DownloadStream.INSTANCE.flushWaitClear();
                 glFinish();
@@ -213,9 +218,11 @@ public class VoxyRenderSystem {
             @Override public ShaderGroup prepare() { return new ShaderGroup(); }
             @Override public void commit(ShaderGroup group) { group.install(); }
             @Override public void failed(Throwable failure) {
+                me.cortex.voxy.client.lod.ClientLodDebug.shaderEnd(VoxyRenderSystem.this, "FAILED_PAUSED", failure.getMessage());
                 Logger.error("Voxy shader reload failed; retained terrain is paused, renderer=" + rendererIdentity, failure);
             }
             @Override public void incompatible(String reason) {
+                me.cortex.voxy.client.lod.ClientLodDebug.shaderEnd(VoxyRenderSystem.this, "REBUILD_REQUIRED", reason);
                 Logger.warn("Voxy model/resource rebuild required: " + reason);
                 if (!constructing && currentShaderOwner()) {
                     var owner = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
@@ -835,6 +842,7 @@ public class VoxyRenderSystem {
 
     /** Releases both fully initialized and constructor-partial renderer state exactly once. */
     private void releaseComponents(Throwable constructionFailure) {
+        me.cortex.voxy.client.lod.ClientLodDebug.shaderEnd(this, "CLOSED", "renderer released during reload");
         this.destroyed = true;
         this.externalShaderReload = null;
         this.pendingIrisMappings = null;

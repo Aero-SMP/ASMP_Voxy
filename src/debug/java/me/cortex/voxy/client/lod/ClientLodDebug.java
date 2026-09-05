@@ -88,6 +88,55 @@ public final class ClientLodDebug {
         return SessionDebugTelemetry.read(session, System.nanoTime());
     }
 
+    static Object workerCreated(ClientSession.Session session, int slot, Thread thread) {
+        return new WorkerDebugTelemetry.Work(session.id, slot, thread.threadId());
+    }
+    static void workerBegin(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {
+        WorkerDebugTelemetry.begin((WorkerDebugTelemetry.Work) state, task, lease);
+    }
+    static void workerStage(Object state, String stage) { ((WorkerDebugTelemetry.Work) state).stage(stage); }
+    static void workerOutcome(Object state, String outcome, long bytes) { ((WorkerDebugTelemetry.Work) state).outcome(outcome, bytes); }
+    static void workerEnd(Object state) { ((WorkerDebugTelemetry.Work) state).end(); }
+    static void workerClosing(Object state) { ((WorkerDebugTelemetry.Work) state).closing(); }
+    static void workerEvidence(String message) { emit(message); }
+    public static void shaderBegin(me.cortex.voxy.client.core.VoxyRenderSystem renderer, Object pipeline, long oldResources, long newResources) {
+        ShaderDebugTelemetry.begin(renderer, pipeline, oldResources, newResources);
+    }
+    public static void shaderClassification(me.cortex.voxy.client.core.VoxyRenderSystem renderer,
+            me.cortex.voxy.client.core.model.ModelFactory models, java.util.Map<?, ?> before, java.util.Map<?, ?> after, Object pipeline) {
+        ShaderDebugTelemetry.classification(renderer, models, before, after, pipeline);
+    }
+    public static void shaderEnd(me.cortex.voxy.client.core.VoxyRenderSystem renderer, String outcome, String reason) {
+        ShaderDebugTelemetry.end(renderer, outcome, reason);
+    }
+    public static void materialDecision(me.cortex.voxy.client.core.model.ModelFactory models,
+            it.unimi.dsi.fastutil.objects.Object2IntMap<net.minecraft.world.level.block.state.BlockState> mapping, String outcome) {
+        ShaderDebugTelemetry.material(models, mapping, outcome);
+    }
+
+    // Coalesce full reload diffs to one pending immutable artifact; do not queue model objects
+    // or retain a growing history. The ordinary log retains reload identities and counts.
+    private static final java.util.concurrent.atomic.AtomicReference<String> SHADER_ARTIFACT = new java.util.concurrent.atomic.AtomicReference<>();
+    private static final java.util.concurrent.atomic.AtomicBoolean SHADER_WRITE_QUEUED = new java.util.concurrent.atomic.AtomicBoolean();
+    static void shaderArtifact(String text) {
+        SHADER_ARTIFACT.set(text);
+        if (!SHADER_WRITE_QUEUED.compareAndSet(false, true)) return;
+        WRITER.execute(ClientLodDebug::writeShaderArtifact);
+    }
+    private static void writeShaderArtifact() {
+        try {
+            String text = SHADER_ARTIFACT.getAndSet(null);
+            if (text != null) Files.writeString(LOG.resolveSibling("voxy-shader-reload.log"), text,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException failure) { LOGGER.error("Could not write shader reload evidence", failure); }
+        finally {
+            SHADER_WRITE_QUEUED.set(false);
+            if (SHADER_ARTIFACT.get() != null && SHADER_WRITE_QUEUED.compareAndSet(false, true)) {
+                WRITER.execute(ClientLodDebug::writeShaderArtifact);
+            }
+        }
+    }
+
     static {
         String version = "Voxy version " + VoxyClient.MOD_VERSION;
         LOGGER.info(version);

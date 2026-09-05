@@ -217,8 +217,17 @@ tasks.register('buildAll') {
 tasks.register('debugHarnessJavaTest', JavaExec) {
     description = 'Run fixed-codec and bounded debug-harness ownership tests'
     dependsOn tasks.named('debugHarnessTestClasses')
+    dependsOn 'workerDebugBehaviorTest'
     classpath = sourceSets.debugHarnessTest.runtimeClasspath
     mainClass.set('me.cortex.voxy.debugtest.DebugHarnessBehaviorTest')
+}
+
+tasks.register('workerDebugBehaviorTest', JavaExec) {
+    description = 'Exercise debug instrumentation on actual cache/decode/model/mesh worker operations'
+    dependsOn tasks.named('schedulerTestClasses'), tasks.named('debugClasses')
+    classpath = sourceSets.debug.output + sourceSets.schedulerTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.client.lod.WorkerShaderDebugBehaviorTest')
+    doFirst { workingDir = java.nio.file.Files.createTempDirectory('voxy-worker-debug-test-').toFile() }
 }
 
 tasks.register('debugHarnessPythonTest', Exec) {
@@ -237,6 +246,8 @@ tasks.register('schedulerBehaviorTest', JavaExec) {
 // the debug facade's updater/log-writer static initializer.
 tasks.named('compileSchedulerTestJava', JavaCompile) {
     source 'src/debug/java/me/cortex/voxy/client/lod/SessionDebugTelemetry.java'
+    source 'src/debug/java/me/cortex/voxy/client/lod/WorkerDebugTelemetry.java'
+    source 'src/debug/java/me/cortex/voxy/client/lod/ShaderDebugTelemetry.java'
 }
 
 tasks.register('verifyDebugHarnessArtifacts') {
@@ -253,6 +264,7 @@ tasks.register('verifyDebugHarnessArtifacts') {
                 include forbiddenPrefix + '**'
                 include '**/LiveClientTestHarness*', '**/LiveServerTestHarness*'
                 include '**/SessionDebugTelemetry*'
+                include '**/WorkerDebugTelemetry*', '**/ShaderDebugTelemetry*'
             }.files
             if (!leaked.empty) throw new GradleException("debug-test protocol leaked into ${artifact}")
         }

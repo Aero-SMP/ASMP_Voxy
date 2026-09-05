@@ -388,6 +388,8 @@ final class ClientAutoUpdater {
                 .append("time=").append(Instant.now()).append('\n')
                 .append("version=").append(VoxyClient.MOD_VERSION).append('\n');
         snapshotDebugLog(staging.resolve("voxy-client-debug.log"), sources, snapshotStatus);
+        snapshot(gameDirectory.resolve("logs").resolve("voxy-shader-reload.log"),
+                staging.resolve("voxy-shader-reload.log"), sources, snapshotStatus);
         snapshot(gameDirectory.resolve("logs").resolve("latest.log"),
                 staging.resolve("latest.log"), sources, snapshotStatus);
         snapshot(gameDirectory.resolve(".voxy-updater").resolve("restart.log"),

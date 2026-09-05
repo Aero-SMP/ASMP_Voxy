@@ -163,12 +163,21 @@ public class ModelFactory implements SectionMesher.Models {
     public synchronized void setCustomBlockStateMapping(Object2IntMap<BlockState> mapping) {
         Object2IntMap<BlockState> effective = mapping == null
                 ? it.unimi.dsi.fastutil.objects.Object2IntMaps.emptyMap() : mapping;
-        if (effective.equals(this.customBlockStateIdMapping)) return;
+        if (effective.equals(this.customBlockStateIdMapping)) {
+            me.cortex.voxy.client.lod.ClientLodDebug.materialDecision(this, effective, "UNCHANGED");
+            return;
+        }
         // Bakes commit aliases under this same monitor. Validate the whole existing alias set
         // before changing any model record, including records still waiting in uploadResults.
-        int[] materials = MaterialCompatibility.resolve(this.mapper.getBlockStateCount(),
-                this.nextModelId, state -> this.idMappings[state],
-                state -> material(effective, this.materialState(state)));
+        int[] materials;
+        try {
+            materials = MaterialCompatibility.resolve(this.mapper.getBlockStateCount(),
+                    this.nextModelId, state -> this.idMappings[state],
+                    state -> material(effective, this.materialState(state)));
+        } catch (me.cortex.voxy.client.core.ShaderReloadCoordinator.Incompatible conflict) {
+            me.cortex.voxy.client.lod.ClientLodDebug.materialDecision(this, effective, "ALIAS_CONFLICT");
+            throw conflict;
+        }
         var snapshot = new Object2IntOpenHashMap<BlockState>(effective);
         for (int id = 0; id < this.nextModelId; id++) {
             ModelEntry old = this.modelEntriesById[id];
@@ -186,7 +195,29 @@ public class ModelFactory implements SectionMesher.Models {
         }
         this.customBlockStateIdMapping = snapshot;
         UploadStream.INSTANCE.commit();
+        me.cortex.voxy.client.lod.ClientLodDebug.materialDecision(this, effective, "UPDATED_IN_PLACE");
     }
+
+    /** Called only through the debug facade, once per reload; no model references enter log tasks. */
+    public synchronized DebugModels debugModels() {
+        int size = this.mapper.getBlockStateCount();
+        BlockState[] states = new BlockState[size];
+        BlockState[] aliases = new BlockState[size];
+        int[] models = java.util.Arrays.copyOf(this.idMappings, size);
+        boolean[] pending = new boolean[size];
+        this.blockStatesInFlightLock.lock();
+        try {
+            for (int id = 0; id < size; id++) {
+                states[id] = this.mapper.getBlockStateFromBlockId(id);
+                aliases[id] = this.materialState(id);
+                pending[id] = this.blockStatesInFlight.contains(id)
+                        || models[id] >= 0 && this.modelIdsPendingUpload.contains(models[id]);
+            }
+        } finally { this.blockStatesInFlightLock.unlock(); }
+        return new DebugModels(states, aliases, models, pending, this.materialUpdates);
+    }
+
+    public record DebugModels(BlockState[] states, BlockState[] aliases, int[] models, boolean[] pending, long materialUpdates) {}
 
     public synchronized long materialUpdates() { return this.materialUpdates; }
 

@@ -59,6 +59,8 @@ final class SessionDebugTelemetry {
         var stats = state(session);
         if (stats.latest != null && now - stats.nextSample < 0) return;
         stats.nextSample = now + INTERVAL_NANOS;
+        long started = System.nanoTime(), allocated = WorkerDebugTelemetry.allocatedBytes();
+        long cpuStarted = WorkerDebugTelemetry.samplerCpuTime();
         long admittedPending = 0;
         for (var demand : session.demands.values()) {
             if (demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
@@ -75,7 +77,15 @@ final class SessionDebugTelemetry {
                 + " meshToLeaseReleaseNanos=" + stats.meshToLeaseReleaseNanos
                 + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos;
         // No shared debug monitor is held while scanning, reading renderer counters or formatting.
-        stats.latest = new Summary(session.id, now, session.snapshot(startup));
+        String workers = WorkerDebugTelemetry.sample(session, now);
+        String summary = session.snapshot(startup) + workers;
+        long afterAllocated = WorkerDebugTelemetry.allocatedBytes();
+        long cpuEnded = WorkerDebugTelemetry.samplerCpuTime();
+        stats.latest = new Summary(session.id, now, summary
+                + " debugSampleBuildNs=" + (System.nanoTime() - started)
+                + " debugSampleCpuNs=" + (cpuStarted < 0 || cpuEnded < 0 ? -1 : cpuEnded - cpuStarted)
+                + " debugSampleAllocatedBytes=" + (allocated < 0 || afterAllocated < 0 ? -1 : afterAllocated - allocated)
+                + " debugSampleChars=" + summary.length());
     }
 
     static synchronized Summary latest(ClientSession.Session session) {
