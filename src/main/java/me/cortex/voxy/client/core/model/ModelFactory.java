@@ -18,6 +18,8 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
+import me.cortex.voxy.client.core.rendering.building.SectionMesher;
 import net.minecraft.world.level.BlockAndTintGetter;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ColorResolver;
@@ -55,7 +57,7 @@ import static org.lwjgl.opengl.GL11.*;
 
 //TODO: NOTE!!! is it worth even uploading as a 16x16 texture, since automatic lod selection... doing 8x8 textures might be perfectly ok!!!
 // this _quarters_ the memory requirements for the texture atlas!!! WHICH IS HUGE saving
-public class ModelFactory {
+public class ModelFactory implements SectionMesher.Models {
     public static final int MODEL_TEXTURE_SIZE = 16;
     public static final int LAYERS = Integer.numberOfTrailingZeros(MODEL_TEXTURE_SIZE);
     private static final short[] MIP_SCRATCH = new short[MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE];
@@ -1074,6 +1076,14 @@ public class ModelFactory {
             }
         }
         return res;
+    }
+
+    public boolean isWaterState(int blockId) {
+        return isWaterState(this.mapper.getBlockStateFromBlockId(blockId));
+    }
+
+    public static boolean isWaterState(BlockState state) {
+        return state.getFluidState().is(FluidTags.WATER);
     }
 
     public int getModelId(int blockId) {

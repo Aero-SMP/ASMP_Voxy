@@ -1,12 +1,17 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.VoxyClient;
+import me.cortex.voxy.client.core.model.ModelFactory;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.client.event.RenderFrameEvent;
 import net.neoforged.neoforge.client.event.ScreenshotEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.TagsUpdatedEvent;
 import org.lwjgl.system.MemoryStack;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,11 +68,29 @@ public final class ClientLodDebug {
         if (initialized) return;
         initialized = true;
         LiveClientTestHarness.register(modBus);
+        NeoForge.EVENT_BUS.addListener(ClientLodDebug::waterTagsUpdated);
         NeoForge.EVENT_BUS.addListener(ClientLodDebug::forceFullSpeed);
         NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, RenderFrameEvent.Post.class,
                 LiveClientTestHarness::renderFrame);
         NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, ScreenshotEvent.class,
                 ClientLodDebug::uploadScreenshot);
+    }
+
+    /** Observe the production predicate after real registry tags are installed, not mocked tags. */
+    private static void waterTagsUpdated(TagsUpdatedEvent event) {
+        var water = Blocks.WATER.defaultBlockState();
+        var slab = Blocks.OAK_SLAB.defaultBlockState();
+        boolean source = ModelFactory.isWaterState(water);
+        boolean flowing = ModelFactory.isWaterState(water.setValue(LiquidBlock.LEVEL, 1));
+        boolean logged = ModelFactory.isWaterState(slab.setValue(BlockStateProperties.WATERLOGGED, true));
+        boolean dry = ModelFactory.isWaterState(slab);
+        boolean lava = ModelFactory.isWaterState(Blocks.LAVA.defaultBlockState());
+        boolean glass = ModelFactory.isWaterState(Blocks.GLASS.defaultBlockState());
+        boolean stone = ModelFactory.isWaterState(Blocks.STONE.defaultBlockState());
+        updaterEvent("state=BOUNDARY_WATER_TAG_CHECK result="
+                + (source && flowing && logged && !dry && !lava && !glass && !stone ? "PASS" : "FAIL")
+                + " source=" + source + " flowing=" + flowing + " waterlogged=" + logged
+                + " dry=" + dry + " lava=" + lava + " glass=" + glass + " stone=" + stone);
     }
 
     private static void uploadScreenshot(ScreenshotEvent event) {

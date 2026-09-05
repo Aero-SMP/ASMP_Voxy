@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.rendering.building;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
-import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.client.core.model.ModelQueries;
 import me.cortex.voxy.client.lod.RegionalSectionCodec;
 import me.cortex.voxy.common.util.MemoryBuffer;
@@ -11,6 +10,7 @@ import org.lwjgl.system.MemoryUtil;
 
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.function.IntConsumer;
 
 /** Compact greedy mesher for the regional 32-cubed section representation. */
 public final class SectionMesher {
@@ -20,13 +20,26 @@ public final class SectionMesher {
     private static final int MAX_QUAD_EDGE = 16;
     private static final int BUCKETS = 8;
 
-    private final ModelBakerySubsystem bakery;
-    private final ModelFactory models;
+    /** Model lookup boundary; meshing itself has no GL or bakery lifecycle dependency. */
+    public interface Models {
+        int getModelId(int blockId);
+        long getModelMetadataFromClientId(int modelId);
+        int getFluidClientStateId(int modelId);
+        boolean isModelReadyForBlockId(int blockId);
+        boolean isWaterState(int blockId);
+    }
+
+    private final IntConsumer requestBake;
+    private final Models models;
     private final ThreadLocal<Workspace> workspaces = ThreadLocal.withInitial(Workspace::new);
 
     public SectionMesher(ModelBakerySubsystem bakery) {
-        this.bakery = Objects.requireNonNull(bakery, "bakery");
-        this.models = bakery.factory;
+        this(Objects.requireNonNull(bakery, "bakery").factory, bakery::requestBlockBake);
+    }
+
+    SectionMesher(Models models, IntConsumer requestBake) {
+        this.models = Objects.requireNonNull(models, "models");
+        this.requestBake = Objects.requireNonNull(requestBake, "requestBake");
     }
 
     public void requestModels(RegionalSectionCodec.SectionData section) {
@@ -34,7 +47,7 @@ public final class SectionMesher {
     }
 
     public void requestModels(int[] blocks) {
-        for (int block : blocks) this.bakery.requestBlockBake(block);
+        for (int block : blocks) this.requestBake.accept(block);
     }
 
     public boolean modelsReady(RegionalSectionCodec.SectionData section) {
@@ -136,6 +149,10 @@ public final class SectionMesher {
         if (model == 0 || !ModelQueries.faceExists(own, face)) return 0;
 
         int neighbor = neighbor(cell, face);
+        // Deliberately omit even exposed water walls here; sections remain independent.
+        // Inspect the original state, not a deduplicated model or the solid waterlogged face.
+        if (neighbor < 0 && face >= 2 && ModelQueries.isFluid(own)
+                && this.models.isWaterState(CatalogMapper.getBlockId(cells[cell]))) return 0;
         int neighborModel = 0;
         long neighborMetadata = 0;
         int neighborLight = CatalogMapper.getLightId(cells[cell]);

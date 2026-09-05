@@ -21,6 +21,7 @@ public final class SectionDemandTableBehaviorTest {
         allocatorReportsFragmentation();
         PublicationRepairBehaviorTest.run();
         me.cortex.voxy.client.core.ShaderReloadBehaviorTest.run();
+        me.cortex.voxy.client.core.rendering.building.BoundaryWaterMesherBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationTopologyBehaviorTest.run();
         System.out.println("coalesced demand-table behavior tests passed");
     }
