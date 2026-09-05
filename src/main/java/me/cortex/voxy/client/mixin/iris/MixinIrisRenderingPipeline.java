@@ -1,6 +1,8 @@
 package me.cortex.voxy.client.mixin.iris;
 
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import me.cortex.voxy.client.iris.IrisUtil;
 import me.cortex.voxy.client.iris.IGetIrisVoxyPipelineData;
 import me.cortex.voxy.client.iris.IGetVoxyPatchData;
@@ -22,6 +24,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(value = IrisRenderingPipeline.class, remap = false)
 public class MixinIrisRenderingPipeline implements IGetVoxyPatchData, IGetIrisVoxyPipelineData {
     @Shadow @Final private CustomUniforms customUniforms;
+    @Shadow private boolean initializedBlockIds;
     @Shadow private ShaderStorageBufferHolder shaderStorageBufferHolder;
     @Unique IrisShaderPatch patchData;
     @Unique
@@ -45,6 +48,33 @@ public class MixinIrisRenderingPipeline implements IGetVoxyPatchData, IGetIrisVo
             var renderer = ((IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
             if (renderer != null) {
                 IrisUtil.CAPTURED_VIEWPORT_PARAMETERS.apply(renderer);
+            }
+        }
+    }
+
+    @Override public boolean voxy$blockMappingsReady() { return this.initializedBlockIds; }
+
+    @WrapMethod(method = "beginLevelRendering")
+    private void voxy$initializeMaterialMappings(Operation<Void> original) {
+        if (this.initializedBlockIds) { original.call(); return; }
+        var renderer = IGetVoxyRenderSystem.getNullable();
+        var scope = renderer == null ? null : renderer.beginShaderReload("Iris block mapping initialization");
+        var captured = IrisUtil.CAPTURED_VIEWPORT_PARAMETERS;
+        Throwable failure = null;
+        try {
+            original.call();
+        } catch (RuntimeException | Error problem) {
+            failure = problem;
+            throw problem;
+        } finally {
+            if (scope != null) {
+                scope.finish(failure);
+                renderer.irisMappingsPrepared(failure);
+                // The earlier viewport hook ran while suspended. Apply this frame's exact
+                // captured camera after committing, never to a replacement world/renderer.
+                if (failure == null && captured != null && IGetVoxyRenderSystem.getNullable() == renderer) {
+                    captured.apply(renderer);
+                }
             }
         }
     }

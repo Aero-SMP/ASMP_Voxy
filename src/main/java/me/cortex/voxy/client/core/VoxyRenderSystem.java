@@ -66,6 +66,7 @@ public class VoxyRenderSystem {
     private boolean constructing = true, destroyed;
     private ShaderReloadCoordinator<ShaderGroup> shaderReload;
     private ShaderReloadCoordinator<ShaderGroup>.Scope externalShaderReload;
+    private ShaderReloadCoordinator<ShaderGroup>.Scope pendingIrisMappings;
     private long historyInvalidations, resumedDraws;
     private java.util.Map<?, ?> modelRenderTypes;
     private final CatalogMapper mapper;
@@ -97,8 +98,29 @@ public class VoxyRenderSystem {
     }
 
     public void irisPipelinePrepared(Throwable failure) {
+        if (failure == null) this.deferUntilIrisMappingsReady();
         var pending = this.externalShaderReload;
         this.externalShaderReload = null;
+        if (pending != null) pending.finish(failure);
+    }
+
+    /** Iris initializes its material maps on the first world frame, after reload() returns. */
+    public void deferUntilIrisMappingsReady() {
+        if (!this.currentShaderOwner() || !IrisUtil.IRIS_INSTALLED) return;
+        var iris = Iris.getPipelineManager().getPipelineNullable();
+        if (iris instanceof IGetIrisVoxyPipelineData data && !data.voxy$blockMappingsReady()) {
+            if (this.pendingIrisMappings == null) {
+                this.pendingIrisMappings = this.beginShaderReload("awaiting Iris block mappings");
+            }
+        } else {
+            // A second reload can disable shaders before the deferred first frame arrives.
+            this.irisMappingsPrepared(null);
+        }
+    }
+
+    public void irisMappingsPrepared(Throwable failure) {
+        var pending = this.pendingIrisMappings;
+        this.pendingIrisMappings = null;
         if (pending != null) pending.finish(failure);
     }
 
@@ -202,7 +224,9 @@ public class VoxyRenderSystem {
                 }
             }
         });
-        this.shaderReload.begin("initial").finish(null);
+        var initial = this.shaderReload.begin("initial");
+        this.deferUntilIrisMappingsReady();
+        initial.finish(null);
     }
     private ModelBakerySubsystem modelService;
     private BasicSectionGeometryData geometryData;
@@ -806,6 +830,7 @@ public class VoxyRenderSystem {
     private void releaseComponents(Throwable constructionFailure) {
         this.destroyed = true;
         this.externalShaderReload = null;
+        this.pendingIrisMappings = null;
         if (this.shaderReload != null) release("shader resources", this.shaderReload::close, constructionFailure);
         release("biome callback", () -> this.mapper.setBiomeCallback(null), constructionFailure);
         AsyncNodeManager nodes = this.nodeManager;

@@ -121,6 +121,17 @@ final class LiveClientTestHarness {
         observedPose = observePose();
         Run active = run;
         if (active == null) return;
+        if (active.shaderAwaitFrame >= 0 && renderedFrame > active.shaderAwaitFrame) {
+            var renderer = IGetVoxyRenderSystem.getNullable();
+            if (renderer != active.renderer) { failRun(DebugTestProtocol.Failure.RENDERER_REPLACED); return; }
+            if (renderer.shaderReloadStatus().equals("FAILED")) { failRun(DebugTestProtocol.Failure.INTERNAL); return; }
+            if (renderer.shaderReloadStatus().equals("READY") && renderer.shaderResumedDraws() > active.shaderDrawMarker) {
+                active.shaderAwaitFrame = -1;
+                requestResult(active.endingShaderRestore ? DebugTestProtocol.ResultKind.RUN_COMPLETE
+                                : DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
+                        active.stepId, DebugTestProtocol.Failure.NONE, active.endingShaderRestore);
+            }
+        }
         PoseExpectation expected = active.pose;
         if (expected != null) {
             if (expected.stabilizer.observe(renderedFrame, matches(expected, observedPose))) {
@@ -186,6 +197,8 @@ final class LiveClientTestHarness {
                     sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
                     break;
                 }
+                active.shaderAwaitFrame = renderedFrame;
+                active.shaderDrawMarker = active.renderer.shaderResumedDraws();
                 try {
                     if (active.shaderSettings == null) active.shaderSettings = new DebugShaderSettings();
                     if (command.kind() == DebugTestProtocol.CommandKind.SHADER_OPTION) {
@@ -205,11 +218,8 @@ final class LiveClientTestHarness {
                     }
                     if (IGetVoxyRenderSystem.getNullable() != active.renderer) {
                         failRun(DebugTestProtocol.Failure.RENDERER_REPLACED);
-                    } else if (!active.renderer.shaderReloadStatus().equals("READY")) {
+                    } else if (active.renderer.shaderReloadStatus().equals("FAILED")) {
                         failRun(DebugTestProtocol.Failure.INTERNAL);
-                    } else {
-                        requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
-                                active.stepId, DebugTestProtocol.Failure.NONE, false);
                     }
                 } catch (Throwable failure) {
                     me.cortex.voxy.common.Logger.error("Debug shader reload failed", failure);
@@ -244,6 +254,7 @@ final class LiveClientTestHarness {
             case CAPTURE_SCREENSHOT -> active.screenshot = new ScreenshotRequest(
                     "voxy-test-" + active.runId + '-' + active.stepId + ".png", renderedFrame);
             case END_RUN -> {
+                active.shaderDrawMarker = active.renderer == null ? 0 : active.renderer.shaderResumedDraws();
                 try {
                     if (active.shaderSettings != null) {
                         active.shaderSettings.restore();
@@ -251,6 +262,9 @@ final class LiveClientTestHarness {
                     }
                     if (IGetVoxyRenderSystem.getNullable() != active.renderer) {
                         failRun(DebugTestProtocol.Failure.RENDERER_REPLACED);
+                    } else if (active.renderer != null && active.renderer.shaderReloadStatus().equals("SUSPENDED")) {
+                        active.endingShaderRestore = true;
+                        active.shaderAwaitFrame = renderedFrame;
                     } else if (active.renderer != null && !active.renderer.shaderReloadStatus().equals("READY")) {
                         failRun(DebugTestProtocol.Failure.INTERNAL);
                     } else {
@@ -581,6 +595,8 @@ final class LiveClientTestHarness {
         final VoxyRenderSystem renderer;
         long stepId;
         DebugShaderSettings shaderSettings;
+        long shaderAwaitFrame = -1, shaderDrawMarker;
+        boolean endingShaderRestore;
         PoseExpectation pose;
         Trace trace;
         ScreenshotRequest screenshot;
@@ -588,7 +604,7 @@ final class LiveClientTestHarness {
             this.runId = runId; this.stepId = stepId; this.renderer = renderer;
         }
         boolean hasOutstandingOperation() {
-            return this.pose != null || this.trace != null || this.screenshot != null
+            return this.shaderAwaitFrame >= 0 || this.pose != null || this.trace != null || this.screenshot != null
                     || snapshotPending;
         }
     }

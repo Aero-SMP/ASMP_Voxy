@@ -29,7 +29,11 @@ public class MixinIris {
             if (problem instanceof Error error) throw error;
             throw new RuntimeException(problem);
         } finally {
-            if (scope != null) scope.finish(failure);
+            if (scope != null) {
+                if (failure == null) renderer.deferUntilIrisMappingsReady();
+                scope.finish(failure);
+                if (failure != null) renderer.irisMappingsPrepared(failure);
+            }
         }
     }
 

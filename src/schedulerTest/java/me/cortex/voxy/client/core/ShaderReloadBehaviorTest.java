@@ -87,6 +87,7 @@ public final class ShaderReloadBehaviorTest {
         compatibleNestedAndRepeated();
         failuresAndRecovery();
         staleWorldCallbacks();
+        deferredIrisMappingInitialization();
         sharedMaterialsAndLateUpload();
         cleanupContinuesAfterFailure();
         System.out.println("shader reload ownership and material behavior tests passed");
@@ -145,6 +146,33 @@ public final class ShaderReloadBehaviorTest {
         owner.incompatible = true;
         owner.reload();
         check(owner.rebuilds == 1 && owner.coordinator.reason().contains("split"), "incompatible mapping not explicit");
+        owner.noLeaks();
+    }
+
+    private static void deferredIrisMappingInitialization() {
+        Owner owner = new Owner();
+        owner.reload();
+        var reload = owner.coordinator.begin("Iris.reload");
+        var mappings = owner.coordinator.begin("pending first world frame");
+        reload.finish(null);
+        check(!owner.coordinator.drawable() && owner.commits == 1 && owner.coordinator.nestedReload(),
+                "Iris return committed resources before deferred material initialization");
+        var firstFrame = owner.coordinator.begin("beginLevelRendering -> allChanged");
+        owner.taa = true;
+        firstFrame.finish(null);
+        check(!owner.coordinator.drawable(), "nested allChanged committed before mappings");
+        mappings.finish(null);
+        check(owner.coordinator.drawable() && owner.commits == 2 && owner.taaPipeline == owner.sampler,
+                "deferred mapping readiness did not commit exactly once");
+        var pendingReload = owner.coordinator.begin("enable");
+        var waiting = owner.coordinator.begin("waiting mappings");
+        pendingReload.finish(null);
+        var disable = owner.coordinator.begin("disable before first frame");
+        waiting.finish(null);
+        check(!owner.coordinator.drawable(), "superseded mapping scope committed before new reload ended");
+        owner.taa = false;
+        disable.finish(null);
+        check(owner.coordinator.drawable() && owner.taaPipeline == null, "disable stranded deferred reload");
         owner.noLeaks();
     }
 
