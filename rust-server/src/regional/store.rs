@@ -880,6 +880,83 @@ mod tests {
     }
 
     #[test]
+    fn published_sections_decode_exact_cells_and_directory_children() {
+        let temporary = TemporaryDirectory::new();
+        let path = temporary.0.join("r.-2.3.vxregion");
+        let mut builder = builder(1);
+        let layout = RegionLayout::new(-2, 12, 5).unwrap();
+        let mut expected = Vec::new();
+        for (ordinal, count) in [1, 3, 257, SECTION_VOLUME].into_iter().enumerate() {
+            let cells = (0..SECTION_VOLUME)
+                .map(|i| {
+                    let id = i % count;
+                    Cell {
+                        block: if count > 1 && id == 0 {
+                            0
+                        } else {
+                            id as u32 + 1
+                        },
+                        biome: id as u32 * 17,
+                        light: id as u8,
+                    }
+                })
+                .collect();
+            let coordinate = layout.coordinate(-2, 3, ordinal).unwrap();
+            let frame = SectionFrame::new(0, cells).unwrap();
+            builder.insert(coordinate, frame.clone()).unwrap();
+            expected.push((coordinate, frame));
+        }
+        let parent = SectionCoordinate {
+            level: 1,
+            x: -16,
+            y: 0,
+            z: 24,
+        };
+        let parent_frame = SectionFrame::new(
+            0xa5,
+            vec![
+                Cell {
+                    block: 9,
+                    biome: 7,
+                    light: 0xf3
+                };
+                SECTION_VOLUME
+            ],
+        )
+        .unwrap();
+        builder.insert(parent, parent_frame.clone()).unwrap();
+        expected.push((parent, parent_frame));
+        let empty = layout.coordinate(-2, 3, 4).unwrap();
+        builder
+            .insert(empty, SectionFrame::empty(0).unwrap())
+            .unwrap();
+        let published = builder.write_atomic(&path).unwrap();
+        drop(published);
+        let loaded = RegionFile::open(&path).unwrap();
+        for (coordinate, frame) in expected {
+            assert_eq!(
+                loaded.read_section(coordinate).unwrap(),
+                Some(frame.clone())
+            );
+            assert_eq!(
+                loaded.entry(coordinate).unwrap().non_empty_children,
+                frame.non_empty_children
+            );
+        }
+        assert_eq!(
+            loaded.read_section(empty).unwrap(),
+            Some(SectionFrame::empty(0).unwrap())
+        );
+        assert!(loaded.read_compressed(empty).unwrap().is_none());
+        assert!(
+            loaded
+                .read_section(layout.coordinate(-2, 3, 5).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn atomic_replacement_keeps_existing_reader_generation() {
         let temporary = TemporaryDirectory::new();
         let path = temporary.0.join("r.-2.3.vxregion");

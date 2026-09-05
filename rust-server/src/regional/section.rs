@@ -103,24 +103,7 @@ impl SectionFrame {
             .chunks_exact(8)
             .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let indexes = unpack_indexes(&words, bits, palette_count, SECTION_VOLUME)?;
-        let mut next = 0usize;
-        let cells = indexes
-            .into_iter()
-            .map(|index| {
-                let index = index as usize;
-                if index > next {
-                    return Err(anyhow::anyhow!("noncanonical section palette order"));
-                }
-                if index == next {
-                    next += 1;
-                }
-                Ok(palette[index])
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if next != palette_count {
-            bail!("unused regional section palette entry");
-        }
+        let cells = unpack_cells(&words, bits, &palette, SECTION_VOLUME)?;
         let frame = Self {
             non_empty_children: 0,
             cells,
@@ -183,18 +166,22 @@ fn pack_indexes(indexes: &[u16], bits: u8) -> Vec<u64> {
     words
 }
 
-fn unpack_indexes(words: &[u64], bits: u8, palette_count: usize, count: usize) -> Result<Vec<u16>> {
+fn unpack_cells(words: &[u64], bits: u8, palette: &[Cell], count: usize) -> Result<Vec<Cell>> {
     if bits == 0 {
-        if palette_count != 1 || !words.is_empty() {
+        if palette.len() != 1 || !words.is_empty() {
             bail!("zero-bit section indexes require one palette cell");
         }
-        return Ok(vec![0; count]);
+        if count == 0 {
+            bail!("unused regional section palette entry");
+        }
+        return Ok(vec![palette[0]; count]);
     }
     if words.len() != words_for(count, bits)? {
         bail!("packed regional section index length mismatch");
     }
     let mask = (1u64 << bits) - 1;
     let mut output = Vec::with_capacity(count);
+    let mut next = 0usize;
     for index in 0..count {
         let bit = index * bits as usize;
         let word = bit / 64;
@@ -203,11 +190,17 @@ fn unpack_indexes(words: &[u64], bits: u8, palette_count: usize, count: usize) -
         if shift + bits as usize > 64 {
             value |= words[word + 1] << (64 - shift);
         }
-        let value = (value & mask) as u16;
-        if value as usize >= palette_count {
+        let value = (value & mask) as usize;
+        if value >= palette.len() {
             bail!("regional section palette index is out of range");
         }
-        output.push(value);
+        if value > next {
+            bail!("noncanonical section palette order");
+        }
+        if value == next {
+            next += 1;
+        }
+        output.push(palette[value]);
     }
     if !(count * bits as usize).is_multiple_of(64) {
         let used = count * bits as usize % 64;
@@ -215,12 +208,154 @@ fn unpack_indexes(words: &[u64], bits: u8, palette_count: usize, count: usize) -
             bail!("nonzero regional section index padding");
         }
     }
+    if next != palette.len() {
+        bail!("unused regional section palette entry");
+    }
     Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_trips_every_valid_palette_width_and_power_boundary() {
+        let mut sizes = std::collections::BTreeSet::from([1, SECTION_VOLUME]);
+        for bit in 1..=15 {
+            for size in [(1 << bit) - 1, 1 << bit, (1 << bit) + 1] {
+                if size <= SECTION_VOLUME {
+                    sizes.insert(size);
+                }
+            }
+        }
+        let mut widths = std::collections::BTreeSet::new();
+        for size in sizes {
+            widths.insert(palette_bits(size).unwrap());
+            let palette = (0..size)
+                .map(|id| Cell {
+                    block: if id == 0 && size > 1 {
+                        0
+                    } else {
+                        id as u32 + 1
+                    },
+                    biome: (id as u32).wrapping_mul(7919).wrapping_add(13),
+                    light: (id * 37 + 255) as u8,
+                })
+                .collect::<Vec<_>>();
+            let mut seed = 0x98765432u32;
+            let cells = (0..SECTION_VOLUME)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    palette[if i < size { i } else { seed as usize % size }]
+                })
+                .collect();
+            let expected = SectionFrame::new(0, cells).unwrap();
+            let bytes = expected.encode().unwrap();
+            let decoded = SectionFrame::decode(&bytes).unwrap();
+            assert_eq!(decoded, expected, "palette size {size}");
+            assert_eq!(decoded.encode().unwrap(), bytes, "palette size {size}");
+        }
+        assert_eq!(widths, (0..=15).collect());
+    }
+
+    #[test]
+    fn packed_cells_validate_padding_length_and_zero_bit_cases() {
+        let palette = [
+            Cell::AIR,
+            Cell {
+                block: 1,
+                biome: 9,
+                light: 255,
+            },
+        ];
+        let valid = pack_indexes(&[0, 1, 0], 1);
+        assert_eq!(
+            unpack_cells(&valid, 1, &palette, 3).unwrap(),
+            vec![palette[0], palette[1], palette[0]]
+        );
+        let mut padded = valid.clone();
+        padded[0] |= 1 << 3;
+        // These indexes already satisfy bounds, first-use and all-used checks.
+        assert!(unpack_cells(&padded, 1, &palette, 3).is_err());
+        assert!(unpack_cells(&[], 1, &palette, 3).is_err());
+        assert!(unpack_cells(&[valid[0], 0], 1, &palette, 3).is_err());
+        assert_eq!(
+            unpack_cells(&[], 0, &palette[1..], 3).unwrap(),
+            vec![palette[1]; 3]
+        );
+        assert!(unpack_cells(&[0], 0, &palette[1..], 3).is_err());
+        assert!(unpack_cells(&[], 0, &palette, 3).is_err());
+        assert!(unpack_cells(&[], 0, &[], 3).is_err());
+        assert!(unpack_cells(&[], 0, &palette[1..], 0).is_err());
+    }
+
+    #[test]
+    fn malformed_lengths_counts_and_all_air_are_rejected() {
+        let frame = SectionFrame::new(
+            0,
+            vec![
+                Cell {
+                    block: 1,
+                    biome: 42,
+                    light: 255
+                };
+                SECTION_VOLUME
+            ],
+        )
+        .unwrap();
+        let valid = frame.encode().unwrap();
+        for length in 0..valid.len() {
+            assert!(SectionFrame::decode(&valid[..length]).is_err());
+        }
+        let mut extra = valid.clone();
+        extra.push(0);
+        assert!(SectionFrame::decode(&extra).is_err());
+        let mut mixed = frame.clone();
+        mixed.cells[SECTION_VOLUME - 1] = Cell::AIR;
+        let packed = mixed.encode().unwrap();
+        assert!(SectionFrame::decode(&packed[..packed.len() - 1]).is_err());
+        let mut extra_packed = packed;
+        extra_packed.push(0);
+        assert!(SectionFrame::decode(&extra_packed).is_err());
+        assert!(SectionFrame::decode(&[0, 0]).is_err());
+        assert!(SectionFrame::decode(&u16::MAX.to_le_bytes()).is_err());
+        for cell in [
+            Cell::AIR,
+            Cell {
+                block: 0,
+                biome: 123,
+                light: 255,
+            },
+        ] {
+            let mut bytes = 1u16.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&cell.block.to_le_bytes());
+            bytes.extend_from_slice(&cell.biome.to_le_bytes());
+            bytes.push(cell.light);
+            assert!(
+                SectionFrame::decode(&bytes).is_err(),
+                "air metadata made an empty payload nonempty"
+            );
+            assert!(
+                SectionFrame::new(0, vec![cell; SECTION_VOLUME])
+                    .unwrap()
+                    .encode()
+                    .is_err()
+            );
+        }
+        // A 16-bit palette is representable in the header but cannot have all entries used
+        // in a 32^3 section. Reach the real all-used check with otherwise valid packed data.
+        let count = SECTION_VOLUME + 1;
+        let mut bytes = (count as u16).to_le_bytes().to_vec();
+        for id in 0..count {
+            bytes.extend_from_slice(&(id as u32 + 1).to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.push(0);
+        }
+        for word in pack_indexes(&(0..SECTION_VOLUME as u16).collect::<Vec<_>>(), 16) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(SectionFrame::decode(&bytes).is_err());
+    }
 
     #[test]
     fn shared_palette_fixtures() {
@@ -276,10 +411,6 @@ mod tests {
                 assert_eq!(frame.encode().unwrap(), bytes);
             }
         }
-        assert!(
-            unpack_indexes(&[2], 1, 2, 1).is_err(),
-            "nonzero padding accepted"
-        );
         assert!(SectionFrame::decode(&[0, 0]).is_err());
         assert!(SectionFrame::decode(&[1]).is_err());
     }
