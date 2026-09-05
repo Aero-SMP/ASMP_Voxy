@@ -874,11 +874,13 @@ public class AsyncNodeManager {
     }
 
     public void setPublicationProgressListener(Runnable listener) {
-        this.progressListener = Objects.requireNonNull(listener);
+        synchronized (this) {
+            this.progressListener = Objects.requireNonNull(listener);
+        }
         listener.run();
     }
 
-    public void clearPublicationProgressListener(Runnable listener) {
+    public synchronized void clearPublicationProgressListener(Runnable listener) {
         if (this.progressListener == listener) this.progressListener = () -> {};
     }
 

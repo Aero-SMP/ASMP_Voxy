@@ -233,6 +233,12 @@ tasks.register('schedulerBehaviorTest', JavaExec) {
     mainClass.set('me.cortex.voxy.client.lod.SectionDemandTableBehaviorTest')
 }
 
+// Exercise the exact debug sampler with the headless scheduler fixtures, without starting
+// the debug facade's updater/log-writer static initializer.
+tasks.named('compileSchedulerTestJava', JavaCompile) {
+    source 'src/debug/java/me/cortex/voxy/client/lod/SessionDebugTelemetry.java'
+}
+
 tasks.register('verifyDebugHarnessArtifacts') {
     description = 'Prove test-control classes occur only in debug artifacts'
     dependsOn tasks.named('buildAll')
@@ -246,6 +252,7 @@ tasks.register('verifyDebugHarnessArtifacts') {
             def leaked = zipTree(artifact).matching {
                 include forbiddenPrefix + '**'
                 include '**/LiveClientTestHarness*', '**/LiveServerTestHarness*'
+                include '**/SessionDebugTelemetry*'
             }.files
             if (!leaked.empty) throw new GradleException("debug-test protocol leaked into ${artifact}")
         }

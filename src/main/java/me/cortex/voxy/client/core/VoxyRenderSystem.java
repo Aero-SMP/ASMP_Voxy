@@ -285,24 +285,25 @@ public class VoxyRenderSystem {
     }
 
     public SectionPublisher regionalSectionPublisher() {
+        AsyncNodeManager nodes = Objects.requireNonNull(this.nodeManager, "renderer not initialized");
         return new SectionPublisher() {
             @Override
             public SubmissionAttempt tryPublishBatch(List<SectionSubmission> submissions) {
-                return publishRegionalSections(submissions);
+                return publishRegionalSections(nodes, submissions);
             }
             @Override public AsyncNodeManager.PublicationProgress progress() {
-                return nodeManager.publicationProgress();
+                return nodes.publicationProgress();
             }
             @Override public void setProgressListener(Runnable listener) {
-                nodeManager.setPublicationProgressListener(listener);
+                nodes.setPublicationProgressListener(listener);
             }
             @Override public void clearProgressListener(Runnable listener) {
-                nodeManager.clearPublicationProgressListener(listener);
+                nodes.clearPublicationProgressListener(listener);
             }
 
             @Override
             public void coarsen(long parent, Runnable success, Consumer<Throwable> failure) {
-                coarsenRegionalSubtree(parent, success, failure);
+                coarsenRegionalSubtree(nodes, parent, success, failure);
             }
         };
     }
@@ -351,10 +352,10 @@ public class VoxyRenderSystem {
                 + ";gpuToActive:" + this.regionalPublicationLatencies[lane][2].snapshot();
     }
 
-    private SubmissionAttempt publishRegionalSections(List<SectionSubmission> submissions) {
+    private SubmissionAttempt publishRegionalSections(AsyncNodeManager nodes, List<SectionSubmission> submissions) {
         Objects.requireNonNull(submissions, "submissions");
         if (submissions.isEmpty()) return new SubmissionAttempt(SubmissionStatus.ACCEPTED, List.of());
-        SubmissionAttempt accepted = this.nodeManager.tryPublishRegionalSections(() -> {
+        SubmissionAttempt accepted = nodes.tryPublishRegionalSections(() -> {
             ArrayList<AsyncNodeManager.RegionalSectionSubmission> rendererSubmissions =
                     new ArrayList<>(submissions.size());
             ArrayList<SectionPublication> handles = new ArrayList<>(submissions.size());
@@ -366,7 +367,7 @@ public class VoxyRenderSystem {
                 RegionalSectionPublication previous = submission.previous()
                         .map(value -> requireRegionalSectionPublication(submission.position(), value))
                         .orElse(null);
-                PreparedRegionalSection prepared = this.prepareRegionalSection(submission.position(),
+                PreparedRegionalSection prepared = this.prepareRegionalSection(nodes, submission.position(),
                         submission.geometry(), previous, submission.coverage(),
                         submission.meshCompletedNanos(), submission.current());
                 rendererSubmissions.add(prepared.submission());
@@ -379,7 +380,7 @@ public class VoxyRenderSystem {
     }
 
     private PreparedRegionalSection prepareRegionalSection(
-            long position, BuiltSection geometry, RegionalSectionPublication previous,
+            AsyncNodeManager nodes, long position, BuiltSection geometry, RegionalSectionPublication previous,
             boolean coverage, long meshCompletedNanos,
             BooleanSupplier current) {
         Objects.requireNonNull(geometry, "geometry");
@@ -389,13 +390,13 @@ public class VoxyRenderSystem {
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
                 geometry.aabb, geometry.geometryBuffer, geometry.offsets);
         RegionalSectionPublication publication = new RegionalSectionPublication(
-                this.nodeManager, position, revision, coverage, meshCompletedNanos);
+                nodes, position, revision, coverage, meshCompletedNanos);
         long previousRevision = previous == null ? -1 : previous.revision;
         AsyncNodeManager.RegionalSectionSubmission submission =
                 new AsyncNodeManager.RegionalSectionSubmission(queued, previousRevision,
                 () -> current.getAsBoolean() && publication.acceptsUpload(),
                 publication::markRendererAdmitted, publication, () ->
-                this.nodeManager.finalizeStagedRoot(revision, () -> {
+                nodes.finalizeStagedRoot(revision, () -> {
                     publication.recordActivationFencePassed(System.nanoTime());
                     publication.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
                     if (previous != null) previous.markRetired();
@@ -411,13 +412,13 @@ public class VoxyRenderSystem {
             RegionalSectionPublication publication,
             AsyncNodeManager.RegionalSectionSubmission submission) {}
 
-    private void coarsenRegionalSubtree(long parent, Runnable success,
+    private void coarsenRegionalSubtree(AsyncNodeManager nodes, long parent, Runnable success,
                                         Consumer<Throwable> failure) {
         Objects.requireNonNull(success, "success");
         Objects.requireNonNull(failure, "failure");
         long revision = this.regionalSectionRevision.getAndIncrement();
         if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
-        this.nodeManager.coarsenSubtree(revision, parent, success, failure);
+        nodes.coarsenSubtree(revision, parent, success, failure);
     }
 
     private RegionalSectionPublication requireRegionalSectionPublication(

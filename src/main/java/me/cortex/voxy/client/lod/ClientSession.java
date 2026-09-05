@@ -100,7 +100,7 @@ final class ClientSession {
 
     static String debugSnapshot() {
         Session current = active;
-        return current == null ? "regional=DISCONNECTED" : current.snapshot();
+        return current == null ? "regional=DISCONNECTED" : ClientLodDebug.sessionSnapshot(current);
     }
 
     /** Debug harness handoff. The real owner thread creates the observation without blocking. */
@@ -700,6 +700,7 @@ final class ClientSession {
                         this.processRegions();
                         this.pollPublications();
                         this.processStages();
+                        ClientLodDebug.captureSession(this);
                         if (this.quic != null && !this.quic.isOpen()) {
                             throw new IOException("regional QUIC connection ended",
                                     this.quic.failure());
@@ -2658,7 +2659,10 @@ final class ClientSession {
             if (this.quic != null) this.quic.close();
         }
 
-        String snapshot() {
+        String snapshot(String startupSummary) {
+            if (Thread.currentThread() != this.thread) {
+                throw new IllegalStateException("session summary must be captured by its owner");
+            }
             int idleWorkers = 0, runningWorkers = 0, completedWorkers = 0;
             for (WorkerSlot worker : this.sectionWorkers) synchronized (worker) {
                 switch (worker.resource.state()) {
@@ -2716,7 +2720,7 @@ final class ClientSession {
                     + " dormantLastEvictionAge=" + this.lastEvictionAge
                     + ' ' + this.renderer.regionalPublicationLatencySnapshot()
                     + " received=" + this.receivedBytes
-                    + ClientLodDebug.startupSnapshot(this)
+                    + startupSummary
                     + " connectionFailure=" + String.valueOf(this.lastConnectionFailure)
                     + " failure=" + String.valueOf(this.failure);
         }
