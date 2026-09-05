@@ -51,6 +51,7 @@ public final class WorkerShaderDebugBehaviorTest {
     private static void actualWorkerStalls() throws Exception {
         var fixture = CacheStartupBehaviorTest.fixture(1, 1, 255, 1);
         var cache = new RegionalCache(Files.createTempDirectory("voxy-instrumentation-cache-"), CacheStartupBehaviorTest.WORLD);
+        CacheStartupBehaviorTest.awaitInventory((RegionalDiskBudget) field(cache, "budget"));
         int ordinal = fixture.index().ordinal(CacheStartupBehaviorTest.KEY);
         cache.put(fixture.index(), ordinal, fixture.payload());
         Object budget = field(cache, "budget");

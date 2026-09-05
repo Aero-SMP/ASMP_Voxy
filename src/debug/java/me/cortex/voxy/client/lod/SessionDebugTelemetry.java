@@ -78,7 +78,8 @@ final class SessionDebugTelemetry {
                 + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos;
         // No shared debug monitor is held while scanning, reading renderer counters or formatting.
         String workers = WorkerDebugTelemetry.sample(session, now);
-        String summary = session.snapshot(startup) + workers;
+        String summary = session.snapshot(startup) + workers
+                + (session.metadata == null ? " cacheInventory=NOT_OPEN" : session.metadata.budget.snapshot());
         long afterAllocated = WorkerDebugTelemetry.allocatedBytes();
         long cpuEnded = WorkerDebugTelemetry.samplerCpuTime();
         stats.latest = new Summary(session.id, now, summary

@@ -11,14 +11,25 @@ import java.util.Set;
 import java.util.function.BooleanSupplier;
 
 /** Saved wire inputs only. No transient renderer IDs, meshes, subscriptions or worker state. */
-final class RegionalMetadataStore {
+final class RegionalMetadataStore implements AutoCloseable {
     private static final long MAGIC = 0x3154524154535856L; // VXSTART1, little endian
     private static final int HEADER = 24, VERSION = 1, ASSOCIATION = 1, CATALOG = 2, REGION = 3;
     private static final int REGION_FIXED = 100;
     final RegionalDiskBudget budget;
+    private boolean closed;
 
-    RegionalMetadataStore(Path root) throws IOException { this(RegionalDiskBudget.open(root)); }
-    RegionalMetadataStore(RegionalDiskBudget budget) { this.budget = budget; }
+    RegionalMetadataStore(Path root) throws IOException { this.budget = RegionalDiskBudget.acquire(root); }
+    RegionalMetadataStore(RegionalDiskBudget budget) { this.budget = budget; budget.retain(); }
+
+    @Override public void close() { synchronized (this.budget) {
+        if (this.closed) return;
+        this.closed = true;
+        this.budget.release();
+    } }
+
+    RegionalDiskBudget.Pin pinRegion(RegionalProtocol.Hash32 world, String dimension, int x, int z) {
+        return this.budget.pin(descriptor(world, dimension, x, z));
+    }
 
     Path namespace(RegionalProtocol.Hash32 world, String dimension) {
         return this.budget.root.resolve(hex(world)).resolve(identifier(dimension));
@@ -56,6 +67,7 @@ final class RegionalMetadataStore {
     void saveCatalog(RegionalProtocol.Hash32 world, String dimension,
                      RegionalProtocol.CatalogMessage message, long stamp,
                      BooleanSupplier current) throws IOException {
+        if (!this.budget.writable()) return;
         if (!hash(message.canonical()).equals(message.fingerprint())) throw new IOException("catalog hash mismatch");
         Path path = catalogPath(world, dimension, message.fingerprint());
         write(path, CATALOG, message.canonical(), stamp, current, Set.of(path));
@@ -84,6 +96,7 @@ final class RegionalMetadataStore {
     void saveRegion(RegionalProtocol.Hash32 world, String dimension, int x, int z,
                     RegionalProtocol.RegionMessage message, long stamp,
                     BooleanSupplier current) throws IOException {
+        if (!this.budget.writable()) return;
         Path target = descriptor(world, dimension, x, z);
         if (message != null && (message.regionX() != x || message.regionZ() != z
                 || message.generation() == 0 || message.fingerprint().isZero()
@@ -113,11 +126,17 @@ final class RegionalMetadataStore {
     private boolean write(Path target, int kind, byte[] body, long stamp,
                           BooleanSupplier current, Set<Path> protectedPaths) throws IOException {
         synchronized (this.budget) {
-            if (!current.getAsBoolean() || stamp != this.budget.eviction) return false;
+            if (this.closed || !this.budget.writable() || !current.getAsBoolean() || stamp != this.budget.eviction) return false;
             if (!this.budget.ensure(HEADER + (long) body.length, protectedPaths)) return false;
             Files.createDirectories(target.getParent());
             Path temporary = target.resolveSibling(target.getFileName() + ".pending");
+            if (Files.exists(temporary) && !Files.isRegularFile(temporary))
+                throw new IOException("cache temporary is not a regular file");
+            if (Files.exists(temporary) && !this.budget.delete(temporary)) return false;
             long old = RegionalDiskBudget.size(target);
+            long reserved = HEADER + (long) body.length;
+            this.budget.bytes += reserved;
+            boolean installed = false;
             try {
                 ByteBuffer header = buffer(new byte[HEADER]);
                 header.putLong(MAGIC).putInt(VERSION).putInt(kind).putInt(body.length)
@@ -131,13 +150,21 @@ final class RegionalMetadataStore {
                 }
                 if (!current.getAsBoolean()) return false;
                 Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                this.budget.bytes += HEADER + body.length - old;
+                this.budget.bytes -= old;
+                installed = true;
                 return true;
-            } finally { Files.deleteIfExists(temporary); }
+            } finally {
+                if (!installed) {
+                    long actual = RegionalDiskBudget.size(temporary);
+                    this.budget.bytes -= reserved - actual;
+                    this.budget.delete(temporary); // A busy temporary remains charged, not forgotten.
+                }
+            }
         }
     }
 
-    private static byte[] read(Path path, int kind, int maximum) throws IOException {
+    private byte[] read(Path path, int kind, int maximum) throws IOException {
+        try (var pin = this.budget.pin(path)) {
         if (!Files.isRegularFile(path)) return null;
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             if (channel.size() < HEADER || channel.size() > HEADER + (long) maximum) return null;
@@ -149,11 +176,13 @@ final class RegionalMetadataStore {
             byte[] body = new byte[length]; readFully(channel, ByteBuffer.wrap(body));
             return RegionalProtocol.crc32c(body) == crc ? body : null;
         }
+        }
     }
 
     // Startup catalog-reference accounting reads fixed prefixes only, never eager region indexes.
-    static Path referencedCatalog(Path descriptor) {
+    static Path referencedCatalog(Path descriptor) throws IOException {
         try (FileChannel channel = FileChannel.open(descriptor, StandardOpenOption.READ)) {
+            if (channel.size() < HEADER + REGION_FIXED) return null;
             ByteBuffer prefix = buffer(new byte[HEADER + REGION_FIXED]);
             readFully(channel, prefix); prefix.flip();
             if (prefix.getLong() != MAGIC || prefix.getInt() != VERSION || prefix.getInt() != REGION) return null;
@@ -164,7 +193,7 @@ final class RegionalMetadataStore {
             var hash = RegionalProtocol.Hash32.read(prefix);
             return hash.equals(RegionalProtocol.Hash32.ZERO) ? null
                     : descriptor.resolveSibling(hex(hash) + ".vxcat");
-        } catch (IOException | RuntimeException invalid) { return null; }
+        } catch (RuntimeException invalid) { return null; }
     }
 
     private static void readFully(FileChannel channel, ByteBuffer bytes) throws IOException {

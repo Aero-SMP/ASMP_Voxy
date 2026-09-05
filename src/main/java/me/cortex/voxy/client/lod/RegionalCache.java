@@ -27,15 +27,26 @@ final class RegionalCache implements AutoCloseable {
     private final LinkedHashMap<Long, Shard> shards = new LinkedHashMap<>(64, 0.75f, true);
     private final RegionalDiskBudget budget;
     private boolean closed;
+    private boolean budgetReleased;
 
     RegionalCache(Path root, RegionalProtocol.Hash32 worldIdentity) throws IOException {
-        this(root, worldIdentity, RegionalDiskBudget.open(root));
+        this(root, worldIdentity, RegionalDiskBudget.acquire(root), true);
     }
 
     RegionalCache(Path root, RegionalProtocol.Hash32 worldIdentity, RegionalDiskBudget budget) throws IOException {
-        this.root = Files.createDirectories(Objects.requireNonNull(root, "cache root"));
-        this.worldIdentity = Objects.requireNonNull(worldIdentity, "world identity");
+        this(root, worldIdentity, budget, false);
+    }
+    private RegionalCache(Path root, RegionalProtocol.Hash32 worldIdentity, RegionalDiskBudget budget,
+                          boolean acquired) throws IOException {
+        try {
+            this.root = Files.createDirectories(Objects.requireNonNull(root, "cache root"));
+            this.worldIdentity = Objects.requireNonNull(worldIdentity, "world identity");
+        } catch (IOException | RuntimeException failure) {
+            if (acquired) budget.release();
+            throw failure;
+        }
         this.budget = budget;
+        if (!acquired) budget.retain();
     }
 
     byte[] get(RegionalProtocol.RegionIndex index, int ordinal) throws IOException {
@@ -60,11 +71,12 @@ final class RegionalCache implements AutoCloseable {
         long added = RECORD_BYTES + (long) compressed.length;
         Shard shard;
         synchronized (this.budget) {
+            if (!this.budget.writable()) return;
             shard = shard(index, true);
             if (shard == null || shard.contains(key)) return;
             if (shard.length() + added > MAX_SHARD_BYTES) {
                 if (shard.users != 0) return;
-                resetShard(index, shard);
+                if (!resetShard(index, shard)) return;
                 shard = shard(index, true);
             }
             if (shard == null || !ensureBudget(added, shard.path)) return;
@@ -88,6 +100,7 @@ final class RegionalCache implements AutoCloseable {
 
     void quarantine(RegionalProtocol.RegionIndex index, int ordinal) {
         synchronized (this.budget) {
+        if (!this.budget.writable()) return;
         try {
             Shard shard = shard(index, false);
             if (shard == null || !shard.contains(key(index, ordinal))) return;
@@ -109,12 +122,18 @@ final class RegionalCache implements AutoCloseable {
         if (this.closed) return null;
         long id = regionKey(index.regionX(), index.regionZ());
         Shard current = this.shards.get(id);
+        if (create && current != null && !current.writable) {
+            if (!closePath(current.path)) return null;
+            current = null;
+        }
         if (current != null) return current;
         Path path = path(index.regionX(), index.regionZ());
+        long oldLength = this.budget.ready() ? RegionalDiskBudget.size(path) : 0;
         Shard opened = Files.exists(path)
-                ? Shard.open(path, this.worldIdentity, index.regionX(), index.regionZ()) : null;
+                ? Shard.open(path, this.worldIdentity, index.regionX(), index.regionZ(), this.budget.ready()) : null;
+        if (opened != null && opened.writable) this.budget.bytes -= oldLength - opened.length();
         if (opened == null && Files.exists(path)) {
-            this.budget.delete(path);
+            if (!this.budget.delete(path)) return null;
         }
         if (opened == null && create && ensureBudget(HEADER_BYTES, path)) {
             opened = Shard.create(path, this.worldIdentity, index.regionX(), index.regionZ());
@@ -128,11 +147,11 @@ final class RegionalCache implements AutoCloseable {
         return opened;
     }
 
-    private void resetShard(RegionalProtocol.RegionIndex index, Shard shard) throws IOException {
+    private boolean resetShard(RegionalProtocol.RegionIndex index, Shard shard) throws IOException {
         this.shards.remove(regionKey(index.regionX(), index.regionZ()));
         shard.close();
         this.budget.unregister(shard.path, this);
-        this.budget.delete(shard.path);
+        return this.budget.delete(shard.path);
     }
 
     private boolean ensureBudget(long added, Path target) throws IOException {
@@ -148,6 +167,7 @@ final class RegionalCache implements AutoCloseable {
             iterator.remove();
             shard.close();
             this.budget.unregister(path, this);
+            releaseBudgetIfClosed();
             return true;
         }
         return true;
@@ -184,6 +204,14 @@ final class RegionalCache implements AutoCloseable {
         synchronized (this.budget) {
             this.closed = true;
             for (Shard shard : java.util.List.copyOf(this.shards.values())) this.closePath(shard.path);
+            releaseBudgetIfClosed();
+        }
+    }
+
+    private void releaseBudgetIfClosed() {
+        if (this.closed && this.shards.isEmpty() && !this.budgetReleased) {
+            this.budgetReleased = true;
+            this.budget.release();
         }
     }
 
@@ -208,17 +236,19 @@ final class RegionalCache implements AutoCloseable {
         private final FileChannel channel;
         private final Map<CacheKey, Long> records;
         private int users;
+        final boolean writable;
 
-        private Shard(Path path, RandomAccessFile file, Map<CacheKey, Long> records) {
+        private Shard(Path path, RandomAccessFile file, Map<CacheKey, Long> records, boolean writable) {
             this.path = path;
             this.file = file;
             this.channel = file.getChannel();
             this.records = records;
+            this.writable = writable;
         }
 
-        static Shard open(Path path, RegionalProtocol.Hash32 world, int x, int z)
+        static Shard open(Path path, RegionalProtocol.Hash32 world, int x, int z, boolean writable)
                 throws IOException {
-            RandomAccessFile file = new RandomAccessFile(path.toFile(), "rw");
+            RandomAccessFile file = new RandomAccessFile(path.toFile(), writable ? "rw" : "r");
             try {
                 if (file.length() < HEADER_BYTES || file.length() > MAX_SHARD_BYTES) {
                     return closeNull(file);
@@ -255,10 +285,10 @@ final class RegionalCache implements AutoCloseable {
                         offset += RECORD_BYTES + length;
                     }
                 }
-                if (offset != file.length()) file.setLength(offset);
-                Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(
+                if (writable && offset != file.length()) file.setLength(offset);
+                if (writable) Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(
                         System.currentTimeMillis()));
-                return new Shard(path, file, records);
+                return new Shard(path, file, records, writable);
             } catch (Throwable failure) {
                 try { file.close(); } catch (IOException suppressed) { failure.addSuppressed(suppressed); }
                 if (failure instanceof IOException io) throw io;
@@ -283,7 +313,7 @@ final class RegionalCache implements AutoCloseable {
                     throw failure;
                 }
             }
-            return open(path, world, x, z);
+            return open(path, world, x, z, true);
         }
 
         private static Shard closeNull(RandomAccessFile file) throws IOException {

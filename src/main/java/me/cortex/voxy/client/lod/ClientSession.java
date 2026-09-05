@@ -557,6 +557,7 @@ final class ClientSession {
                     }
                 } finally {
                     this.codec.close();
+                    if (this.index == -1 && metadata != null) metadata.close();
                 }
             }
 
@@ -635,7 +636,7 @@ final class ClientSession {
             }
 
             private WorkerResult loadMetadata(LoadMetadataTask task) {
-                try {
+                try (var pin = metadata.pinRegion(task.world(), dimension, (int) task.region(), (int) (task.region() >>> 32))) {
                     var saved = metadata.region(task.world(), dimension, (int) task.region(), (int) (task.region() >>> 32));
                     if (saved != null && !saved.absent()) {
                         var message = saved.message();
@@ -1817,7 +1818,7 @@ final class ClientSession {
         }
 
         void saveRegion(SectionDemandTable.RegionDemand state, RegionalProtocol.RegionMessage message) {
-            if (this.metadata == null) return;
+            if (this.metadata == null || !this.metadata.budget.writable()) return;
             long view = this.viewRevision, revision = state.metadataRevision;
             this.metadataWrites.put(state.key, new SaveMetadataTask(view, state.key, this.worldIdentity,
                     message, this.metadata.budget.stamp(),
@@ -2169,6 +2170,7 @@ final class ClientSession {
         }
 
         static void freeWorkerResult(WorkerResult result) {
+            if (result instanceof WorkerBootstrap boot) boot.metadata().close();
             if (result instanceof WorkerGeometry geometry) geometry.geometry().free();
             if (result instanceof WorkerWorld world) world.cache().close();
         }

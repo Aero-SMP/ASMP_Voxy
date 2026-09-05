@@ -23,6 +23,7 @@ final class CacheStartupBehaviorTest {
     static final RegionalSectionCodec.Mappings MAPPINGS = new RegionalSectionCodec.Mappings(new int[]{15}, new int[]{0});
 
     static void run() throws Exception {
+        CacheInventoryBehaviorTest.run();
         localActivationAndValidation();
         cachedRefinementWhileHeld();
         missesDoNotSpin();
@@ -75,12 +76,19 @@ final class CacheStartupBehaviorTest {
     }
 
     static void persist(RegionalMetadataStore store, Fixture fixture, boolean payload) throws Exception {
+        awaitInventory(store.budget);
         store.associate(SERVER, DIMENSION, WORLD, store.budget.stamp(), () -> true);
         store.saveCatalog(WORLD, DIMENSION, fixture.catalog(), store.budget.stamp(), () -> true);
         store.saveRegion(WORLD, DIMENSION, 0, 0, fixture.message(), store.budget.stamp(), () -> true);
         if (payload) try (var cache = new RegionalCache(store.namespace(WORLD, DIMENSION), WORLD, store.budget)) {
             cache.put(fixture.index(), 340, fixture.payload());
         }
+    }
+
+    static void awaitInventory(RegionalDiskBudget budget) throws Exception {
+        long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!budget.ready() && System.nanoTime() < end) Thread.sleep(1);
+        check(budget.ready(), "inventory did not become ready: " + budget.snapshot());
     }
 
     static final class Publication extends SectionPublicationState {
