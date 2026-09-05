@@ -285,6 +285,7 @@ final class ClientSession {
         final Set<Long> missingCoverage = new HashSet<>();
         final Set<Long> coarseningRoots = new HashSet<>();
         final Set<Long> rendererBlocked = new LinkedHashSet<>();
+        final Set<Long> regionReleases = new LinkedHashSet<>();
         final Long2ObjectOpenHashMap<DormantRoot> dormantRoots =
                 new Long2ObjectOpenHashMap<>();
         final Long2LongOpenHashMap pendingDormantEvictions = new Long2LongOpenHashMap();
@@ -637,6 +638,7 @@ final class ClientSession {
             if (previous != null) previous.close();
             this.pendingControl = null;
             this.catalogRequested = false;
+            this.regionReleases.clear();
             this.inFlightBatches = 0;
             this.inFlightSections = 0;
             this.inFlightBytes = 0;
@@ -703,15 +705,13 @@ final class ClientSession {
                 this.catalogRequirementRevision++;
             }
             if (fingerprint.equals(this.catalogFingerprint) && this.mappings != null) return;
-            if (!this.catalogRequested) {
+            if (!this.catalogRequested && this.quic.requestCatalog()) {
                 this.catalogRequested = true;
                 this.catalogRequestedRevision = this.catalogRequirementRevision;
-                this.quic.requestCatalog();
             }
         }
 
         void acceptCatalog(RegionalProtocol.CatalogMessage message) throws Exception {
-            this.catalogRequested = false;
             if (!hash32(message.canonical()).equals(message.fingerprint())) {
                 throw new IOException("regional catalog fingerprint mismatch");
             }
@@ -791,6 +791,7 @@ final class ClientSession {
                             this.ensureCatalog(this.requiredCatalogFingerprint);
                             continue;
                         }
+                        this.catalogRequested = false;
                         this.catalogFingerprint = ready.fingerprint;
                         this.mappings = ready.mappings;
                         this.ensureCatalog(this.requiredCatalogFingerprint);
@@ -1394,12 +1395,7 @@ final class ClientSession {
             if (state == null || !state.subscribed) return;
             state.subscribed = false;
             if (this.quic == null) return;
-            try {
-                this.quic.releaseRegion((int) region, (int) (region >>> 32));
-            } catch (IOException failure) {
-                Logger.warn("Could not release obsolete regional subscription; the connection "
-                        + "will discard it", failure);
-            }
+            this.regionReleases.add(region);
         }
 
         void bind(Demand demand, RegionalProtocol.RegionIndex index, int ordinal) {
@@ -1458,11 +1454,25 @@ final class ClientSession {
 
         void processRegions() throws IOException {
             if (this.worldIdentity == null) return;
+            if (this.requiredCatalogFingerprint != null) {
+                this.ensureCatalog(this.requiredCatalogFingerprint);
+            }
+            // Releases precede new requests, so camera churn cannot accumulate an outgoing
+            // backlog beyond the subscriptions already issued on this connection.
+            var releases = this.regionReleases.iterator();
+            while (releases.hasNext()) {
+                long key = releases.next();
+                if (!this.quic.releaseRegion((int) key, (int) (key >>> 32))) return;
+                releases.remove();
+            }
             SectionDemandTable.RegionDemand region;
             while ((region = this.demands.pollRegion()) != null) {
                 if (region.requested || region.users == 0
                         || region.subscribed && (region.index != null || region.absent)) continue;
-                this.quic.requestRegion((int) region.key, (int) (region.key >>> 32));
+                if (!this.quic.requestRegion((int) region.key, (int) (region.key >>> 32))) {
+                    this.demands.readyRegion(region);
+                    return;
+                }
                 region.requested = true;
                 region.subscribed = true;
             }

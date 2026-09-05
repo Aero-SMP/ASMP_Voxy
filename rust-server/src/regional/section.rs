@@ -104,17 +104,15 @@ impl SectionFrame {
             .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
             .collect::<Vec<_>>();
         let indexes = unpack_indexes(&words, bits, palette_count, SECTION_VOLUME)?;
-        let mut seen = vec![false; palette_count];
         let mut next = 0usize;
         let cells = indexes
             .into_iter()
             .map(|index| {
                 let index = index as usize;
-                if !seen[index] {
-                    if index != next {
-                        return Err(anyhow::anyhow!("noncanonical section palette order"));
-                    }
-                    seen[index] = true;
+                if index > next {
+                    return Err(anyhow::anyhow!("noncanonical section palette order"));
+                }
+                if index == next {
                     next += 1;
                 }
                 Ok(palette[index])
@@ -223,6 +221,68 @@ fn unpack_indexes(words: &[u64], bits: u8, palette_count: usize, count: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_palette_fixtures() {
+        for line in include_str!("../../../test-fixtures/regional-section-cases.txt").lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let count: usize = fields[1].parse().unwrap();
+            let mode = fields[2];
+            let mut bytes = (count as u16).to_le_bytes().to_vec();
+            for i in 0..count {
+                let i = if mode == "duplicate" && i == 1 { 0 } else { i };
+                bytes.extend_from_slice(&(i as u32 + 1).to_le_bytes());
+                bytes.extend_from_slice(&(i as u32 % 17).to_le_bytes());
+                bytes.push(i as u8);
+            }
+            let indexes = (0..SECTION_VOLUME)
+                .map(|i| {
+                    (match mode {
+                        "repeat" => i / 2 % count,
+                        "first" if i == 0 => 1,
+                        "skip" if i == 1 => 2,
+                        "overflow" if i == SECTION_VOLUME - 1 => count,
+                        "unused" => i % (count - 1),
+                        _ => i % count,
+                    }) as u16
+                })
+                .collect::<Vec<_>>();
+            for word in pack_indexes(&indexes, palette_bits(count).unwrap()) {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            let hash = blake3::hash(&bytes).to_hex()[..32].to_owned();
+            assert_eq!(hash, fields[4], "{}", fields[0]);
+            let result = SectionFrame::decode(&bytes);
+            assert_eq!(
+                result.is_ok(),
+                fields[3] == "true",
+                "{}: {result:?}",
+                fields[0]
+            );
+            if let Ok(frame) = result {
+                for (cell, index) in frame.cells.iter().zip(&indexes) {
+                    assert_eq!(
+                        *cell,
+                        Cell {
+                            block: *index as u32 + 1,
+                            biome: *index as u32 % 17,
+                            light: *index as u8
+                        }
+                    );
+                }
+                assert_eq!(frame.encode().unwrap(), bytes);
+            }
+        }
+        assert!(
+            unpack_indexes(&[2], 1, 2, 1).is_err(),
+            "nonzero padding accepted"
+        );
+        assert!(SectionFrame::decode(&[0, 0]).is_err());
+        assert!(SectionFrame::decode(&[1]).is_err());
+    }
 
     #[test]
     fn section_frame_round_trip_keeps_one_cell_payload() {

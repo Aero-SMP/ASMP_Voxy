@@ -1,7 +1,7 @@
 use crate::{
     crc::xxh64,
     key::SectionKey,
-    lod::{Cell, SECTION_EDGE, SECTION_VOLUME, Section, cell_index},
+    lod::{Cell, SECTION_VOLUME, Section, cell_index},
     read_file_bounded,
     registry::Registry,
     write_lock,
@@ -510,25 +510,25 @@ impl LevelZeroGroup {
             };
             SECTION_VOLUME
         ];
-        for y in 0..SECTION_EDGE {
-            let section_y = base_section_y + (y / 16) as i32;
-            let local_y = y & 15;
-            for z in 0..SECTION_EDGE {
-                let dz = z / 16;
-                let local_z = z & 15;
-                for x in 0..SECTION_EDGE {
-                    let dx = x / 16;
-                    let local_x = x & 15;
+        for dy in 0..2 {
+            for dz in 0..2 {
+                for dx in 0..2 {
                     let Some(section) = self
                         .chunks
                         .get(dx + dz * 2)
                         .and_then(Option::as_ref)
-                        .and_then(|chunk| chunk.sections.get(&section_y))
+                        .and_then(|chunk| chunk.sections.get(&(base_section_y + dy as i32)))
                     else {
                         continue;
                     };
-                    cells[cell_index(x, y, z)] =
-                        section.cells[local_x | (local_z << 4) | (local_y << 8)];
+                    for y in 0..16 {
+                        for z in 0..16 {
+                            let source = (z << 4) | (y << 8);
+                            let destination = cell_index(dx * 16, dy * 16 + y, dz * 16 + z);
+                            cells[destination..destination + 16]
+                                .copy_from_slice(&section.cells[source..source + 16]);
+                        }
+                    }
                 }
             }
         }
@@ -918,7 +918,98 @@ fn nibble(data: Option<&[i8]>, index: usize, missing: u8) -> u8 {
 
 #[cfg(test)]
 mod region_boundary_tests {
-    use super::region_is_representable;
+    use super::*;
+    use crate::regional::SectionFrame;
+
+    #[test]
+    fn group_rows_match_coordinate_oracle() {
+        let world = AnvilWorld::new("minecraft:overworld".into(), PathBuf::new());
+        for (gx, gy, gz) in [(0, 0, 0), (-3, -1, -7), (2, -2, 4), (-1, 1, 0)] {
+            for present in [0u8, 255, 0b01011001] {
+                let mut group = LevelZeroGroup {
+                    x: gx,
+                    z: gz,
+                    chunks: vec![None; 4],
+                };
+                for dz in 0..2 {
+                    for dx in 0..2 {
+                        let mut sections = BTreeMap::new();
+                        for dy in 0..2 {
+                            let source = dx + dz * 2 + dy * 4;
+                            if present & (1 << source) == 0 {
+                                continue;
+                            }
+                            let cells = (0..4096)
+                                .map(|i| Cell {
+                                    // Include explicit stored air with non-default biome/light.
+                                    block: if i % 11 == 0 {
+                                        0
+                                    } else {
+                                        (source * 4096 + i + 1) as u32
+                                    },
+                                    biome: (source * 4096 + i) as u32,
+                                    light: (i ^ (source * 37)) as u8,
+                                })
+                                .collect();
+                            let y = gy * 2 + dy as i32;
+                            sections.insert(y, ChunkSection { y, cells });
+                        }
+                        if !sections.is_empty() {
+                            group.chunks[dx + dz * 2] = Some(ParsedChunk {
+                                x: gx * 2 + dx as i32,
+                                z: gz * 2 + dz as i32,
+                                sections,
+                                source_fingerprint: (dx + dz * 2 + 1) as u64,
+                                terrain_fingerprint: [0; 2],
+                            });
+                        }
+                    }
+                }
+                let key = SectionKey::new(0, gx, gy, gz).unwrap();
+                let actual = group.build(key, &world).unwrap();
+                let expected = (0..SECTION_VOLUME)
+                    .map(|i| {
+                        let x = i % 32;
+                        let z = i / 32 % 32;
+                        let y = i / 1024;
+                        group.chunks[x / 16 + z / 16 * 2]
+                            .as_ref()
+                            .and_then(|chunk| chunk.sections.get(&(gy * 2 + (y / 16) as i32)))
+                            .map(|section| section.cells[x % 16 + z % 16 * 16 + y % 16 * 256])
+                            .unwrap_or(Cell {
+                                block: 0,
+                                biome: 0,
+                                light: world.default_sky_light(),
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual.section,
+                    Section::from_cells(key, expected.clone()).unwrap()
+                );
+                assert_eq!(actual.sources, group.sources());
+                if present != 0 {
+                    let a = SectionFrame::new(0, actual.section.cells)
+                        .unwrap()
+                        .encode()
+                        .unwrap();
+                    let b = SectionFrame::new(0, expected).unwrap().encode().unwrap();
+                    assert_eq!(a, b);
+                    assert_eq!(blake3::hash(&a), blake3::hash(&b));
+                }
+                assert!(
+                    group
+                        .build(SectionKey::new(1, gx, gy, gz).unwrap(), &world)
+                        .is_err()
+                );
+                assert!(
+                    group
+                        .build(SectionKey::new(0, gx + 1, gy, gz).unwrap(), &world)
+                        .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn regional_source_ignores_unrepresentable_anvil_coordinates() {

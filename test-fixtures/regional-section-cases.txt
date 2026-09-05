@@ -1,0 +1,12 @@
+# name palette-count index-pattern accepted blake3-128
+# Palette i: block=i+1, biome=i%17, light=i%256; 32768 indexes, packed LSB-first.
+# cycle: i%count; repeat: (i/2)%count. Other patterns mutate cycle as named.
+single 1 cycle true 5533ba6c6682b4b76806fbc0eed06d95
+repeated 3 repeat true f2d3c1d176f9fbb7f90a0e5cfb2848fb
+word_crossing 5 cycle true 280a8c234d798bb95038be717c753a7a
+maximum 32768 cycle true bb4e62abfe2eb0c09ff84d711c07ce7e
+nonzero_first 3 first false b85974913f0988672c473b50d5f50803
+skipped_id 3 skip false cd665473a2192216327676934ca70f62
+out_of_range 3 overflow false f5f0a148b8a33cb11efeb6d9e51d1628
+unused_entry 3 unused false de848ccf8a7702ee05248dfb1b8996ce
+duplicate_value 3 duplicate false 08d5c697a86d034c160f063856b6608f

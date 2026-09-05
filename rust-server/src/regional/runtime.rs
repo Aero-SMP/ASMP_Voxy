@@ -49,6 +49,86 @@ struct PriorityRequests {
     active: BTreeMap<(i32, i32), Arc<RegionFile>>,
 }
 
+fn refresh_order<T>(
+    headers: &BTreeMap<(i32, i32), T>,
+    priority: &Mutex<PriorityRequests>,
+    mut is_current: impl FnMut((i32, i32), &T) -> bool,
+) -> Result<Vec<(i32, i32)>> {
+    let mut selected = None;
+    {
+        let mut priority = priority
+            .lock()
+            .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?;
+        while let Some(&coordinate) = priority.order.front() {
+            if !priority.membership.contains(&coordinate) {
+                priority.order.pop_front();
+                continue;
+            }
+            if let Some(header) = headers.get(&coordinate)
+                && !is_current(coordinate, header)
+            {
+                // Retain the hint until publication succeeds; a failed build retries it.
+                selected = Some(coordinate);
+                break;
+            }
+            priority.order.pop_front();
+            priority.membership.remove(&coordinate);
+        }
+    }
+    let mut order = Vec::with_capacity(headers.len());
+    order.extend(selected);
+    order.extend(
+        headers
+            .keys()
+            .copied()
+            .filter(|coordinate| Some(*coordinate) != selected),
+    );
+    Ok(order)
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn priority_order_is_unique_and_retries_until_current() {
+        let headers = BTreeMap::from([((-2, 1), ()), ((0, 0), ()), ((4, -3), ())]);
+        let natural = headers.keys().copied().collect::<Vec<_>>();
+        let empty = Mutex::new(PriorityRequests::default());
+        assert_eq!(
+            refresh_order(&headers, &empty, |_, _| false).unwrap(),
+            natural
+        );
+        for chosen in natural.iter().copied() {
+            let stale = (100, 100);
+            let cancelled = (101, 101);
+            let priority = Mutex::new(PriorityRequests {
+                order: VecDeque::from([cancelled, stale, chosen, chosen]),
+                membership: BTreeSet::from([stale, chosen]),
+                ..Default::default()
+            });
+            let expected = std::iter::once(chosen)
+                .chain(natural.iter().copied().filter(|key| *key != chosen))
+                .collect::<Vec<_>>();
+            // A build failure does not mark the header current: repeat the actual order path.
+            for _ in 0..2 {
+                assert_eq!(
+                    refresh_order(&headers, &priority, |_, _| false).unwrap(),
+                    expected
+                );
+                assert_eq!(priority.lock().unwrap().order.front(), Some(&chosen));
+            }
+            assert_eq!(
+                refresh_order(&headers, &priority, |key, _| key == chosen).unwrap(),
+                natural
+            );
+            let priority = priority.lock().unwrap();
+            assert!(priority.order.is_empty());
+            assert!(priority.membership.is_empty());
+        }
+    }
+}
+
 impl RegionalRuntime {
     pub fn open(
         data_root: impl AsRef<Path>,
@@ -318,37 +398,9 @@ impl RegionalRuntime {
             result.removed.push(*coordinate);
         }
 
-        let mut order = Vec::with_capacity(headers.len());
-        let mut seen = BTreeSet::new();
-        {
-            let mut priority = self
-                .priority
-                .lock()
-                .map_err(|_| anyhow::anyhow!("regional priority lock poisoned"))?;
-            while let Some(&coordinate) = priority.order.front() {
-                if !priority.membership.contains(&coordinate) {
-                    priority.order.pop_front();
-                    continue;
-                }
-                if let Some(header) = headers.get(&coordinate)
-                    && !self.header_is_current(coordinate, header)
-                {
-                    order.push(coordinate);
-                    seen.insert(coordinate);
-                    // Keep the selected coordinate at the head until publication succeeds. If
-                    // Anvil changes during the build, the next refresh retries the same requested
-                    // region instead of leaving a permanent local hole.
-                    break;
-                }
-                priority.order.pop_front();
-                priority.membership.remove(&coordinate);
-            }
-        }
-        for coordinate in headers.keys().copied() {
-            if seen.insert(coordinate) {
-                order.push(coordinate);
-            }
-        }
+        let order = refresh_order(&headers, &self.priority, |coordinate, header| {
+            self.header_is_current(coordinate, header)
+        })?;
 
         for coordinate in order {
             let header = &headers[&coordinate];

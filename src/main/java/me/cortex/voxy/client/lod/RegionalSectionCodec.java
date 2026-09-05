@@ -138,11 +138,9 @@ public final class RegionalSectionCodec implements AutoCloseable {
             if (finalWord >>> used != 0) throw new IOException("nonzero section index padding");
         }
         long[] cells = new long[SECTION_CELLS];
-        boolean[] used = new boolean[paletteCount];
         int next = 0;
         if (bits == 0) {
             Arrays.fill(cells, palette[0]);
-            used[0] = true;
             next = 1;
         } else {
             long mask = (1L << bits) - 1;
@@ -155,10 +153,8 @@ public final class RegionalSectionCodec implements AutoCloseable {
                 }
                 int selected = (int) (packed & mask);
                 if (selected >= paletteCount) throw new IOException("section palette index overflow");
-                if (!used[selected]) {
-                    if (selected != next) throw new IOException("noncanonical section palette order");
-                    used[selected] = true; next++;
-                }
+                if (selected > next) throw new IOException("noncanonical section palette order");
+                if (selected == next) next++;
                 cells[index] = palette[selected];
             }
         }

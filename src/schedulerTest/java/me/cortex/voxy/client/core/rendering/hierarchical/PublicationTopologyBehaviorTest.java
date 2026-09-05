@@ -17,6 +17,7 @@ public final class PublicationTopologyBehaviorTest {
         retirementsProgressIndependentlyAndRespectRevision();
         cancellationDuringStagingWaitsForRollbackFence();
         fragmentedAndSectionIdAllocation();
+        subtreePendingGeometryChecks();
         System.out.println("publication topology and allocator behavior tests passed");
     }
 
@@ -24,6 +25,78 @@ public final class PublicationTopologyBehaviorTest {
         int frees;
         Buffer(long bytes) { super(bytes); }
         @Override public void free() { super.free(); this.frees++; }
+    }
+
+    private static void subtreePendingGeometryChecks() {
+        BasicAsyncGeometryManager allocator = new BasicAsyncGeometryManager(32, 32768);
+        NodeManager nodes = new NodeManager(1024, allocator);
+        long root = key(0), unrelated = key(1), leaf = SectionKey.pack(0, 0, 0, 0);
+        nodes.insertTopLevelNode(root);
+        nodes.insertTopLevelNode(unrelated);
+        for (int level = 4; level >= 0; level--) {
+            long position = SectionKey.pack(level, 0, 0, 0);
+            check(nodes.ensureHierarchyOwner(position), "nested fixture lost hierarchy owner");
+            stage(nodes, BuiltSection.emptyWithChildren(position, 1, (byte) (level == 0 ? 0 : 1)));
+            check(nodes.finalizeStagedRoot(1), "nested empty subtree did not publish");
+        }
+        try {
+            check(removable(nodes, root, 10), "empty nested subtree is not removable");
+            for (boolean committed : new boolean[]{false, true}) {
+                check(nodes.stageGeometryResult(BuiltSection.emptyWithChildren(leaf, 20, (byte) 0)) != null,
+                        "deep pending fixture not staged");
+                if (committed) nodes.commitStagedRoot(20, Set.of(leaf));
+                check(!removable(nodes, root, 10), "deep conflicting pending geometry was ignored");
+                check(removable(nodes, root, 20), "same-revision empty geometry changed treatment");
+                check(removable(nodes, unrelated, 10), "unrelated pending geometry blocked removal");
+
+                // Simulate an absent queried owner while retaining the actual staged/committed entry.
+                // The pending scan must precede the missing-node early return as before.
+                var map = activeMap(nodes);
+                int state = map.remove(root);
+                try {
+                    check(!removable(nodes, root, 10), "missing owner bypassed pending checks");
+                    check(removable(nodes, root, 20), "same-revision missing owner changed treatment");
+                } finally { map.put(root, state); }
+                nodes.rollbackStagedRoot(20);
+                nodes.completeRollback(20);
+            }
+
+            // Unpublished top-level requests have no renderer node yet.
+            for (boolean committed : new boolean[]{false, true}) {
+                check(nodes.stageGeometryResult(BuiltSection.emptyWithChildren(unrelated, 30, (byte) 0)) != null,
+                        "request geometry not staged");
+                if (committed) nodes.commitStagedRoot(30, Set.of(unrelated));
+                check(!removable(nodes, unrelated, 10) && removable(nodes, unrelated, 30),
+                        "request owner bypassed revision-sensitive pending checks");
+                check(removable(nodes, root, 10), "outside pending request blocked nested subtree");
+                nodes.rollbackStagedRoot(30);
+                nodes.completeRollback(30);
+            }
+            Buffer geometry = new Buffer(1024);
+            stage(nodes, mesh(leaf, 40, geometry));
+            check(nodes.finalizeStagedRoot(40), "nonempty descendant did not publish");
+            check(!removable(nodes, root, 40), "nonempty descendant renderer geometry was ignored");
+        } finally {
+            nodes.removeTopLevelNode(root);
+            nodes.removeTopLevelNode(unrelated);
+        }
+        check(allocator.getSectionCount() == 0, "subtree fixture leaked geometry");
+    }
+
+    private static boolean removable(NodeManager nodes, long position, long revision) {
+        try {
+            var method = NodeManager.class.getDeclaredMethod("canRemoveSubtree", long.class, long.class);
+            method.setAccessible(true);
+            return (boolean) method.invoke(nodes, position, revision);
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+
+    private static it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap activeMap(NodeManager nodes) {
+        try {
+            var field = NodeManager.class.getDeclaredField("activeSectionMap");
+            field.setAccessible(true);
+            return (it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap) field.get(nodes);
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
     }
     private static BuiltSection mesh(long key, long revision, Buffer buffer) {
         return new BuiltSection(key, revision, (byte) 0, 0, buffer, new int[8]);

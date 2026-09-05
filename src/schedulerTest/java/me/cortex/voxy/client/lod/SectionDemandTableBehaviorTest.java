@@ -19,6 +19,8 @@ public final class SectionDemandTableBehaviorTest {
         staleTicketCannotMutateReplacement();
         allocatorUsesExactOneKiBUnits();
         allocatorReportsFragmentation();
+        RegionalSectionCodecBehaviorTest.run();
+        RegionalControlFlowBehaviorTest.run();
         PublicationRepairBehaviorTest.run();
         me.cortex.voxy.client.core.ShaderReloadBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.building.BoundaryWaterMesherBehaviorTest.run();

@@ -647,6 +647,11 @@ public class NodeManager {
                 return false;
             }
         }
+        // This owner-thread walk cannot acquire new pending geometry between descendants.
+        return this.isSubtreeRendererEmpty(position);
+    }
+
+    private boolean isSubtreeRendererEmpty(long position) {
         int state = this.activeSectionMap.get(position);
         if (state == -1) return true;
         int type = state & NODE_TYPE_MSK;
@@ -663,8 +668,7 @@ public class NodeManager {
                 throw new IllegalStateException("inner node has no concrete children");
             }
             for (int index = 0; index < count; index++) {
-                if (!this.canRemoveSubtree(this.nodeData.nodePosition(pointer + index),
-                        sourceRevision)) return false;
+                if (!this.isSubtreeRendererEmpty(this.nodeData.nodePosition(pointer + index))) return false;
             }
         }
         return true;

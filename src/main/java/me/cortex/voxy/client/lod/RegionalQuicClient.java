@@ -40,7 +40,7 @@ final class RegionalQuicClient implements AutoCloseable {
     private final QuicClientConnection connection;
     private final QuicStream control;
     private final InputStream controlInput;
-    private final OutputStream controlOutput;
+    private final ControlWriter controlWriter;
     private final ExecutorService workers = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("Voxy regional QUIC-", 0).factory());
     private final Object controlHandoffLock = new Object();
@@ -51,7 +51,6 @@ final class RegionalQuicClient implements AutoCloseable {
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final AtomicReference<Runnable> activity = new AtomicReference<>(() -> {});
     private final AtomicBoolean closed = new AtomicBoolean();
-    private final Object controlWriteLock = new Object();
     private final String description;
 
     static RegionalQuicClient connect(InetAddress[] addresses, int port, String alpn,
@@ -104,7 +103,8 @@ final class RegionalQuicClient implements AutoCloseable {
         this.connection = connection;
         this.control = control;
         this.controlInput = control.getInputStream();
-        this.controlOutput = control.getOutputStream();
+        this.controlWriter = new ControlWriter(control.getOutputStream(), this::signalActivity,
+                this::fail);
         this.description = description;
         for (RegionalProtocol.Lane lane : RegionalProtocol.Lane.values()) {
             this.nextLane[lane.ordinal()] = new AtomicInteger();
@@ -118,6 +118,7 @@ final class RegionalQuicClient implements AutoCloseable {
 
     private void start() {
         this.workers.submit(this::readControls);
+        this.workers.submit(this.controlWriter);
         for (List<LaneWorker> group : this.lanes) {
             for (LaneWorker lane : group) this.workers.submit(lane::run);
         }
@@ -166,16 +167,18 @@ final class RegionalQuicClient implements AutoCloseable {
     }
 
     void hello(String dimension) throws IOException {
-        sendControl(RegionalProtocol.hello(dimension));
+        if (!sendControl(RegionalProtocol.hello(dimension))) {
+            throw new IOException("regional hello must be the first control write");
+        }
     }
-    void requestRegion(int regionX, int regionZ) throws IOException {
-        sendControl(RegionalProtocol.regionRequest(regionX, regionZ));
+    boolean requestRegion(int regionX, int regionZ) throws IOException {
+        return sendControl(RegionalProtocol.regionRequest(regionX, regionZ));
     }
-    void releaseRegion(int regionX, int regionZ) throws IOException {
-        sendControl(RegionalProtocol.regionRelease(regionX, regionZ));
+    boolean releaseRegion(int regionX, int regionZ) throws IOException {
+        return sendControl(RegionalProtocol.regionRelease(regionX, regionZ));
     }
-    void requestCatalog() throws IOException {
-        sendControl(RegionalProtocol.catalogRequest());
+    boolean requestCatalog() throws IOException {
+        return sendControl(RegionalProtocol.catalogRequest());
     }
 
     boolean requestSections(RegionalProtocol.Lane priority, long epoch,
@@ -193,16 +196,60 @@ final class RegionalQuicClient implements AutoCloseable {
         return false;
     }
 
-    private void sendControl(byte[] record) throws IOException {
+    private boolean sendControl(byte[] record) throws IOException {
         if (!isOpen()) throw closedFailure();
-        synchronized (this.controlWriteLock) {
+        return this.controlWriter.offer(record);
+    }
+
+    /** One writer-owned record, no backlog. The owner must stay free to drain responses even
+     * when the peer cannot read another request until its response has been consumed. */
+    static final class ControlWriter implements Runnable, AutoCloseable {
+        private final OutputStream output;
+        private final Runnable activity;
+        private final java.util.function.Consumer<Throwable> failure;
+        private byte[] record;
+        private boolean closed;
+
+        ControlWriter(OutputStream output, Runnable activity,
+                      java.util.function.Consumer<Throwable> failure) {
+            this.output = output;
+            this.activity = activity;
+            this.failure = failure;
+        }
+
+        synchronized boolean offer(byte[] record) {
+            if (this.closed || this.record != null) return false;
+            this.record = Objects.requireNonNull(record);
+            this.notifyAll();
+            return true;
+        }
+
+        @Override public void run() {
             try {
-                this.controlOutput.write(record);
-                this.controlOutput.flush();
-            } catch (IOException failure) {
-                fail(failure);
-                throw failure;
+                while (true) {
+                    byte[] writing;
+                    synchronized (this) {
+                        while (!this.closed && this.record == null) this.wait();
+                        if (this.closed) return;
+                        writing = this.record;
+                    }
+                    this.output.write(writing);
+                    this.output.flush();
+                    synchronized (this) { this.record = null; }
+                    this.activity.run();
+                }
+            } catch (Throwable failure) {
+                boolean report;
+                synchronized (this) { report = !this.closed; }
+                this.close();
+                if (report) this.failure.accept(failure);
             }
+        }
+
+        @Override public synchronized void close() {
+            this.closed = true;
+            this.record = null;
+            this.notifyAll();
         }
     }
 
@@ -339,6 +386,7 @@ final class RegionalQuicClient implements AutoCloseable {
     @Override
     public void close() {
         if (!this.closed.compareAndSet(false, true)) return;
+        this.controlWriter.close();
         for (List<LaneWorker> group : this.lanes) for (LaneWorker lane : group) lane.stop();
         synchronized (this.controlHandoffLock) {
             this.controlHandoffLock.notifyAll();
