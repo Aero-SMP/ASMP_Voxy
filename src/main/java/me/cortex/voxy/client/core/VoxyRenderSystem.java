@@ -403,7 +403,7 @@ public class VoxyRenderSystem {
                 new AsyncNodeManager.RegionalSectionSubmission(queued, previousRevision,
                 () -> current.getAsBoolean() && publication.acceptsUpload(),
                 publication::markRendererAdmitted, publication, () ->
-                nodes.finalizeStagedRoot(revision, () -> {
+                nodes.finalizeSection(revision, position, () -> {
                     publication.recordActivationFencePassed(System.nanoTime());
                     publication.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
                     if (previous != null) previous.markRetired();
@@ -499,8 +499,8 @@ public class VoxyRenderSystem {
             this.renderer.retirePublication(retirementRevision, this.revision, this.position,
                     this::markRetired, failure -> {
                         if (this.renderer.isStopping()) { this.rendererStopped(); return; }
-                        this.renderer.rollbackStagedRoot(
-                            retirementRevision, this::markRetired, rollback -> {
+                        this.renderer.rollbackSection(
+                            retirementRevision, this.position, this::markRetired, rollback -> {
                                 if (this.renderer.isStopping()) { this.rendererStopped(); return; }
                                 failure.addSuppressed(rollback);
                                 Logger.error("Regional retirement rollback failed", failure);
@@ -521,7 +521,7 @@ public class VoxyRenderSystem {
             Objects.requireNonNull(primary, "primary");
             if (this.renderer.isStopping()) { this.rendererStopped(); return; }
             if (!this.failureRecoveryQueued.compareAndSet(false, true)) return;
-            this.renderer.rollbackStagedRoot(this.revision,
+            this.renderer.rollbackSection(this.revision, this.position,
                     () -> this.recordFailure(primary, null),
                     rollback -> this.recordFailure(primary, rollback));
         }

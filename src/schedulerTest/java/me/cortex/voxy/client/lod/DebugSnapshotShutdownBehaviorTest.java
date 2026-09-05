@@ -21,6 +21,7 @@ final class DebugSnapshotShutdownBehaviorTest {
     static void run() throws Exception {
         ownerPublishesImmutableSamples();
         for (boolean stopFirst : new boolean[]{false, true}) publisherSurvivesTeardown(stopFirst);
+        sectionCallbacksKeepIdentityAndOwner();
         normalFacadeDoesNothing();
         System.out.println("debug owner snapshot cadence/concurrency and publisher shutdown race tests passed");
     }
@@ -128,6 +129,7 @@ final class DebugSnapshotShutdownBehaviorTest {
         set(nodes, "topologyGeneration", new AtomicLong());
         set(nodes, "geometryManager", new BasicAsyncGeometryManager(8, 8192));
         set(nodes, "running", true);
+        set(nodes, "workPending", new AtomicBoolean());
         set(nodes, "thread", new Thread(() -> {}));
         set(nodes, "progressListener", (Runnable) () -> {});
         set(nodes, "completedRegionalSectionPublications", new ArrayList<>());
@@ -195,6 +197,57 @@ final class DebugSnapshotShutdownBehaviorTest {
         var session = new ClientSession.Session(105, "test", null, null, null, 0);
         for (int i = 0; i < 1000; i++) ClientLodDebug.captureSession(session);
         check(SessionDebugTelemetry.latest(session) == null, "normal facade sampled");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void sectionCallbacksKeepIdentityAndOwner() throws Exception {
+        var renderer = allocate(VoxyRenderSystem.class);
+        var old = manager(); var successor = manager();
+        set(renderer, "regionalSectionRevision", new AtomicLong(41));
+        set(renderer, "nodeManager", old);
+        var prepare = Arrays.stream(VoxyRenderSystem.class.getDeclaredMethods())
+                .filter(method -> method.getName().equals("prepareRegionalSection")).findFirst().orElseThrow();
+        prepare.setAccessible(true);
+        Object prepared = prepare.invoke(renderer, old, 16L,
+                BuiltSection.emptyWithChildren(16, 1, (byte) 0), null, true, 0L,
+                (java.util.function.BooleanSupplier) () -> true);
+        var submission = (AsyncNodeManager.RegionalSectionSubmission) get(prepared, "submission");
+        var publication = (SectionPublicationState) get(prepared, "publication");
+        var queue = (Deque<Object>) get(old, "rendererTransactionQueue");
+        var nextQueue = (Deque<Object>) get(successor, "rendererTransactionQueue");
+        // Replacement/shutdown can change the outer renderer while old GPU callbacks remain.
+        set(renderer, "nodeManager", successor);
+        submission.success().run();
+        Object finalize = queue.removeFirst();
+        checkTransaction(finalize, "FINALIZE", 41, 16);
+        check(nextQueue.isEmpty(), "upload callback reached successor renderer");
+        ((Runnable) get(finalize, "success")).run(); // explicit fake completion boundary
+        publication.close();
+        Object retirement = queue.removeFirst();
+        checkTransaction(retirement, "RETIRE", 42, 16);
+        check((long) get(retirement, "expectedRevision") == 41, "retirement lost expected publication revision");
+        ((java.util.function.Consumer<Throwable>) get(retirement, "failure"))
+                .accept(new IllegalStateException("injected retirement failure"));
+        Object rollback = queue.removeFirst();
+        checkTransaction(rollback, "ROLLBACK", 42, 16);
+        ((Runnable) get(rollback, "success")).run();
+        Object completion = queue.removeFirst();
+        checkTransaction(completion, "COMPLETE_ROLLBACK", 42, 16);
+        check(!publication.retirementFencePassed(), "rollback skipped completion fence");
+        ((Runnable) get(completion, "success")).run();
+        check(publication.retirementFencePassed() && queue.isEmpty() && nextQueue.isEmpty(),
+                "rollback completion reached new owner or lost retirement");
+        old.stop();
+        submission.failure().accept(new IllegalStateException("late stopped callback"));
+        check(nextQueue.isEmpty(), "stopped failure callback used successor renderer");
+        successor.stop();
+    }
+
+    private static void checkTransaction(Object transaction, String operation, long revision, long position)
+            throws Exception {
+        check(get(transaction, "operation").toString().equals(operation)
+                && (long) get(transaction, "sourceRevision") == revision
+                && (long) get(transaction, "position") == position, "transaction lost exact section identity");
     }
 
     private static <T> T allocate(Class<T> type) throws Exception {

@@ -14,10 +14,8 @@ import me.cortex.voxy.client.core.rendering.SectionKey;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 import static me.cortex.voxy.client.core.rendering.SectionKey.MAX_LOD_LAYER;
 
@@ -265,7 +263,7 @@ public class NodeManager {
         }
         if (this.activeSectionMap.get(position) == -1) return true;
         this.stageGeometryResult(BuiltSection.emptyWithChildren(position, revision, (byte) 0));
-        this.commitStagedRoot(revision, Set.of(position));
+        this.commitSection(revision, position);
         return true;
     }
 
@@ -277,229 +275,161 @@ public class NodeManager {
     }
 
     /**
-     * Attaches already-uploaded candidates and indexed child topology without freeing active
-     * geometry until every key passes preflight. Request-to-node publication waits for finalize.
+     * Preflights and attaches one uploaded candidate without freeing its previous geometry.
+     * Request-to-node publication waits for finalize.
      */
-    public void commitStagedRoot(long sourceRevision, Set<Long> positions) {
-        Objects.requireNonNull(positions, "positions");
-        ArrayList<CommitTarget> targets = new ArrayList<>(positions.size());
-        HashSet<Long> unique = new HashSet<>();
-        for (long position : positions) {
-            if (!unique.add(position)) throw new IllegalArgumentException("duplicate staged position");
-            StagedGeometryKey key = new StagedGeometryKey(sourceRevision, position);
-            if (this.committedGeometry.containsKey(key)
-                    || this.committedPositions.containsKey(position)) {
-                throw new IllegalStateException("staged geometry is already committed");
-            }
-            StagedGeometry candidate = this.stagedGeometry.get(key);
-            if (candidate == null) {
-                throw new IllegalStateException("missing staged geometry for "
-                        + SectionKey.describe(position));
-            }
-            int state = this.activeSectionMap.get(position);
-            if (state == -1) {
-                throw new IllegalStateException("staged geometry lost its hierarchy owner");
-            }
-            if ((state & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
-                NodeRequest request = this.request(state);
-                int child = (state & REQUEST_TYPE_MSK) == REQUEST_TYPE_SINGLE
-                        ? 0 : getChildIdx(position);
-                // Access is also the complete, non-mutating ownership preflight.
-                request.mesh(child);
-                targets.add(new CommitTarget(key, candidate, state, request, child));
-            } else if ((state & NODE_TYPE_MSK) == NODE_TYPE_INNER
-                    || (state & NODE_TYPE_MSK) == NODE_TYPE_LEAF) {
-                targets.add(new CommitTarget(key, candidate, state, null, -1));
-            } else {
-                throw new IllegalStateException("invalid staged hierarchy owner");
-            }
+    public void commitSection(long sourceRevision, long position) {
+        StagedGeometryKey key = new StagedGeometryKey(sourceRevision, position);
+        if (this.committedGeometry.containsKey(key) || this.committedPositions.containsKey(position)) {
+            throw new IllegalStateException("staged geometry is already committed");
         }
-
-        for (CommitTarget target : targets) {
-            int oldGeometry;
-            byte previousChildExistence;
-            boolean previousChildExistenceKnown;
-            if (target.request != null) {
-                previousChildExistenceKnown = target.request.hasChildExistence(target.child);
-                previousChildExistence = previousChildExistenceKnown
-                        ? target.request.childExistence(target.child) : 0;
-                oldGeometry = target.request.replaceMesh(target.child,
-                        target.candidate.geometryId);
-                target.request.setChildExistence(target.child,
-                        target.candidate.childExistence);
-                // Keep the request form until the renderer fence is finalized. Rollback can then
-                // restore the exact request instead of reconstructing it from published nodes.
-            } else {
-                int node = target.state & NODE_ID_MSK;
-                oldGeometry = this.nodeData.getNodeGeometry(node);
-                previousChildExistence = this.nodeData.getNodeChildExistence(node);
-                previousChildExistenceKnown = true;
-                this.nodeData.setNodeGeometry(node, target.candidate.geometryId);
-                // Existing child topology remains authoritative through the geometry fence.
-                // Finalization reconciles the old allocation with the new indexed mask.
-                this.invalidateNode(node);
-            }
-            this.stagedGeometry.remove(target.key);
-            this.committedGeometry.put(target.key, new CommittedGeometry(
-                    target.candidate.geometryId, oldGeometry,
-                    target.candidate.childExistence, previousChildExistence,
-                    previousChildExistenceKnown));
-            this.committedPositions.put(target.key.position, target.key);
+        StagedGeometry candidate = this.stagedGeometry.get(key);
+        if (candidate == null) {
+            throw new IllegalStateException("missing staged geometry for " + SectionKey.describe(position));
         }
+        GeometryOwner owner = this.resolveGeometryOwner(position);
+        int oldGeometry;
+        byte previousChildExistence;
+        boolean previousChildExistenceKnown;
+        if (owner.request != null) {
+            previousChildExistenceKnown = owner.request.hasChildExistence(owner.child);
+            previousChildExistence = previousChildExistenceKnown
+                    ? owner.request.childExistence(owner.child) : 0;
+            oldGeometry = owner.request.replaceMesh(owner.child, candidate.geometryId);
+            owner.request.setChildExistence(owner.child, candidate.childExistence);
+            // Keep requests until finalization so rollback can restore their exact state.
+        } else {
+            oldGeometry = this.nodeData.getNodeGeometry(owner.node);
+            previousChildExistence = this.nodeData.getNodeChildExistence(owner.node);
+            previousChildExistenceKnown = true;
+            this.nodeData.setNodeGeometry(owner.node, candidate.geometryId);
+            // Existing child topology remains authoritative through the geometry fence.
+            this.invalidateNode(owner.node);
+        }
+        this.stagedGeometry.remove(key);
+        this.committedGeometry.put(key, new CommittedGeometry(candidate.geometryId, oldGeometry,
+                candidate.childExistence, previousChildExistence, previousChildExistenceKnown));
+        this.committedPositions.put(position, key);
     }
 
     /** Restores attached candidates and drops unattached ones without exposing a missing mesh. */
-    public void rollbackStagedRoot(long sourceRevision) {
-        ArrayList<Map.Entry<StagedGeometryKey, CommittedGeometry>> committed = new ArrayList<>();
-        for (Map.Entry<StagedGeometryKey, CommittedGeometry> entry
-                : this.committedGeometry.entrySet()) {
-            if (entry.getKey().sourceRevision == sourceRevision) committed.add(entry);
-        }
-        ArrayList<RollbackTarget> targets = new ArrayList<>(committed.size());
-        for (Map.Entry<StagedGeometryKey, CommittedGeometry> entry : committed) {
-            targets.add(this.resolveRollbackTarget(entry.getKey(), entry.getValue()));
-        }
-        for (RollbackTarget target : targets) {
-            CommittedGeometry geometry = target.geometry;
-            if (target.request != null) {
-                target.request.restoreMesh(target.child, geometry.previousGeometry);
-                target.request.restoreChildExistence(target.child,
+    public void rollbackSection(long sourceRevision, long position) {
+        StagedGeometryKey key = new StagedGeometryKey(sourceRevision, position);
+        CommittedGeometry geometry = this.committedGeometry.get(key);
+        if (geometry != null) {
+            GeometryOwner owner = this.resolveGeometryOwner(position);
+            int attached = owner.request != null ? owner.request.mesh(owner.child)
+                    : this.nodeData.getNodeGeometry(owner.node);
+            if (attached != geometry.candidateGeometry) {
+                throw new IllegalStateException("committed geometry was replaced");
+            }
+            if (this.rolledBackGeometry.containsKey(key)) {
+                throw new IllegalStateException("rollback geometry is already awaiting retirement");
+            }
+            if (owner.request != null) {
+                owner.request.restoreMesh(owner.child, geometry.previousGeometry);
+                owner.request.restoreChildExistence(owner.child,
                         geometry.previousChildExistenceKnown,
                         geometry.previousChildExistence);
             } else {
-                this.nodeData.setNodeGeometry(target.node, geometry.previousGeometry);
-                this.nodeData.setNodeChildExistence(target.node,
-                        geometry.previousChildExistence);
-                this.invalidateNode(target.node);
+                this.nodeData.setNodeGeometry(owner.node, geometry.previousGeometry);
+                this.nodeData.setNodeChildExistence(owner.node, geometry.previousChildExistence);
+                this.invalidateNode(owner.node);
             }
-            Integer priorRetirement = this.rolledBackGeometry.put(target.key,
-                    geometry.candidateGeometry);
-            if (priorRetirement != null) {
-                throw new IllegalStateException("rollback geometry is already awaiting retirement");
-            }
-            this.committedGeometry.remove(target.key);
-            this.committedPositions.remove(target.key.position, target.key);
+            this.rolledBackGeometry.put(key, geometry.candidateGeometry);
+            this.committedGeometry.remove(key);
+            this.committedPositions.remove(position, key);
         }
-
-        var iterator = this.stagedGeometry.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<StagedGeometryKey, StagedGeometry> entry = iterator.next();
-            if (entry.getKey().sourceRevision != sourceRevision) continue;
-            removeGeometryIfAllocated(entry.getValue().geometryId);
-            iterator.remove();
-        }
+        this.discardStagedSection(key);
     }
 
     /** Releases rollback candidates only after the restored node pointers crossed a GPU fence. */
-    public void completeRollback(long sourceRevision) {
-        var iterator = this.rolledBackGeometry.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<StagedGeometryKey, Integer> entry = iterator.next();
-            if (entry.getKey().sourceRevision != sourceRevision) continue;
-            removeGeometryIfAllocated(entry.getValue());
-            iterator.remove();
-        }
+    public void completeSectionRollback(long sourceRevision, long position) {
+        StagedGeometryKey key = new StagedGeometryKey(sourceRevision, position);
+        Integer candidate = this.rolledBackGeometry.get(key);
+        if (candidate == null) return;
+        removeGeometryIfAllocated(candidate);
+        this.rolledBackGeometry.remove(key);
     }
 
     /** Releases the old allocation only after the committed node pointers crossed a GPU fence. */
-    public boolean finalizeStagedRoot(long sourceRevision) {
-        for (Map.Entry<StagedGeometryKey, CommittedGeometry> entry
-                : this.committedGeometry.entrySet()) {
-            if (entry.getKey().sourceRevision != sourceRevision) continue;
-            int state = this.activeSectionMap.get(entry.getKey().position);
-            if (state == -1 || (state & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) continue;
-            int node = state & NODE_ID_MSK;
-            int current = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node));
-            int desired = Byte.toUnsignedInt(entry.getValue().candidateChildExistence);
-            if (current != desired
-                    && !this.canReconcileTopology(entry.getKey().position, node, desired,
-                    sourceRevision)) return false;
-        }
-        this.finishPublishedRequests(sourceRevision);
-        var iterator = this.committedGeometry.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<StagedGeometryKey, CommittedGeometry> entry = iterator.next();
-            if (entry.getKey().sourceRevision != sourceRevision) continue;
-            CommittedGeometry geometry = entry.getValue();
-            int state = this.activeSectionMap.get(entry.getKey().position);
+    public boolean finalizeSection(long sourceRevision, long position) {
+        StagedGeometryKey key = new StagedGeometryKey(sourceRevision, position);
+        CommittedGeometry geometry = this.committedGeometry.get(key);
+        if (geometry != null) {
+            int state = this.activeSectionMap.get(position);
+            if (state != -1 && (state & NODE_TYPE_MSK) != NODE_TYPE_REQUEST) {
+                int node = state & NODE_ID_MSK;
+                int current = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node));
+                int desired = Byte.toUnsignedInt(geometry.candidateChildExistence);
+                if (current != desired
+                        && !this.canReconcileTopology(position, node, desired, sourceRevision)) return false;
+            }
+            this.finishPublishedRequest(position, geometry);
+            // Completing a shared sibling request can convert this owner into a real node.
+            state = this.activeSectionMap.get(position);
             if (state != -1 && (state & NODE_TYPE_MSK) != NODE_TYPE_REQUEST) {
                 int node = state & NODE_ID_MSK;
                 int current = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node));
                 int desired = Byte.toUnsignedInt(geometry.candidateChildExistence);
                 if (current != desired) {
-                    this.reconcileTopology(entry.getKey().position, node, desired);
+                    this.reconcileTopology(position, node, desired);
                 }
             }
             if (geometry.previousGeometry != geometry.candidateGeometry) {
                 removeGeometryIfAllocated(geometry.previousGeometry);
             }
-            this.committedPositions.remove(entry.getKey().position, entry.getKey());
-            this.publishedRevisions.put(entry.getKey().position, sourceRevision);
-            iterator.remove();
+            this.committedPositions.remove(position, key);
+            this.publishedRevisions.put(position, sourceRevision);
+            this.committedGeometry.remove(key);
         }
-        var staged = this.stagedGeometry.entrySet().iterator();
-        while (staged.hasNext()) {
-            Map.Entry<StagedGeometryKey, StagedGeometry> entry = staged.next();
-            if (entry.getKey().sourceRevision != sourceRevision) continue;
-            removeGeometryIfAllocated(entry.getValue().geometryId);
-            staged.remove();
-        }
+        this.discardStagedSection(key);
         return true;
     }
 
-    private record CommitTarget(StagedGeometryKey key, StagedGeometry candidate, int state,
-                                NodeRequest request, int child) {}
+    private void discardStagedSection(StagedGeometryKey key) {
+        StagedGeometry staged = this.stagedGeometry.get(key);
+        if (staged == null) return;
+        removeGeometryIfAllocated(staged.geometryId);
+        this.stagedGeometry.remove(key);
+    }
+
     private record CommittedGeometry(int candidateGeometry, int previousGeometry,
                                      byte candidateChildExistence,
                                      byte previousChildExistence,
                                      boolean previousChildExistenceKnown) {}
-    private record RollbackTarget(StagedGeometryKey key, CommittedGeometry geometry,
-                                  NodeRequest request, int child, int node) {}
+    private record GeometryOwner(NodeRequest request, int child, int node) {}
 
-    private RollbackTarget resolveRollbackTarget(StagedGeometryKey key,
-                                                 CommittedGeometry geometry) {
-        int state = this.activeSectionMap.get(key.position);
+    private GeometryOwner resolveGeometryOwner(long position) {
+        int state = this.activeSectionMap.get(position);
         if (state == -1) {
-            throw new IllegalStateException("committed geometry lost its hierarchy owner");
+            throw new IllegalStateException("geometry lost its hierarchy owner");
         }
         if ((state & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
             NodeRequest request = this.request(state);
             int child = (state & REQUEST_TYPE_MSK) == REQUEST_TYPE_SINGLE
-                    ? 0 : getChildIdx(key.position);
-            if (request.mesh(child) != geometry.candidateGeometry) {
-                throw new IllegalStateException("committed request geometry was replaced");
-            }
-            return new RollbackTarget(key, geometry, request, child, -1);
+                    ? 0 : getChildIdx(position);
+            request.mesh(child); // Non-mutating request ownership preflight.
+            return new GeometryOwner(request, child, -1);
         }
         if ((state & NODE_TYPE_MSK) == NODE_TYPE_INNER
                 || (state & NODE_TYPE_MSK) == NODE_TYPE_LEAF) {
             int node = state & NODE_ID_MSK;
-            if (this.nodeData.getNodeGeometry(node) != geometry.candidateGeometry) {
-                throw new IllegalStateException("committed node geometry was replaced");
-            }
-            return new RollbackTarget(key, geometry, null, -1, node);
+            return new GeometryOwner(null, -1, node);
         }
-        throw new IllegalStateException("invalid committed hierarchy owner");
+        throw new IllegalStateException("invalid geometry hierarchy owner");
     }
 
     /** Staged requests become real nodes only after geometry and topology crossed sync. */
-    private void finishPublishedRequests(long sourceRevision) {
-        for (Map.Entry<StagedGeometryKey, CommittedGeometry> entry
-                : this.committedGeometry.entrySet()) {
-            StagedGeometryKey key = entry.getKey();
-            CommittedGeometry geometry = entry.getValue();
-            if (key.sourceRevision != sourceRevision) continue;
-            int state = this.activeSectionMap.get(key.position);
-            if (state == -1 || (state & NODE_TYPE_MSK) != NODE_TYPE_REQUEST) continue;
-            NodeRequest request = this.request(state);
-            int child = (state & REQUEST_TYPE_MSK) == REQUEST_TYPE_SINGLE
-                    ? 0 : getChildIdx(key.position);
-            if (request.mesh(child) != geometry.candidateGeometry) {
-                throw new IllegalStateException("committed request geometry was replaced");
-            }
-            this.finishRequestIfSatisfied(state & NODE_ID_MSK, request,
-                    state & REQUEST_TYPE_MSK);
+    private void finishPublishedRequest(long position, CommittedGeometry geometry) {
+        int state = this.activeSectionMap.get(position);
+        if (state == -1 || (state & NODE_TYPE_MSK) != NODE_TYPE_REQUEST) return;
+        NodeRequest request = this.request(state);
+        int child = (state & REQUEST_TYPE_MSK) == REQUEST_TYPE_SINGLE ? 0 : getChildIdx(position);
+        if (request.mesh(child) != geometry.candidateGeometry) {
+            throw new IllegalStateException("committed request geometry was replaced");
         }
+        this.finishRequestIfSatisfied(state & NODE_ID_MSK, request, state & REQUEST_TYPE_MSK);
     }
 
     /**

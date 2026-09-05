@@ -46,9 +46,9 @@ final class RendererAdmissionBehaviorTest {
             if (failAt == 1) throw new IllegalStateException("injected stage failure");
             return super.stageGeometryResult(section);
         }
-        @Override public void commitStagedRoot(long revision, Set<Long> positions) {
+        @Override public void commitSection(long revision, long position) {
             if (failAt == 2) throw new IllegalStateException("injected commit preflight failure");
-            super.commitStagedRoot(revision, positions);
+            super.commitSection(revision, position);
             afterCommit.run();
             if (failAt == 3) throw new IllegalStateException("injected post-commit failure");
         }
@@ -116,8 +116,8 @@ final class RendererAdmissionBehaviorTest {
         @Override public void close() {
             // Fence phases explicitly advanced only during cleanup.
             for (Attempt attempt : attempts) {
-                nodes.rollbackStagedRoot(attempt.mesh.sourceRevision);
-                nodes.completeRollback(attempt.mesh.sourceRevision);
+                nodes.rollbackSection(attempt.mesh.sourceRevision, attempt.mesh.position);
+                nodes.completeSectionRollback(attempt.mesh.sourceRevision, attempt.mesh.position);
             }
             roots.forEach(nodes::removeTopLevelNode);
             for (Attempt attempt : attempts) {
@@ -143,7 +143,7 @@ final class RendererAdmissionBehaviorTest {
                 if (failAt == 3) {
                     check(h.allocator.getSectionCount() == 1 && !attempt.mesh.geometryBuffer.isFreed(),
                             "post-commit rollback skipped retirement fence");
-                    h.nodes.completeRollback(1);
+                    h.nodes.completeSectionRollback(1, attempt.mesh.position);
                 }
                 if (failAt != 0) {
                     h.nodes.failAt = 0;
@@ -167,7 +167,7 @@ final class RendererAdmissionBehaviorTest {
                     "failure after acknowledgement retained a success completion");
             check(h.allocator.getSectionCount() == 1 && !attempt.mesh.geometryBuffer.isFreed(),
                     "failure after admission freed before rollback fence");
-            h.nodes.completeRollback(1);
+            h.nodes.completeSectionRollback(1, attempt.mesh.position);
             check(h.allocator.getSectionCount() == 0, "admitted notification failure leaked allocation");
         }
         try (ConsumerHarness h = new ConsumerHarness(1, 1024)) {

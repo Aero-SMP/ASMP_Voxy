@@ -8,13 +8,13 @@ import me.cortex.voxy.common.util.MemoryBuffer;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 
 /** The production topology/allocator with fence phases explicitly driven by the test. */
 public final class PublicationTopologyBehaviorTest {
     private PublicationTopologyBehaviorTest() {}
     public static void run() {
         RendererAdmissionBehaviorTest.run();
+        SectionPublicationLookupBehaviorTest.run();
         retirementsProgressIndependentlyAndRespectRevision();
         cancellationDuringStagingWaitsForRollbackFence();
         fragmentedAndSectionIdAllocation();
@@ -38,14 +38,14 @@ public final class PublicationTopologyBehaviorTest {
             long position = SectionKey.pack(level, 0, 0, 0);
             check(nodes.ensureHierarchyOwner(position), "nested fixture lost hierarchy owner");
             stage(nodes, BuiltSection.emptyWithChildren(position, 1, (byte) (level == 0 ? 0 : 1)));
-            check(nodes.finalizeStagedRoot(1), "nested empty subtree did not publish");
+            check(nodes.finalizeSection(1, position), "nested empty subtree did not publish");
         }
         try {
             check(removable(nodes, root, 10), "empty nested subtree is not removable");
             for (boolean committed : new boolean[]{false, true}) {
                 check(nodes.stageGeometryResult(BuiltSection.emptyWithChildren(leaf, 20, (byte) 0)) != null,
                         "deep pending fixture not staged");
-                if (committed) nodes.commitStagedRoot(20, Set.of(leaf));
+                if (committed) nodes.commitSection(20, leaf);
                 check(!removable(nodes, root, 10), "deep conflicting pending geometry was ignored");
                 check(removable(nodes, root, 20), "same-revision empty geometry changed treatment");
                 check(removable(nodes, unrelated, 10), "unrelated pending geometry blocked removal");
@@ -58,24 +58,24 @@ public final class PublicationTopologyBehaviorTest {
                     check(!removable(nodes, root, 10), "missing owner bypassed pending checks");
                     check(removable(nodes, root, 20), "same-revision missing owner changed treatment");
                 } finally { map.put(root, state); }
-                nodes.rollbackStagedRoot(20);
-                nodes.completeRollback(20);
+                nodes.rollbackSection(20, leaf);
+                nodes.completeSectionRollback(20, leaf);
             }
 
             // Unpublished top-level requests have no renderer node yet.
             for (boolean committed : new boolean[]{false, true}) {
                 check(nodes.stageGeometryResult(BuiltSection.emptyWithChildren(unrelated, 30, (byte) 0)) != null,
                         "request geometry not staged");
-                if (committed) nodes.commitStagedRoot(30, Set.of(unrelated));
+                if (committed) nodes.commitSection(30, unrelated);
                 check(!removable(nodes, unrelated, 10) && removable(nodes, unrelated, 30),
                         "request owner bypassed revision-sensitive pending checks");
                 check(removable(nodes, root, 10), "outside pending request blocked nested subtree");
-                nodes.rollbackStagedRoot(30);
-                nodes.completeRollback(30);
+                nodes.rollbackSection(30, unrelated);
+                nodes.completeSectionRollback(30, unrelated);
             }
             Buffer geometry = new Buffer(1024);
             stage(nodes, mesh(leaf, 40, geometry));
-            check(nodes.finalizeStagedRoot(40), "nonempty descendant did not publish");
+            check(nodes.finalizeSection(40, leaf), "nonempty descendant did not publish");
             check(!removable(nodes, root, 40), "nonempty descendant renderer geometry was ignored");
         } finally {
             nodes.removeTopLevelNode(root);
@@ -105,7 +105,7 @@ public final class PublicationTopologyBehaviorTest {
     private static long key(int x) { return SectionKey.pack(4, x, 0, 0); }
     private static void stage(NodeManager nodes, BuiltSection geometry) {
         check(nodes.stageGeometryResult(geometry) != null, "geometry has no hierarchy owner");
-        nodes.commitStagedRoot(geometry.sourceRevision, Set.of(geometry.position));
+        nodes.commitSection(geometry.sourceRevision, geometry.position);
     }
 
     private static final class Publication extends SectionPublicationState {
@@ -131,7 +131,7 @@ public final class PublicationTopologyBehaviorTest {
             nodes.insertTopLevelNode(key);
             Buffer buffer = new Buffer(1024); buffers.add(buffer);
             stage(nodes, mesh(key, revision, buffer));
-            check(nodes.finalizeStagedRoot(revision), "initial upload did not finalize");
+            check(nodes.finalizeSection(revision, key), "initial upload did not finalize");
             Publication publication = new Publication(key, revision, 100 + i, retirements);
             publication.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
             publication.close(); publication.close();
@@ -139,14 +139,14 @@ public final class PublicationTopologyBehaviorTest {
         check(retirements.size() == 4 && allocator.getSectionCount() == 4, "close duplicated or freed live state");
         Buffer newer = new Buffer(1024);
         stage(nodes, mesh(key(0), 20, newer));
-        check(nodes.finalizeStagedRoot(20), "replacement did not finalize");
+        check(nodes.finalizeSection(20, key(0)), "replacement did not finalize");
         for (Publication p : retirements) {
             check(nodes.retirePublication(p.retirementRevision, p.revision, p.key), "retirement blocked on handoff");
             check(allocator.getSectionCount() >= 1, "retirement freed before fence");
         }
         check(allocator.getSectionCount() == 4 && !newer.isFreed(), "staging retirement freed GPU state early");
         for (Publication p : retirements) {
-            check(nodes.finalizeStagedRoot(p.retirementRevision), "fenced retirement did not finalize");
+            check(nodes.finalizeSection(p.retirementRevision, p.key), "fenced retirement did not finalize");
             p.markRetired();
         }
         check(allocator.getSectionCount() == 1 && !newer.isFreed(), "late old close removed newer publication");
@@ -161,7 +161,7 @@ public final class PublicationTopologyBehaviorTest {
         NodeManager nodes = new NodeManager(1024, allocator);
         nodes.insertTopLevelNode(key(0));
         Buffer fallback = new Buffer(1024), candidate = new Buffer(1024);
-        stage(nodes, mesh(key(0), 1, fallback)); nodes.finalizeStagedRoot(1);
+        stage(nodes, mesh(key(0), 1, fallback)); nodes.finalizeSection(1, key(0));
         stage(nodes, mesh(key(0), 2, candidate));
         List<Publication> retirements = new ArrayList<>();
         Publication upload = new Publication(key(0), 2, 3, retirements);
@@ -169,10 +169,10 @@ public final class PublicationTopologyBehaviorTest {
         upload.markRendererAdmitted();
         check(upload.rendererAdmitted() && !upload.activationFencePassed(), "admission bypassed activation fence");
         check(retirements.isEmpty() && allocator.getSectionCount() == 2, "close overtook staged upload");
-        nodes.rollbackStagedRoot(2);
+        nodes.rollbackSection(2, key(0));
         check(!candidate.isFreed() && !fallback.isFreed(), "rollback freed before pointer fence");
         check(!nodes.retirePublication(4, 1, key(0)), "retirement overtook rollback-owned geometry");
-        nodes.completeRollback(2);
+        nodes.completeSectionRollback(2, key(0));
         upload.completeUpload(new UploadOutcome(UploadStatus.FAILED, null, new IllegalStateException("injected")));
         check(candidate.frees == 1 && !fallback.isFreed(), "rollback failed to retain fallback");
         nodes.removeTopLevelNode(key(0));

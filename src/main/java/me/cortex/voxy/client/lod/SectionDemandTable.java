@@ -126,15 +126,11 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
 
     /** Same-priority regions rotate after every claim. */
     private static final class ReadyGroup {
-        final Map<Long, IntrusiveList> regions = new HashMap<>();
-        final LinkedHashMap<Long, Boolean> rotation = new LinkedHashMap<>();
+        final LinkedHashMap<Long, IntrusiveList> regions = new LinkedHashMap<>();
         int size;
 
         void add(Demand demand) {
-            IntrusiveList list = this.regions.computeIfAbsent(demand.regionKey, ignored -> {
-                this.rotation.put(demand.regionKey, Boolean.TRUE);
-                return new IntrusiveList();
-            });
+            IntrusiveList list = this.regions.computeIfAbsent(demand.regionKey, ignored -> new IntrusiveList());
             list.add(demand);
             this.size++;
         }
@@ -146,20 +142,11 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             this.size--;
             if (list.size == 0) {
                 this.regions.remove(demand.readyRegion);
-                this.rotation.remove(demand.readyRegion);
             }
         }
 
         Demand poll() {
-            if (this.rotation.isEmpty()) return null;
-            long region = this.rotation.keySet().iterator().next();
-            IntrusiveList list = this.regions.get(region);
-            Demand result = list.removeFirst();
-            this.size--;
-            this.rotation.remove(region);
-            if (list.size == 0) this.regions.remove(region);
-            else this.rotation.put(region, Boolean.TRUE);
-            return result;
+            return this.regions.isEmpty() ? null : this.poll(this.regions.firstEntry().getKey());
         }
 
         Demand poll(long region) {
@@ -167,9 +154,8 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             if (list == null) return null;
             Demand result = list.removeFirst();
             this.size--;
-            this.rotation.remove(region);
             if (list.size == 0) this.regions.remove(region);
-            else this.rotation.put(region, Boolean.TRUE);
+            else this.regions.putLast(region, list);
             return result;
         }
     }

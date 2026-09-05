@@ -5,6 +5,9 @@ import me.cortex.voxy.common.util.AllocationArena;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
 
 /** Dependency-free executable behavior tests; never packaged in either client artifact. */
 public final class SectionDemandTableBehaviorTest {
@@ -18,6 +21,8 @@ public final class SectionDemandTableBehaviorTest {
         coalescesNewestUnsignedEpoch();
         priorityMovesOneMembership();
         coveragePrecedesFairRegionalRefinement();
+        readyRegionOrdering();
+        mixedReadyRegionOrdering();
         finalSectionReleasesRegion();
         staleTicketCannotMutateReplacement();
         allocatorUsesExactOneKiBUnits();
@@ -100,6 +105,87 @@ public final class SectionDemandTableBehaviorTest {
                 "region was released too early");
         table.remove(2);
         check(table.regionCount() == 0, "final section did not release its region");
+    }
+
+    private static void readyRegionOrdering() {
+        var table = new SectionDemandTable<SectionDemandTable.Demand>(8);
+        var kind = SectionDemandTable.ReadyKind.NETWORK;
+        var a = table.adopt(demand(1, 10, 100, false, 7));
+        var a2 = table.adopt(demand(2, 10, 100, false, 7));
+        var a3 = table.adopt(demand(3, 10, 100, false, 7));
+        var b = table.adopt(demand(4, 20, 100, false, 7));
+        var b2 = table.adopt(demand(5, 20, 100, false, 7));
+        var c = table.adopt(demand(6, 30, 100, false, 7));
+        var c2 = table.adopt(demand(7, 30, 100, false, 7));
+        for (var d : List.of(a, b, c, a2, b2, c2, a3)) { table.ready(d, kind); table.checkInvariants(); }
+        check(table.pollSameRegion(kind, 999, false, 7) == null, "missing region produced work");
+        table.remove(a2.key); table.checkInvariants(); // Nonfinal removal must not rotate A.
+        check(table.poll(kind) == a, "adding/removing a region member changed its turn");
+        table.checkInvariants();
+        check(table.pollSameRegion(kind, 10, false, 7) == a3, "batch did not preserve regional FIFO");
+        table.checkInvariants();
+        table.ready(a, kind); // A was empty; it must rejoin behind B and C.
+        check(table.pollSameRegion(kind, 20, false, 7) == b, "explicit batch chose wrong region");
+        table.checkInvariants(); // B moved behind C and A, but retained b2.
+        check(table.poll(kind) == c && table.poll(kind) == a && table.poll(kind) == b2
+                && table.poll(kind) == c2 && table.poll(kind) == null, "three-region round robin changed");
+        table.checkInvariants();
+        table.ready(b, kind); table.ready(c, kind); table.ready(a, kind);
+        table.setPriority(a, 1); // lower pixel priority cannot steal a turn
+        table.ready(c, SectionDemandTable.ReadyKind.RENDERER);
+        table.owned(b, SectionDemandTable.CandidateState.WORKER_OWNED);
+        table.checkInvariants();
+        check(table.readyCount(kind) == 1 && table.readyCount(SectionDemandTable.ReadyKind.RENDERER) == 1,
+                "transition duplicated membership");
+        check(table.poll(kind) == a && table.poll(SectionDemandTable.ReadyKind.RENDERER) == c,
+                "priority/kind transition lost work");
+        table.checkInvariants();
+        table.ready(a, kind); table.ready(b, kind);
+        check(table.poll(kind) == b && table.poll(kind) == a, "pixel priority ordering changed");
+        table.checkInvariants();
+    }
+
+    private static void mixedReadyRegionOrdering() {
+        var table = new SectionDemandTable<SectionDemandTable.Demand>(8);
+        var kind = SectionDemandTable.ReadyKind.SOURCE;
+        // Small list-of-FIFO-batches oracle, deliberately independent of intrusive/map storage.
+        List<List<SectionDemandTable.Demand>> turns = new ArrayList<>();
+        Random random = new Random(0x52ea7);
+        for (int step = 0; step < 4000; step++) {
+            long id = random.nextInt(48);
+            var d = table.get(id);
+            int op = random.nextInt(5);
+            if (op < 3) {
+                if (d == null) d = table.adopt(demand(id, id % 3, 100, false, 7));
+                for (var batch : turns) batch.remove(d);
+                turns.removeIf(List::isEmpty);
+                if (op == 0) {
+                    table.ready(d, kind);
+                    List<SectionDemandTable.Demand> batch = null;
+                    for (var candidate : turns) if (candidate.getFirst().regionKey == d.regionKey) batch = candidate;
+                    if (batch == null) { batch = new ArrayList<>(); turns.add(batch); }
+                    batch.add(d);
+                } else if (op == 1) table.remove(id);
+                else table.owned(d, SectionDemandTable.CandidateState.WORKER_OWNED);
+            } else {
+                long region = random.nextInt(5); // includes missing-region polls
+                int turn = -1;
+                if (op == 3 && !turns.isEmpty()) turn = 0;
+                else if (op == 4) for (int i = 0; i < turns.size(); i++) {
+                    if (turns.get(i).getFirst().regionKey == region) turn = i;
+                }
+                SectionDemandTable.Demand expected = null;
+                if (turn >= 0) {
+                    var batch = turns.remove(turn); expected = batch.removeFirst();
+                    if (!batch.isEmpty()) turns.add(batch);
+                }
+                var actual = op == 3 ? table.poll(kind) : table.pollSameRegion(kind, region, false, 7);
+                check(actual == expected, "mixed ready order differs at step " + step);
+            }
+            table.checkInvariants();
+            check(table.readyCount(kind) == turns.stream().mapToInt(List::size).sum(), "mixed count mismatch");
+        }
+        table.clear(); table.checkInvariants();
     }
 
     private static void staleTicketCannotMutateReplacement() {

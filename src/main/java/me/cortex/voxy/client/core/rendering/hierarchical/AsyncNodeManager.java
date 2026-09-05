@@ -26,7 +26,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -307,21 +306,16 @@ public class AsyncNodeManager {
             try {
                 boolean completed = switch (transaction.operation) {
                     case RETIRE -> this.manager.retirePublication(transaction.sourceRevision,
-                            transaction.expectedRevision, transaction.positions.iterator().next());
-                    case COMMIT -> {
-                        this.manager.commitStagedRoot(
-                                transaction.sourceRevision, transaction.positions);
-                        yield true;
-                    }
+                            transaction.expectedRevision, transaction.position);
                     case ROLLBACK -> {
-                        this.manager.rollbackStagedRoot(transaction.sourceRevision);
+                        this.manager.rollbackSection(transaction.sourceRevision, transaction.position);
                         yield true;
                     }
                     case COMPLETE_ROLLBACK -> {
-                        this.manager.completeRollback(transaction.sourceRevision);
+                        this.manager.completeSectionRollback(transaction.sourceRevision, transaction.position);
                         yield true;
                     }
-                    case FINALIZE -> this.manager.finalizeStagedRoot(transaction.sourceRevision);
+                    case FINALIZE -> this.manager.finalizeSection(transaction.sourceRevision, transaction.position);
                     case RELEASE_COARSEN -> {
                         this.manager.releaseCoarsened(transaction.sourceRevision);
                         yield true;
@@ -352,7 +346,7 @@ public class AsyncNodeManager {
                 RendererTransaction transaction = this.coarsenQueue.peek();
                 if (transaction == null) break;
                 try {
-                    long parent = transaction.positions.iterator().next();
+                    long parent = transaction.position;
                     if (!this.manager.coarsenSubtree(transaction.sourceRevision, parent)) {
                         topologyDeferred = true;
                         break;
@@ -583,7 +577,7 @@ public class AsyncNodeManager {
             // The atomic batch handoff already validates every section against the
             // exact upload ceiling before accepting ownership.
             if (publication.previousRevision() >= 0) {
-                if (!this.manager.finalizeStagedRoot(publication.previousRevision())) {
+                if (!this.manager.finalizeSection(publication.previousRevision(), geometry.position)) {
                     publication.blocked().accept(new RegionalAllocationBlock(geometry,
                             RegionalAllocationStatus.TOPOLOGY_NOT_READY, 0, 0,
                             geometry.position, observed));
@@ -635,7 +629,7 @@ public class AsyncNodeManager {
             }
             transferred = true;
             this.usedGeometryAmount = this.geometryManager.getGeometryUsedBytes();
-            this.manager.commitStagedRoot(geometry.sourceRevision, Set.of(geometry.position));
+            this.manager.commitSection(geometry.sourceRevision, geometry.position);
             this.completedRegionalSectionPublications.add(publication);
             publication.admitted.run();
         } catch (Throwable failure) {
@@ -644,7 +638,7 @@ public class AsyncNodeManager {
             this.completedRegionalSectionPublications.remove(publication);
             if (!transferred) geometry.free();
             try {
-                this.manager.rollbackStagedRoot(geometry.sourceRevision);
+                this.manager.rollbackSection(geometry.sourceRevision, geometry.position);
             } catch (Throwable rollbackFailure) {
                 failure.addSuppressed(rollbackFailure);
             }
@@ -937,50 +931,44 @@ public class AsyncNodeManager {
     public record PreparedBatch<T>(List<RegionalSectionSubmission> submissions, T receipt) {}
 
     private enum RendererOperation {
-        COMMIT, ROLLBACK, COMPLETE_ROLLBACK, FINALIZE, COARSEN, RELEASE_COARSEN, RETIRE
+        ROLLBACK, COMPLETE_ROLLBACK, FINALIZE, COARSEN, RELEASE_COARSEN, RETIRE
     }
-    private record RendererTransaction(long sourceRevision, Set<Long> positions,
+    private record RendererTransaction(long sourceRevision, long position,
                                        RendererOperation operation,
                                        Runnable success, Consumer<Throwable> failure,
                                        long expectedRevision) {
-        RendererTransaction(long revision, Set<Long> positions, RendererOperation operation,
+        RendererTransaction(long revision, long position, RendererOperation operation,
                             Runnable success, Consumer<Throwable> failure) {
-            this(revision, positions, operation, success, failure, -1);
+            this(revision, position, operation, success, failure, -1);
         }
     }
     private record GpuCompletion(GlFence fence,
                                  ArrayList<RendererTransaction> rendererTransactions,
                                  ArrayList<RegionalSectionPublication> regionalSectionPublications) {}
 
-    public void commitStagedRoot(long sourceRevision, Set<Long> positions, Runnable success,
-                                 Consumer<Throwable> failure) {
-        this.submitRendererTransaction(new RendererTransaction(sourceRevision,
-                Set.copyOf(positions), RendererOperation.COMMIT, success, failure));
-    }
-
-    public void rollbackStagedRoot(long sourceRevision, Runnable success,
+    public void rollbackSection(long sourceRevision, long position, Runnable success,
                                    Consumer<Throwable> failure) {
         this.submitRendererTransaction(new RendererTransaction(sourceRevision,
-                Set.of(), RendererOperation.ROLLBACK,
+                position, RendererOperation.ROLLBACK,
                 () -> this.submitRendererTransaction(new RendererTransaction(sourceRevision,
-                        Set.of(), RendererOperation.COMPLETE_ROLLBACK, success, failure)),
+                        position, RendererOperation.COMPLETE_ROLLBACK, success, failure)),
                 failure));
     }
 
-    public void finalizeStagedRoot(long sourceRevision, Runnable success,
+    public void finalizeSection(long sourceRevision, long position, Runnable success,
                                    Consumer<Throwable> failure) {
         this.submitRendererTransaction(new RendererTransaction(sourceRevision,
-                Set.of(), RendererOperation.FINALIZE, success, failure));
+                position, RendererOperation.FINALIZE, success, failure));
     }
 
     public void coarsenSubtree(long revision, long parent, Runnable success,
                                Consumer<Throwable> failure) {
         Objects.requireNonNull(success, "success");
         Objects.requireNonNull(failure, "failure");
-        RendererTransaction transaction = new RendererTransaction(revision, Set.of(parent),
+        RendererTransaction transaction = new RendererTransaction(revision, parent,
                 RendererOperation.COARSEN,
                 () -> this.submitRendererTransaction(new RendererTransaction(revision,
-                        Set.of(), RendererOperation.RELEASE_COARSEN, success, failure)),
+                        parent, RendererOperation.RELEASE_COARSEN, success, failure)),
                 failure);
         synchronized (this.submissionLock) {
             if (!this.running) {
@@ -994,9 +982,9 @@ public class AsyncNodeManager {
 
     public void retirePublication(long revision, long expectedRevision, long position,
                                   Runnable success, Consumer<Throwable> failure) {
-        this.submitRendererTransaction(new RendererTransaction(revision, Set.of(position),
+        this.submitRendererTransaction(new RendererTransaction(revision, position,
                 RendererOperation.RETIRE,
-                () -> this.finalizeStagedRoot(revision, success, failure), failure,
+                () -> this.finalizeSection(revision, position, success, failure), failure,
                 expectedRevision));
     }
 
