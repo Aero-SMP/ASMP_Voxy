@@ -12,7 +12,6 @@ import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
 import net.irisshaders.iris.pipeline.IrisRenderingPipeline;
 import net.irisshaders.iris.shaderpack.programs.ProgramSet;
 import net.irisshaders.iris.uniforms.custom.CustomUniforms;
-import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -44,11 +43,13 @@ public class MixinIrisRenderingPipeline implements IGetVoxyPatchData, IGetIrisVo
 
     @Inject(method = "beginLevelRendering", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/systems/RenderSystem;activeTexture(I)V", shift = At.Shift.BEFORE), remap = false)
     private void voxy$injectViewportSetup(CallbackInfo ci) {
-        if (IrisUtil.CAPTURED_VIEWPORT_PARAMETERS != null) {
-            var renderer = ((IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
-            if (renderer != null) {
-                IrisUtil.CAPTURED_VIEWPORT_PARAMETERS.apply(renderer);
-            }
+        var renderer = IGetVoxyRenderSystem.getNullable();
+        var captured = IrisUtil.CAPTURED_VIEWPORT_PARAMETERS;
+        if (renderer != null) {
+            // Iris has installed its maps and completed allChanged(), but has not yet
+            // evaluated custom uniforms. Commit now so this frame's matrices are valid.
+            if (this.initializedBlockIds) renderer.irisMappingsPrepared(null);
+            if (captured != null && IGetVoxyRenderSystem.getNullable() == renderer) captured.apply(renderer);
         }
     }
 
@@ -58,24 +59,17 @@ public class MixinIrisRenderingPipeline implements IGetVoxyPatchData, IGetIrisVo
     private void voxy$initializeMaterialMappings(Operation<Void> original) {
         if (this.initializedBlockIds) { original.call(); return; }
         var renderer = IGetVoxyRenderSystem.getNullable();
-        var scope = renderer == null ? null : renderer.beginShaderReload("Iris block mapping initialization");
         var captured = IrisUtil.CAPTURED_VIEWPORT_PARAMETERS;
-        Throwable failure = null;
+        if (renderer != null) {
+            renderer.deferUntilIrisMappingsReady();
+            // Suspending clears stale captures; this one belongs to the current world frame.
+            IrisUtil.CAPTURED_VIEWPORT_PARAMETERS = captured;
+        }
         try {
             original.call();
         } catch (RuntimeException | Error problem) {
-            failure = problem;
+            if (renderer != null) renderer.irisMappingsPrepared(problem);
             throw problem;
-        } finally {
-            if (scope != null) {
-                scope.finish(failure);
-                renderer.irisMappingsPrepared(failure);
-                // The earlier viewport hook ran while suspended. Apply this frame's exact
-                // captured camera after committing, never to a replacement world/renderer.
-                if (failure == null && captured != null && IGetVoxyRenderSystem.getNullable() == renderer) {
-                    captured.apply(renderer);
-                }
-            }
         }
     }
 

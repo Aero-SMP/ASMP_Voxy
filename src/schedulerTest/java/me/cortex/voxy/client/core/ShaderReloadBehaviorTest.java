@@ -88,6 +88,7 @@ public final class ShaderReloadBehaviorTest {
         failuresAndRecovery();
         staleWorldCallbacks();
         deferredIrisMappingInitialization();
+        me.cortex.voxy.client.iris.VoxyUniformBehaviorTest.run();
         sharedMaterialsAndLateUpload();
         cleanupContinuesAfterFailure();
         System.out.println("shader reload ownership and material behavior tests passed");

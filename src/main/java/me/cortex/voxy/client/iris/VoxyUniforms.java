@@ -2,8 +2,8 @@ package me.cortex.voxy.client.iris;
 
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
+import me.cortex.voxy.client.core.rendering.Viewport;
 import net.irisshaders.iris.gl.uniform.UniformHolder;
-import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 
@@ -13,35 +13,31 @@ import static net.irisshaders.iris.gl.uniform.UniformUpdateFrequency.PER_FRAME;
 
 public class VoxyUniforms {
 
-    public static Matrix4f getViewProjection() {//This is 1 frame late ;-; cries, since the update occurs _before_ the voxy render pipeline
-        var getVrs = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
-        if (getVrs == null || getVrs.voxy$getRenderSystem() == null) {
-            return new Matrix4f();
-        }
-        var vrs = getVrs.voxy$getRenderSystem();
-        return new Matrix4f(vrs.getViewport().MVP);
+    private static Viewport viewport() {
+        var renderer = IGetVoxyRenderSystem.getNullable();
+        // Iris can evaluate uniforms during construction, failed reloads or shadow rendering.
+        // A live renderer does not imply a drawable viewport.
+        return renderer == null ? null : renderer.getViewport();
     }
 
-    public static Matrix4f getModelView() {//This is 1 frame late ;-; cries, since the update occurs _before_ the voxy render pipeline
-        var getVrs = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
-        if (getVrs == null || getVrs.voxy$getRenderSystem() == null) {
-            return new Matrix4f();
-        }
-        var vrs = getVrs.voxy$getRenderSystem();
-        return new Matrix4f(vrs.getViewport().modelView);
+    public static Matrix4f getViewProjection() { return getViewProjection(viewport()); }
+    public static Matrix4f getModelView() { return getModelView(viewport()); }
+    public static Matrix4f getProjection() { return getProjection(viewport()); }
+
+    static Matrix4f getViewProjection(Viewport viewport) {
+        return copyOrIdentity(viewport == null ? null : viewport.MVP);
     }
 
-    public static Matrix4f getProjection() {//This is 1 frame late ;-; cries, since the update occurs _before_ the voxy render pipeline
-        var getVrs = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
-        if (getVrs == null || getVrs.voxy$getRenderSystem() == null) {
-            return new Matrix4f();
-        }
-        var vrs = getVrs.voxy$getRenderSystem();
-        var mat = vrs.getViewport().projection;
-        if (mat == null) {
-            return new Matrix4f();
-        }
-        return new Matrix4f(mat);
+    static Matrix4f getModelView(Viewport viewport) {
+        return copyOrIdentity(viewport == null ? null : viewport.modelView);
+    }
+
+    static Matrix4f getProjection(Viewport viewport) {
+        return copyOrIdentity(viewport == null ? null : viewport.projection);
+    }
+
+    private static Matrix4f copyOrIdentity(Matrix4fc matrix) {
+        return matrix == null ? new Matrix4f() : new Matrix4f(matrix);
     }
 
     public static void addUniforms(UniformHolder uniforms) {
@@ -61,7 +57,7 @@ public class VoxyUniforms {
 
 
 
-    private record Inverted(Supplier<Matrix4fc> parent) implements Supplier<Matrix4fc> {
+    record Inverted(Supplier<Matrix4fc> parent) implements Supplier<Matrix4fc> {
         public Matrix4fc get() {
             Matrix4f copy = new Matrix4f(this.parent.get());
             copy.invert();
@@ -69,7 +65,7 @@ public class VoxyUniforms {
         }
     }
 
-    private static class PreviousMat implements Supplier<Matrix4fc> {
+    static class PreviousMat implements Supplier<Matrix4fc> {
         private final Supplier<Matrix4fc> parent;
         private Matrix4f previous;
 
