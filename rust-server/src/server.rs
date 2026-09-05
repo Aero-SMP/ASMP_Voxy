@@ -489,14 +489,18 @@ mod priority_tests {
     // receive window. Neither stream may require the other to finish first.
     async fn metadata_and_coverage_progress() -> Result<()> {
         let cert = rcgen::generate_simple_self_signed(vec!["voxy.local".into()])?;
-        let identity = PersistentIdentity::new(cert.cert.der().to_vec(), cert.key_pair.serialize_der())?;
+        let identity =
+            PersistentIdentity::new(cert.cert.der().to_vec(), cert.key_pair.serialize_der())?;
         let server = Endpoint::server(make_server_config(&identity)?, "127.0.0.1:0".parse()?)?;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from(identity.certificate))?;
-        let mut tls = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let mut config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls)?));
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+        ));
         let mut receive = quinn::TransportConfig::default();
         receive.receive_window(VarInt::from_u32(16 * 1024));
         receive.stream_receive_window(VarInt::from_u32(16 * 1024));
@@ -512,7 +516,10 @@ mod priority_tests {
             terrain.set_priority(CONTROL_STREAM_PRIORITY + 1)?;
             let metadata_body = vec![0; 32 * 1024];
             let terrain_body = vec![7; 32 * 1024];
-            tokio::try_join!(metadata.write_all(&metadata_body), terrain.write_all(&terrain_body))?;
+            tokio::try_join!(
+                metadata.write_all(&metadata_body),
+                terrain.write_all(&terrain_body)
+            )?;
             metadata.finish()?;
             terrain.finish()?;
             connection.closed().await;
@@ -524,8 +531,12 @@ mod priority_tests {
         let (mut request, mut terrain) = connection.open_bi().await?;
         request.write_all(&[1]).await?;
         let result = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::try_join!(metadata.read_to_end(32 * 1024), terrain.read_to_end(32 * 1024))
-        }).await;
+            tokio::try_join!(
+                metadata.read_to_end(32 * 1024),
+                terrain.read_to_end(32 * 1024)
+            )
+        })
+        .await;
         connection.close(VarInt::from_u32(0), b"test complete");
         incoming.abort();
         let _ = incoming.await;
