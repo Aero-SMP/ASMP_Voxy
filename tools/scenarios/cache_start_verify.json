@@ -1,0 +1,19 @@
+{
+  "name": "cache-start-after-whole-game-restart-with-transport-held",
+  "steps": [
+    {"op": "wait_until", "field": "gpuDraws", "comparison": ">", "value": 0, "timeout_ms": 120000, "cadence_ms": 1000},
+    {"op": "checkpoint", "name": "local"},
+    {"op": "assert", "field": "connectionEpoch", "comparison": "==", "value": 0},
+    {"op": "assert", "field": "cacheHits", "comparison": ">", "value": 0},
+    {"op": "assert", "field": "networkBytes", "comparison": "==", "value": 0},
+    {"op": "screenshot"},
+    {"op": "resume_quic"},
+    {"op": "wait_until", "field": "connectionEpoch", "comparison": ">", "value": 0, "timeout_ms": 120000, "cadence_ms": 1000},
+    {"op": "trace", "duration_ms": 30000, "cadence_ms": 1000},
+    {"op": "checkpoint", "name": "validated"},
+    {"op": "assert", "mode": "delta", "field": "sessionGeneration", "from": "local", "to": "validated", "comparison": "==", "value": 0},
+    {"op": "assert", "field": "gpuDraws", "comparison": ">", "value": 0},
+    {"op": "assert", "mode": "absence_of_failure"},
+    {"op": "screenshot"}
+  ]
+}

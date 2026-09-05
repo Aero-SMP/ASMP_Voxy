@@ -42,6 +42,13 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         boolean requested;
         boolean subscribed;
         boolean absent;
+        boolean validated;
+        boolean localTried;
+        volatile long metadataRevision;
+        long retryAfter;
+        RegionalSectionCodec.BoundCatalog catalog;
+        RegionalProtocol.RegionIndex pendingIndex;
+        RegionalProtocol.Hash32 pendingCatalog;
         int resourceSlot = -1;
         WorkerResource.Lease resourceLease;
         final LinkedHashMap<Long, Demand> members = new LinkedHashMap<>();
@@ -266,20 +273,25 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         return java.util.Collections.unmodifiableSet(this.demands.entrySet());
     }
     RegionDemand region(long key) { return this.regions.get(key); }
-    Iterable<RegionDemand> regions() { return this.regions.values(); }
+    java.util.Collection<RegionDemand> regions() { return this.regions.values(); }
     int regionCount() { return this.regions.size(); }
 
     void readyRegion(RegionDemand region) {
-        if (region != null && this.regions.get(region.key) == region && !region.requested
-                && (!region.subscribed || !region.absent && region.index == null)) {
+        if (region != null && this.regions.get(region.key) == region
+                && (!region.localTried || !region.requested && !region.validated)) {
             this.readyRegions.put(region.key, region);
         }
     }
 
     RegionDemand pollRegion() {
+        return this.pollRegion(region -> true);
+    }
+
+    RegionDemand pollRegion(java.util.function.Predicate<RegionDemand> eligible) {
         if (this.readyRegions.isEmpty()) return null;
         RegionDemand selected = null;
         for (RegionDemand candidate : this.readyRegions.values()) {
+            if (!eligible.test(candidate)) continue;
             if (selected == null
                     || candidate.coverageUsers > 0 && selected.coverageUsers == 0
                     || (candidate.coverageUsers > 0) == (selected.coverageUsers > 0)
@@ -287,7 +299,8 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
                 selected = candidate;
             }
         }
-        long key = Objects.requireNonNull(selected).key;
+        if (selected == null) return null;
+        long key = selected.key;
         return this.readyRegions.remove(key);
     }
 

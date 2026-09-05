@@ -228,7 +228,11 @@ impl RegionalResponder {
 
     pub fn region(&self, region_x: i32, region_z: i32) -> Result<ControlMessage> {
         let Some(region) = self.runtime.region(region_x, region_z)? else {
-            return Ok(ControlMessage::RegionAbsent { region_x, region_z });
+            return Ok(ControlMessage::RegionUnavailable {
+                region_x,
+                region_z,
+                confirmed_absent: self.runtime.confirmed_absent(region_x, region_z)?,
+            });
         };
         let catalog = self.catalog.get()?;
         Ok(ControlMessage::Region {

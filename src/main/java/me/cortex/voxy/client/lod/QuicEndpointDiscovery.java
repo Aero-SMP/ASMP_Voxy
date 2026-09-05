@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.network.QuicEndpointPayload;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
@@ -22,7 +21,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Discovers the authenticated QUIC endpoint advertised by the Minecraft server. */
 final class QuicEndpointDiscovery {
-    private static final AtomicReference<ArrayBlockingQueue<QuicEndpointPayload>> REQUEST =
+    private record Request(net.minecraft.network.Connection connection,
+                           ArrayBlockingQueue<QuicEndpointPayload> response) {}
+    private static final AtomicReference<Request> REQUEST =
             new AtomicReference<>();
     /** One resolver may be stuck in native DNS; no further work queues behind it. */
     private static final ThreadPoolExecutor RESOLVER = new ThreadPoolExecutor(
@@ -42,23 +43,24 @@ final class QuicEndpointDiscovery {
         var registrar = event.registrar(QuicEndpointPayload.REGISTRATION_VERSION)
                 .optional().executesOn(HandlerThread.NETWORK);
         registrar.playBidirectional(QuicEndpointPayload.TYPE, QuicEndpointPayload.CODEC,
-                (payload, context) -> receiveEndpoint(payload));
+                (payload, context) -> receiveEndpoint(payload, context.connection()));
     }
 
-    static RegionalQuicClient connect() throws IOException {
-        ClientPacketListener listener = Minecraft.getInstance().getConnection();
+    static RegionalQuicClient connect(ClientPacketListener listener) throws IOException {
         if (listener == null || !listener.hasChannel(QuicEndpointPayload.TYPE)) {
             throw new IOException("Minecraft server does not advertise Voxy QUIC");
         }
 
         var response = new ArrayBlockingQueue<QuicEndpointPayload>(1);
-        if (!REQUEST.compareAndSet(null, response)) {
+        var request = new Request(listener.getConnection(), response);
+        if (!REQUEST.compareAndSet(null, request)) {
             throw new IOException("a Voxy QUIC endpoint request is already pending");
         }
         QuicEndpointPayload endpoint = null;
         try {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (endpoint == null && System.nanoTime() - deadline < 0) {
+                if (!request.connection().isConnected()) throw new IOException("Minecraft connection ended during endpoint discovery");
                 listener.send(QuicEndpointPayload.request());
                 endpoint = response.poll(250, TimeUnit.MILLISECONDS);
             }
@@ -66,10 +68,13 @@ final class QuicEndpointDiscovery {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted waiting for the Voxy QUIC endpoint", exception);
         } finally {
-            REQUEST.compareAndSet(response, null);
+            REQUEST.compareAndSet(request, null);
         }
         if (endpoint == null || endpoint.isRequest()) {
             throw new IOException("Minecraft server did not provide a Voxy QUIC endpoint");
+        }
+        if (!RegionalProtocol.ALPN.equals(endpoint.alpn())) {
+            throw new IOException("Voxy server requires the matching cache-start protocol artifact");
         }
         InetAddress[] addresses = endpoint.host().isEmpty()
                 ? new InetAddress[]{remoteAddress(listener.getConnection().getRemoteAddress())}
@@ -78,9 +83,9 @@ final class QuicEndpointDiscovery {
                 endpoint.certificateSha256());
     }
 
-    private static void receiveEndpoint(QuicEndpointPayload payload) {
-        var response = REQUEST.get();
-        if (response != null) response.offer(payload);
+    private static void receiveEndpoint(QuicEndpointPayload payload, net.minecraft.network.Connection connection) {
+        var request = REQUEST.get();
+        if (request != null && request.connection() == connection) request.response().offer(payload);
     }
 
     private static InetAddress remoteAddress(SocketAddress remote) throws IOException {

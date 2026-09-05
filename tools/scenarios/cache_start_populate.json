@@ -1,0 +1,13 @@
+{
+  "name": "cache-start-populate-before-game-restart",
+  "steps": [
+    {"op": "resume_quic"},
+    {"op": "wait_until", "field": "gpuDraws", "comparison": ">", "value": 0, "timeout_ms": 120000, "cadence_ms": 1000},
+    {"op": "hold", "duration_ms": 30000, "cadence_ms": 1000},
+    {"op": "checkpoint", "name": "online"},
+    {"op": "screenshot"},
+    {"op": "hold_quic"},
+    {"op": "hold", "duration_ms": 3000, "cadence_ms": 1000},
+    {"op": "assert", "field": "active", "comparison": ">", "value": 0}
+  ]
+}

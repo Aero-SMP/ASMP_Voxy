@@ -8,6 +8,9 @@ public final class ClientLodDebug {
 
     static void init(IEventBus modBus) {}
     static void tick() {}
+    static boolean connectionAllowed() { return true; }
+    static void startupEvent(ClientSession.Session session, String event, long bytes) {}
+    static String startupSnapshot(ClientSession.Session session) { return ""; }
     public static void captureRender(int frameId, int geometrySections,
                                      int renderListBuffer, int drawCountBuffer) {}
 }

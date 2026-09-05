@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN: &[u8] = b"voxy-region";
+pub const ALPN: &[u8] = b"voxy-region-cache-start";
 pub const STREAM_CONTROL: u8 = 0;
 pub const STREAM_SECTION_LANE: u8 = 1;
 pub const MAX_DIMENSION_BYTES: usize = 1024;
@@ -77,9 +77,10 @@ pub enum ControlMessage {
         catalog_fingerprint: [u8; 32],
         compressed: Vec<u8>,
     },
-    RegionAbsent {
+    RegionUnavailable {
         region_x: i32,
         region_z: i32,
+        confirmed_absent: bool,
     },
     CatalogRequest,
     Catalog {
@@ -194,8 +195,13 @@ fn encode_control_payload(message: &ControlMessage) -> Result<(u8, Vec<u8>)> {
             output.extend_from_slice(compressed);
             S_REGION
         }
-        ControlMessage::RegionAbsent { region_x, region_z } => {
+        ControlMessage::RegionUnavailable {
+            region_x,
+            region_z,
+            confirmed_absent,
+        } => {
             put_region_identity(&mut output, *region_x, *region_z, 0);
+            output.push(u8::from(*confirmed_absent));
             S_REGION
         }
         ControlMessage::CatalogRequest => C_CATALOG_REQUEST,
@@ -271,7 +277,16 @@ fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> {
             let region_z = take_i32(&mut input)?;
             let generation = take_u64(&mut input)?;
             if generation == 0 {
-                ControlMessage::RegionAbsent { region_x, region_z }
+                let confirmed_absent = match take_u8(&mut input)? {
+                    0 => false,
+                    1 => true,
+                    _ => bail!("invalid regional availability status"),
+                };
+                ControlMessage::RegionUnavailable {
+                    region_x,
+                    region_z,
+                    confirmed_absent,
+                }
             } else {
                 let fingerprint = take(&mut input, 16)?.try_into().unwrap();
                 let catalog_fingerprint = take(&mut input, 32)?.try_into().unwrap();
@@ -658,9 +673,15 @@ mod tests {
                 catalog_fingerprint: [4; 32],
                 compressed: vec![1, 2, 3],
             },
-            ControlMessage::RegionAbsent {
+            ControlMessage::RegionUnavailable {
                 region_x: 8,
                 region_z: -9,
+                confirmed_absent: true,
+            },
+            ControlMessage::RegionUnavailable {
+                region_x: 8,
+                region_z: -9,
+                confirmed_absent: false,
             },
             ControlMessage::CatalogRequest,
             ControlMessage::Catalog {

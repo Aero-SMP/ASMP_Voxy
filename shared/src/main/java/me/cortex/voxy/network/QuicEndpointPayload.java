@@ -13,7 +13,7 @@ import java.util.Locale;
 /** Empty endpoint request or the exact QUIC endpoint authenticated by Minecraft. */
 public record QuicEndpointPayload(String host, int udpPort, String alpn,
                                   byte[] certificateSha256) implements CustomPacketPayload {
-    public static final String REGISTRATION_VERSION = "voxy";
+    public static final String REGISTRATION_VERSION = "voxy-cache-start";
     public static final int MAX_HOST_LENGTH = 255;
     public static final int MAX_ALPN_LENGTH = 255;
     public static final int CERTIFICATE_SHA256_BYTES = 32;

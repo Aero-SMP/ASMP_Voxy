@@ -123,6 +123,10 @@ final class LiveServerTestHarness {
         root.then(singleStep("checkpoint", LiveServerTestHarness::checkpoint));
         root.then(singleStep("reconnect_quic", (source, run, step) ->
                 simple(source, run, step, DebugTestProtocol.CommandKind.RECONNECT_QUIC)));
+        root.then(singleStep("hold_quic", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.HOLD_QUIC)));
+        root.then(singleStep("resume_quic", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.RESUME_QUIC)));
         root.then(Commands.literal("shader_option")
                 .then(Commands.argument("run", StringArgumentType.word())
                 .then(Commands.argument("step", LongArgumentType.longArg(1))
@@ -366,7 +370,7 @@ final class LiveServerTestHarness {
             case BEGIN_RUN -> result == DebugTestProtocol.ResultKind.CLIENT_READY;
             case EXPECT_POSE -> result == DebugTestProtocol.ResultKind.POSE_REACHED
                     || result == DebugTestProtocol.ResultKind.POSE_FAILED;
-            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC, SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION ->
+            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC, HOLD_QUIC, RESUME_QUIC, SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION ->
                     result == DebugTestProtocol.ResultKind.CHECKPOINT_RESULT;
             case CAPTURE_SCREENSHOT -> result == DebugTestProtocol.ResultKind.SCREENSHOT_RESULT;
             case END_RUN -> result == DebugTestProtocol.ResultKind.RUN_COMPLETE;

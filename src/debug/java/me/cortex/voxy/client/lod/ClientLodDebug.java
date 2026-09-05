@@ -54,6 +54,54 @@ public final class ClientLodDebug {
     private static volatile int refinedSelected;
     private static volatile int conservativeDraws;
     private static volatile int refinedDraws;
+    private static final Path TRANSPORT_HOLD = Path.of(".voxy", "debug-hold-regional-transport");
+    private static volatile boolean transportHeld = Files.exists(TRANSPORT_HOLD);
+    private static final java.util.Map<ClientSession.Session, StartupStats> STARTUP = new java.util.WeakHashMap<>();
+
+    private static final class StartupStats {
+        final long start = System.nanoTime();
+        long firstLocal, hello, localViews, localActivations, validated, replacements, invalidations, metadataBytes;
+    }
+
+    static boolean connectionAllowed() { return !transportHeld; }
+
+    /** Debug-only persistent hold survives a whole-game restart; Minecraft traffic is untouched. */
+    static void holdTransport(boolean held) {
+        transportHeld = held;
+        WRITER.execute(() -> {
+            try {
+                Files.createDirectories(TRANSPORT_HOLD.getParent());
+                if (held) Files.writeString(TRANSPORT_HOLD, "Debug cache-start test: resume with resume_quic.\n");
+                else Files.deleteIfExists(TRANSPORT_HOLD);
+                emit("VOXY_CACHE_START transportHeld=" + held + " persisted=true");
+            } catch (IOException failure) { LOGGER.error("Could not persist debug transport hold", failure); }
+        });
+    }
+
+    static synchronized void startupEvent(ClientSession.Session session, String event, long bytes) {
+        var stats = STARTUP.computeIfAbsent(session, ignored -> new StartupStats());
+        switch (event) {
+            case "hello" -> { if (stats.hello == 0) stats.hello = System.nanoTime() - stats.start; }
+            case "localView" -> stats.localViews++;
+            case "localActivation" -> {
+                stats.localActivations++;
+                if (stats.firstLocal == 0) stats.firstLocal = System.nanoTime() - stats.start;
+            }
+            case "validated" -> stats.validated++;
+            case "replacement" -> stats.replacements++;
+            case "invalidation", "worldCorrection" -> stats.invalidations++;
+            case "metadata" -> stats.metadataBytes += bytes;
+        }
+    }
+
+    static synchronized String startupSnapshot(ClientSession.Session session) {
+        var stats = STARTUP.get(session);
+        return stats == null ? "" : " transportHeld=" + transportHeld + " localViews=" + stats.localViews
+                + " localActivations=" + stats.localActivations + " firstLocalNanos=" + stats.firstLocal
+                + " firstHelloNanos=" + stats.hello + " validatedViews=" + stats.validated
+                + " replacements=" + stats.replacements + " invalidations=" + stats.invalidations
+                + " metadataNetworkBytes=" + stats.metadataBytes;
+    }
 
     static {
         String version = "Voxy version " + VoxyClient.MOD_VERSION;

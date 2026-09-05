@@ -20,6 +20,7 @@ import java.util.zip.CRC32C;
 
 /** The sole current client/server protocol: spatial regional indexes and complete sections. */
 final class RegionalProtocol {
+    static final String ALPN = "voxy-region-cache-start";
     static final int STREAM_CONTROL = 0;
     static final int STREAM_SECTION_LANE = 1;
     static final int MAX_DIMENSION_BYTES = 1024;
@@ -92,6 +93,10 @@ final class RegionalProtocol {
             putLong(output, this.c); putLong(output, this.d);
         }
         boolean isZero() { return this.equals(ZERO); }
+        byte[] bytes() {
+            return ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+                    .putLong(this.a).putLong(this.b).putLong(this.c).putLong(this.d).array();
+        }
     }
 
     static final class RegionIndex {
@@ -181,14 +186,14 @@ final class RegionalProtocol {
         }
     }
 
-    sealed interface Control permits ServerHello, RegionMessage, RegionAbsent,
+    sealed interface Control permits ServerHello, RegionMessage, RegionUnavailable,
             CatalogMessage, RegionChanged, ServerError, ServerShutdown {}
     record ServerHello(long serverInstance, Hash32 worldIdentity, long catalogId,
                        Hash32 catalogFingerprint) implements Control {}
     record RegionMessage(int regionX, int regionZ, long generation,
                               Fingerprint fingerprint, Hash32 catalogFingerprint,
                               byte[] compressed) implements Control {}
-    record RegionAbsent(int regionX, int regionZ) implements Control {}
+    record RegionUnavailable(int regionX, int regionZ, boolean confirmedAbsent) implements Control {}
     record CatalogMessage(Hash32 fingerprint, byte[] canonical) implements Control {}
     record RegionChanged(int regionX, int regionZ, long generation) implements Control {}
     record ServerError(int code, String message) implements Control {}
@@ -380,7 +385,11 @@ final class RegionalProtocol {
 
     private static Control decodeRegionMessage(ByteBuffer input) throws IOException {
         int x = input.getInt(); int z = input.getInt(); long generation = input.getLong();
-        if (generation == 0) return new RegionAbsent(x, z);
+        if (generation == 0) {
+            int status = Byte.toUnsignedInt(input.get());
+            if (status > 1) throw new IOException("invalid regional availability status");
+            return new RegionUnavailable(x, z, status == 1);
+        }
         Fingerprint fingerprint = Fingerprint.read(input);
         Hash32 catalogFingerprint = Hash32.read(input);
         int length = input.getInt();

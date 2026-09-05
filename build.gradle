@@ -122,6 +122,7 @@ tasks.named('processResources') {
 dependencies {
     // Scheduler ownership tests exercise real native allocations outside a Minecraft launch.
     schedulerTestRuntimeOnly 'org.lwjgl:lwjgl:3.3.3:natives-linux'
+    schedulerTestRuntimeOnly 'org.lwjgl:lwjgl-zstd:3.3.3:natives-linux'
     def sodiumVersion = providers.gradleProperty('sodium_version').get()
     def lwjglZstd = 'org.lwjgl:lwjgl-zstd:3.3.3'
     def kwikVersion = '0.10.10'

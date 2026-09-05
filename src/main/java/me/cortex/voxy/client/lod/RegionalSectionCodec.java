@@ -29,6 +29,8 @@ public final class RegionalSectionCodec implements AutoCloseable {
         }
     }
 
+    record BoundCatalog(RegionalProtocol.Hash32 fingerprint, Mappings mappings) {}
+
     public record SectionData(long key, int childMask, long[] cells, int[] usedBlocks) {
         public SectionData {
             if ((childMask & ~0xff) != 0 || cells.length != SECTION_CELLS

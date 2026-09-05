@@ -72,6 +72,7 @@ final class RegionalControlFlowBehaviorTest {
             var session = new ClientSession.Session(1, "minecraft:overworld", null, null, null, 0);
             session.quic = client;
             session.worldIdentity = RegionalProtocol.Hash32.ZERO;
+            session.helloAccepted = true; // This test exercises post-handshake control backpressure.
             client.setActivityListener(session::signal);
             var demand = new ClientSession.Demand(SectionKey.pack(4, 0, 0, 0));
             session.demands.adopt(demand);

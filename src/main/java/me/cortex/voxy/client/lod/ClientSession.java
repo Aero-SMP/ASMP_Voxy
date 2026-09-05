@@ -176,7 +176,7 @@ final class ClientSession {
             try {
                 task.run(renderer);
             } catch (Throwable failure) {
-                current.fail(failure);
+                task.owner().putEvent(new CatalogReady(task, null, failure));
             }
         }
         if (current != null && !current.thread.isAlive()) {
@@ -219,10 +219,12 @@ final class ClientSession {
 
     static final class Demand extends SectionDemandTable.Demand {
         RegionalProtocol.RegionIndex index;
+        RegionalSectionCodec.BoundCatalog catalog;
         int ordinal = -1;
         VoxyRenderSystem.SectionPublication publication;
         VoxyRenderSystem.SectionPublication previousPublication;
         RegionalProtocol.RegionIndex pendingIndex;
+        RegionalSectionCodec.BoundCatalog pendingCatalog;
         int pendingOrdinal = -1;
         BuiltSection completedGeometry;
         long meshCompletedNanos;
@@ -276,6 +278,7 @@ final class ClientSession {
         final Object wakeupLock = new Object();
         boolean wakePending;
         final WorkerSlot[] sectionWorkers;
+        final WorkerSlot metadataWorker = new WorkerSlot(-1);
         final int sectionWorkerCount;
         final Set<Long> waitingModels = new LinkedHashSet<>();
         final ConcurrentLinkedQueue<NetworkReply> networkReplies =
@@ -297,12 +300,32 @@ final class ClientSession {
         final long[] publicationOutcomes = new long[VoxyRenderSystem.UploadStatus.values().length];
 
         RegionalQuicClient quic;
+        RegionalConnectionAttempt.Connector connector;
+        RegionalConnectionAttempt connectionAttempt;
+        long nextConnectionAttempt;
+        boolean helloAccepted;
+        Path cacheRoot;
+        String serverKey;
+        RegionalMetadataStore metadata;
+        volatile long viewRevision;
+        CatalogTask pendingCatalogTask;
+        boolean pendingCatalogSubmitted;
+        volatile RegionalProtocol.Hash32 rejectedCatalog;
+        final java.util.concurrent.ConcurrentHashMap<RegionalProtocol.Hash32,
+                java.lang.ref.WeakReference<RegionalSectionCodec.BoundCatalog>> savedMappings =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        final LinkedHashMap<Long, SaveMetadataTask> metadataWrites = new LinkedHashMap<>();
+        boolean associationPending;
+        boolean cacheOpened;
+        boolean metadataUnavailable;
+        RegionalProtocol.Hash32 catalogProbed;
         RegionalProtocol.Control pendingControl;
         RegionalCache cache;
         RegionalProtocol.Hash32 worldIdentity;
         RegionalProtocol.Hash32 catalogFingerprint = RegionalProtocol.Hash32.ZERO;
         RegionalProtocol.Hash32 requiredCatalogFingerprint = RegionalProtocol.Hash32.ZERO;
         RegionalSectionCodec.Mappings mappings;
+        RegionalSectionCodec.BoundCatalog currentCatalog;
         boolean catalogRequested;
         long catalogRequirementRevision;
         long catalogRequestedRevision;
@@ -357,19 +380,44 @@ final class ClientSession {
         }
 
         private enum WorkerSource { CACHE, NETWORK }
-        sealed interface WorkerTask permits SectionWorkerTask, IndexWorkerTask, EmptyWorkerTask {}
+        sealed interface WorkerTask permits SectionWorkerTask, IndexWorkerTask, EmptyWorkerTask,
+                BootstrapTask, OpenWorldTask, LoadMetadataTask, SaveMetadataTask, CatalogWorkerTask, AssociationTask, ProbeCatalogTask {}
         record EmptyWorkerTask(SectionDemandTable.Ticket ticket, byte children)
                 implements WorkerTask {}
         private record SectionWorkerTask(SectionDemandTable.Ticket ticket,
                                          RegionalProtocol.RegionIndex index, int ordinal,
                                          WorkerSource source, byte[] compressed,
-                                         RegionalSectionCodec.Mappings mappings)
+                                         RegionalSectionCodec.Mappings mappings, RegionalCache cache)
                 implements WorkerTask {}
-        private record IndexWorkerTask(long session, long connection, long region, long generation,
+        private record IndexWorkerTask(long session, long connection, long view, long revision, long region, long generation,
                                        int slot, RegionalProtocol.RegionMessage message)
                 implements WorkerTask {}
         sealed interface WorkerResult permits WorkerMiss, WorkerModels,
-                WorkerGeometry, WorkerIndex, WorkerFailure {}
+                WorkerGeometry, WorkerIndex, WorkerFailure, WorkerBootstrap, WorkerWorld,
+                WorkerMetadata, WorkerSaved, WorkerCatalog, WorkerCatalogProbe {}
+        private record ProbeCatalogTask(long view, RegionalProtocol.Hash32 world,
+                                        RegionalProtocol.Hash32 fingerprint) implements WorkerTask {}
+        private record WorkerCatalogProbe(ProbeCatalogTask task, CatalogCodec.Catalog catalog) implements WorkerResult {}
+        record BootstrapTask(Path root, String server, String dimension) implements WorkerTask {}
+        private record OpenWorldTask(long view, RegionalProtocol.Hash32 world) implements WorkerTask {}
+        private record AssociationTask(long view, RegionalProtocol.Hash32 world, long stamp) implements WorkerTask {}
+        private record LoadMetadataTask(long view, long region, long revision,
+                                        RegionalProtocol.Hash32 world) implements WorkerTask {}
+        private record SaveMetadataTask(long view, long region, RegionalProtocol.Hash32 world,
+                                        RegionalProtocol.RegionMessage message, long stamp,
+                                        java.util.function.BooleanSupplier current) implements WorkerTask {}
+        private record CatalogWorkerTask(long view, long connection, long requirement, RegionalProtocol.Hash32 world,
+                                          RegionalProtocol.CatalogMessage message, long stamp) implements WorkerTask {}
+        private record WorkerBootstrap(RegionalMetadataStore metadata, RegionalProtocol.Hash32 hint)
+                implements WorkerResult {}
+        private record WorkerWorld(long view, RegionalCache cache) implements WorkerResult {}
+        private record WorkerMetadata(LoadMetadataTask task, RegionalProtocol.RegionIndex index,
+                                      RegionalSectionCodec.BoundCatalog binding,
+                                      RegionalProtocol.Hash32 fingerprint, CatalogCodec.Catalog catalog)
+                implements WorkerResult {}
+        private record WorkerSaved() implements WorkerResult {}
+        private record WorkerCatalog(CatalogWorkerTask task, CatalogCodec.Catalog catalog)
+                implements WorkerResult {}
         private record WorkerMiss(SectionDemandTable.Ticket ticket, boolean corrupt)
                 implements WorkerResult {}
         private record WorkerModels(SectionDemandTable.Ticket ticket, int[] blocks,
@@ -378,8 +426,7 @@ final class ClientSession {
         record WorkerGeometry(SectionDemandTable.Ticket ticket, BuiltSection geometry,
                                       long completedNanos, boolean cacheHit,
                                       int compressedBytes) implements WorkerResult {}
-        private record WorkerIndex(long session, long connection, long region, long generation,
-                                   int slot, RegionalProtocol.RegionIndex index)
+        private record WorkerIndex(IndexWorkerTask task, RegionalProtocol.RegionIndex index)
                 implements WorkerResult {}
         private record WorkerFailure(WorkerTask task, int slot, Throwable failure)
                 implements WorkerResult {}
@@ -407,11 +454,11 @@ final class ClientSession {
                 WorkerResource.Lease lease = this.resource.acquire();
                 if (lease == null) return null;
                 this.task = Objects.requireNonNull(task);
-                this.sectionOperation = !(task instanceof IndexWorkerTask);
+                this.sectionOperation = task instanceof SectionWorkerTask || task instanceof EmptyWorkerTask;
                 this.operationKey = switch (task) {
                     case SectionWorkerTask section -> section.ticket().key();
                     case EmptyWorkerTask empty -> empty.ticket().key();
-                    case IndexWorkerTask ignored -> 0;
+                    default -> 0;
                 };
                 this.taskLease = lease;
                 this.notifyAll();
@@ -449,6 +496,47 @@ final class ClientSession {
                                         BuiltSection.emptyWithChildren(empty.ticket().key(),
                                                 empty.ticket().demandRevision(), empty.children()),
                                         System.nanoTime(), true, 0);
+                                case BootstrapTask bootstrap -> {
+                                    var store = new RegionalMetadataStore(bootstrap.root());
+                                    RegionalProtocol.Hash32 hint;
+                                    try { hint = store.world(bootstrap.server(), bootstrap.dimension()); }
+                                    catch (IOException invalid) { hint = null; }
+                                    yield new WorkerBootstrap(store, hint);
+                                }
+                                case OpenWorldTask world -> {
+                                    var cache = new RegionalCache(metadata.namespace(world.world(), dimension),
+                                            world.world(), metadata.budget);
+                                    yield new WorkerWorld(world.view(), cache);
+                                }
+                                case LoadMetadataTask load -> this.loadMetadata(load);
+                                case ProbeCatalogTask probe -> {
+                                    CatalogCodec.Catalog decoded = null;
+                                    try {
+                                        byte[] bytes = metadata.readCatalog(probe.world(), dimension, probe.fingerprint());
+                                        if (bytes != null) decoded = CatalogCodec.decode(bytes);
+                                    } catch (IOException invalid) { /* A broken saved catalog is a miss. */ }
+                                    yield new WorkerCatalogProbe(probe, decoded);
+                                }
+                                case SaveMetadataTask save -> {
+                                    metadata.saveRegion(save.world(), dimension, (int) save.region(),
+                                            (int) (save.region() >>> 32), save.message(), save.stamp(), save.current());
+                                    yield new WorkerSaved();
+                                }
+                                case CatalogWorkerTask catalog -> {
+                                    if (!hash32(catalog.message().canonical()).equals(catalog.message().fingerprint())) {
+                                        throw new IOException("regional catalog fingerprint mismatch");
+                                    }
+                                    CatalogCodec.Catalog decoded = CatalogCodec.decode(catalog.message().canonical());
+                                    try { if (metadata != null) metadata.saveCatalog(catalog.world(), dimension, catalog.message(), catalog.stamp(),
+                                            () -> open.get() && viewRevision == catalog.view()); }
+                                    catch (IOException cacheFailure) { /* Metadata persistence is optional. */ }
+                                    yield new WorkerCatalog(catalog, decoded);
+                                }
+                                case AssociationTask association -> {
+                                    metadata.associate(serverKey, dimension, association.world(), association.stamp(),
+                                            () -> open.get() && viewRevision == association.view());
+                                    yield new WorkerSaved();
+                                }
                             };
                         } catch (Throwable failure) {
                             completion = new WorkerFailure(claimed, this.index, failure);
@@ -465,7 +553,7 @@ final class ClientSession {
                 byte[] compressed = task.compressed();
                 boolean cacheHit = task.source() == WorkerSource.CACHE;
                 if (cacheHit) {
-                    try { compressed = cache.get(task.index(), task.ordinal()); }
+                    try { compressed = task.cache() == null ? null : task.cache().get(task.index(), task.ordinal()); }
                     catch (IOException ignored) { compressed = null; }
                     if (compressed == null) return new WorkerMiss(task.ticket(), false);
                 }
@@ -477,7 +565,7 @@ final class ClientSession {
                             task.index().sectionFingerprint(task.ordinal()), task.mappings());
                     mesher.requestModels(section);
                     if (!cacheHit) {
-                        try { cache.put(task.index(), task.ordinal(), compressed); }
+                        try { if (task.cache() != null) task.cache().put(task.index(), task.ordinal(), compressed); }
                         catch (IOException ignored) { }
                     }
                     if (!mesher.modelsReady(section)) {
@@ -489,13 +577,16 @@ final class ClientSession {
                             compressed.length);
                 } catch (Throwable failure) {
                     if (!cacheHit) throw failure;
-                    cache.quarantine(task.index(), task.ordinal());
+                    if (task.cache() != null) task.cache().quarantine(task.index(), task.ordinal());
                     return new WorkerMiss(task.ticket(), true);
                 }
             }
 
             private WorkerResult index(IndexWorkerTask task) throws Exception {
-                RegionalProtocol.RegionMessage message = task.message();
+                return new WorkerIndex(task, this.decodeIndex(task.message()));
+            }
+
+            private RegionalProtocol.RegionIndex decodeIndex(RegionalProtocol.RegionMessage message) throws Exception {
                 byte[] canonical = this.codec.decompressFramed(message.compressed(),
                         RegionalProtocol.MAX_INDEX_BYTES);
                 byte[] hash = new Blake3.Hasher().update(canonical).digest();
@@ -510,8 +601,27 @@ final class ClientSession {
                         || index.generation() != message.generation()) {
                     throw new IOException("regional response disagrees with its index");
                 }
-                return new WorkerIndex(task.session(), task.connection(), task.region(),
-                        task.generation(), task.slot(), index);
+                return index;
+            }
+
+            private WorkerResult loadMetadata(LoadMetadataTask task) {
+                try {
+                    var saved = metadata.region(task.world(), dimension, (int) task.region(), (int) (task.region() >>> 32));
+                    if (saved != null && !saved.absent()) {
+                        var message = saved.message();
+                        if (message.catalogFingerprint().equals(rejectedCatalog)) {
+                            return new WorkerMetadata(task, null, null, null, null);
+                        }
+                        var index = this.decodeIndex(message);
+                        var reference = savedMappings.get(message.catalogFingerprint());
+                        var binding = reference == null ? null : reference.get();
+                        if (binding != null) return new WorkerMetadata(task, index, binding, binding.fingerprint(), null);
+                        byte[] canonical = metadata.readCatalog(task.world(), dimension, message.catalogFingerprint());
+                        if (canonical != null) return new WorkerMetadata(task, index, null,
+                                message.catalogFingerprint(), CatalogCodec.decode(canonical));
+                    }
+                } catch (Exception invalid) { /* Corrupt/missing metadata is a local miss. */ }
+                return new WorkerMetadata(task, null, null, null, null);
             }
 
             synchronized void close() {
@@ -526,6 +636,13 @@ final class ClientSession {
             this(id, dimension, renderer, renderer.regionalSectionPublisher(),
                     renderer.regionalSectionMesher(), Math.max(2, Math.min(16,
                             Runtime.getRuntime().availableProcessors() - 2)));
+            Minecraft minecraft = Minecraft.getInstance();
+            var listener = minecraft.getConnection();
+            this.connector = () -> QuicEndpointDiscovery.connect(listener);
+            this.cacheRoot = minecraft.gameDirectory.toPath().resolve(".voxy").resolve("regional");
+            var server = minecraft.getCurrentServer();
+            // Integrated worlds without a persistent logical identity do not use optimistic lookup.
+            this.serverKey = server == null ? null : server.ip;
         }
 
         Session(long id, String dimension, VoxyRenderSystem renderer,
@@ -548,7 +665,10 @@ final class ClientSession {
         }
 
         void start() {
+            ClientLodDebug.startupEvent(this, "start", 0);
             this.publisher.setProgressListener(this.rendererWake);
+            this.metadataWorker.start();
+            if (this.cacheRoot != null) this.metadataWorker.assign(new BootstrapTask(this.cacheRoot, this.serverKey, this.dimension));
             for (WorkerSlot worker : this.sectionWorkers) worker.start();
             this.thread.start();
         }
@@ -569,27 +689,18 @@ final class ClientSession {
         void run() {
             try {
                 while (this.open.get()) {
-                    if (this.quic == null) {
-                        try {
-                            this.connect();
-                        } catch (IOException failure) {
-                            this.lastConnectionFailure = failure;
-                            Logger.warn("Regional Voxy reconnect is waiting for its endpoint",
-                                    failure);
-                            this.awaitWake(1_000);
-                            continue;
-                        }
-                    }
                     try {
+                        this.connect();
                         this.drainWorkers();
                         this.drainNetworkReplies();
-                        this.drainControls();
+                        if (this.quic != null) this.drainControls();
                         this.drainEvents();
                         this.drainDemand();
+                        this.processMetadata();
                         this.processRegions();
                         this.pollPublications();
                         this.processStages();
-                        if (!this.quic.isOpen()) {
+                        if (this.quic != null && !this.quic.isOpen()) {
                             throw new IOException("regional QUIC connection ended",
                                     this.quic.failure());
                         }
@@ -612,7 +723,23 @@ final class ClientSession {
         }
 
         void connect() throws IOException {
-            RegionalQuicClient connected = QuicEndpointDiscovery.connect();
+            if (!ClientLodDebug.connectionAllowed()) return;
+            if (this.quic != null || this.connector == null) return;
+            if (this.connectionAttempt == null) {
+                if (System.nanoTime() - this.nextConnectionAttempt < 0) return;
+                this.connectionAttempt = new RegionalConnectionAttempt(this.connector);
+            }
+            var outcome = this.connectionAttempt.poll();
+            if (outcome == null) return;
+            this.connectionAttempt.close();
+            this.connectionAttempt = null;
+            this.nextConnectionAttempt = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            if (outcome.failure() != null) {
+                this.lastConnectionFailure = outcome.failure();
+                return;
+            }
+            RegionalQuicClient connected = outcome.connection();
+            if (!this.open.get()) { connected.close(); return; }
             try {
                 connected.setActivityListener(this::signal);
                 connected.hello(this.dimension);
@@ -622,6 +749,7 @@ final class ClientSession {
                 throw new IOException("could not initialize regional QUIC", failure);
             }
             this.quic = connected;
+            this.helloAccepted = false;
             if (++this.connectionEpoch == 0) ++this.connectionEpoch;
             this.lastConnectionFailure = null;
             Logger.info("Using regional Voxy over QUIC " + connected.description()
@@ -635,6 +763,8 @@ final class ClientSession {
                     + "reconnecting", cause);
             RegionalQuicClient previous = this.quic;
             this.quic = null;
+            this.helloAccepted = false;
+            this.nextConnectionAttempt = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
             if (previous != null) previous.close();
             this.pendingControl = null;
             this.catalogRequested = false;
@@ -654,6 +784,8 @@ final class ClientSession {
             for (SectionDemandTable.RegionDemand region : this.demands.regions()) {
                 region.requested = false;
                 region.subscribed = false;
+                region.validated = false;
+                region.retryAfter = 0;
                 this.queueRegion(region.key);
             }
         }
@@ -672,8 +804,13 @@ final class ClientSession {
                             return;
                         }
                     }
-                    case RegionalProtocol.RegionAbsent absent -> this.acceptRegionAbsent(absent);
-                    case RegionalProtocol.CatalogMessage catalog -> this.acceptCatalog(catalog);
+                    case RegionalProtocol.RegionUnavailable unavailable -> this.acceptRegionUnavailable(unavailable);
+                    case RegionalProtocol.CatalogMessage catalog -> {
+                        if (!this.acceptCatalog(catalog)) {
+                            this.pendingControl = catalog;
+                            return;
+                        }
+                    }
                     case RegionalProtocol.RegionChanged changed -> this.regionChanged(changed);
                     case RegionalProtocol.ServerError error -> throw new IOException(
                             "regional server error " + error.code() + ": " + error.message());
@@ -684,15 +821,10 @@ final class ClientSession {
         }
 
         void acceptHello(RegionalProtocol.ServerHello hello) throws IOException {
-            if (this.worldIdentity == null) {
-                this.worldIdentity = hello.worldIdentity();
-                Path root = Minecraft.getInstance().gameDirectory.toPath()
-                        .resolve(".voxy").resolve("regional");
-                this.cache = new RegionalCache(root, this.worldIdentity);
-            } else if (!this.worldIdentity.equals(hello.worldIdentity())) {
-                throw new IllegalStateException(
-                        "regional endpoint changed world identity during one dimension session");
-            }
+            this.helloAccepted = true;
+            ClientLodDebug.startupEvent(this, "hello", 0);
+            if (!hello.worldIdentity().equals(this.worldIdentity)) this.changeWorld(hello.worldIdentity());
+            this.associationPending = true;
             this.ensureCatalog(hello.catalogFingerprint());
             for (SectionDemandTable.RegionDemand region : this.demands.regions()) {
                 this.queueRegion(region.key);
@@ -705,56 +837,81 @@ final class ClientSession {
                 this.catalogRequirementRevision++;
             }
             if (fingerprint.equals(this.catalogFingerprint) && this.mappings != null) return;
-            if (!this.catalogRequested && this.quic.requestCatalog()) {
+            if (fingerprint.equals(this.rejectedCatalog)) return;
+            var existing = this.mapping(fingerprint);
+            if (existing != null) {
+                this.catalogFingerprint = existing.fingerprint();
+                this.mappings = existing.mappings();
+                this.currentCatalog = existing;
+                this.applyPendingIndexes(existing);
+                return;
+            }
+            // Probe the exact saved catalog before requesting it, without blocking local jobs.
+            if (this.cacheRoot != null && !this.metadataUnavailable
+                    && (this.metadata == null || !fingerprint.equals(this.catalogProbed))) return;
+            if (this.quic != null && this.helloAccepted && !this.catalogRequested && this.quic.requestCatalog()) {
                 this.catalogRequested = true;
                 this.catalogRequestedRevision = this.catalogRequirementRevision;
             }
         }
 
-        void acceptCatalog(RegionalProtocol.CatalogMessage message) throws Exception {
-            if (!hash32(message.canonical()).equals(message.fingerprint())) {
-                throw new IOException("regional catalog fingerprint mismatch");
-            }
-            CatalogCodec.Catalog catalog = CatalogCodec.decode(message.canonical());
-            enqueueCatalog(new CatalogTask(this, catalog, message.fingerprint(),
-                    this.catalogRequestedRevision, this.connectionEpoch));
+        boolean acceptCatalog(RegionalProtocol.CatalogMessage message) {
+            if (!this.metadataWorker.idle()) return false;
+            ClientLodDebug.startupEvent(this, "metadata", message.canonical().length);
+            return this.metadataWorker.assign(new CatalogWorkerTask(this.viewRevision, this.connectionEpoch,
+                    this.catalogRequirementRevision, this.worldIdentity,
+                    message, this.metadata == null ? 0 : this.metadata.budget.stamp())) != null;
         }
 
         boolean acceptRegion(RegionalProtocol.RegionMessage message) throws IOException {
             long region = regionKey(message.regionX(), message.regionZ());
             SectionDemandTable.RegionDemand state = this.demands.region(region);
             if (state == null || !state.subscribed) return true;
-            state.requested = false;
             long expected = state.announcedGeneration;
             if (expected != 0
                     && Long.compareUnsigned(message.generation(), expected) < 0) {
-                state.index = null;
-                state.installedGeneration = 0;
+                state.requested = false;
+                state.validated = false;
                 this.queueRegion(region);
                 return true;
             }
-            state.announcedGeneration = message.generation();
-            state.absent = false;
             this.ensureCatalog(message.catalogFingerprint());
             WorkerSlot worker = this.idleWorker(state.coverageUsers > 0);
             if (worker == null) return false;
+            // Receiving a record is not validation. Keep requests parked until its owned
+            // decoder verifies the index; the installed index may still be provisional.
+            state.requested = true;
+            state.validated = false;
+            state.localTried = true;
+            state.announcedGeneration = message.generation();
+            state.absent = false;
+            long revision = ++state.metadataRevision;
             WorkerResource.Lease lease = worker.assign(new IndexWorkerTask(this.id,
-                    this.connectionEpoch, region, message.generation(), worker.index, message));
+                    this.connectionEpoch, this.viewRevision, revision, region, message.generation(), worker.index, message));
             if (lease == null) return false;
+            ClientLodDebug.startupEvent(this, "metadata", message.compressed().length);
             state.resourceSlot = worker.index;
             state.resourceLease = lease;
             return true;
         }
 
-        void acceptRegionAbsent(RegionalProtocol.RegionAbsent message) {
+        void acceptRegionUnavailable(RegionalProtocol.RegionUnavailable message) {
             long region = regionKey(message.regionX(), message.regionZ());
             SectionDemandTable.RegionDemand state = this.demands.region(region);
             if (state == null || !state.subscribed) return;
             state.requested = false;
+            state.validated = message.confirmedAbsent();
+            if (!message.confirmedAbsent()) {
+                state.retryAfter = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                this.queueRegion(region);
+                return;
+            }
+            this.invalidateSavedRegion(state);
             state.announcedGeneration = 0;
             state.installedGeneration = 0;
             state.absent = true;
             state.index = null;
+            state.catalog = null;
             this.retireRegion(region);
         }
 
@@ -769,12 +926,20 @@ final class ClientSession {
             if (state == null) return;
             state.announcedGeneration = generation;
             state.requested = false;
+            state.validated = false;
+            state.retryAfter = 0;
+            state.metadataRevision++;
+            state.pendingIndex = null;
+            state.pendingCatalog = null;
             state.absent = false;
-            state.index = null;
-            state.installedGeneration = 0;
             // The arriving index binds new work. Already-owned operations finish with their
             // exact revision and keep the old surface available until a replacement is ready.
             if (generation == 0) {
+                state.index = null;
+                state.catalog = null;
+                state.installedGeneration = 0;
+                this.invalidateSavedRegion(state);
+                state.validated = true;
                 state.absent = true;
                 this.retireRegion(region);
             } else {
@@ -787,17 +952,28 @@ final class ClientSession {
             while ((event = this.events.poll()) != null) {
                 switch (event) {
                     case CatalogReady ready -> {
-                        if (ready.connectionEpoch != this.connectionEpoch) {
-                            this.ensureCatalog(this.requiredCatalogFingerprint);
-                            continue;
+                        CatalogTask task = ready.task();
+                        if (task.view() == this.viewRevision && this.open.get()) {
+                            if (ready.binding() != null) {
+                                this.savedMappings.entrySet().removeIf(entry -> entry.getValue().get() == null);
+                                this.savedMappings.put(ready.binding().fingerprint(), new java.lang.ref.WeakReference<>(ready.binding()));
+                            } else {
+                                this.rejectedCatalog = task.fingerprint();
+                                Logger.warn("Cannot map regional catalog; retaining other cached terrain", ready.failure());
+                            }
+                            task.complete().accept(ready.binding());
                         }
-                        this.catalogRequested = false;
-                        this.catalogFingerprint = ready.fingerprint;
-                        this.mappings = ready.mappings;
-                        this.ensureCatalog(this.requiredCatalogFingerprint);
+                        if (this.pendingCatalogTask == task) {
+                            this.pendingCatalogTask = null;
+                            this.pendingCatalogSubmitted = false;
+                        }
+                        this.metadataWorker.releaseCompletion(task.lease());
                     }
-                    case Coarsened result -> this.finishCoarsening(result.parent, true);
+                    case Coarsened result -> {
+                        if (result.view == this.viewRevision) this.finishCoarsening(result.parent, true);
+                    }
                     case CoarsenFailed failed -> {
+                        if (failed.view != this.viewRevision) continue;
                         this.finishCoarsening(failed.parent, false);
                         Logger.warn("Regional subtree coarsening failed; retained geometry "
                                 + "remains authoritative", failed.failure);
@@ -1209,9 +1385,10 @@ final class ClientSession {
                         this.retireDetailDemand(key);
                     }
                 }
+                long view = this.viewRevision;
                 this.publisher.coarsen(parent,
-                        () -> this.putEvent(new Coarsened(parent)),
-                        failure -> this.putEvent(new CoarsenFailed(parent, failure)));
+                        () -> this.putEvent(new Coarsened(parent, view)),
+                        failure -> this.putEvent(new CoarsenFailed(parent, view, failure)));
             }
             // A completed CPU-side replacement is canceled above but was never physical GPU
             // occupancy. Return only bytes the fence will actually release; one is a success
@@ -1233,6 +1410,7 @@ final class ClientSession {
             this.discardCompletedGeometry(demand);
             this.releasePublishingGeometryAccounting(demand);
             demand.pendingIndex = null;
+            demand.pendingCatalog = null;
             demand.pendingOrdinal = -1;
             if (demand.installed) this.activeCount--;
             demand.installed = false;
@@ -1334,10 +1512,17 @@ final class ClientSession {
         }
 
         void installIndex(RegionalProtocol.RegionIndex index) {
+            var state = this.demands.region(regionKey(index.regionX(), index.regionZ()));
+            this.installIndex(index, state != null && state.catalog != null ? state.catalog
+                    : new RegionalSectionCodec.BoundCatalog(this.catalogFingerprint, this.mappings), false);
+        }
+
+        void installIndex(RegionalProtocol.RegionIndex index, RegionalSectionCodec.BoundCatalog catalog, boolean local) {
             long region = regionKey(index.regionX(), index.regionZ());
             SectionDemandTable.RegionDemand state = this.demands.region(region);
-            if (state == null || state.announcedGeneration != index.generation()) return;
+            if (state == null || !local && state.announcedGeneration != index.generation()) return;
             state.index = index;
+            state.catalog = catalog;
             state.installedGeneration = index.generation();
             if (!state.members.isEmpty()) for (long key : List.copyOf(state.members.keySet())) {
                 Demand demand = this.demands.get(key);
@@ -1375,8 +1560,10 @@ final class ClientSession {
                 this.missingCoverage.remove(key);
                 demand.publication = null;
                 demand.pendingIndex = null;
+                demand.pendingCatalog = null;
                 demand.pendingOrdinal = -1;
                 demand.index = null;
+                demand.catalog = null;
                 demand.ordinal = -1;
                 demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
             } else {
@@ -1392,6 +1579,10 @@ final class ClientSession {
         }
 
         void releaseRegion(long region, SectionDemandTable.RegionDemand state) {
+            var write = this.metadataWrites.get(region);
+            if (state != null && state.users == 0 && write != null && write.message() != null) {
+                this.metadataWrites.remove(region);
+            }
             if (state == null || !state.subscribed) return;
             state.subscribed = false;
             if (this.quic == null) return;
@@ -1399,31 +1590,47 @@ final class ClientSession {
         }
 
         void bind(Demand demand, RegionalProtocol.RegionIndex index, int ordinal) {
+            var state = this.demands.region(demand.regionKey);
+            var catalog = state != null && state.catalog != null ? state.catalog
+                    : new RegionalSectionCodec.BoundCatalog(this.catalogFingerprint, this.mappings);
+            this.bind(demand, index, ordinal, catalog);
+        }
+
+        void bind(Demand demand, RegionalProtocol.RegionIndex index, int ordinal,
+                  RegionalSectionCodec.BoundCatalog catalog) {
             if (ordinal < 0 || !index.isPresent(ordinal)) return;
             if (demand.workLease != null && demand.completedGeometry == null
                     || demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED) {
                 demand.pendingIndex = index;
+                demand.pendingCatalog = catalog;
                 demand.pendingOrdinal = ordinal;
                 return;
             }
-            if (demand.index != null && demand.ordinal >= 0 && (demand.installed
+            if (demand.index != null && demand.ordinal >= 0 && (demand.completedGeometry != null || demand.installed
+                    && demand.candidate == SectionDemandTable.CandidateState.NONE
                     || demand.blockedReason == VoxyRenderSystem.AllocationStatus.IMPOSSIBLE)
+                    && (demand.catalog == null ? this.catalogFingerprint : demand.catalog.fingerprint())
+                            .equals(catalog.fingerprint())
                     && demand.index.sectionFingerprint(demand.ordinal)
                             .equals(index.sectionFingerprint(ordinal))
                     && demand.index.childMask(demand.ordinal) == index.childMask(ordinal)) {
                 demand.index = index;
+                demand.catalog = catalog;
                 demand.ordinal = ordinal;
                 demand.regionGeneration = index.generation();
                 return;
             }
             demand.pendingIndex = null;
+            demand.pendingCatalog = null;
             demand.pendingOrdinal = -1;
             this.rendererBlocked.remove(demand.key);
+            if (demand.installed) ClientLodDebug.startupEvent(this, "replacement", 0);
             demand.blockedReason = null;
             this.demands.unlinkReady(demand);
             this.discardCompletedGeometry(demand);
             this.demands.revise(demand);
             demand.index = index;
+            demand.catalog = catalog;
             demand.regionGeneration = index.generation();
             demand.ordinal = ordinal;
             if (demand.coverage) this.missingCoverage.add(demand.key);
@@ -1439,6 +1646,7 @@ final class ClientSession {
             this.scheduleReadyPublications();
             this.processWaitingModels();
             this.scheduleSourceWork();
+            if (this.quic == null || !this.helloAccepted) return;
             while (true) {
                 List<Demand> selected = this.selectNetworkBatch();
                 if (selected.isEmpty()) break;
@@ -1453,7 +1661,7 @@ final class ClientSession {
         }
 
         void processRegions() throws IOException {
-            if (this.worldIdentity == null) return;
+            if (this.worldIdentity == null || this.quic == null || !this.helloAccepted) return;
             if (this.requiredCatalogFingerprint != null) {
                 this.ensureCatalog(this.requiredCatalogFingerprint);
             }
@@ -1466,16 +1674,141 @@ final class ClientSession {
                 releases.remove();
             }
             SectionDemandTable.RegionDemand region;
-            while ((region = this.demands.pollRegion()) != null) {
-                if (region.requested || region.users == 0
-                        || region.subscribed && (region.index != null || region.absent)) continue;
+            long now = System.nanoTime();
+            while ((region = this.demands.pollRegion(candidate -> !candidate.requested
+                    && !candidate.validated && now - candidate.retryAfter >= 0)) != null) {
+                if (region.users == 0) continue;
                 if (!this.quic.requestRegion((int) region.key, (int) (region.key >>> 32))) {
                     this.demands.readyRegion(region);
                     return;
                 }
                 region.requested = true;
                 region.subscribed = true;
+                this.demands.readyRegion(region);
             }
+        }
+
+        void changeWorld(RegionalProtocol.Hash32 world) {
+            ++this.viewRevision;
+            if (this.worldIdentity != null) {
+                ClientLodDebug.startupEvent(this, "worldCorrection", 0);
+                for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
+            }
+            if (this.cache != null) this.cache.close();
+            this.cache = null;
+            this.cacheOpened = false;
+            this.worldIdentity = world;
+            this.catalogFingerprint = RegionalProtocol.Hash32.ZERO;
+            this.mappings = null;
+            this.currentCatalog = null;
+            this.savedMappings.clear();
+            this.catalogProbed = null;
+            this.coarseningRoots.clear();
+            this.pendingDormantEvictions.clear();
+            this.pendingDormantEvictionBytes = 0;
+            this.rejectedCatalog = null;
+            this.metadataWrites.clear();
+            for (SectionDemandTable.RegionDemand region : this.demands.regions()) {
+                region.index = null;
+                region.catalog = null;
+                region.pendingIndex = null;
+                region.pendingCatalog = null;
+                region.installedGeneration = 0;
+                region.announcedGeneration = 0;
+                region.metadataRevision++;
+                region.localTried = false;
+                region.validated = false;
+                region.absent = false;
+                region.requested = false;
+                region.retryAfter = 0;
+                this.queueRegion(region.key);
+            }
+        }
+
+        RegionalSectionCodec.BoundCatalog mapping(RegionalProtocol.Hash32 fingerprint) {
+            var reference = this.savedMappings.get(fingerprint);
+            return reference == null ? null : reference.get();
+        }
+
+        void processMetadata() {
+            if (this.pendingCatalogTask != null) {
+                if (!this.pendingCatalogSubmitted) {
+                    this.pendingCatalogSubmitted = CATALOG_TASK.compareAndSet(null, this.pendingCatalogTask);
+                }
+                return;
+            }
+            if (this.metadata == null || this.worldIdentity == null || !this.metadataWorker.idle()) return;
+            if (!this.cacheOpened) {
+                this.cacheOpened = true;
+                this.metadataWorker.assign(new OpenWorldTask(this.viewRevision, this.worldIdentity));
+                return;
+            }
+            if (this.associationPending) {
+                this.associationPending = false;
+                this.metadataWorker.assign(new AssociationTask(this.viewRevision, this.worldIdentity, this.metadata.budget.stamp()));
+                return;
+            }
+            if (this.helloAccepted && !this.requiredCatalogFingerprint.equals(this.catalogProbed)
+                    && this.mapping(this.requiredCatalogFingerprint) == null) {
+                this.metadataWorker.assign(new ProbeCatalogTask(this.viewRevision, this.worldIdentity,
+                        this.requiredCatalogFingerprint));
+                return;
+            }
+            // Persist accepted updates promptly; otherwise a long cold-cache sweep can starve
+            // deletion tombstones and the metadata needed by the next launch.
+            var writes = this.metadataWrites.entrySet().iterator();
+            while (writes.hasNext()) {
+                var write = writes.next().getValue();
+                if (write.message() != null && this.mapping(write.message().catalogFingerprint()) == null) continue;
+                writes.remove();
+                this.metadataWorker.assign(write);
+                return;
+            }
+            var local = this.demands.pollRegion(region -> !region.localTried);
+            if (local != null) {
+                local.localTried = true;
+                this.metadataWorker.assign(new LoadMetadataTask(this.viewRevision, local.key,
+                        local.metadataRevision, this.worldIdentity));
+                this.demands.readyRegion(local);
+                return;
+            }
+        }
+
+        void invalidateSavedRegion(SectionDemandTable.RegionDemand state) {
+            state.metadataRevision++;
+            state.localTried = true;
+            state.pendingIndex = null;
+            state.pendingCatalog = null;
+            ClientLodDebug.startupEvent(this, "invalidation", 0);
+            this.saveRegion(state, null);
+        }
+
+        void saveRegion(SectionDemandTable.RegionDemand state, RegionalProtocol.RegionMessage message) {
+            if (this.metadata == null) return;
+            long view = this.viewRevision, revision = state.metadataRevision;
+            this.metadataWrites.put(state.key, new SaveMetadataTask(view, state.key, this.worldIdentity,
+                    message, this.metadata.budget.stamp(),
+                    () -> this.open.get() && this.viewRevision == view && state.metadataRevision == revision));
+        }
+
+        void applyPendingIndexes(RegionalSectionCodec.BoundCatalog binding) {
+            for (var state : List.copyOf(this.demands.regions())) {
+                if (state.pendingIndex == null || !binding.fingerprint().equals(state.pendingCatalog)) continue;
+                var index = state.pendingIndex;
+                state.pendingIndex = null;
+                state.pendingCatalog = null;
+                this.installIndex(index, binding, false);
+            }
+        }
+
+        void applyLocalIndex(WorkerMetadata ready, RegionalSectionCodec.BoundCatalog binding) {
+            if (binding == null) return;
+            var task = ready.task();
+            var state = this.demands.region(task.region());
+            if (task.view() != this.viewRevision || state == null || state.validated
+                    || state.metadataRevision != task.revision() || ready.index() == null) return;
+            ClientLodDebug.startupEvent(this, "localView", 0);
+            this.installIndex(ready.index(), binding, true);
         }
 
         WorkerSlot idleWorker() {
@@ -1520,23 +1853,112 @@ final class ClientSession {
         }
 
         void drainWorkers() throws IOException {
+            this.drainWorker(this.metadataWorker);
             for (WorkerSlot worker : this.sectionWorkers) {
+                this.drainWorker(worker);
+            }
+        }
+
+        void drainWorker(WorkerSlot worker) throws IOException {
                 WorkerResource.Completion<WorkerResult> completion = worker.resource.claim();
-                if (completion == null) continue;
+                if (completion == null) return;
                 WorkerResource.Lease lease = completion.lease();
                 WorkerResult result = completion.value();
                 switch (result) {
+                    case WorkerBootstrap boot -> {
+                        this.metadata = boot.metadata();
+                        if (this.worldIdentity == null && boot.hint() != null) this.changeWorld(boot.hint());
+                        worker.releaseCompletion(lease);
+                    }
+                    case WorkerWorld world -> {
+                        if (world.view() == this.viewRevision) this.cache = world.cache();
+                        else world.cache().close();
+                        worker.releaseCompletion(lease);
+                    }
+                    case WorkerSaved ignored -> worker.releaseCompletion(lease);
+                    case WorkerCatalogProbe probe -> {
+                        if (probe.task().view() != this.viewRevision) {
+                            worker.releaseCompletion(lease);
+                        } else if (probe.catalog() == null) {
+                            this.catalogProbed = probe.task().fingerprint();
+                            worker.releaseCompletion(lease);
+                        } else {
+                            this.pendingCatalogTask = new CatalogTask(this, probe.catalog(), probe.task().fingerprint(),
+                                    probe.task().view(), lease, binding -> {
+                                this.catalogProbed = probe.task().fingerprint();
+                                if (binding != null) {
+                                    if (binding.fingerprint().equals(this.requiredCatalogFingerprint)) {
+                                        this.catalogFingerprint = binding.fingerprint();
+                                        this.mappings = binding.mappings();
+                                        this.currentCatalog = binding;
+                                    }
+                                    this.applyPendingIndexes(binding);
+                                }
+                            });
+                        }
+                    }
+                    case WorkerMetadata saved -> {
+                        if (saved.catalog() == null || saved.task().view() != this.viewRevision) {
+                            if (saved.binding() != null) this.applyLocalIndex(saved, saved.binding());
+                            worker.releaseCompletion(lease);
+                        } else {
+                            this.pendingCatalogTask = new CatalogTask(this, saved.catalog(), saved.fingerprint(),
+                                    saved.task().view(), lease, binding -> this.applyLocalIndex(saved, binding));
+                        }
+                    }
+                    case WorkerCatalog saved -> {
+                        var task = saved.task();
+                        if (task.view() != this.viewRevision) {
+                            worker.releaseCompletion(lease);
+                            break;
+                        }
+                        this.pendingCatalogTask = new CatalogTask(this, saved.catalog(), task.message().fingerprint(),
+                                task.view(), lease, binding -> {
+                            if (task.connection() == this.connectionEpoch) this.catalogRequested = false;
+                            if (binding == null) return;
+                            if (task.requirement() == this.catalogRequirementRevision) {
+                                this.requiredCatalogFingerprint = binding.fingerprint();
+                            }
+                            if (binding.fingerprint().equals(this.requiredCatalogFingerprint)) {
+                                this.catalogFingerprint = binding.fingerprint();
+                                this.mappings = binding.mappings();
+                                this.currentCatalog = binding;
+                            }
+                            this.applyPendingIndexes(binding);
+                            for (var state : this.demands.regions()) {
+                                if (state.pendingCatalog != null && this.mapping(state.pendingCatalog) == null) {
+                                    state.validated = false;
+                                    this.queueRegion(state.key);
+                                }
+                            }
+                        });
+                    }
                     case WorkerIndex ready -> {
-                        SectionDemandTable.RegionDemand region = this.demands.region(ready.region());
-                        if (ready.session() == this.id
-                                && ready.connection() == this.connectionEpoch
-                                && ready.slot() == worker.index
+                        var task = ready.task();
+                        SectionDemandTable.RegionDemand region = this.demands.region(task.region());
+                        if (task.session() == this.id && task.view() == this.viewRevision
+                                && task.connection() == this.connectionEpoch
+                                && task.slot() == worker.index
                                 && region != null && lease.equals(region.resourceLease)
-                                && region.announcedGeneration == ready.generation()) {
+                                && region.metadataRevision == task.revision()
+                                && region.announcedGeneration == task.generation()) {
                             region.resourceSlot = -1;
-                            this.installIndex(ready.index());
+                            region.resourceLease = null;
+                            region.requested = false;
+                            region.validated = true;
+                            ClientLodDebug.startupEvent(this, "validated", 0);
+                            var binding = this.mapping(task.message().catalogFingerprint());
+                            if (binding != null) this.installIndex(ready.index(), binding, false);
+                            else {
+                                region.pendingIndex = ready.index();
+                                region.pendingCatalog = task.message().catalogFingerprint();
+                            }
+                            this.saveRegion(region, task.message());
                         } else if (region != null && lease.equals(region.resourceLease)) {
                             region.resourceSlot = -1;
+                            region.resourceLease = null;
+                            region.requested = false;
+                            region.validated = false;
                             this.queueRegion(region.key);
                         }
                         worker.releaseCompletion(lease);
@@ -1545,10 +1967,9 @@ final class ClientSession {
                         Demand demand = this.currentWorkerDemand(miss.ticket(), worker, lease);
                         if (demand != null) {
                             demand.workLease = null;
-                            demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                             this.cacheReads++;
                             this.cacheMisses++;
-                            this.demands.ready(demand, SectionDemandTable.ReadyKind.NETWORK);
+                            this.waitForNetwork(demand);
                         } else {
                             this.finishStaleWorker(miss.ticket(), lease);
                         }
@@ -1574,7 +1995,7 @@ final class ClientSession {
                             geometry.geometry().free();
                             this.finishStaleWorker(geometry.ticket(), lease);
                             worker.releaseCompletion(lease);
-                            continue;
+                            return;
                         }
                         this.recordWorkerSource(geometry.cacheHit(), geometry.compressedBytes(),
                                 true);
@@ -1587,6 +2008,14 @@ final class ClientSession {
                         // The slot remains COMPLETED as the exact backpressure resource.
                     }
                     case WorkerFailure failed -> {
+                        if (failed.task() instanceof BootstrapTask) this.metadataUnavailable = true;
+                        if (failed.task() instanceof ProbeCatalogTask probe && probe.view() == this.viewRevision) {
+                            this.catalogProbed = probe.fingerprint();
+                        }
+                        if (failed.task() instanceof CatalogWorkerTask catalog
+                                && catalog.connection() == this.connectionEpoch) {
+                            this.catalogRequested = false;
+                        }
                         Demand currentDemand = null;
                         SectionDemandTable.RegionDemand currentRegion = null;
                         boolean stale = switch (failed.task()) {
@@ -1601,11 +2030,13 @@ final class ClientSession {
                             case IndexWorkerTask index -> {
                                 currentRegion = this.demands.region(index.region());
                                 yield index.session() != this.id
+                                        || index.view() != this.viewRevision
                                         || index.connection() != this.connectionEpoch
                                         || currentRegion == null
                                         || !lease.equals(currentRegion.resourceLease)
                                         || currentRegion.announcedGeneration != index.generation();
                             }
+                            default -> true;
                         };
                         if (failed.task() instanceof SectionWorkerTask section && stale) {
                             this.finishStaleWorker(section.ticket(), lease);
@@ -1635,6 +2066,19 @@ final class ClientSession {
                                 failed.failure());
                     }
                 }
+        }
+
+        boolean validated(Demand demand) {
+            var region = this.demands.region(demand.regionKey);
+            return this.helloAccepted && region != null && region.validated && region.subscribed
+                    && region.pendingIndex == null && region.index == demand.index;
+        }
+
+        void waitForNetwork(Demand demand) {
+            demand.candidate = this.validated(demand) ? SectionDemandTable.CandidateState.READY_SOURCE
+                    : SectionDemandTable.CandidateState.WAIT_REGION;
+            if (demand.candidate == SectionDemandTable.CandidateState.READY_SOURCE) {
+                this.demands.ready(demand, SectionDemandTable.ReadyKind.NETWORK);
             }
         }
 
@@ -1652,10 +2096,12 @@ final class ClientSession {
             demand.workLease = null;
             if (demand.pendingIndex == null || demand.pendingOrdinal < 0) return;
             RegionalProtocol.RegionIndex index = demand.pendingIndex;
+            var catalog = demand.pendingCatalog;
             int ordinal = demand.pendingOrdinal;
             demand.pendingIndex = null;
+            demand.pendingCatalog = null;
             demand.pendingOrdinal = -1;
-            this.bind(demand, index, ordinal);
+            this.bind(demand, index, ordinal, catalog);
         }
 
         void recordWorkerSource(boolean cacheHit, int compressedBytes, boolean meshed) {
@@ -1691,6 +2137,7 @@ final class ClientSession {
 
         static void freeWorkerResult(WorkerResult result) {
             if (result instanceof WorkerGeometry geometry) geometry.geometry().free();
+            if (result instanceof WorkerWorld world) world.cache().close();
         }
 
         void scheduleSourceWork() {
@@ -1706,8 +2153,7 @@ final class ClientSession {
                     }
                     continue;
                 }
-                if (this.mappings == null || !this.catalogFingerprint.equals(
-                        this.requiredCatalogFingerprint)) {
+                if (demand.catalog == null || demand.catalog.mappings() == null) {
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                     continue;
                 }
@@ -1719,7 +2165,7 @@ final class ClientSession {
                 WorkerSource source = WorkerSource.CACHE;
                 SectionDemandTable.Ticket ticket = demand.ticket(this.id, worker.index);
                 SectionWorkerTask task = new SectionWorkerTask(ticket, demand.index,
-                        demand.ordinal, source, null, this.mappings);
+                        demand.ordinal, source, null, demand.catalog.mappings(), this.cache);
                 demand.workLease = worker.assign(task);
                 this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
                 if (demand.workLease == null) {
@@ -1736,6 +2182,10 @@ final class ClientSession {
             Demand first = this.demands.poll(SectionDemandTable.ReadyKind.NETWORK);
             if (first == null) return result;
             if (first.candidate != SectionDemandTable.CandidateState.READY_SOURCE) return result;
+            if (!this.validated(first)) {
+                first.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
+                return result;
+            }
             result.add(first);
             while (result.size() < RegionalProtocol.MAX_SECTION_REQUESTS) {
                 Demand demand = this.demands.pollSameRegion(
@@ -1826,8 +2276,7 @@ final class ClientSession {
                     Demand demand = this.replyDemand(body);
                     if (demand == null || unadmittable.contains(body)) return ReplyAdmission.INELIGIBLE;
                     if (body.reply.status() == RegionalProtocol.Status.DATA
-                            && (this.mappings == null || !this.catalogFingerprint.equals(
-                                    this.requiredCatalogFingerprint))) return ReplyAdmission.INELIGIBLE;
+                            && (demand.catalog == null || demand.catalog.mappings() == null)) return ReplyAdmission.INELIGIBLE;
                     return demand.coverage ? Integer.MAX_VALUE : demand.pixelBucket;
                 });
                 if (handoff == null) return;
@@ -1845,7 +2294,7 @@ final class ClientSession {
                         }
                         SectionWorkerTask task = new SectionWorkerTask(demand.ticket(this.id, worker.index),
                                 demand.index, demand.ordinal, WorkerSource.NETWORK,
-                                reply.compressed(), this.mappings);
+                                reply.compressed(), demand.catalog.mappings(), this.cache);
                         demand.workLease = worker.assign(task);
                         if (demand.workLease == null) return;
                         this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
@@ -2088,6 +2537,7 @@ final class ClientSession {
                         if (!demand.installed) { demand.installed = true; this.activeCount++; }
                         if (demand.coverage) this.missingCoverage.remove(demand.key);
                         this.activated++;
+                        ClientLodDebug.startupEvent(this, this.helloAccepted ? "activation" : "localActivation", 0);
                         this.uploadedSections++;
                         demand.workLease = null;
                         this.releaseRendererSlot(ref.lease());
@@ -2096,10 +2546,12 @@ final class ClientSession {
                 if (demand.pendingIndex != null && (demand.workLease == null
                         || demand.completedGeometry != null)) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
+                    var catalog = demand.pendingCatalog;
                     int ordinal = demand.pendingOrdinal;
                     demand.pendingIndex = null;
+                    demand.pendingCatalog = null;
                     demand.pendingOrdinal = -1;
-                    this.bind(demand, index, ordinal);
+                    this.bind(demand, index, ordinal, catalog);
                 }
             }
             this.retryRendererBlocked();
@@ -2248,18 +2700,25 @@ final class ClientSession {
                     + " dormantLastEvictionAge=" + this.lastEvictionAge
                     + ' ' + this.renderer.regionalPublicationLatencySnapshot()
                     + " received=" + this.receivedBytes
+                    + ClientLodDebug.startupSnapshot(this)
                     + " connectionFailure=" + String.valueOf(this.lastConnectionFailure)
                     + " failure=" + String.valueOf(this.failure);
         }
 
         @Override public void close() {
             if (!this.open.getAndSet(false)) return;
+            ++this.viewRevision;
+            if (this.connectionAttempt != null) this.connectionAttempt.close();
             signal();
             this.thread.interrupt();
             if (this.quic != null) this.quic.close();
         }
 
         void release() {
+            if (this.connectionAttempt != null) this.connectionAttempt.close();
+            this.metadataWorker.close();
+            if (this.pendingCatalogTask != null) CATALOG_TASK.compareAndSet(this.pendingCatalogTask, null);
+            this.metadataWrites.clear();
             if (this.quic != null) this.quic.close();
             NetworkReply reply;
             while ((reply = this.networkReplies.poll()) != null) reply.transferred();
@@ -2304,19 +2763,19 @@ final class ClientSession {
 
     private sealed interface Event permits CatalogReady, Coarsened,
             CoarsenFailed, BatchComplete, BatchFailed, SessionObservation {}
-    private record CatalogReady(RegionalProtocol.Hash32 fingerprint,
-                                RegionalSectionCodec.Mappings mappings,
-                                long connectionEpoch) implements Event {}
-    private record Coarsened(long parent) implements Event {}
-    private record CoarsenFailed(long parent, Throwable failure) implements Event {}
+    private record CatalogReady(CatalogTask task, RegionalSectionCodec.BoundCatalog binding,
+                                Throwable failure) implements Event {}
+    private record Coarsened(long parent, long view) implements Event {}
+    private record CoarsenFailed(long parent, long view, Throwable failure) implements Event {}
     private record BatchComplete(long connectionEpoch, long reservedBytes,
                                  int sectionCount) implements Event {}
     private record BatchFailed(long connectionEpoch, Throwable failure) implements Event {}
     private record SessionObservation(Consumer<Session> receiver) implements Event {}
 
-    private record CatalogTask(Session owner, CatalogCodec.Catalog catalog,
+    record CatalogTask(Session owner, CatalogCodec.Catalog catalog,
                                RegionalProtocol.Hash32 fingerprint,
-                               long requirementRevision, long connectionEpoch) {
+                               long view, WorkerResource.Lease lease,
+                               Consumer<RegionalSectionCodec.BoundCatalog> complete) {
         void run(VoxyRenderSystem renderer) {
             CatalogMapper mapper = renderer.getMapper();
             int[] blocks = new int[this.catalog.blocks().size()];
@@ -2329,17 +2788,17 @@ final class ClientSession {
                 biomes[index] = mapper.getIdForBiome(
                         requireCanonicalBiome(this.catalog.biomes().get(index)));
             }
-            this.owner.putEvent(new CatalogReady(this.fingerprint,
-                    new RegionalSectionCodec.Mappings(blocks, biomes), this.connectionEpoch));
+            this.mapped(new RegionalSectionCodec.Mappings(blocks, biomes));
+        }
+        void mapped(RegionalSectionCodec.Mappings mappings) {
+            CATALOG_TASK.compareAndSet(this, null);
+            this.owner.putEvent(new CatalogReady(this,
+                    new RegionalSectionCodec.BoundCatalog(this.fingerprint, mappings), null));
         }
     }
 
     private static void discardEvent(Event event) {
         // Remaining events carry no native or heavyweight resource.
-    }
-
-    private static void enqueueCatalog(CatalogTask task) {
-        if (task.owner().open.get()) CATALOG_TASK.set(task);
     }
 
     private static boolean current(Demand demand, long revision,

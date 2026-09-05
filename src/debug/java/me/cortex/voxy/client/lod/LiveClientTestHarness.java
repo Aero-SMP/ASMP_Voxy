@@ -226,11 +226,21 @@ final class LiveClientTestHarness {
                     failRun(DebugTestProtocol.Failure.INTERNAL);
                 }
             }
-            case RECONNECT_QUIC -> {
+            case RECONNECT_QUIC, HOLD_QUIC, RESUME_QUIC -> {
                 // Close only this Voxy transport on its owner. Normal connection-loss recovery
                 // must reconnect; neither Minecraft nor any other client is disconnected.
                 if (!ClientSession.requestDebugSession(session -> {
-                    if (session.quic != null) session.quic.close();
+                    if (command.kind() != DebugTestProtocol.CommandKind.RECONNECT_QUIC) {
+                        ClientLodDebug.holdTransport(command.kind() == DebugTestProtocol.CommandKind.HOLD_QUIC);
+                    }
+                    if (command.kind() != DebugTestProtocol.CommandKind.RESUME_QUIC) {
+                        if (session.connectionAttempt != null) {
+                            session.connectionAttempt.close();
+                            session.connectionAttempt = null;
+                        }
+                        if (session.quic != null) session.quic.close();
+                    }
+                    session.signal();
                     Minecraft.getInstance().execute(() -> {
                         if (run == active) requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT,
                                 active.runId, active.stepId, DebugTestProtocol.Failure.NONE, false);

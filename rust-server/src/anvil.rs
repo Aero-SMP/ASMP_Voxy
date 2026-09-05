@@ -166,7 +166,14 @@ impl AnvilWorld {
         let mut out = RegionHeaders::default();
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // An empty dimension is valid, but unavailable world storage is not proof
+                // that all previously saved terrain was deleted.
+                if !fs::metadata(&self.root)?.is_dir() {
+                    anyhow::bail!("Anvil world root is not a directory");
+                }
+                return Ok(out);
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("read {}", directory.display()));
             }

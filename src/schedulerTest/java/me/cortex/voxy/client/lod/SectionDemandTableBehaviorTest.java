@@ -21,6 +21,7 @@ public final class SectionDemandTableBehaviorTest {
         allocatorReportsFragmentation();
         RegionalSectionCodecBehaviorTest.run();
         RegionalControlFlowBehaviorTest.run();
+        CacheStartupBehaviorTest.run();
         PublicationRepairBehaviorTest.run();
         me.cortex.voxy.client.core.ShaderReloadBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.building.BoundaryWaterMesherBehaviorTest.run();

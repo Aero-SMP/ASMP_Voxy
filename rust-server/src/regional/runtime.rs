@@ -37,6 +37,9 @@ pub struct RegionalRuntime {
     regions: RwLock<BTreeMap<(i32, i32), u64>>,
     sources: RwLock<BTreeMap<(i32, i32), RegionSourceTable>>,
     recovering: RwLock<BTreeSet<(i32, i32)>>,
+    // Successful Anvil inventory, including unreadable regions. Missing generated LOD data
+    // alone never proves terrain deletion; a failed directory scan revokes absence evidence.
+    inventory: RwLock<Option<BTreeSet<(i32, i32)>>>,
     maintenance: Mutex<()>,
     priority: Mutex<PriorityRequests>,
 }
@@ -89,6 +92,51 @@ fn refresh_order<T>(
 #[cfg(test)]
 mod order_tests {
     use super::*;
+
+    #[test]
+    fn confirmed_absence_requires_successful_source_inventory() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "voxy-absence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let world = root.join("world");
+        fs::create_dir_all(world.join("region"))?;
+        // Corrupt source and no generated LOD file: repair/pending, never deletion.
+        fs::write(world.join("region/r.0.0.mca"), [1])?;
+        let runtime = RegionalRuntime::open(
+            root.join("data"),
+            "minecraft:overworld".into(),
+            Arc::new(AnvilWorld::new("minecraft:overworld".into(), world.clone())),
+            Arc::new(RwLock::new(Registry::open(root.join("registry"))?)),
+            RegionLayout::new(0, 1, 5)?,
+        )?;
+        assert!(!runtime.confirmed_absent(0, 0)?);
+        assert!(runtime.confirmed_absent(1, 0)?);
+        runtime.refresh()?;
+        assert!(!runtime.confirmed_absent(0, 0)?);
+        // Deletion observed after an offline interval, with no live removal event required.
+        fs::remove_file(world.join("region/r.0.0.mca"))?;
+        runtime.refresh()?;
+        assert!(runtime.confirmed_absent(0, 0)?);
+        // Failed directory enumeration revokes all absence evidence.
+        fs::remove_dir(world.join("region"))?;
+        fs::write(world.join("region"), [1])?;
+        assert!(runtime.refresh().is_err());
+        assert!(!runtime.confirmed_absent(0, 0)?);
+        fs::remove_file(world.join("region"))?;
+        fs::remove_dir(&world)?;
+        assert!(runtime.refresh().is_err());
+        assert!(!runtime.confirmed_absent(1, 0)?);
+        fs::create_dir(&world)?;
+        runtime.refresh()?;
+        assert!(runtime.confirmed_absent(0, 0)?);
+        drop(runtime);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn priority_order_is_unique_and_retries_until_current() {
@@ -213,6 +261,7 @@ impl RegionalRuntime {
             regions: RwLock::new(regions),
             sources: RwLock::new(sources),
             recovering: RwLock::new(BTreeSet::new()),
+            inventory: RwLock::new(Some(source_coordinates)),
             maintenance: Mutex::new(()),
             priority: Mutex::new(PriorityRequests::default()),
         })
@@ -224,6 +273,12 @@ impl RegionalRuntime {
 
     pub fn world_identity(&self) -> [u8; 32] {
         self.world_identity
+    }
+
+    pub fn confirmed_absent(&self, x: i32, z: i32) -> Result<bool> {
+        Ok(read_lock(&self.inventory)?
+            .as_ref()
+            .is_some_and(|coordinates| !coordinates.contains(&(x, z))))
     }
 
     pub fn region(&self, x: i32, z: i32) -> Result<Option<Arc<RegionFile>>> {
@@ -366,7 +421,25 @@ impl RegionalRuntime {
             .maintenance
             .lock()
             .map_err(|_| anyhow::anyhow!("regional maintenance lock poisoned"))?;
-        let headers = self.source.region_headers()?;
+        let headers = match self.source.region_headers() {
+            Ok(headers) => headers,
+            Err(error) => {
+                *write_lock(&self.inventory)? = None;
+                return Err(error);
+            }
+        };
+        let inventory = headers
+            .valid
+            .iter()
+            .map(|header| (header.region_x, header.region_z))
+            .chain(
+                headers
+                    .failed
+                    .iter()
+                    .map(|header| (header.region_x, header.region_z)),
+            )
+            .collect::<BTreeSet<_>>();
+        *write_lock(&self.inventory)? = Some(inventory.clone());
         for failed in headers.failed {
             eprintln!(
                 "{}: cannot snapshot Anvil region ({},{}): {}",
@@ -384,7 +457,7 @@ impl RegionalRuntime {
             .collect::<BTreeSet<_>>();
         let mut result = RegionalRefresh::default();
 
-        for coordinate in stored_coordinates.difference(&headers.keys().copied().collect()) {
+        for coordinate in stored_coordinates.difference(&inventory) {
             write_lock(&self.regions)?.remove(coordinate);
             write_lock(&self.sources)?.remove(coordinate);
             write_lock(&self.recovering)?.remove(coordinate);

@@ -64,6 +64,7 @@ final class RegionalQuicClient implements AutoCloseable {
         }
         Throwable last = null;
         for (InetAddress address : addresses) {
+            if (Thread.currentThread().isInterrupted()) throw new IOException("regional connection attempt cancelled");
             QuicClientConnection connection = null;
             try {
                 ConnectionOwner owner = new ConnectionOwner();

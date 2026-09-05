@@ -8,7 +8,6 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -22,26 +21,27 @@ final class RegionalCache implements AutoCloseable {
     private static final int RECORD_BYTES = 20;
     private static final int MAX_OPEN_SHARDS = 64;
     private static final long MAX_SHARD_BYTES = 256L * 1024 * 1024;
-    private static final long MAX_CACHE_BYTES = 2L * 1024 * 1024 * 1024;
 
     private final Path root;
     private final RegionalProtocol.Hash32 worldIdentity;
     private final LinkedHashMap<Long, Shard> shards = new LinkedHashMap<>(64, 0.75f, true);
-    private long cacheBytes;
+    private final RegionalDiskBudget budget;
+    private boolean closed;
 
     RegionalCache(Path root, RegionalProtocol.Hash32 worldIdentity) throws IOException {
+        this(root, worldIdentity, RegionalDiskBudget.open(root));
+    }
+
+    RegionalCache(Path root, RegionalProtocol.Hash32 worldIdentity, RegionalDiskBudget budget) throws IOException {
         this.root = Files.createDirectories(Objects.requireNonNull(root, "cache root"));
         this.worldIdentity = Objects.requireNonNull(worldIdentity, "world identity");
-        try (var paths = Files.list(this.root)) {
-            this.cacheBytes = paths.filter(RegionalCache::isShard)
-                    .mapToLong(RegionalCache::sizeOrZero).sum();
-        }
+        this.budget = budget;
     }
 
     byte[] get(RegionalProtocol.RegionIndex index, int ordinal) throws IOException {
         if (index.isEmpty(ordinal)) return null;
         Shard shard;
-        synchronized (this) {
+        synchronized (this.budget) {
             shard = shard(index, false);
             if (shard != null) shard.users++;
         }
@@ -59,7 +59,7 @@ final class RegionalCache implements AutoCloseable {
         CacheKey key = key(index, ordinal);
         long added = RECORD_BYTES + (long) compressed.length;
         Shard shard;
-        synchronized (this) {
+        synchronized (this.budget) {
             shard = shard(index, true);
             if (shard == null || shard.contains(key)) return;
             if (shard.length() + added > MAX_SHARD_BYTES) {
@@ -68,23 +68,26 @@ final class RegionalCache implements AutoCloseable {
                 shard = shard(index, true);
             }
             if (shard == null || !ensureBudget(added, shard.path)) return;
-            this.cacheBytes += added;
+            this.budget.bytes += added;
             shard.users++;
         }
         boolean written = false;
         try {
-            written = shard.put(key, compressed);
+            // A retiring session may still own a cache write when its successor opens the
+            // same namespace. Serialize appends across both handles, not only per Shard.
+            synchronized (this.budget) { written = shard.put(key, compressed); }
         } finally {
-            synchronized (this) {
+            synchronized (this.budget) {
                 if (!written) {
-                    this.cacheBytes = Math.max(0, this.cacheBytes - added);
+                    this.budget.bytes = Math.max(0, this.budget.bytes - added);
                 }
                 releaseLocked(shard);
             }
         }
     }
 
-    synchronized void quarantine(RegionalProtocol.RegionIndex index, int ordinal) {
+    void quarantine(RegionalProtocol.RegionIndex index, int ordinal) {
+        synchronized (this.budget) {
         try {
             Shard shard = shard(index, false);
             if (shard == null || !shard.contains(key(index, ordinal))) return;
@@ -92,16 +95,18 @@ final class RegionalCache implements AutoCloseable {
             if (shard.length() + added <= MAX_SHARD_BYTES
                     && ensureBudget(added, shard.path)) {
                 shard.remove(key(index, ordinal));
-                this.cacheBytes += added;
+                this.budget.bytes += added;
             } else {
                 if (shard.users == 0) resetShard(index, shard);
             }
         } catch (IOException ignored) {
             // A cache miss is always safe; the authoritative section remains on the server.
         }
+        }
     }
 
     private Shard shard(RegionalProtocol.RegionIndex index, boolean create) throws IOException {
+        if (this.closed) return null;
         long id = regionKey(index.regionX(), index.regionZ());
         Shard current = this.shards.get(id);
         if (current != null) return current;
@@ -109,15 +114,15 @@ final class RegionalCache implements AutoCloseable {
         Shard opened = Files.exists(path)
                 ? Shard.open(path, this.worldIdentity, index.regionX(), index.regionZ()) : null;
         if (opened == null && Files.exists(path)) {
-            this.cacheBytes -= Files.size(path);
-            Files.delete(path);
+            this.budget.delete(path);
         }
         if (opened == null && create && ensureBudget(HEADER_BYTES, path)) {
             opened = Shard.create(path, this.worldIdentity, index.regionX(), index.regionZ());
-            this.cacheBytes += HEADER_BYTES;
+            this.budget.bytes += HEADER_BYTES;
         }
         if (opened != null) {
             this.shards.put(id, opened);
+            this.budget.register(path, this, () -> this.closePath(path));
             trimOpenShards();
         }
         return opened;
@@ -126,25 +131,12 @@ final class RegionalCache implements AutoCloseable {
     private void resetShard(RegionalProtocol.RegionIndex index, Shard shard) throws IOException {
         this.shards.remove(regionKey(index.regionX(), index.regionZ()));
         shard.close();
-        long size = sizeOrZero(shard.path);
-        Files.deleteIfExists(shard.path);
-        this.cacheBytes = Math.max(0, this.cacheBytes - size);
+        this.budget.unregister(shard.path, this);
+        this.budget.delete(shard.path);
     }
 
     private boolean ensureBudget(long added, Path target) throws IOException {
-        if (this.cacheBytes + added <= MAX_CACHE_BYTES) return true;
-        try (var paths = Files.list(this.root)) {
-            for (Path candidate : paths.filter(RegionalCache::isShard)
-                    .filter(path -> !path.equals(target))
-                    .sorted(Comparator.comparingLong(RegionalCache::modifiedOrMinimum)).toList()) {
-                if (!closePath(candidate)) continue;
-                long size = sizeOrZero(candidate);
-                Files.deleteIfExists(candidate);
-                this.cacheBytes = Math.max(0, this.cacheBytes - size);
-                if (this.cacheBytes + added <= MAX_CACHE_BYTES) return true;
-            }
-        }
-        return this.cacheBytes + added <= MAX_CACHE_BYTES;
+        return this.budget.ensure(added, java.util.Set.of(target));
     }
 
     private boolean closePath(Path path) {
@@ -155,6 +147,7 @@ final class RegionalCache implements AutoCloseable {
             if (shard.users != 0) return false;
             iterator.remove();
             shard.close();
+            this.budget.unregister(path, this);
             return true;
         }
         return true;
@@ -169,6 +162,7 @@ final class RegionalCache implements AutoCloseable {
                 if (oldest.users != 0) continue;
                 iterator.remove();
                 oldest.close();
+                this.budget.unregister(oldest.path, this);
                 closed = true;
                 break;
             }
@@ -177,17 +171,20 @@ final class RegionalCache implements AutoCloseable {
     }
 
     private void release(Shard shard) {
-        synchronized (this) { releaseLocked(shard); }
+        synchronized (this.budget) { releaseLocked(shard); }
     }
 
     private void releaseLocked(Shard shard) {
         if (--shard.users < 0) throw new IllegalStateException("regional cache shard lease underflow");
+        if (this.closed && shard.users == 0) this.closePath(shard.path);
         trimOpenShards();
     }
 
-    @Override public synchronized void close() {
-        for (Shard shard : this.shards.values()) shard.close();
-        this.shards.clear();
+    @Override public void close() {
+        synchronized (this.budget) {
+            this.closed = true;
+            for (Shard shard : java.util.List.copyOf(this.shards.values())) this.closePath(shard.path);
+        }
     }
 
     private Path path(int x, int z) {
@@ -202,18 +199,6 @@ final class RegionalCache implements AutoCloseable {
         return Integer.toUnsignedLong(x) | Integer.toUnsignedLong(z) << 32;
     }
 
-    private static boolean isShard(Path path) {
-        return path.getFileName().toString().endsWith(".vxcache");
-    }
-
-    private static long sizeOrZero(Path path) {
-        try { return Files.size(path); } catch (IOException ignored) { return 0; }
-    }
-
-    private static long modifiedOrMinimum(Path path) {
-        try { return Files.getLastModifiedTime(path).toMillis(); }
-        catch (IOException ignored) { return Long.MIN_VALUE; }
-    }
 
     private record CacheKey(RegionalProtocol.Fingerprint fingerprint, int length) {}
 
@@ -290,7 +275,13 @@ final class RegionalCache implements AutoCloseable {
             header.putInt(x).putInt(z).putLong(0).position(HEADER_BYTES).flip();
             try (FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE_NEW,
                     StandardOpenOption.WRITE)) {
-                writeFully(channel, 0, header);
+                try { writeFully(channel, 0, header); }
+                catch (IOException failure) {
+                    channel.close();
+                    try { Files.deleteIfExists(path); }
+                    catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+                    throw failure;
+                }
             }
             return open(path, world, x, z);
         }
@@ -317,8 +308,13 @@ final class RegionalCache implements AutoCloseable {
             ByteBuffer header = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
             header.putLong(key.fingerprint.low()).putLong(key.fingerprint.high());
             header.putInt(key.length).flip();
-            writeFully(this.channel, offset, header);
-            writeFully(this.channel, offset + RECORD_BYTES, ByteBuffer.wrap(bytes));
+            try {
+                writeFully(this.channel, offset, header);
+                writeFully(this.channel, offset + RECORD_BYTES, ByteBuffer.wrap(bytes));
+            } catch (IOException failure) {
+                this.file.setLength(offset);
+                throw failure;
+            }
             this.records.put(key, offset + RECORD_BYTES);
             return true;
         }
@@ -329,7 +325,8 @@ final class RegionalCache implements AutoCloseable {
             ByteBuffer tombstone = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
             tombstone.putLong(key.fingerprint.low()).putLong(key.fingerprint.high());
             tombstone.putInt(-key.length).flip();
-            writeFully(this.channel, offset, tombstone);
+            try { writeFully(this.channel, offset, tombstone); }
+            catch (IOException failure) { this.file.setLength(offset); throw failure; }
         }
 
         private static void readFully(FileChannel channel, long offset, ByteBuffer output)
