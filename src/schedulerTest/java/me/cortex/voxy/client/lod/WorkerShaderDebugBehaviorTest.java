@@ -22,6 +22,7 @@ public final class WorkerShaderDebugBehaviorTest {
         stageAccountingAndCpuUnavailable();
         actualWorkerStalls();
         shaderDiffAndAliases();
+        HarnessTerminalBehaviorTest.run();
         System.out.println("actual debug worker boundaries, lock-owner evidence, CPU availability and shader diff tests passed");
     }
 

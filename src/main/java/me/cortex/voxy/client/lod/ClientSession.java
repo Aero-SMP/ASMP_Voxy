@@ -104,6 +104,7 @@ final class ClientSession {
     }
 
     static long debugSessionIdentity() { Session current = active; return current == null ? 0 : current.id; }
+    static long debugOpenSessionIdentity() { Session current = active; return current == null || !current.open.get() ? 0 : current.id; }
 
     /** Debug harness handoff. The real owner thread creates the observation without blocking. */
     static boolean requestDebugSnapshot(Consumer<PipelineSnapshot> receiver) {

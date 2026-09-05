@@ -47,6 +47,7 @@ final class LiveClientTestHarness {
     private static long renderedFrame;
     private static boolean snapshotPending;
     private static long snapshotToken;
+    private static long snapshotSession;
     private static final DebugLatestMailbox<DebugTestResultPayload> TRACE_MAILBOX =
             new DebugLatestMailbox<>();
     private static long traceCaptureCoalesced;
@@ -75,10 +76,17 @@ final class LiveClientTestHarness {
         Minecraft minecraft = Minecraft.getInstance();
         ClientPacketListener current = minecraft.getConnection();
         if (current != connection) {
+            failRun(DebugTestProtocol.Failure.DISCONNECTED,
+                    (failed, reason) -> localTerminal(failed, reason, "Minecraft disconnected; not sent"),
+                    LiveClientTestHarness::restoreSettings);
             connection = current;
             connectionEpoch = current == null ? 0 : ++epochCounter;
             readyAdvertised = false;
             clearRun();
+        }
+        if (snapshotPending && snapshotSession != ClientSession.debugOpenSessionIdentity()) {
+            if (run != null) failRun(DebugTestProtocol.Failure.RENDERER_REPLACED);
+            else { invalidateSnapshot(); readyAdvertised = false; }
         }
         if (current != null && !readyAdvertised && observedPose.frame >= 0
                 && buildIdentity != null && current.hasChannel(DebugTestResultPayload.TYPE)
@@ -171,6 +179,7 @@ final class LiveClientTestHarness {
                 sendFailure(command, DebugTestProtocol.Failure.INVALID_STATE);
                 return;
             }
+            invalidateSnapshot(); // A discarded connection-ready observation cannot gate a new run.
             run = new Run(command.runId(), command.stepId(),
                     IGetVoxyRenderSystem.getNullable());
             requestResult(DebugTestProtocol.ResultKind.CLIENT_READY, command.runId(),
@@ -181,8 +190,7 @@ final class LiveClientTestHarness {
         if (command.kind() == DebugTestProtocol.CommandKind.ABORT_RUN && active != null
                 && active.runId.equals(command.runId()) && command.stepId() > active.stepId) {
             active.stepId = command.stepId();
-            requestResult(DebugTestProtocol.ResultKind.RUN_FAILED, active.runId,
-                    active.stepId, DebugTestProtocol.Failure.ABORTED, true);
+            failRun(DebugTestProtocol.Failure.ABORTED);
             return;
         }
         if (active == null || !active.runId.equals(command.runId())
@@ -267,8 +275,9 @@ final class LiveClientTestHarness {
                 active.shaderDrawMarker = active.renderer == null ? 0 : active.renderer.shaderResumedDraws();
                 try {
                     if (active.shaderSettings != null) {
-                        active.shaderSettings.restore();
+                        var settings = active.shaderSettings;
                         active.shaderSettings = null;
+                        settings.restore();
                     }
                     if (IGetVoxyRenderSystem.getNullable() != active.renderer) {
                         failRun(DebugTestProtocol.Failure.RENDERER_REPLACED);
@@ -286,8 +295,7 @@ final class LiveClientTestHarness {
                     failRun(DebugTestProtocol.Failure.INTERNAL);
                 }
             }
-            case ABORT_RUN -> requestResult(DebugTestProtocol.ResultKind.RUN_FAILED,
-                    active.runId, active.stepId, DebugTestProtocol.Failure.ABORTED, true);
+            case ABORT_RUN -> failRun(DebugTestProtocol.Failure.ABORTED);
             case BEGIN_RUN -> throw new AssertionError();
         }
     }
@@ -298,6 +306,7 @@ final class LiveClientTestHarness {
             return;
         }
         snapshotPending = true;
+        snapshotSession = ClientSession.debugOpenSessionIdentity();
         long token = ++snapshotToken;
         Pose pose = observedPose;
         if (!ClientSession.requestDebugSnapshot(pipeline -> Minecraft.getInstance().execute(() -> {
@@ -361,18 +370,11 @@ final class LiveClientTestHarness {
                                       long step, DebugTestProtocol.Failure failure,
                                       boolean clearAfter) {
         if (snapshotPending) {
-            Run active = run;
-            if (active != null) {
-                sendCritical(resultPayload(DebugTestProtocol.ResultKind.RUN_FAILED,
-                        active.runId, active.stepId, connectionEpoch,
-                        DebugTestProtocol.Failure.INTERNAL,
-                        Math.max(0, observedPose.frame), Math.max(0, observedPose.frame), 0,
-                        snapshot(observedPose, null)));
-                clearRun();
-            }
+            failRun(DebugTestProtocol.Failure.INTERNAL);
             return;
         }
         snapshotPending = true;
+        snapshotSession = ClientSession.debugOpenSessionIdentity();
         long token = ++snapshotToken;
         long resultEpoch = connectionEpoch;
         ClientPacketListener resultConnection = connection;
@@ -405,10 +407,44 @@ final class LiveClientTestHarness {
     }
 
     private static void failRun(DebugTestProtocol.Failure failure) {
+        failRun(failure, (active, reason) -> {
+            if (connection == null || !connection.hasChannel(DebugTestResultPayload.TYPE)) {
+                localTerminal(active, reason, "debug channel unavailable; not sent");
+                return;
+            }
+            sendCritical(resultPayload(DebugTestProtocol.ResultKind.RUN_FAILED, active.runId,
+                    active.stepId, connectionEpoch, reason,
+                    Math.max(0, observedPose.frame), Math.max(0, observedPose.frame), 0,
+                    snapshot(observedPose, null)));
+        }, LiveClientTestHarness::restoreSettings);
+    }
+
+    // Terminal delivery does not request a SessionObservation. Detach before callbacks:
+    // restoration can itself rebuild the renderer and late observations must be inert.
+    static void failRun(DebugTestProtocol.Failure failure,
+                        java.util.function.BiConsumer<Run, DebugTestProtocol.Failure> deliver,
+                        java.util.function.Consumer<Run> restore) {
         Run active = run;
         if (active == null) return;
-        requestResult(DebugTestProtocol.ResultKind.RUN_FAILED, active.runId,
-                active.stepId, failure, true);
+        run = null;
+        invalidateSnapshot();
+        TRACE_MAILBOX.clear();
+        traceCaptureCoalesced = 0;
+        try { deliver.accept(active, failure); }
+        catch (Throwable unavailable) {
+            localTerminal(active, failure, "terminal send failed: " + unavailable);
+        } finally {
+            try { restore.accept(active); }
+            catch (Throwable problem) {
+                me.cortex.voxy.common.Logger.error("Harness shader restoration failed after terminal result", problem);
+            }
+        }
+    }
+
+    private static void localTerminal(Run active, DebugTestProtocol.Failure failure, String detail) {
+        ClientLodDebug.updaterEvent("state=HARNESS_TERMINAL_LOCAL run=" + active.runId
+                + " step=" + active.stepId + " connection=" + connectionEpoch
+                + " reason=" + failure + " detail=" + detail);
     }
 
     private static void sendCritical(DebugTestResultPayload result) {
@@ -587,20 +623,31 @@ final class LiveClientTestHarness {
     private static void clearRun() {
         Run previous = run;
         run = null;
+        invalidateSnapshot();
+        TRACE_MAILBOX.clear();
+        traceCaptureCoalesced = 0;
+        restoreSettings(previous);
+    }
+
+    private static void restoreSettings(Run previous) {
         if (previous != null && previous.shaderSettings != null && IrisUtil.IRIS_INSTALLED) {
+            var settings = previous.shaderSettings;
+            previous.shaderSettings = null;
             try {
-                previous.shaderSettings.restore();
+                settings.restore();
             } catch (Throwable failure) {
                 me.cortex.voxy.common.Logger.error("Could not restore original shader enable state", failure);
             }
         }
-        snapshotToken++;
-        snapshotPending = false;
-        TRACE_MAILBOX.clear();
-        traceCaptureCoalesced = 0;
     }
 
-    private static final class Run {
+    private static void invalidateSnapshot() {
+        snapshotToken++;
+        snapshotPending = false;
+        snapshotSession = 0;
+    }
+
+    static final class Run {
         final UUID runId;
         final VoxyRenderSystem renderer;
         long stepId;
