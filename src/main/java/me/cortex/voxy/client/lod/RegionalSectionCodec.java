@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.core.model.CatalogMapper;
+import it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet;
 import org.lwjgl.system.MemoryUtil;
 
 import java.io.IOException;
@@ -115,7 +116,8 @@ public final class RegionalSectionCodec implements AutoCloseable {
             throw new IOException("regional section palette or word extent is invalid");
         }
         long[] palette = new long[paletteCount];
-        int[] paletteBlocks = new int[paletteCount];
+        // The validated palette bounds unique IDs; reserve once instead of rehashing during translation.
+        var usedBlocks = new IntLinkedOpenHashSet(paletteCount);
         java.util.HashSet<RemotePaletteEntry> remotePalette =
                 new java.util.HashSet<>(paletteCount * 2);
         for (int index = 0; index < paletteCount; index++) {
@@ -129,7 +131,7 @@ public final class RegionalSectionCodec implements AutoCloseable {
                 throw new IOException("invalid regional section palette entry");
             }
             int localBlock = mappings.blocks[(int) remoteBlock];
-            paletteBlocks[index] = localBlock;
+            if (localBlock != 0) usedBlocks.add(localBlock);
             palette[index] = CatalogMapper.composeMappingId(light,
                     localBlock, mappings.biomes[(int) remoteBiome]);
         }
@@ -161,8 +163,7 @@ public final class RegionalSectionCodec implements AutoCloseable {
             }
         }
         if (next != paletteCount) throw new IOException("unused regional section palette entry");
-        return new SectionData(key, childMask, cells,
-                java.util.Arrays.stream(paletteBlocks).filter(value -> value != 0).distinct().toArray());
+        return new SectionData(key, childMask, cells, usedBlocks.toIntArray());
     }
 
     private static int minimumBits(int paletteCount) {

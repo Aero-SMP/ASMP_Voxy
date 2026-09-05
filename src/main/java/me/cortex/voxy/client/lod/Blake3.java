@@ -20,6 +20,18 @@ public final class Blake3 {
     private static final int[] MESSAGE_PERMUTATION = {
             2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
     };
+    private static final int[][] ROUND_SCHEDULES = roundSchedules();
+
+    private static int[][] roundSchedules() {
+        int[][] schedules = new int[7][16];
+        for (int index = 0; index < 16; index++) schedules[0][index] = index;
+        for (int round = 1; round < 7; round++) {
+            for (int index = 0; index < 16; index++) {
+                schedules[round][index] = schedules[round - 1][MESSAGE_PERMUTATION[index]];
+            }
+        }
+        return schedules;
+    }
 
     private Blake3() {}
 
@@ -114,21 +126,15 @@ public final class Blake3 {
         state[13] = (int) (counter >>> 32);
         state[14] = blockLength;
         state[15] = flags;
-        int[] schedule = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
         for (int round = 0; round < 7; round++) {
-            round(state, block, schedule);
-            int[] permuted = new int[16];
-            for (int index = 0; index < 16; index++) {
-                permuted[index] = schedule[MESSAGE_PERMUTATION[index]];
-            }
-            schedule = permuted;
+            round(state, block, ROUND_SCHEDULES[round]);
         }
-        int[] output = new int[16];
         for (int index = 0; index < 8; index++) {
-            output[index] = state[index] ^ state[index + 8];
-            output[index + 8] = state[index + 8] ^ chainingValue[index];
+            int upper = state[index + 8];
+            state[index] ^= upper;
+            state[index + 8] = upper ^ chainingValue[index];
         }
-        return output;
+        return state;
     }
 
     private static void round(int[] state, int[] message, int[] schedule) {

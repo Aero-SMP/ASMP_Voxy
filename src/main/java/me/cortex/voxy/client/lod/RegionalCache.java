@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.lod;
 
+import it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
@@ -8,7 +9,6 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -234,11 +234,12 @@ final class RegionalCache implements AutoCloseable {
         final Path path;
         private final RandomAccessFile file;
         private final FileChannel channel;
-        private final Map<CacheKey, Long> records;
+        // Payload offsets follow the nonempty shard/record headers; zero means absent.
+        private final Object2LongOpenHashMap<CacheKey> records;
         private int users;
         final boolean writable;
 
-        private Shard(Path path, RandomAccessFile file, Map<CacheKey, Long> records, boolean writable) {
+        private Shard(Path path, RandomAccessFile file, Object2LongOpenHashMap<CacheKey> records, boolean writable) {
             this.path = path;
             this.file = file;
             this.channel = file.getChannel();
@@ -264,7 +265,7 @@ final class RegionalCache implements AutoCloseable {
                         || storedX != x || storedZ != z || input.getLong() != 0) {
                     return closeNull(file);
                 }
-                Map<CacheKey, Long> records = new HashMap<>();
+                var records = new Object2LongOpenHashMap<CacheKey>();
                 long offset = HEADER_BYTES;
                 ByteBuffer record = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
                 while (offset + RECORD_BYTES <= extent) {
@@ -278,7 +279,7 @@ final class RegionalCache implements AutoCloseable {
                     if (length > RegionalProtocol.MAX_SECTION_BYTES) break;
                     CacheKey key = new CacheKey(fingerprint, length);
                     if (signedLength < 0) {
-                        records.remove(key);
+                        records.removeLong(key);
                         offset += RECORD_BYTES;
                     } else {
                         if (offset + RECORD_BYTES + length > extent) break;
@@ -326,8 +327,8 @@ final class RegionalCache implements AutoCloseable {
         synchronized long length() throws IOException { return this.file.length(); }
 
         synchronized byte[] get(CacheKey key) throws IOException {
-            Long offset = this.records.get(key);
-            if (offset == null) return null;
+            long offset = this.records.getLong(key);
+            if (offset == 0) return null;
             byte[] bytes = new byte[key.length];
             readFully(this.channel, offset, ByteBuffer.wrap(bytes));
             return bytes;
@@ -351,7 +352,7 @@ final class RegionalCache implements AutoCloseable {
         }
 
         synchronized void remove(CacheKey key) throws IOException {
-            if (this.records.remove(key) == null) return;
+            if (this.records.removeLong(key) == 0) return;
             long offset = this.file.length();
             ByteBuffer tombstone = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
             tombstone.putLong(key.fingerprint.low()).putLong(key.fingerprint.high());

@@ -24,6 +24,7 @@ final class CacheStartupBehaviorTest {
 
     static void run() throws Exception {
         shardReconstruction();
+        grownShardOffsets();
         overlappingShardOwners();
         trimmedShardsReopen();
         CacheInventoryBehaviorTest.run();
@@ -133,6 +134,45 @@ final class CacheStartupBehaviorTest {
         } finally { cleanup(root); }
     }
 
+    private static void grownShardOffsets() throws Exception {
+        Path root = Files.createTempDirectory("voxy-shard-growth-");
+        Path path = root.resolve("r.0.0.vxcache");
+        int count = 8192;
+        try {
+            ByteBuffer bytes = buffer(64 + count * 24);
+            bytes.put(new byte[]{'V','X','Y','S','E','C',0,0}).putLong(1).putLong(2).putLong(3).putLong(4);
+            bytes.putInt(0).putInt(0).putLong(0).position(64);
+            for (int i = 0; i < count; i++) bytes.put(record(i, 4, buffer(4).putInt(i).array()));
+            Files.write(path, bytes.array());
+            try (var shard = openShard(path, true)) {
+                check(Arrays.equals(shardValue(shard, 0, 4), new byte[4]), "first payload offset confused with zero absence sentinel");
+                var key = shardKey(count + 1, 4);
+                var remove = shard.getClass().getDeclaredMethod("remove", key.getClass()); remove.setAccessible(true);
+                long before = Files.size(path);
+                invoke(remove, shard, key); check(Files.size(path) == before, "absent removal appended a tombstone");
+                for (int i = 0; i < count; i += 3) invoke(remove, shard, shardKey(i, 4));
+                long after = Files.size(path);
+                for (int i = 0; i < count; i += 3) invoke(remove, shard, shardKey(i, 4));
+                check(Files.size(path) == after, "repeated removals appended tombstones");
+            }
+            // Replay duplicates, resurrection and same fingerprint/different lengths through the real parser.
+            Files.write(path, record(0, 4, buffer(4).putInt(99).array()), StandardOpenOption.APPEND);
+            Files.write(path, record(1, 4, buffer(4).putInt(101).array()), StandardOpenOption.APPEND);
+            Files.write(path, record(1, 2, new byte[]{8, 9}), StandardOpenOption.APPEND);
+            byte[] expectedDisk = Files.readAllBytes(path);
+            for (int pass = 0; pass < 3; pass++) try (var shard = openShard(path, false)) {
+                for (int i = 0; i < count; i++) {
+                    byte[] expected = i == 0 ? buffer(4).putInt(99).array() : i == 1 ? buffer(4).putInt(101).array()
+                            : i % 3 == 0 ? null : buffer(4).putInt(i).array();
+                    check(Arrays.equals(shardValue(shard, i, 4), expected), "grown/replayed offset lost for " + i);
+                }
+                check(Arrays.equals(shardValue(shard, 1, 2), new byte[]{8, 9}), "different-length key conflated");
+                check(shardValue(shard, count + 1, 4) == null, "missing offset became readable");
+                check(Arrays.equals(Files.readAllBytes(path), expectedDisk), "read-only replay changed file");
+            }
+        } finally { cleanup(root); }
+    }
+
     private static byte[] record(long fingerprint, int length, byte[] payload) {
         return buffer(20 + payload.length).putLong(fingerprint).putLong(0).putInt(length).put(payload).array();
     }
@@ -145,12 +185,15 @@ final class CacheStartupBehaviorTest {
         return (AutoCloseable) invoke(method, null, path, WORLD, 0, 0, writable);
     }
     private static byte[] shardValue(AutoCloseable shard, long fingerprint, int length) throws Exception {
+        Object key = shardKey(fingerprint, length);
+        var method = shard.getClass().getDeclaredMethod("get", key.getClass()); method.setAccessible(true);
+        return (byte[]) invoke(method, shard, key);
+    }
+    private static Object shardKey(long fingerprint, int length) throws Exception {
         var keyType = Class.forName(RegionalCache.class.getName() + "$CacheKey");
         var constructor = keyType.getDeclaredConstructor(RegionalProtocol.Fingerprint.class, int.class);
         constructor.setAccessible(true);
-        var key = constructor.newInstance(new RegionalProtocol.Fingerprint(fingerprint, 0), length);
-        var method = shard.getClass().getDeclaredMethod("get", keyType); method.setAccessible(true);
-        return (byte[]) invoke(method, shard, key);
+        return constructor.newInstance(new RegionalProtocol.Fingerprint(fingerprint, 0), length);
     }
     private static Object invoke(java.lang.reflect.Method method, Object target, Object... args) throws Exception {
         try { return method.invoke(target, args); }

@@ -27,6 +27,7 @@ public final class SectionDemandTableBehaviorTest {
         staleTicketCannotMutateReplacement();
         allocatorUsesExactOneKiBUnits();
         allocatorReportsFragmentation();
+        Blake3BehaviorTest.run();
         RegionalSectionCodecBehaviorTest.run();
         RegionalControlFlowBehaviorTest.run();
         CacheStartupBehaviorTest.run();
