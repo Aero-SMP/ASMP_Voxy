@@ -35,6 +35,7 @@ import java.util.function.BooleanSupplier;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import static org.lwjgl.opengl.ARBUniformBufferObject.glBindBufferBase;
 import static org.lwjgl.opengl.GL30C.glUniform1ui;
@@ -155,6 +156,8 @@ public class AsyncNodeManager {
             }
             this.uncaughtException = e;
             this.running = false;
+            this.regionalBatchHandoff.stop(e);
+            this.notifyPublicationProgress();
         });
         this.thread.setName("Async Node Manager");
 
@@ -303,6 +306,8 @@ public class AsyncNodeManager {
             if (transaction == null) break;
             try {
                 boolean completed = switch (transaction.operation) {
+                    case RETIRE -> this.manager.retirePublication(transaction.sourceRevision,
+                            transaction.expectedRevision, transaction.positions.iterator().next());
                     case COMMIT -> {
                         this.manager.commitStagedRoot(
                                 transaction.sourceRevision, transaction.positions);
@@ -381,20 +386,19 @@ public class AsyncNodeManager {
             }
             publication = this.takeRegionalSectionPublication();
             workDone++;
-            this.processRegionalSectionPublication(publication);
+            hierarchyAdvanced |= this.processRegionalSectionPublication(publication);
         }
 
-        if (workDone == 0) {//Nothing happened, which is odd, but just return
-            //Should probably log that nothing happened, at least once
-            if (topologyDeferred) {
-                long idleStart = System.nanoTime();
-                LockSupport.parkNanos(10_000_000L);
-                this.workerIdleNanos.addAndGet(System.nanoTime() - idleStart);
-                this.workPending.set(true);
-            }
-            return;
+        if (workDone == 0) return;
+        // Retry topology commands only after real hierarchy/fence/input progress.
+        if (hierarchyAdvanced) {
+            this.topologyGeneration.incrementAndGet();
+            this.notifyPublicationProgress();
+            if (topologyDeferred) this.workPending.set(true);
         }
-        if (topologyDeferred) this.workPending.set(true);
+        this.largestFreeGeometryUnits = this.geometryManager.getLargestFreeGeometryUnits();
+        this.usedGeometrySections = this.geometryManager.getSectionCount();
+        this.notifyPublicationProgress();
         if (this.needsWaitForSync) {
             while (RESULT_HANDLE.get(this) != null && this.running) {
                 this.waitingForRenderSync = true;
@@ -545,11 +549,9 @@ public class AsyncNodeManager {
 
     private RegionalSectionPublication peekRegionalSectionPublication() {
         if (this.activeRegionalBatch == null) {
-            synchronized (this.submissionLock) {
-                this.activeRegionalBatch = this.regionalBatchHandoff;
-                this.regionalBatchHandoff = null;
-            }
+            this.activeRegionalBatch = this.regionalBatchHandoff.take();
             if (this.activeRegionalBatch == null) return null;
+            this.notifyPublicationProgress();
             this.activeRegionalBatchIndex = 0;
             this.regionalBatchStartLatency.record(System.nanoTime()
                     - this.activeRegionalBatch.enqueuedNanos());
@@ -577,6 +579,7 @@ public class AsyncNodeManager {
                 this.cancelRegionalSectionPublication(publication);
                 return true;
             }
+            PublicationProgress observed = this.publicationProgress();
             long geometryBytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
             long stagedBytes = UploadStream.alignUp(geometryBytes,
                     UploadStream.BASE_ALLOCATION_ALIGNEMENT)
@@ -588,8 +591,9 @@ public class AsyncNodeManager {
             if (publication.previousRevision() >= 0) {
                 if (!this.manager.finalizeStagedRoot(publication.previousRevision())) {
                     publication.blocked().accept(new RegionalAllocationBlock(geometry,
-                            RegionalAllocationStatus.TOPOLOGY_NOT_READY, 0, 0));
-                    return true;
+                            RegionalAllocationStatus.TOPOLOGY_NOT_READY, 0, 0,
+                            geometry.position, observed));
+                    return false;
                 }
             }
             NodeManager.RendererFence staged;
@@ -606,8 +610,8 @@ public class AsyncNodeManager {
                             "accepted allocation raised an admission exception");
                 };
                 publication.blocked().accept(new RegionalAllocationBlock(geometry, status,
-                        admission.requiredUnits(), admission.largestFreeUnits()));
-                return true;
+                        admission.requiredUnits(), admission.largestFreeUnits(), geometry.position, observed));
+                return false;
             }
             if (staged == null && this.manager.ensureHierarchyOwner(geometry.position)) {
                 try {
@@ -623,16 +627,17 @@ public class AsyncNodeManager {
                                 "accepted allocation raised an admission exception");
                     };
                     publication.blocked().accept(new RegionalAllocationBlock(geometry, status,
-                            admission.requiredUnits(), admission.largestFreeUnits()));
-                    return true;
+                            admission.requiredUnits(), admission.largestFreeUnits(), geometry.position, observed));
+                    return false;
                 }
             }
             if (staged == null) {
                 RegionalAllocationStatus status = this.manager.hasTopLevelAncestor(
                         geometry.position) ? RegionalAllocationStatus.TOPOLOGY_NOT_READY
                         : RegionalAllocationStatus.STALE;
-                publication.blocked().accept(new RegionalAllocationBlock(geometry, status, 0, 0));
-                return true;
+                publication.blocked().accept(new RegionalAllocationBlock(geometry, status, 0, 0,
+                        this.manager.publicationPrerequisite(geometry.position), observed));
+                return false;
             }
             transferred = true;
             this.usedGeometryAmount = this.geometryManager.getGeometryUsedBytes();
@@ -855,7 +860,32 @@ public class AsyncNodeManager {
     //Incoming events
 
     /** One producer handoff; the renderer does not hide a second geometry backlog. */
-    private RegionalPublicationBatch regionalBatchHandoff;
+    private final PublicationHandoff<RegionalPublicationBatch> regionalBatchHandoff =
+            new PublicationHandoff<>();
+    private final AtomicLong topologyGeneration = new AtomicLong();
+    private volatile Runnable progressListener = () -> {};
+
+    public record PublicationProgress(long handoff, long topology, long allocation,
+                                      long sectionIds, boolean occupied, Throwable failure) {}
+
+    public PublicationProgress publicationProgress() {
+        return new PublicationProgress(this.regionalBatchHandoff.consumed(),
+                this.topologyGeneration.get(), this.geometryManager.allocationReleaseGeneration(),
+                this.geometryManager.sectionReleaseGeneration(), this.regionalBatchHandoff.occupied(),
+                this.uncaughtException != null ? this.uncaughtException
+                        : this.running ? null : new IllegalStateException("renderer stopped"));
+    }
+
+    public void setPublicationProgressListener(Runnable listener) {
+        this.progressListener = Objects.requireNonNull(listener);
+        listener.run();
+    }
+
+    public void clearPublicationProgressListener(Runnable listener) {
+        if (this.progressListener == listener) this.progressListener = () -> {};
+    }
+
+    public void notifyPublicationProgress() { this.progressListener.run(); }
     /** Worker-owned cursor into the one atomically published producer batch being drained. */
     private RegionalPublicationBatch activeRegionalBatch;
     private int activeRegionalBatchIndex;
@@ -875,8 +905,8 @@ public class AsyncNodeManager {
 
     public record RegionalAllocationBlock(BuiltSection geometry,
                                           RegionalAllocationStatus status,
-                                          long requiredUnits,
-                                          long largestFreeUnits) {}
+                                          long requiredUnits, long largestFreeUnits,
+                                          long prerequisite, PublicationProgress observed) {}
 
     public record RegionalSectionSubmission(BuiltSection geometry, long previousRevision,
                                             BooleanSupplier current, Runnable reserved,
@@ -903,14 +933,22 @@ public class AsyncNodeManager {
                                              Consumer<RegionalAllocationBlock> blocked,
                                              Consumer<Throwable> failure) {}
     private record RegionalPublicationBatch(RegionalSectionPublication[] publications,
-                                            long enqueuedNanos) {}
+                                            long enqueuedNanos, Object receipt) {}
+
+    public record PreparedBatch<T>(List<RegionalSectionSubmission> submissions, T receipt) {}
 
     private enum RendererOperation {
-        COMMIT, ROLLBACK, COMPLETE_ROLLBACK, FINALIZE, COARSEN, RELEASE_COARSEN
+        COMMIT, ROLLBACK, COMPLETE_ROLLBACK, FINALIZE, COARSEN, RELEASE_COARSEN, RETIRE
     }
     private record RendererTransaction(long sourceRevision, Set<Long> positions,
                                        RendererOperation operation,
-                                       Runnable success, Consumer<Throwable> failure) {}
+                                       Runnable success, Consumer<Throwable> failure,
+                                       long expectedRevision) {
+        RendererTransaction(long revision, Set<Long> positions, RendererOperation operation,
+                            Runnable success, Consumer<Throwable> failure) {
+            this(revision, positions, operation, success, failure, -1);
+        }
+    }
     private record GpuCompletion(GlFence fence,
                                  ArrayList<RendererTransaction> rendererTransactions,
                                  ArrayList<RegionalSectionPublication> regionalSectionPublications) {}
@@ -953,6 +991,14 @@ public class AsyncNodeManager {
             this.coarsenQueue.add(transaction);
         }
         this.signalWork();
+    }
+
+    public void retirePublication(long revision, long expectedRevision, long position,
+                                  Runnable success, Consumer<Throwable> failure) {
+        this.submitRendererTransaction(new RendererTransaction(revision, Set.of(position),
+                RendererOperation.RETIRE,
+                () -> this.finalizeStagedRoot(revision, success, failure), failure,
+                expectedRevision));
     }
 
     private void submitRendererTransaction(RendererTransaction transaction) {
@@ -1064,48 +1110,43 @@ public class AsyncNodeManager {
      * Atomically publishes one complete producer batch. Ownership of every geometry allocation
      * transfers together when the batch is appended; any thrown exception means none transferred.
      */
-    public void publishRegionalSections(List<RegionalSectionSubmission> submissions) {
-        Objects.requireNonNull(submissions, "submissions");
-        if (submissions.isEmpty()) return;
-        RegionalSectionPublication[] publications =
-                new RegionalSectionPublication[submissions.size()];
-        for (int index = 0; index < publications.length; index++) {
-            RegionalSectionSubmission submission = Objects.requireNonNull(
-                    submissions.get(index), "submission");
-            BuiltSection geometry = submission.geometry();
-            long geometryBytes = geometry.geometryBuffer == null ? 0
-                    : geometry.geometryBuffer.size;
-            long stagedBytes = UploadStream.alignUp(geometryBytes,
-                    UploadStream.BASE_ALLOCATION_ALIGNEMENT)
-                    + UploadStream.alignUp(16, UploadStream.BASE_ALLOCATION_ALIGNEMENT);
-            if (stagedBytes > UploadStream.CAPACITY_BYTES) {
-                throw new IllegalArgumentException("one regional section exceeds the render "
-                        + "upload safety ceiling: " + geometryBytes + " bytes");
-            }
-            publications[index] = new RegionalSectionPublication(submission.geometry(),
-                    submission.previousRevision(), submission.current(), submission.reserved(),
-                    submission.timing(), submission.success(), submission.canceled(),
-                    submission.blocked(), submission.failure());
-        }
-        long rendererQueuedNanos = System.nanoTime();
+    @SuppressWarnings("unchecked")
+    public <T> T tryPublishRegionalSections(Supplier<PreparedBatch<T>> prepare) {
+        RegionalPublicationBatch batch;
         synchronized (this.submissionLock) {
-            if (!this.running) {
-                if (this.uncaughtException != null) {
-                    throw new RuntimeException(this.uncaughtException);
+            if (!this.running) throw new IllegalStateException("renderer stopped",
+                    this.uncaughtException);
+            batch = this.regionalBatchHandoff.trySubmit(() -> {
+                PreparedBatch<T> prepared = Objects.requireNonNull(prepare.get());
+                List<RegionalSectionSubmission> submissions = prepared.submissions();
+                if (submissions.isEmpty()) throw new IllegalArgumentException("empty batch");
+                RegionalSectionPublication[] publications =
+                        new RegionalSectionPublication[submissions.size()];
+                for (int index = 0; index < publications.length; index++) {
+                    RegionalSectionSubmission submission = submissions.get(index);
+                    BuiltSection geometry = submission.geometry();
+                    long bytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
+                    long staged = UploadStream.alignUp(bytes, UploadStream.BASE_ALLOCATION_ALIGNEMENT)
+                            + UploadStream.alignUp(16, UploadStream.BASE_ALLOCATION_ALIGNEMENT);
+                    if (staged > UploadStream.CAPACITY_BYTES) {
+                        throw new IllegalArgumentException("regional section exceeds upload ceiling");
+                    }
+                    publications[index] = new RegionalSectionPublication(geometry,
+                            submission.previousRevision(), submission.current(), submission.reserved(),
+                            submission.timing(), submission.success(), submission.canceled(),
+                            submission.blocked(), submission.failure());
                 }
-                throw new IllegalStateException("Voxy renderer is not running");
-            }
-            if (this.regionalBatchHandoff != null) {
-                throw new IllegalStateException("regional renderer handoff is occupied");
-            }
-            for (RegionalSectionPublication publication : publications) {
-                publication.timing().recordRendererQueued(rendererQueuedNanos);
-            }
-            long enqueuedNanos = System.nanoTime();
-            this.regionalBatchHandoff = new RegionalPublicationBatch(publications, enqueuedNanos);
-            this.recordSubmittedRegionalBatch(publications.length);
+                long now = System.nanoTime();
+                for (RegionalSectionPublication publication : publications) {
+                    publication.timing().recordRendererQueued(now);
+                }
+                return new RegionalPublicationBatch(publications, now, prepared.receipt());
+            });
         }
+        if (batch == null) return null;
+        this.recordSubmittedRegionalBatch(batch.publications().length);
         this.signalWork();
+        return (T) batch.receipt();
     }
 
     public void addTopLevel(long section) {//Only called from render thread
@@ -1144,13 +1185,16 @@ public class AsyncNodeManager {
         this.thread.start();
     }
 
+    private boolean stopping;
+
     public void stop() {
         synchronized (this.submissionLock) {
-            if (!this.running) {
-                throw new IllegalStateException();
-            }
+            if (this.stopping) return;
+            this.stopping = true;
             this.running = false;
+            this.regionalBatchHandoff.stop(new IllegalStateException("renderer stopped"));
         }
+        this.notifyPublicationProgress();
         LockSupport.unpark(this.thread);
         try {
             while (this.thread.isAlive()) {
@@ -1160,6 +1204,14 @@ public class AsyncNodeManager {
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
         }
+
+        // A failed worker may have staged native meshes without reaching the sync upload.
+        // No worker can touch them after join; queued publications below own different buffers.
+        for (var buffer : this.geometryManager.getUploads().values()) {
+            if (!buffer.isFreed()) buffer.free();
+        }
+        this.geometryManager.getUploads().clear();
+        this.geometryManager.uploadsDrained();
 
         if (this.activeRegionalBatch != null) {
             RegionalSectionPublication[] publications =
@@ -1171,11 +1223,7 @@ public class AsyncNodeManager {
             this.activeRegionalBatch = null;
             this.activeRegionalBatchIndex = 0;
         }
-        RegionalPublicationBatch handoff;
-        synchronized (this.submissionLock) {
-            handoff = this.regionalBatchHandoff;
-            this.regionalBatchHandoff = null;
-        }
+        RegionalPublicationBatch handoff = this.regionalBatchHandoff.take();
         if (handoff != null) {
             for (RegionalSectionPublication publication : handoff.publications()) {
                 this.failUnsubmittedPublication(publication);

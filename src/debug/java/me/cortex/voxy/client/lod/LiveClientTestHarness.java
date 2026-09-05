@@ -177,6 +177,17 @@ final class LiveClientTestHarness {
         }
         active.stepId = command.stepId();
         switch (command.kind()) {
+            case RECONNECT_QUIC -> {
+                // Close only this Voxy transport on its owner. Normal connection-loss recovery
+                // must reconnect; neither Minecraft nor any other client is disconnected.
+                if (!ClientSession.requestDebugSession(session -> {
+                    if (session.quic != null) session.quic.close();
+                    Minecraft.getInstance().execute(() -> {
+                        if (run == active) requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT,
+                                active.runId, active.stepId, DebugTestProtocol.Failure.NONE, false);
+                    });
+                })) sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
+            }
             case EXPECT_POSE -> active.pose = new PoseExpectation(command,
                     System.nanoTime() + command.timeoutNanos(), renderedFrame);
             case START_TRACE -> {
@@ -453,7 +464,25 @@ final class LiveClientTestHarness {
                 pipeline == null ? 0 : pipeline.rendererAllocatedBytes(),
                 Math.max(render.conservativeSelected(), render.refinedSelected()),
                 Math.max(render.conservativeDraws(), render.refinedDraws()),
-                render.ageNanos());
+                render.ageNanos(),
+                pipeline == null ? 0 : pipeline.handoffGeneration(),
+                pipeline == null ? 0 : pipeline.handoffOccupied(),
+                pipeline == null ? 0 : pipeline.publicationActivated(),
+                pipeline == null ? 0 : pipeline.publicationReturned(),
+                pipeline == null ? 0 : pipeline.publicationCancelled(),
+                pipeline == null ? 0 : pipeline.publicationFailed(),
+                pipeline == null ? 0 : pipeline.outstandingLeases(),
+                pipeline == null ? 0 : pipeline.pendingCoverageReplies(),
+                pipeline == null ? 0 : pipeline.pendingRefinementReplies(),
+                pipeline == null ? 0 : pipeline.blockedGeometry(),
+                pipeline == null ? 0 : pipeline.blockedSectionId(),
+                pipeline == null ? 0 : pipeline.blockedTopology(),
+                pipeline == null ? 0 : pipeline.blockedStale(),
+                pipeline == null ? 0 : pipeline.impossible(),
+                pipeline == null ? 0 : pipeline.topologyGeneration(),
+                pipeline == null ? 0 : pipeline.allocationReleaseGeneration(),
+                pipeline == null ? 0 : pipeline.sectionIdReleaseGeneration(),
+                pipeline == null ? 0 : pipeline.handoffBusy());
     }
 
     private static void clearRun() {

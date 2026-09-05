@@ -12,6 +12,7 @@ import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.building.SectionMesher;
 import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
+import me.cortex.voxy.client.core.rendering.hierarchical.SectionPublicationState;
 import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierarchical.NodeCleaner;
 import me.cortex.voxy.client.core.rendering.section.MDICSectionRenderer;
@@ -74,8 +75,8 @@ public class VoxyRenderSystem {
 
     public interface SectionPublication extends AutoCloseable {
         boolean activationFencePassed();
-        Optional<Throwable> activationFailure();
-        Optional<AllocationBlock> takeAllocationBlock();
+        Optional<UploadOutcome> takeUploadOutcome();
+        void abandon(Runnable resolved);
         boolean retirementFencePassed();
         @Override void close();
     }
@@ -85,7 +86,13 @@ public class VoxyRenderSystem {
     }
 
     public record AllocationBlock(BuiltSection geometry, AllocationStatus status,
-                                  long requiredUnits, long largestFreeUnits) {}
+                                  long requiredUnits, long largestFreeUnits, long prerequisite,
+                                  AsyncNodeManager.PublicationProgress observed) {}
+
+    public enum UploadStatus { ACTIVATED, RETURNED, CANCELLED, FAILED }
+    public record UploadOutcome(UploadStatus status, AllocationBlock block, Throwable failure) {}
+    public enum SubmissionStatus { ACCEPTED, BUSY }
+    public record SubmissionAttempt(SubmissionStatus status, List<SectionPublication> publications) {}
 
     public record SectionSubmission(long position, BuiltSection geometry, boolean coverage,
                                     long meshCompletedNanos,
@@ -100,16 +107,27 @@ public class VoxyRenderSystem {
     }
 
     public interface SectionPublisher {
-        List<SectionPublication> publishBatch(List<SectionSubmission> submissions);
+        SubmissionAttempt tryPublishBatch(List<SectionSubmission> submissions);
+        AsyncNodeManager.PublicationProgress progress();
+        void setProgressListener(Runnable listener);
+        void clearProgressListener(Runnable listener);
         void coarsen(long parent, Runnable success, Consumer<Throwable> failure);
     }
 
     public SectionPublisher regionalSectionPublisher() {
         return new SectionPublisher() {
             @Override
-            public List<SectionPublication> publishBatch(
-                    List<SectionSubmission> submissions) {
+            public SubmissionAttempt tryPublishBatch(List<SectionSubmission> submissions) {
                 return publishRegionalSections(submissions);
+            }
+            @Override public AsyncNodeManager.PublicationProgress progress() {
+                return nodeManager.publicationProgress();
+            }
+            @Override public void setProgressListener(Runnable listener) {
+                nodeManager.setPublicationProgressListener(listener);
+            }
+            @Override public void clearProgressListener(Runnable listener) {
+                nodeManager.clearPublicationProgressListener(listener);
             }
 
             @Override
@@ -163,54 +181,36 @@ public class VoxyRenderSystem {
                 + ";gpuToActive:" + this.regionalPublicationLatencies[lane][2].snapshot();
     }
 
-    private List<SectionPublication> publishRegionalSections(
-            List<SectionSubmission> submissions) {
+    private SubmissionAttempt publishRegionalSections(List<SectionSubmission> submissions) {
         Objects.requireNonNull(submissions, "submissions");
-        if (submissions.isEmpty()) return List.of();
-        ArrayList<AsyncNodeManager.RegionalSectionSubmission> rendererSubmissions =
-                new ArrayList<>(submissions.size());
-        ArrayList<SectionPublication> handles = new ArrayList<>(submissions.size());
-        for (SectionSubmission submission : submissions) {
-            Objects.requireNonNull(submission, "submission");
-            if (submission.geometry().position != submission.position()) {
-                throw new IllegalArgumentException(
-                        "regional geometry is bound to the wrong section");
+        if (submissions.isEmpty()) return new SubmissionAttempt(SubmissionStatus.ACCEPTED, List.of());
+        SubmissionAttempt accepted = this.nodeManager.tryPublishRegionalSections(() -> {
+            ArrayList<AsyncNodeManager.RegionalSectionSubmission> rendererSubmissions =
+                    new ArrayList<>(submissions.size());
+            ArrayList<SectionPublication> handles = new ArrayList<>(submissions.size());
+            for (SectionSubmission submission : submissions) {
+                Objects.requireNonNull(submission, "submission");
+                if (submission.geometry().position != submission.position()) {
+                    throw new IllegalArgumentException("geometry is bound to the wrong section");
+                }
+                RegionalSectionPublication previous = submission.previous()
+                        .map(value -> requireRegionalSectionPublication(submission.position(), value))
+                        .orElse(null);
+                PreparedRegionalSection prepared = this.prepareRegionalSection(submission.position(),
+                        submission.geometry(), previous, submission.coverage(),
+                        submission.meshCompletedNanos(), submission.current(), submission.reserved());
+                rendererSubmissions.add(prepared.submission());
+                handles.add(prepared.publication());
             }
-            RegionalSectionPublication previousPublication = submission.previous()
-                    .map(value -> requireRegionalSectionPublication(
-                            submission.position(), value))
-                    .orElse(null);
-            PreparedRegionalSection prepared = this.prepareRegionalSection(
-                    submission.position(), submission.geometry(), previousPublication, false,
-                    submission.coverage(), submission.meshCompletedNanos(),
-                    submission.current(), submission.reserved());
-            rendererSubmissions.add(prepared.submission());
-            handles.add(prepared.publication());
-        }
-        // Allocate the result before ownership transfers; returning after enqueue cannot fail.
-        List<SectionPublication> result = List.copyOf(handles);
-        this.nodeManager.publishRegionalSections(rendererSubmissions);
-        return result;
-    }
-
-    private RegionalSectionPublication queueRegionalSection(
-            long position, BuiltSection geometry, RegionalSectionPublication previous,
-            boolean removal, boolean coverage, long meshCompletedNanos,
-            BooleanSupplier current, Runnable reserved) {
-        PreparedRegionalSection prepared = this.prepareRegionalSection(position, geometry,
-                previous, removal, coverage, meshCompletedNanos, current, reserved);
-        try {
-            this.nodeManager.publishRegionalSections(List.of(prepared.submission()));
-        } catch (RuntimeException | Error failure) {
-            prepared.submission().geometry().free();
-            prepared.publication().failAndRollback(failure);
-        }
-        return prepared.publication();
+            return new AsyncNodeManager.PreparedBatch<>(rendererSubmissions,
+                    new SubmissionAttempt(SubmissionStatus.ACCEPTED, List.copyOf(handles)));
+        });
+        return accepted == null ? new SubmissionAttempt(SubmissionStatus.BUSY, List.of()) : accepted;
     }
 
     private PreparedRegionalSection prepareRegionalSection(
             long position, BuiltSection geometry, RegionalSectionPublication previous,
-            boolean removal, boolean coverage, long meshCompletedNanos,
+            boolean coverage, long meshCompletedNanos,
             BooleanSupplier current, Runnable reserved) {
         Objects.requireNonNull(geometry, "geometry");
         Objects.requireNonNull(current, "current");
@@ -220,21 +220,20 @@ public class VoxyRenderSystem {
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
                 geometry.aabb, geometry.geometryBuffer, geometry.offsets);
         RegionalSectionPublication publication = new RegionalSectionPublication(
-                this.nodeManager, position, revision, removal, coverage, meshCompletedNanos);
+                this.nodeManager, position, revision, coverage, meshCompletedNanos);
         long previousRevision = previous == null ? -1 : previous.revision;
         AsyncNodeManager.RegionalSectionSubmission submission =
                 new AsyncNodeManager.RegionalSectionSubmission(queued, previousRevision,
-                current, reserved, publication, () ->
+                () -> current.getAsBoolean() && publication.acceptsUpload(),
+                reserved, publication, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
                     publication.recordActivationFencePassed(System.nanoTime());
-                    publication.activated.set(true);
-                    if (previous != null) previous.markSafeToRelease();
-                    if (removal) publication.markSafeToRelease();
-                    publication.finishCloseIfRequested();
+                    publication.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
+                    if (previous != null) previous.markRetired();
                 }, publication::failAndRollback), publication::cancelBeforeStaging,
                 block -> publication.recordAllocationBlock(new AllocationBlock(block.geometry(),
                         AllocationStatus.valueOf(block.status().name()), block.requiredUnits(),
-                        block.largestFreeUnits())),
+                        block.largestFreeUnits(), block.prerequisite(), block.observed())),
                 publication::failAndRollback);
         return new PreparedRegionalSection(publication, submission);
     }
@@ -260,44 +259,35 @@ public class VoxyRenderSystem {
             throw new IllegalArgumentException(
                     "replacement publication belongs to another renderer");
         }
-        if (!publication.activationFencePassed() || publication.retired.get()) {
+        if (!publication.activationFencePassed() || publication.retirementFencePassed()) {
             throw new IllegalStateException("publication is not an active renderer surface");
         }
         return publication;
     }
 
-    private final class RegionalSectionPublication
-            implements SectionPublication, AsyncNodeManager.RegionalPublicationTiming {
+    private final class RegionalSectionPublication extends SectionPublicationState
+            implements AsyncNodeManager.RegionalPublicationTiming {
         private final AsyncNodeManager renderer;
         private final long position;
         private final long revision;
-        private final boolean removal;
         private final boolean coverage;
         private final long meshCompletedNanos;
         private volatile long rendererQueuedNanos;
         private volatile long gpuUploadSubmittedNanos;
-        private final AtomicBoolean activated = new AtomicBoolean();
-        private final AtomicBoolean retired = new AtomicBoolean();
-        private final AtomicBoolean closeRequested = new AtomicBoolean();
-        private final AtomicBoolean removalQueued = new AtomicBoolean();
         private final AtomicBoolean failureRecoveryQueued = new AtomicBoolean();
-        private final AtomicReference<AllocationBlock> allocationBlock = new AtomicReference<>();
-        private volatile Throwable failure;
 
         private RegionalSectionPublication(AsyncNodeManager renderer, long position,
-                                           long revision, boolean removal, boolean coverage,
+                                           long revision, boolean coverage,
                                            long meshCompletedNanos) {
             this.renderer = renderer;
             this.position = position;
             this.revision = revision;
-            this.removal = removal;
             this.coverage = coverage;
             this.meshCompletedNanos = meshCompletedNanos;
         }
 
         @Override
         public void recordRendererQueued(long nowNanos) {
-            if (this.removal) return;
             this.rendererQueuedNanos = nowNanos;
             regionalPublicationLatencies[this.coverage ? 0 : 1][0]
                     .record(nowNanos - this.meshCompletedNanos);
@@ -305,68 +295,39 @@ public class VoxyRenderSystem {
 
         @Override
         public void recordGpuUploadSubmitted(long nowNanos) {
-            if (this.removal || this.rendererQueuedNanos == 0) return;
+            if (this.rendererQueuedNanos == 0) return;
             this.gpuUploadSubmittedNanos = nowNanos;
             regionalPublicationLatencies[this.coverage ? 0 : 1][1]
                     .record(nowNanos - this.rendererQueuedNanos);
         }
 
         private void recordActivationFencePassed(long nowNanos) {
-            if (this.removal || this.gpuUploadSubmittedNanos == 0) return;
+            if (this.gpuUploadSubmittedNanos == 0) return;
             regionalPublicationLatencies[this.coverage ? 0 : 1][2]
                     .record(nowNanos - this.gpuUploadSubmittedNanos);
         }
 
-        @Override
-        public boolean activationFencePassed() {
-            return this.activated.get() && this.failure == null;
-        }
-
-        @Override
-        public Optional<Throwable> activationFailure() {
-            return Optional.ofNullable(this.failure);
-        }
-
-        @Override
-        public Optional<AllocationBlock> takeAllocationBlock() {
-            return Optional.ofNullable(this.allocationBlock.getAndSet(null));
-        }
-
         private void recordAllocationBlock(AllocationBlock block) {
-            if (!this.allocationBlock.compareAndSet(null, block)) {
-                block.geometry().free();
-                this.failAndRollback(new IllegalStateException(
-                        "renderer returned one publication more than once"));
-            }
+            this.completeUpload(new UploadOutcome(UploadStatus.RETURNED, block, null));
+        }
+
+        @Override protected void stateChanged() {
             this.renderer.regionalPublicationStateChanged();
+            this.renderer.notifyPublicationProgress();
         }
 
-        @Override
-        public boolean retirementFencePassed() {
-            return this.retired.get();
-        }
-
-        @Override
-        public void close() {
-            this.closeRequested.set(true);
-            this.renderer.regionalPublicationStateChanged();
-            finishCloseIfRequested();
-        }
-
-        private void finishCloseIfRequested() {
-            if (!this.closeRequested.get() || this.failure != null || !this.activated.get()
-                    || this.retired.get() || this.removal
-                    || !this.removalQueued.compareAndSet(false, true)) return;
-            // Retirement removes this complete subtree. The old geometry remains active until
-            // the zero-child replacement and every descendant retirement cross their fences.
-            BuiltSection empty = BuiltSection.emptyWithChildren(this.position, (byte) 0);
-            queueRegionalSection(this.position, empty, this, true, false, 0,
-                    () -> true, () -> {});
+        @Override protected void requestRetirement() {
+            long retirementRevision = regionalSectionRevision.getAndIncrement();
+            this.renderer.retirePublication(retirementRevision, this.revision, this.position,
+                    this::markRetired, failure -> this.renderer.rollbackStagedRoot(
+                            retirementRevision, this::markRetired, rollback -> {
+                                failure.addSuppressed(rollback);
+                                Logger.error("Regional retirement rollback failed", failure);
+                            }));
         }
 
         private void cancelBeforeStaging() {
-            this.activated.set(true);
-            this.retired.set(true);
+            this.completeUpload(new UploadOutcome(UploadStatus.CANCELLED, null, null));
         }
 
         /**
@@ -384,14 +345,9 @@ public class VoxyRenderSystem {
 
         private void recordFailure(Throwable primary, Throwable rollback) {
             if (rollback != null && rollback != primary) primary.addSuppressed(rollback);
-            this.failure = primary;
-            markSafeToRelease();
-            this.finishCloseIfRequested();
+            this.completeUpload(new UploadOutcome(UploadStatus.FAILED, null, primary));
         }
 
-        private void markSafeToRelease() {
-            this.retired.set(true);
-        }
     }
 
     private static PublicationLatencyCounters[][] createPublicationLatencyCounters() {

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert"}
+VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert", "reconnect_quic"}
 COMPARISONS = {"==", "!=", "<", "<=", ">", ">="}
 RESULT_KINDS = {
     "pose": "POSE_REACHED",
@@ -96,6 +96,7 @@ def validate_scenario(scenario: Any) -> None:
             "wait_until": {"op", "field", "comparison", "value", "timeout_ms", "cadence_ms"},
             "checkpoint": {"op", "name"},
             "screenshot": {"op"},
+            "reconnect_quic": {"op"},
             "assert": {"op", "mode", "field", "comparison", "value", "from", "to", "direction"},
         }[operation]
         extras = set(step) - allowed
@@ -287,7 +288,11 @@ class ScenarioRun:
 
     def execute_step(self, operation: dict[str, Any], index: int) -> None:
         kind = operation["op"]
-        if kind == "pose":
+        if kind == "reconnect_quic":
+            self.step += 1
+            self.command_and_wait(f"voxytest reconnect_quic {self.run_id} {self.step}",
+                                  {"CHECKPOINT_RESULT"}, 30, f"reconnect_quic[{index}]")
+        elif kind == "pose":
             self.do_pose(operation, f"pose[{index}]")
         elif kind in {"hold", "trace"}:
             self.step += 1

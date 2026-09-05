@@ -25,6 +25,11 @@ public class BasicAsyncGeometryManager {
     private final IntOpenHashSet heapRemoveUploads = new IntOpenHashSet(1024);//Any removals are added here, so that it can be properly synced
     private long usedCapacity = 0;
     private long pendingUploadBytes = 0;
+    private volatile long allocationReleaseGeneration;
+    private volatile long sectionReleaseGeneration;
+
+    public long allocationReleaseGeneration() { return this.allocationReleaseGeneration; }
+    public long sectionReleaseGeneration() { return this.sectionReleaseGeneration; }
 
     public enum AdmissionStatus {
         ACCEPTED, NO_CONTIGUOUS_GEOMETRY_SPACE, NO_SECTION_ID, IMPOSSIBLE
@@ -210,6 +215,8 @@ public class BasicAsyncGeometryManager {
         }
         this.heapRemoveUploads.add(ptr);
         this.invalidatedIds.add(id);
+        this.allocationReleaseGeneration++;
+        this.sectionReleaseGeneration++;
     }
 
     private SectionMeta createMeta(BuiltSection section) {

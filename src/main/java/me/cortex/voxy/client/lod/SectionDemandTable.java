@@ -43,6 +43,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         boolean subscribed;
         boolean absent;
         int resourceSlot = -1;
+        WorkerResource.Lease resourceLease;
         final LinkedHashMap<Long, Demand> members = new LinkedHashMap<>();
 
         RegionDemand(long key) { this.key = key; }

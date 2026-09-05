@@ -24,7 +24,8 @@ public record DebugTestSnapshot(
         long selectedBytes, long warmBytes, long coldBytes,
         long pendingRetirementBytes, long physicalGeometryBytes,
         long rendererTargetBytes, long rendererAllocatedBytes,
-        int gpuSelected, int gpuDraws, long gpuReadbackAgeNanos) {
+        int gpuSelected, int gpuDraws, long gpuReadbackAgeNanos,
+        long handoffGeneration, long handoffOccupied, long publicationActivated, long publicationReturned, long publicationCancelled, long publicationFailed, long outstandingLeases, long pendingCoverageReplies, long pendingRefinementReplies, long blockedGeometry, long blockedSectionId, long blockedTopology, long blockedStale, long impossible, long topologyGeneration, long allocationReleaseGeneration, long sectionIdReleaseGeneration, long handoffBusy) {
     public static final long POSE_PRESENT = 1L;
     public static final long SESSION_PRESENT = 1L << 1;
     public static final long GEOMETRY_RETENTION_PRESENT = 1L << 2;
@@ -34,7 +35,8 @@ public record DebugTestSnapshot(
         return new DebugTestSnapshot(0, 0, 0, "", 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     static DebugTestSnapshot decode(RegistryFriendlyByteBuf input) {
@@ -68,7 +70,8 @@ public record DebugTestSnapshot(
                 counters[15], counters[16], counters[17], counters[18], counters[19],
                 counters[20], counters[21], counters[22], counters[23], counters[24],
                 counters[25], counters[26], input.readVarInt(), input.readVarInt(),
-                input.readVarLong());
+                input.readVarLong(),
+                input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong());
     }
 
     void encode(RegistryFriendlyByteBuf output) {
@@ -95,6 +98,24 @@ public record DebugTestSnapshot(
         for (long counter : counters) output.writeVarLong(counter);
         output.writeVarInt(this.gpuSelected); output.writeVarInt(this.gpuDraws);
         output.writeVarLong(this.gpuReadbackAgeNanos);
+        output.writeVarLong(this.handoffGeneration);
+        output.writeVarLong(this.handoffOccupied);
+        output.writeVarLong(this.publicationActivated);
+        output.writeVarLong(this.publicationReturned);
+        output.writeVarLong(this.publicationCancelled);
+        output.writeVarLong(this.publicationFailed);
+        output.writeVarLong(this.outstandingLeases);
+        output.writeVarLong(this.pendingCoverageReplies);
+        output.writeVarLong(this.pendingRefinementReplies);
+        output.writeVarLong(this.blockedGeometry);
+        output.writeVarLong(this.blockedSectionId);
+        output.writeVarLong(this.blockedTopology);
+        output.writeVarLong(this.blockedStale);
+        output.writeVarLong(this.impossible);
+        output.writeVarLong(this.topologyGeneration);
+        output.writeVarLong(this.allocationReleaseGeneration);
+        output.writeVarLong(this.sectionIdReleaseGeneration);
+        output.writeVarLong(this.handoffBusy);
     }
 
     public DebugTestSnapshot {

@@ -10,7 +10,7 @@ import java.util.Map;
 public final class SectionDemandTableBehaviorTest {
     private SectionDemandTableBehaviorTest() {}
 
-    public static void main(String[] arguments) {
+    public static void main(String[] arguments) throws Exception {
         retainsOneHundredThousandDetailTransitions();
         coalescesNewestUnsignedEpoch();
         priorityMovesOneMembership();
@@ -19,6 +19,8 @@ public final class SectionDemandTableBehaviorTest {
         staleTicketCannotMutateReplacement();
         allocatorUsesExactOneKiBUnits();
         allocatorReportsFragmentation();
+        PublicationRepairBehaviorTest.run();
+        me.cortex.voxy.client.core.rendering.hierarchical.PublicationTopologyBehaviorTest.run();
         System.out.println("coalesced demand-table behavior tests passed");
     }
 

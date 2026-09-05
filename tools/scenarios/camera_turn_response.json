@@ -7,6 +7,8 @@
     {"op": "pose", "dimension": "minecraft:overworld", "x": 0.5, "y": 100.0, "z": 0.5, "yaw": 180.0, "pitch": 0.0},
     {"op": "trace", "duration_ms": 15000, "cadence_ms": 100},
     {"op": "checkpoint", "name": "view_b"},
-    {"op": "assert", "mode": "delta", "field": "activatedTotal", "from": "view_a", "to": "view_b", "comparison": ">", "value": 0}
+    {"op": "assert", "field": "active", "comparison": ">", "value": 0},
+    {"op": "assert", "field": "coverageMissing", "comparison": "==", "value": 0},
+    {"op": "assert", "mode": "absence_of_failure"}
   ]
 }

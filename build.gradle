@@ -120,6 +120,8 @@ tasks.named('processResources') {
 }
 
 dependencies {
+    // Scheduler ownership tests exercise real native allocations outside a Minecraft launch.
+    schedulerTestRuntimeOnly 'org.lwjgl:lwjgl:3.3.3:natives-linux'
     def sodiumVersion = providers.gradleProperty('sodium_version').get()
     def lwjglZstd = 'org.lwjgl:lwjgl-zstd:3.3.3'
     def kwikVersion = '0.10.10'
@@ -240,12 +242,20 @@ tasks.register('verifyDebugHarnessArtifacts') {
         def serverNormal = project(':server').tasks.named('jar', Jar).get().archiveFile.get().asFile
         def serverDebug = project(':server').tasks.named('debugJar', Jar).get().archiveFile.get().asFile
         [clientNormal, serverNormal].each { artifact ->
-            def leaked = zipTree(artifact).matching { include forbiddenPrefix + '**' }.files
+            def leaked = zipTree(artifact).matching {
+                include forbiddenPrefix + '**'
+                include '**/LiveClientTestHarness*', '**/LiveServerTestHarness*'
+            }.files
             if (!leaked.empty) throw new GradleException("debug-test protocol leaked into ${artifact}")
         }
         [clientDebug, serverDebug].each { artifact ->
             def protocol = zipTree(artifact).matching { include forbiddenPrefix + '**' }.files
             if (protocol.empty) throw new GradleException("debug-test protocol missing from ${artifact}")
+        }
+        [clientNormal, serverNormal, clientDebug, serverDebug].each { artifact ->
+            if (!zipTree(artifact).matching { include '**/*BehaviorTest*' }.files.empty) {
+                throw new GradleException("offline behavior tests leaked into ${artifact}")
+            }
         }
         if (!zipTree(clientDebug).matching {
             include 'me/cortex/voxy/client/lod/LiveClientTestHarness.class'

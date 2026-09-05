@@ -17,6 +17,7 @@ public final class DebugHarnessBehaviorTest {
 
     public static void main(String[] arguments) {
         codecRoundTrips();
+        snapshotCountersRoundTripIndividually();
         malformedVersionIsRejected();
         orderingRejectsStaleAndFutureResults();
         yawWrapsAtTheSignedBoundary();
@@ -56,6 +57,31 @@ public final class DebugHarnessBehaviorTest {
         expectFailure(() -> new DebugTestCommandPayload(DebugTestProtocol.CommandKind.BEGIN_RUN,
                         UUID.randomUUID(), -1, 1, "", 0, 0, 0, 0, 0, 0, 0, 0),
                 "negative step was accepted");
+    }
+
+    private static void snapshotCountersRoundTripIndividually() {
+        try {
+            var fields = DebugTestSnapshot.class.getRecordComponents();
+            Class<?>[] types = new Class<?>[fields.length];
+            Object[] values = new Object[fields.length];
+            for (int i = 0; i < fields.length; i++) {
+                types[i] = fields[i].getType();
+                if (types[i] == long.class) values[i] = (long) i + 1;
+                else if (types[i] == int.class) values[i] = i + 1;
+                else if (types[i] == float.class) values[i] = (float) i + 1;
+                else if (types[i] == double.class) values[i] = (double) i + 1;
+                else if (types[i] == boolean.class) values[i] = true;
+                else values[i] = "minecraft:overworld";
+            }
+            var original = DebugTestSnapshot.class.getDeclaredConstructor(types).newInstance(values);
+            RegistryFriendlyByteBuf bytes = buffer();
+            original.encode(bytes);
+            check(original.equals(DebugTestSnapshot.decode(bytes)), "snapshot field ordering changed");
+            check(!bytes.isReadable(), "snapshot codec left unread counters");
+            bytes.release();
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("snapshot codec test could not construct observation", failure);
+        }
     }
 
     private static void orderingRejectsStaleAndFutureResults() {

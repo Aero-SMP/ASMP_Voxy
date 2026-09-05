@@ -4,6 +4,7 @@ import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
+import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
 import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
@@ -105,9 +106,15 @@ final class ClientSession {
     /** Debug harness handoff. The real owner thread creates the observation without blocking. */
     static boolean requestDebugSnapshot(Consumer<PipelineSnapshot> receiver) {
         Objects.requireNonNull(receiver, "snapshot receiver");
+        return requestDebugSession(session -> receiver.accept(session.pipelineSnapshot()));
+    }
+
+    /** Existing owner-event boundary; test actions themselves live only in the debug artifact. */
+    static boolean requestDebugSession(Consumer<Session> receiver) {
+        Objects.requireNonNull(receiver, "session observer");
         Session current = active;
         if (current == null || !current.open.get()) return false;
-        boolean accepted = current.events.offer(new SnapshotRequest(receiver));
+        boolean accepted = current.events.offer(new SessionObservation(receiver));
         if (accepted) current.signal();
         return accepted;
     }
@@ -127,7 +134,8 @@ final class ClientSession {
             int idleWorkers, int runningWorkers, int completedWorkers,
             long completedWorkerBytes, int idleLanes, int activeLanes,
             int activeLaneSections, long laneBodyBytes, long reconnects,
-            long largestFreeGeometryUnits, int usedGeometrySections) {}
+            long largestFreeGeometryUnits, int usedGeometrySections,
+            long handoffGeneration, long handoffOccupied, long publicationActivated, long publicationReturned, long publicationCancelled, long publicationFailed, long outstandingLeases, long pendingCoverageReplies, long pendingRefinementReplies, long blockedGeometry, long blockedSectionId, long blockedTopology, long blockedStale, long impossible, long topologyGeneration, long allocationReleaseGeneration, long sectionIdReleaseGeneration, long handoffBusy) {}
 
     static void tick() {
         Minecraft minecraft = Minecraft.getInstance();
@@ -209,7 +217,7 @@ final class ClientSession {
         synchronized (TOP_LEVEL) { return List.copyOf(TOP_LEVEL); }
     }
 
-    private static final class Demand extends SectionDemandTable.Demand {
+    static final class Demand extends SectionDemandTable.Demand {
         RegionalProtocol.RegionIndex index;
         int ordinal = -1;
         VoxyRenderSystem.SectionPublication publication;
@@ -228,8 +236,10 @@ final class ClientSession {
         int dormantBucket;
         long lastSelectedSequence;
         int[] waitingModels;
-        Session.WorkerSlot completedSlot;
-        int activeWorkerSlot = -1;
+        WorkerResource.Lease workLease;
+        VoxyRenderSystem.AllocationStatus blockedReason;
+        AsyncNodeManager.PublicationProgress blockedAt;
+        long prerequisite;
         long blockedRequiredBytes;
 
         Demand(long key) {
@@ -252,7 +262,7 @@ final class ClientSession {
         }
     }
 
-    private static final class Session implements AutoCloseable {
+    static final class Session implements AutoCloseable {
         final long id;
         final String dimension;
         final VoxyRenderSystem renderer;
@@ -280,6 +290,10 @@ final class ClientSession {
         final Long2LongOpenHashMap pendingDormantEvictions = new Long2LongOpenHashMap();
         final Object publicationLock = new Object();
         final ArrayDeque<PublicationRef> publicationQueue = new ArrayDeque<>();
+        final Runnable rendererWake = this::signal;
+        long busyHandoff = -1;
+        long handoffBusy;
+        final long[] publicationOutcomes = new long[VoxyRenderSystem.UploadStatus.values().length];
 
         RegionalQuicClient quic;
         RegionalProtocol.Control pendingControl;
@@ -323,22 +337,28 @@ final class ClientSession {
         volatile Throwable lastConnectionFailure;
         long reconnects;
 
-        private static final class NetworkReply {
+        static final class NetworkReply {
             final long connectionEpoch;
             final RegionalProtocol.SectionReply reply;
+            final SectionDemandTable.Ticket ticket;
             final Semaphore transferred = new Semaphore(0);
+            final AtomicBoolean released = new AtomicBoolean();
 
-            NetworkReply(long connectionEpoch, RegionalProtocol.SectionReply reply) {
+            NetworkReply(long connectionEpoch, RegionalProtocol.SectionReply reply,
+                         SectionDemandTable.Ticket ticket) {
                 this.connectionEpoch = connectionEpoch;
                 this.reply = reply;
+                this.ticket = ticket;
             }
 
             void awaitTransfer() throws InterruptedException { this.transferred.acquire(); }
-            void transferred() { this.transferred.release(); }
+            void transferred() { if (this.released.compareAndSet(false, true)) this.transferred.release(); }
         }
 
         private enum WorkerSource { CACHE, NETWORK }
-        private sealed interface WorkerTask permits SectionWorkerTask, IndexWorkerTask {}
+        sealed interface WorkerTask permits SectionWorkerTask, IndexWorkerTask, EmptyWorkerTask {}
+        record EmptyWorkerTask(SectionDemandTable.Ticket ticket, byte children)
+                implements WorkerTask {}
         private record SectionWorkerTask(SectionDemandTable.Ticket ticket,
                                          RegionalProtocol.RegionIndex index, int ordinal,
                                          WorkerSource source, byte[] compressed,
@@ -347,14 +367,14 @@ final class ClientSession {
         private record IndexWorkerTask(long session, long connection, long region, long generation,
                                        int slot, RegionalProtocol.RegionMessage message)
                 implements WorkerTask {}
-        private sealed interface WorkerResult permits WorkerMiss, WorkerModels,
+        sealed interface WorkerResult permits WorkerMiss, WorkerModels,
                 WorkerGeometry, WorkerIndex, WorkerFailure {}
         private record WorkerMiss(SectionDemandTable.Ticket ticket, boolean corrupt)
                 implements WorkerResult {}
         private record WorkerModels(SectionDemandTable.Ticket ticket, int[] blocks,
                                     boolean cacheHit, int compressedBytes)
                 implements WorkerResult {}
-        private record WorkerGeometry(SectionDemandTable.Ticket ticket, BuiltSection geometry,
+        record WorkerGeometry(SectionDemandTable.Ticket ticket, BuiltSection geometry,
                                       long completedNanos, boolean cacheHit,
                                       int compressedBytes) implements WorkerResult {}
         private record WorkerIndex(long session, long connection, long region, long generation,
@@ -364,96 +384,76 @@ final class ClientSession {
                 implements WorkerResult {}
 
         /** A persistent resource slot owns exactly one task or completion and has no backlog. */
-        private final class WorkerSlot {
-            private enum State { IDLE, RUNNING, COMPLETED, CLOSED }
+        final class WorkerSlot {
             final int index;
             final Thread workerThread;
             final RegionalSectionCodec codec = new RegionalSectionCodec();
-            private State state = State.IDLE;
+            final WorkerResource<WorkerResult> resource;
             private WorkerTask task;
-            private WorkerResult result;
-            private boolean completionClaimed;
+            private WorkerResource.Lease taskLease;
+            private long operationKey;
+            private boolean sectionOperation;
 
             WorkerSlot(int index) {
                 this.index = index;
-                this.workerThread = new Thread(this::run,
-                        "Voxy regional section worker-" + index);
+                this.resource = new WorkerResource<>(index, Session::freeWorkerResult);
+                this.workerThread = new Thread(this::run, "Voxy regional section worker-" + index);
                 this.workerThread.setDaemon(true);
             }
 
             void start() { this.workerThread.start(); }
-
-            synchronized boolean assign(WorkerTask task) {
-                if (this.state != State.IDLE) return false;
-                this.task = Objects.requireNonNull(task, "task");
-                this.state = State.RUNNING;
+            synchronized WorkerResource.Lease assign(WorkerTask task) {
+                WorkerResource.Lease lease = this.resource.acquire();
+                if (lease == null) return null;
+                this.task = Objects.requireNonNull(task);
+                this.sectionOperation = !(task instanceof IndexWorkerTask);
+                this.operationKey = switch (task) {
+                    case SectionWorkerTask section -> section.ticket().key();
+                    case EmptyWorkerTask empty -> empty.ticket().key();
+                    case IndexWorkerTask ignored -> 0;
+                };
+                this.taskLease = lease;
                 this.notifyAll();
-                return true;
+                return lease;
             }
-
-            synchronized boolean idle() { return this.state == State.IDLE; }
-            synchronized WorkerResult completion() {
-                if (this.state != State.COMPLETED || this.completionClaimed) return null;
-                this.completionClaimed = true;
-                return this.result;
-            }
-
-            synchronized boolean hasCompletion() {
-                return this.state == State.COMPLETED;
-            }
-
-            synchronized void disownCompletion(WorkerResult claimed) {
-                if (this.state != State.COMPLETED || !this.completionClaimed
-                        || this.result != claimed) {
-                    throw new IllegalStateException("worker completion ownership is invalid");
-                }
-                this.result = null;
-            }
-
-            synchronized void releaseCompletion() {
-                if (this.state != State.COMPLETED) {
-                    throw new IllegalStateException("worker has no completed resource");
-                }
-                this.result = null;
-                this.completionClaimed = false;
-                this.state = State.IDLE;
-                this.notifyAll();
+            boolean idle() { return this.resource.state() == WorkerResource.State.IDLE; }
+            void releaseCompletion(WorkerResource.Lease lease) {
+                if (this.resource.release(lease)) signal();
             }
 
             private void run() {
                 try {
                     while (true) {
-                    WorkerTask claimed;
-                    synchronized (this) {
-                        while (this.state != State.RUNNING && this.state != State.CLOSED) {
-                            try { this.wait(); }
-                            catch (InterruptedException interrupted) {
-                                if (this.state == State.CLOSED) return;
+                        WorkerTask claimed;
+                        WorkerResource.Lease lease;
+                        synchronized (this) {
+                            while (this.task == null
+                                    && this.resource.state() != WorkerResource.State.CLOSED) {
+                                try { this.wait(); }
+                                catch (InterruptedException interrupted) {
+                                    if (this.resource.state() == WorkerResource.State.CLOSED) return;
+                                }
                             }
+                            if (this.resource.state() == WorkerResource.State.CLOSED) return;
+                            claimed = this.task;
+                            lease = this.taskLease;
+                            this.task = null;
                         }
-                        if (this.state == State.CLOSED) return;
-                        claimed = this.task;
-                        this.task = null;
-                    }
-                    WorkerResult completion;
-                    try {
-                        completion = switch (claimed) {
-                            case SectionWorkerTask section -> this.section(section);
-                            case IndexWorkerTask index -> this.index(index);
-                        };
-                    } catch (Throwable failure) {
-                        completion = new WorkerFailure(claimed, this.index, failure);
-                    }
-                    synchronized (this) {
-                        if (this.state == State.CLOSED) {
-                            freeWorkerResult(completion);
-                            return;
+                        WorkerResult completion;
+                        try {
+                            completion = switch (claimed) {
+                                case SectionWorkerTask section -> this.section(section);
+                                case IndexWorkerTask index -> this.index(index);
+                                case EmptyWorkerTask empty -> new WorkerGeometry(empty.ticket(),
+                                        BuiltSection.emptyWithChildren(empty.ticket().key(),
+                                                empty.ticket().demandRevision(), empty.children()),
+                                        System.nanoTime(), true, 0);
+                            };
+                        } catch (Throwable failure) {
+                            completion = new WorkerFailure(claimed, this.index, failure);
                         }
-                        this.result = completion;
-                        this.completionClaimed = false;
-                        this.state = State.COMPLETED;
-                    }
-                    signal();
+                        this.resource.complete(lease, completion);
+                        signal();
                     }
                 } finally {
                     this.codec.close();
@@ -514,27 +514,28 @@ final class ClientSession {
             }
 
             synchronized void close() {
-                if (this.state == State.CLOSED) return;
-                if (this.result != null) freeWorkerResult(this.result);
-                this.result = null;
-                this.completionClaimed = false;
+                this.resource.close();
                 this.task = null;
-                this.state = State.CLOSED;
                 this.notifyAll();
                 this.workerThread.interrupt();
             }
         }
 
         Session(long id, String dimension, VoxyRenderSystem renderer) {
+            this(id, dimension, renderer, renderer.regionalSectionPublisher(),
+                    renderer.regionalSectionMesher(), Math.max(2, Math.min(16,
+                            Runtime.getRuntime().availableProcessors() - 2)));
+        }
+
+        Session(long id, String dimension, VoxyRenderSystem renderer,
+                VoxyRenderSystem.SectionPublisher publisher, SectionMesher mesher, int workers) {
             this.id = id;
             this.demands = new SectionDemandTable<>(
                     HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT, id);
             this.dimension = dimension;
             this.renderer = renderer;
-            this.publisher = renderer.regionalSectionPublisher();
-            this.mesher = renderer.regionalSectionMesher();
-            int workers = Math.max(2, Math.min(16,
-                    Runtime.getRuntime().availableProcessors() - 2));
+            this.publisher = publisher;
+            this.mesher = mesher;
             this.sectionWorkerCount = workers;
             this.sectionWorkers = new WorkerSlot[workers];
             for (int index = 0; index < workers; index++) {
@@ -546,6 +547,7 @@ final class ClientSession {
         }
 
         void start() {
+            this.publisher.setProgressListener(this.rendererWake);
             for (WorkerSlot worker : this.sectionWorkers) worker.start();
             this.thread.start();
         }
@@ -736,9 +738,11 @@ final class ClientSession {
             this.ensureCatalog(message.catalogFingerprint());
             WorkerSlot worker = this.idleWorker(state.coverageUsers > 0);
             if (worker == null) return false;
-            if (!worker.assign(new IndexWorkerTask(this.id, this.connectionEpoch, region,
-                    message.generation(), worker.index, message))) return false;
+            WorkerResource.Lease lease = worker.assign(new IndexWorkerTask(this.id,
+                    this.connectionEpoch, region, message.generation(), worker.index, message));
+            if (lease == null) return false;
             state.resourceSlot = worker.index;
+            state.resourceLease = lease;
             return true;
         }
 
@@ -768,17 +772,8 @@ final class ClientSession {
             state.absent = false;
             state.index = null;
             state.installedGeneration = 0;
-            for (SectionDemandTable.Demand base : state.members.values()) {
-                Demand demand = (Demand) base;
-                if (demand.installed
-                        && demand.candidate == SectionDemandTable.CandidateState.NONE) continue;
-                this.demands.unlinkReady(demand);
-                this.discardCompletedGeometry(demand);
-                this.demands.revise(demand);
-                demand.pendingIndex = null;
-                demand.pendingOrdinal = -1;
-                demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
-            }
+            // The arriving index binds new work. Already-owned operations finish with their
+            // exact revision and keep the old surface available until a replacement is ready.
             if (generation == 0) {
                 state.absent = true;
                 this.retireRegion(region);
@@ -820,7 +815,7 @@ final class ClientSession {
                             throw new IOException("regional section lane failed", failed.failure);
                         }
                     }
-                    case SnapshotRequest request -> request.receiver.accept(this.pipelineSnapshot());
+                    case SessionObservation request -> request.receiver.accept(this);
                 }
             }
         }
@@ -830,7 +825,9 @@ final class ClientSession {
             long ready = 0, publishing = 0;
             long waitRegion = 0, sourceReady = 0, networkOwned = 0, workerOwned = 0;
             long waitModels = 0, rendererOwned = 0;
+            long[] blocked = new long[AsyncNodeManager.RegionalAllocationStatus.values().length];
             for (Demand demand : this.demands.values()) {
+                if (demand.blockedReason != null) blocked[demand.blockedReason.ordinal()]++;
                 switch (demand.candidate) {
                     case WAIT_REGION -> waitRegion++;
                     case NETWORK_OWNED -> { downloading++; networkOwned++; }
@@ -853,12 +850,12 @@ final class ClientSession {
             long completedWorkerBytes = 0;
             for (WorkerSlot worker : this.sectionWorkers) {
                 synchronized (worker) {
-                    switch (worker.state) {
+                    switch (worker.resource.state()) {
                         case IDLE -> idleWorkers++;
                         case RUNNING -> runningWorkers++;
                         case COMPLETED -> {
                             completedWorkers++;
-                            if (worker.result instanceof WorkerGeometry geometry
+                            if (worker.resource.pendingResult() instanceof WorkerGeometry geometry
                                     && geometry.geometry().geometryBuffer != null) {
                                 completedWorkerBytes += geometry.geometry().geometryBuffer.size;
                             }
@@ -875,6 +872,15 @@ final class ClientSession {
                 newestRoot = Math.max(newestRoot, region.announcedGeneration);
             }
             long retry = Math.max(0, retryAfter - System.nanoTime());
+            var progress = this.publisher.progress();
+            long coverageReplies = 0, refinementReplies = 0;
+            for (NetworkReply reply : this.networkReplies) {
+                Demand demand = this.replyDemand(reply);
+                if (demand != null) {
+                    if (demand.coverage) coverageReplies++;
+                    else refinementReplies++;
+                }
+            }
             return new PipelineSnapshot(this.id, this.connectionEpoch, newestRoot,
                     this.failure != null, retry, this.missingCoverage.size(), this.demands.size(),
                     downloading, cacheReading, decoding, meshing, ready, publishing,
@@ -890,7 +896,18 @@ final class ClientSession {
                     runningWorkers, completedWorkers, completedWorkerBytes, lanes.idle(),
                     lanes.active(), lanes.activeSections(), lanes.bodyBytes(), this.reconnects,
                     this.renderer.regionalLargestFreeGeometryUnits(),
-                    this.renderer.regionalGeometrySectionCount());
+                    this.renderer.regionalGeometrySectionCount(), progress.handoff(), progress.occupied() ? 1 : 0,
+                    this.publicationOutcomes[VoxyRenderSystem.UploadStatus.ACTIVATED.ordinal()],
+                    this.publicationOutcomes[VoxyRenderSystem.UploadStatus.RETURNED.ordinal()],
+                    this.publicationOutcomes[VoxyRenderSystem.UploadStatus.CANCELLED.ordinal()],
+                    this.publicationOutcomes[VoxyRenderSystem.UploadStatus.FAILED.ordinal()],
+                    runningWorkers + completedWorkers, coverageReplies, refinementReplies,
+                    blocked[AsyncNodeManager.RegionalAllocationStatus.NO_CONTIGUOUS_GEOMETRY_SPACE.ordinal()],
+                    blocked[AsyncNodeManager.RegionalAllocationStatus.NO_SECTION_ID.ordinal()],
+                    blocked[AsyncNodeManager.RegionalAllocationStatus.TOPOLOGY_NOT_READY.ordinal()],
+                    blocked[AsyncNodeManager.RegionalAllocationStatus.STALE.ordinal()],
+                    blocked[AsyncNodeManager.RegionalAllocationStatus.IMPOSSIBLE.ordinal()],
+                    progress.topology(), progress.allocation(), progress.sectionIds(), this.handoffBusy);
         }
 
         void drainDemand() {
@@ -899,7 +916,6 @@ final class ClientSession {
                 this.dormantRoots.clear();
                 this.dormantGeometryBytes = 0;
                 this.demands.clear();
-                this.clearStageQueues();
             }
             this.demands.drainTop((key, add) -> {
                 if (add) {
@@ -992,13 +1008,10 @@ final class ClientSession {
             if (previous != null) this.dormantGeometryBytes -= previous.bytes;
             this.dormantGeometryBytes += bytes;
             this.validateGeometryAccounting();
-            long blockedBytes = 0;
             for (long blockedKey : this.rendererBlocked) {
                 Demand blocked = this.demands.get(blockedKey);
-                if (blocked != null) blockedBytes = Math.max(blockedBytes,
-                        blocked.blockedRequiredBytes);
+                if (blocked != null) this.requestBlockedRetirement(blocked);
             }
-            this.evictDormant(blockedBytes, true);
         }
 
         void wakeDormant(long key, int epoch) {
@@ -1254,16 +1267,23 @@ final class ClientSession {
         }
 
         void retryRendererBlocked() {
-            if (!this.coarseningRoots.isEmpty()) return;
+            AsyncNodeManager.PublicationProgress now = this.publisher.progress();
             for (long key : List.copyOf(this.rendererBlocked)) {
                 Demand demand = this.demands.get(key);
-                if (demand == null || demand.completedGeometry == null
-                        || demand.candidate
-                        != SectionDemandTable.CandidateState.WORKER_OWNED) {
+                if (demand == null || demand.blockedReason == null) {
                     this.rendererBlocked.remove(key);
                     continue;
                 }
-                demand.blockedRequiredBytes = 0;
+                if (!RendererWait.progressed(demand.blockedReason, demand.blockedAt, now)) continue;
+                if (demand.blockedReason == VoxyRenderSystem.AllocationStatus.STALE) {
+                    if (!hasTop(topAncestor(key))) continue;
+                    this.rendererBlocked.remove(key);
+                    demand.blockedReason = null;
+                    if (demand.index != null) this.queueBound(demand);
+                    else this.ensureRegion(key);
+                    continue;
+                }
+                demand.blockedReason = null;
                 this.rendererBlocked.remove(key);
                 this.demands.ready(demand, SectionDemandTable.ReadyKind.RENDERER);
             }
@@ -1381,22 +1401,26 @@ final class ClientSession {
 
         void bind(Demand demand, RegionalProtocol.RegionIndex index, int ordinal) {
             if (ordinal < 0 || !index.isPresent(ordinal)) return;
-            if (demand.activeWorkerSlot != -1 || demand.completedGeometry != null
+            if (demand.workLease != null && demand.completedGeometry == null
                     || demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED) {
                 demand.pendingIndex = index;
                 demand.pendingOrdinal = ordinal;
                 return;
             }
-            if (demand.index != null && demand.ordinal >= 0 && demand.installed
+            if (demand.index != null && demand.ordinal >= 0 && (demand.installed
+                    || demand.blockedReason == VoxyRenderSystem.AllocationStatus.IMPOSSIBLE)
                     && demand.index.sectionFingerprint(demand.ordinal)
                             .equals(index.sectionFingerprint(ordinal))
                     && demand.index.childMask(demand.ordinal) == index.childMask(ordinal)) {
                 demand.index = index;
                 demand.ordinal = ordinal;
+                demand.regionGeneration = index.generation();
                 return;
             }
             demand.pendingIndex = null;
             demand.pendingOrdinal = -1;
+            this.rendererBlocked.remove(demand.key);
+            demand.blockedReason = null;
             this.demands.unlinkReady(demand);
             this.discardCompletedGeometry(demand);
             this.demands.revise(demand);
@@ -1446,13 +1470,26 @@ final class ClientSession {
             return null;
         }
 
-        WorkerSlot idleWorker(boolean coverage) {
+        WorkerSlot idleWorker(boolean coverage) { return this.idleWorker(coverage, null); }
+
+        WorkerSlot idleWorker(Demand prerequisite) {
+            return this.idleWorker(prerequisite.coverage, prerequisite);
+        }
+
+        WorkerSlot idleWorker(boolean coverage, Demand prerequisite) {
             WorkerSlot idle = this.idleWorker();
-            if (idle != null || !coverage) return idle;
+            if (idle != null) return idle;
             Demand selected = null;
-            for (Demand demand : this.demands.values()) {
-                if (demand.coverage || demand.completedGeometry == null
-                        || demand.completedSlot == null
+            for (WorkerSlot holder : this.sectionWorkers) {
+                if (!holder.sectionOperation) continue;
+                Demand demand = this.demands.get(holder.operationKey);
+                if (demand == null || !holder.resource.matches(demand.workLease)) continue;
+                boolean dependency = prerequisite != null
+                        && demand.blockedReason == VoxyRenderSystem.AllocationStatus.TOPOLOGY_NOT_READY
+                        && (demand.prerequisite == prerequisite.key
+                                || contains(prerequisite.key, demand.key));
+                if ((!coverage && !dependency) || demand.coverage || demand.completedGeometry == null
+                        || demand.workLease == null
                         || demand.candidate
                         != SectionDemandTable.CandidateState.WORKER_OWNED) continue;
                 if (selected == null || demand.pixelBucket < selected.pixelBucket) {
@@ -1460,8 +1497,9 @@ final class ClientSession {
                 }
             }
             if (selected == null) return null;
-            WorkerSlot reclaimed = selected.completedSlot;
+            WorkerSlot reclaimed = this.sectionWorkers[selected.workLease.slot()];
             this.rendererBlocked.remove(selected.key);
+            selected.blockedReason = null;
             this.discardCompletedGeometry(selected);
             selected.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
             this.demands.ready(selected, SectionDemandTable.ReadyKind.SOURCE);
@@ -1470,58 +1508,59 @@ final class ClientSession {
 
         void drainWorkers() throws IOException {
             for (WorkerSlot worker : this.sectionWorkers) {
-                WorkerResult result = worker.completion();
-                if (result == null) continue;
+                WorkerResource.Completion<WorkerResult> completion = worker.resource.claim();
+                if (completion == null) continue;
+                WorkerResource.Lease lease = completion.lease();
+                WorkerResult result = completion.value();
                 switch (result) {
                     case WorkerIndex ready -> {
                         SectionDemandTable.RegionDemand region = this.demands.region(ready.region());
                         if (ready.session() == this.id
                                 && ready.connection() == this.connectionEpoch
                                 && ready.slot() == worker.index
-                                && region != null && region.resourceSlot == worker.index
+                                && region != null && lease.equals(region.resourceLease)
                                 && region.announcedGeneration == ready.generation()) {
                             region.resourceSlot = -1;
                             this.installIndex(ready.index());
-                        } else if (region != null && region.resourceSlot == worker.index) {
+                        } else if (region != null && lease.equals(region.resourceLease)) {
                             region.resourceSlot = -1;
                             this.queueRegion(region.key);
                         }
-                        worker.releaseCompletion();
+                        worker.releaseCompletion(lease);
                     }
                     case WorkerMiss miss -> {
-                        Demand demand = this.currentWorkerDemand(miss.ticket(), worker);
+                        Demand demand = this.currentWorkerDemand(miss.ticket(), worker, lease);
                         if (demand != null) {
-                            demand.activeWorkerSlot = -1;
+                            demand.workLease = null;
                             demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                             this.cacheReads++;
                             this.cacheMisses++;
                             this.demands.ready(demand, SectionDemandTable.ReadyKind.NETWORK);
                         } else {
-                            this.finishStaleWorker(miss.ticket(), worker);
+                            this.finishStaleWorker(miss.ticket(), lease);
                         }
-                        worker.releaseCompletion();
+                        worker.releaseCompletion(lease);
                     }
                     case WorkerModels models -> {
-                        Demand demand = this.currentWorkerDemand(models.ticket(), worker);
+                        Demand demand = this.currentWorkerDemand(models.ticket(), worker, lease);
                         if (demand != null) {
-                            demand.activeWorkerSlot = -1;
+                            demand.workLease = null;
                             demand.waitingModels = models.blocks();
                             demand.candidate = SectionDemandTable.CandidateState.WAIT_MODELS;
                             this.waitingModels.add(demand.key);
                             this.recordWorkerSource(models.cacheHit(), models.compressedBytes(),
                                     false);
                         } else {
-                            this.finishStaleWorker(models.ticket(), worker);
+                            this.finishStaleWorker(models.ticket(), lease);
                         }
-                        worker.releaseCompletion();
+                        worker.releaseCompletion(lease);
                     }
                     case WorkerGeometry geometry -> {
-                        Demand demand = this.currentWorkerDemand(geometry.ticket(), worker);
+                        Demand demand = this.currentWorkerDemand(geometry.ticket(), worker, lease);
                         if (demand == null) {
-                            worker.disownCompletion(geometry);
                             geometry.geometry().free();
-                            this.finishStaleWorker(geometry.ticket(), worker);
-                            worker.releaseCompletion();
+                            this.finishStaleWorker(geometry.ticket(), lease);
+                            worker.releaseCompletion(lease);
                             continue;
                         }
                         this.recordWorkerSource(geometry.cacheHit(), geometry.compressedBytes(),
@@ -1529,8 +1568,7 @@ final class ClientSession {
                         // Once observed, the demand is the sole owner of the mesh buffer. The
                         // worker remains reserved until renderer admission completes, but must
                         // neither redeliver nor free a buffer that may already be uploading.
-                        worker.disownCompletion(geometry);
-                        demand.completedSlot = worker;
+                        demand.workLease = lease;
                         this.completeGeometry(demand, geometry.geometry(),
                                 geometry.completedNanos());
                         // The slot remains COMPLETED as the exact backpressure resource.
@@ -1540,7 +1578,11 @@ final class ClientSession {
                         SectionDemandTable.RegionDemand currentRegion = null;
                         boolean stale = switch (failed.task()) {
                             case SectionWorkerTask section -> {
-                                currentDemand = this.currentWorkerDemand(section.ticket(), worker);
+                                currentDemand = this.currentWorkerDemand(section.ticket(), worker, lease);
+                                yield currentDemand == null;
+                            }
+                            case EmptyWorkerTask empty -> {
+                                currentDemand = this.currentWorkerDemand(empty.ticket(), worker, lease);
                                 yield currentDemand == null;
                             }
                             case IndexWorkerTask index -> {
@@ -1548,15 +1590,19 @@ final class ClientSession {
                                 yield index.session() != this.id
                                         || index.connection() != this.connectionEpoch
                                         || currentRegion == null
-                                        || currentRegion.resourceSlot != worker.index
+                                        || !lease.equals(currentRegion.resourceLease)
                                         || currentRegion.announcedGeneration != index.generation();
                             }
                         };
                         if (failed.task() instanceof SectionWorkerTask section && stale) {
-                            this.finishStaleWorker(section.ticket(), worker);
+                            this.finishStaleWorker(section.ticket(), lease);
                         }
-                        if (!stale && failed.task() instanceof SectionWorkerTask section) {
-                            currentDemand.activeWorkerSlot = -1;
+                        if (!stale && failed.task() instanceof EmptyWorkerTask) {
+                            currentDemand.workLease = null;
+                            currentDemand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
+                            this.demands.ready(currentDemand, SectionDemandTable.ReadyKind.SOURCE);
+                        } else if (!stale && failed.task() instanceof SectionWorkerTask section) {
+                            currentDemand.workLease = null;
                             this.demands.revise(currentDemand);
                             currentDemand.candidate =
                                     SectionDemandTable.CandidateState.READY_SOURCE;
@@ -1570,7 +1616,7 @@ final class ClientSession {
                             currentRegion.index = null;
                             this.queueRegion(currentRegion.key);
                         }
-                        worker.releaseCompletion();
+                        worker.releaseCompletion(lease);
                         if (!stale) Logger.warn("Regional worker " + failed.slot()
                                 + " failed; its last-known-good geometry remains active",
                                 failed.failure());
@@ -1579,16 +1625,18 @@ final class ClientSession {
             }
         }
 
-        Demand currentWorkerDemand(SectionDemandTable.Ticket ticket, WorkerSlot worker) {
+        Demand currentWorkerDemand(SectionDemandTable.Ticket ticket, WorkerSlot worker,
+                                   WorkerResource.Lease lease) {
             if (!this.demands.current(ticket) || ticket.resourceSlot() != worker.index) return null;
             Demand demand = this.demands.get(ticket.key());
-            return demand != null && demand.activeWorkerSlot == worker.index ? demand : null;
+            return demand != null && lease.equals(demand.workLease)
+                    && worker.resource.matches(lease) ? demand : null;
         }
 
-        void finishStaleWorker(SectionDemandTable.Ticket ticket, WorkerSlot worker) {
+        void finishStaleWorker(SectionDemandTable.Ticket ticket, WorkerResource.Lease lease) {
             Demand demand = this.demands.get(ticket.key());
-            if (demand == null || demand.activeWorkerSlot != worker.index) return;
-            demand.activeWorkerSlot = -1;
+            if (demand == null || !lease.equals(demand.workLease)) return;
+            demand.workLease = null;
             if (demand.pendingIndex == null || demand.pendingOrdinal < 0) return;
             RegionalProtocol.RegionIndex index = demand.pendingIndex;
             int ordinal = demand.pendingOrdinal;
@@ -1598,6 +1646,7 @@ final class ClientSession {
         }
 
         void recordWorkerSource(boolean cacheHit, int compressedBytes, boolean meshed) {
+            if (compressedBytes == 0) return; // Empty sections use a lease, but no I/O.
             if (cacheHit) {
                 this.cacheReads++;
                 this.cacheHits++;
@@ -1638,7 +1687,10 @@ final class ClientSession {
                 if (demand == null) return;
                 if (demand.candidate != SectionDemandTable.CandidateState.READY_SOURCE) continue;
                 if (demand.index.isEmpty(demand.ordinal)) {
-                    this.publishEmpty(demand);
+                    if (!this.publishEmpty(demand)) {
+                        this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
+                        return;
+                    }
                     continue;
                 }
                 if (this.mappings == null || !this.catalogFingerprint.equals(
@@ -1646,7 +1698,7 @@ final class ClientSession {
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                     continue;
                 }
-                WorkerSlot worker = this.idleWorker(demand.coverage);
+                WorkerSlot worker = this.idleWorker(demand);
                 if (worker == null) {
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                     return;
@@ -1655,10 +1707,10 @@ final class ClientSession {
                 SectionDemandTable.Ticket ticket = demand.ticket(this.id, worker.index);
                 SectionWorkerTask task = new SectionWorkerTask(ticket, demand.index,
                         demand.ordinal, source, null, this.mappings);
-                demand.activeWorkerSlot = worker.index;
+                demand.workLease = worker.assign(task);
                 this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
-                if (!worker.assign(task)) {
-                    demand.activeWorkerSlot = -1;
+                if (demand.workLease == null) {
+                    demand.workLease = null;
                     demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                     return;
@@ -1692,11 +1744,13 @@ final class ClientSession {
                     .mapToLong(demand -> demand.index.compressedLength(demand.ordinal)).sum();
             RegionalProtocol.RegionIndex index = selected.getFirst().index;
             List<Integer> ordinals = new ArrayList<>(selected.size());
+            Map<Long, SectionDemandTable.Ticket> tickets = new HashMap<>();
             for (Demand demand : selected) {
                 if (demand.index != index) {
                     throw new IOException("regional request batch spans multiple indexes");
                 }
                 ordinals.add(demand.ordinal);
+                tickets.put(demand.key, demand.ticket(this.id, -1));
             }
             RegionalProtocol.Lane lane = selected.getFirst().coverage
                     ? RegionalProtocol.Lane.COVERAGE : RegionalProtocol.Lane.REFINEMENT;
@@ -1704,7 +1758,8 @@ final class ClientSession {
                     new RegionalQuicClient.BatchReceiver() {
                         @Override public void reply(RegionalProtocol.SectionReply reply)
                                 throws InterruptedException {
-                            NetworkReply handoff = new NetworkReply(batchConnectionEpoch, reply);
+                            NetworkReply handoff = new NetworkReply(batchConnectionEpoch, reply,
+                                    tickets.get(reply.key()));
                             networkReplies.add(handoff);
                             signal();
                             handoff.awaitTransfer();
@@ -1733,74 +1788,86 @@ final class ClientSession {
             return true;
         }
 
+        Demand replyDemand(NetworkReply handoff) {
+            if (handoff.connectionEpoch != this.connectionEpoch || handoff.ticket == null
+                    || !this.demands.current(handoff.ticket)) return null;
+            Demand demand = this.demands.get(handoff.reply.key());
+            return demand != null
+                    && demand.candidate == SectionDemandTable.CandidateState.NETWORK_OWNED
+                    && demand.index != null && demand.index.generation() == handoff.reply.generation()
+                    && demand.ordinal == handoff.reply.ordinal() ? demand : null;
+        }
+
+        void finishReply(NetworkReply handoff) {
+            this.networkReplies.remove(handoff);
+            handoff.transferred();
+        }
+
         void drainNetworkReplies() throws IOException {
+            Set<NetworkReply> unadmittable = new HashSet<>();
+            for (NetworkReply handoff : this.networkReplies) {
+                if (this.replyDemand(handoff) == null) this.finishReply(handoff);
+            }
             while (true) {
-                NetworkReply handoff = this.networkReplies.peek();
+                NetworkReply handoff = ReplyAdmission.select(this.networkReplies, body -> {
+                    Demand demand = this.replyDemand(body);
+                    if (demand == null || unadmittable.contains(body)) return ReplyAdmission.INELIGIBLE;
+                    if (body.reply.status() == RegionalProtocol.Status.DATA
+                            && (this.mappings == null || !this.catalogFingerprint.equals(
+                                    this.requiredCatalogFingerprint))) return ReplyAdmission.INELIGIBLE;
+                    return demand.coverage ? Integer.MAX_VALUE : demand.pixelBucket;
+                });
                 if (handoff == null) return;
-                if (handoff.connectionEpoch != this.connectionEpoch) {
-                    this.networkReplies.remove(handoff);
-                    handoff.transferred();
-                    continue;
-                }
+                Demand demand = this.replyDemand(handoff);
                 RegionalProtocol.SectionReply reply = handoff.reply;
-                Demand demand = this.demands.get(reply.key());
-                if (demand == null
-                        || demand.candidate != SectionDemandTable.CandidateState.NETWORK_OWNED
-                        || demand.index.generation() != reply.generation()
-                        || demand.ordinal != reply.ordinal()) {
-                    this.networkReplies.remove(handoff);
-                    handoff.transferred();
-                    continue;
-                }
                 switch (reply.status()) {
-                case DATA -> {
-                    if (reply.compressed().length
-                            != demand.index.compressedLength(demand.ordinal)) {
-                        throw new IOException("regional section reply disagrees with its index");
+                    case DATA -> {
+                        if (reply.compressed().length != demand.index.compressedLength(demand.ordinal)) {
+                            throw new IOException("regional section reply disagrees with its index");
+                        }
+                        WorkerSlot worker = this.idleWorker(demand);
+                        if (worker == null) {
+                            unadmittable.add(handoff);
+                            continue;
+                        }
+                        SectionWorkerTask task = new SectionWorkerTask(demand.ticket(this.id, worker.index),
+                                demand.index, demand.ordinal, WorkerSource.NETWORK,
+                                reply.compressed(), this.mappings);
+                        demand.workLease = worker.assign(task);
+                        if (demand.workLease == null) return;
+                        this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
                     }
-                    if (this.mappings == null || !this.catalogFingerprint.equals(
-                            this.requiredCatalogFingerprint)) return;
-                    WorkerSlot worker = this.idleWorker(demand.coverage);
-                    if (worker == null) return;
-                    SectionDemandTable.Ticket ticket = demand.ticket(this.id, worker.index);
-                    SectionWorkerTask task = new SectionWorkerTask(ticket, demand.index,
-                            demand.ordinal, WorkerSource.NETWORK, reply.compressed(), this.mappings);
-                    demand.activeWorkerSlot = worker.index;
-                    this.demands.owned(demand,
-                            SectionDemandTable.CandidateState.WORKER_OWNED);
-                    if (!worker.assign(task)) {
-                        demand.activeWorkerSlot = -1;
-                        demand.candidate = SectionDemandTable.CandidateState.NETWORK_OWNED;
-                        return;
+                    case EMPTY -> {
+                        if (!demand.index.isEmpty(demand.ordinal)) throw new IOException("unexpected empty section");
+                        if (!this.publishEmpty(demand)) {
+                            unadmittable.add(handoff);
+                            continue;
+                        }
                     }
-                }
-                case EMPTY -> {
-                    if (!demand.index.isEmpty(demand.ordinal)) {
-                        throw new IOException("unexpected empty regional section");
+                    case STALE -> {
+                        SectionDemandTable.RegionDemand state = this.demands.region(demand.regionKey);
+                        if (state != null) {
+                            state.index = null;
+                            state.installedGeneration = 0;
+                            state.requested = false;
+                        }
+                        demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
+                        this.queueRegion(demand.regionKey);
                     }
-                    this.publishEmpty(demand);
+                    case ABSENT -> throw new IOException("indexed regional section became absent");
                 }
-                case STALE -> {
-                    long region = regionFor(demand.key);
-                    SectionDemandTable.RegionDemand state = this.demands.region(region);
-                    if (state != null) {
-                        state.index = null;
-                        state.installedGeneration = 0;
-                        state.requested = false;
-                    }
-                    this.queueRegion(region);
-                }
-                case ABSENT -> throw new IOException("indexed regional section became absent");
-                }
-                this.networkReplies.remove(handoff);
-                handoff.transferred();
+                this.finishReply(handoff);
             }
         }
 
-        void publishEmpty(Demand demand) {
-            BuiltSection empty = BuiltSection.emptyWithChildren(demand.key, demand.revision + 1L,
-                    (byte) demand.index.childMask(demand.ordinal));
-            this.completeGeometry(demand, empty, System.nanoTime());
+        boolean publishEmpty(Demand demand) {
+            WorkerSlot worker = this.idleWorker(demand);
+            if (worker == null) return false;
+            demand.workLease = worker.assign(new EmptyWorkerTask(demand.ticket(this.id, worker.index),
+                    (byte) demand.index.childMask(demand.ordinal)));
+            if (demand.workLease == null) return false;
+            this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
+            return true;
         }
 
         void completeGeometry(Demand demand, BuiltSection geometry, long completedNanos) {
@@ -1820,9 +1887,10 @@ final class ClientSession {
         }
 
         void scheduleReadyPublications() {
-            // One explicit renderer handoff at a time. Its maximum is the number of real
-            // section workers, not another arbitrary queue capacity.
-            if (!this.publicationQueue.isEmpty()) return;
+            AsyncNodeManager.PublicationProgress progress = this.publisher.progress();
+            if (progress.failure() != null) throw new IllegalStateException("renderer stopped", progress.failure());
+            if (this.busyHandoff == progress.handoff()) return;
+            this.busyHandoff = -1;
             int remaining = Math.min(this.sectionWorkerCount,
                     this.demands.readyCount(SectionDemandTable.ReadyKind.RENDERER));
             ArrayList<ReadyPublication> ready = new ArrayList<>(remaining);
@@ -1874,34 +1942,38 @@ final class ClientSession {
                     this.demands.owned(item.demand(),
                             SectionDemandTable.CandidateState.RENDERER_OWNED);
                 }
-                List<VoxyRenderSystem.SectionPublication> publications;
+                AsyncNodeManager.PublicationProgress observed = this.publisher.progress();
+                VoxyRenderSystem.SubmissionAttempt attempt;
                 try {
-                    publications = this.publisher.publishBatch(submissions);
+                    attempt = this.publisher.tryPublishBatch(submissions);
                 } catch (RuntimeException | Error failure) {
-                    // publishBatch guarantees a throw occurs before ownership transfer. Restore
-                    // the complete owner-side batch so normal session teardown releases it once.
-                    for (PreparedPublication item : prepared) {
-                        Demand demand = item.demand();
-                        if (demand.candidate
-                                == SectionDemandTable.CandidateState.RENDERER_OWNED
-                                && demand.completedGeometry == null
-                                && demand.publication == item.previous()) {
-                            demand.completedGeometry = item.geometry();
-                            demand.candidate = SectionDemandTable.CandidateState.WORKER_OWNED;
-                            this.demands.ready(demand,
-                                    SectionDemandTable.ReadyKind.RENDERER);
-                        }
-                    }
+                    this.restorePrepared(prepared);
                     throw failure;
+                }
+                if (attempt.status() == VoxyRenderSystem.SubmissionStatus.BUSY) {
+                    this.restorePrepared(prepared);
+                    this.busyHandoff = observed.handoff();
+                    this.handoffBusy++;
+                    return;
                 }
                 for (int index = 0; index < prepared.size(); index++) {
                     PreparedPublication item = prepared.get(index);
-                    this.transferGeometryAccounting(item.demand());
-                    item.demand().previousPublication = item.previous();
-                    item.demand().publication = publications.get(index);
-                    this.publicationQueue.addLast(new PublicationRef(item.demand().key,
-                            item.revision(), item.previous(), item.demand().completedSlot));
+                    Demand demand = item.demand();
+                    this.transferGeometryAccounting(demand);
+                    demand.previousPublication = item.previous();
+                    demand.publication = attempt.publications().get(index);
+                    this.publicationQueue.addLast(new PublicationRef(demand, item.revision(),
+                            demand.publication, item.previous(), demand.workLease, demand.geometryBytes));
                 }
+            }
+        }
+
+        void restorePrepared(List<PreparedPublication> prepared) {
+            for (PreparedPublication item : prepared) {
+                Demand demand = item.demand();
+                demand.completedGeometry = item.geometry();
+                demand.candidate = SectionDemandTable.CandidateState.WORKER_OWNED;
+                this.demands.ready(demand, SectionDemandTable.ReadyKind.RENDERER);
             }
         }
 
@@ -1916,11 +1988,13 @@ final class ClientSession {
         void discardCompletedGeometry(Demand demand) {
             BuiltSection geometry = demand.completedGeometry;
             demand.completedGeometry = null;
-            WorkerSlot slot = demand.completedSlot;
-            demand.completedSlot = null;
-            demand.activeWorkerSlot = -1;
-            if (geometry != null) geometry.free();
-            if (slot != null && slot.hasCompletion()) slot.releaseCompletion();
+            WorkerResource.Lease lease = demand.workLease;
+            // Renderer-owned buffers and their leases belong to PublicationRef until its outcome.
+            if (geometry != null) {
+                geometry.free();
+                this.releaseRendererSlot(lease);
+            }
+            demand.workLease = null;
             this.releaseGeometryAccounting(demand);
         }
 
@@ -1944,7 +2018,7 @@ final class ClientSession {
         void releasePublishingGeometryAccounting(Demand demand) {
             if (!demand.publishingGeometryOwned) return;
             demand.publishingGeometryOwned = false;
-            this.publishingGeometryBytes -= demand.geometryBytes;
+
         }
 
         void releaseAllGeometryAccounting(Demand demand) {
@@ -1952,93 +2026,120 @@ final class ClientSession {
             this.releasePublishingGeometryAccounting(demand);
         }
 
-        void pollPublications() throws IOException {
+        void pollPublications() {
             int remaining = this.publicationQueue.size();
             while (remaining-- > 0) {
                 PublicationRef ref = this.publicationQueue.pollFirst();
-                if (ref == null) return;
-                Demand demand = this.demands.get(ref.key());
-                if (!current(demand, ref.revision(),
-                        SectionDemandTable.CandidateState.RENDERER_OWNED)
-                        || demand.publication == null) {
-                    this.releaseRendererSlot(ref.slot());
-                    if (demand != null && demand.completedSlot == ref.slot()) {
-                        demand.completedSlot = null;
-                        demand.activeWorkerSlot = -1;
-                    }
-                    continue;
-                }
-                Optional<VoxyRenderSystem.AllocationBlock> blocked =
-                        demand.publication.takeAllocationBlock();
-                if (blocked.isPresent()) {
-                    VoxyRenderSystem.AllocationBlock result = blocked.orElseThrow();
-                    this.releasePublishingGeometryAccounting(demand);
-                    demand.publication = ref.previous();
-                    demand.previousPublication = null;
-                    demand.completedGeometry = result.geometry();
-                    demand.completedGeometryOwned = true;
-                    this.completedGeometryBytes += demand.geometryBytes;
-                    demand.candidate = SectionDemandTable.CandidateState.WORKER_OWNED;
-                    if (result.status() == VoxyRenderSystem.AllocationStatus.IMPOSSIBLE) {
-                        Logger.warn("Regional detail geometry cannot fit the configured arena: "
-                                + result.requiredUnits() * 8L + " bytes");
-                        if (demand.coverage) {
-                            this.discardCompletedGeometry(demand);
-                        } else {
-                            this.retireDetailDemand(demand.key);
-                        }
-                    } else {
-                        long requiredBytes = Math.max(1, result.requiredUnits()) * 8L;
-                        this.evictDormant(requiredBytes, true);
-                        demand.blockedRequiredBytes = requiredBytes;
-                        this.rendererBlocked.add(demand.key);
-                    }
-                    continue;
-                }
-                Optional<Throwable> failure = demand.publication.activationFailure();
-                if (failure.isPresent()) {
-                    this.releaseAllGeometryAccounting(demand);
-                    Logger.warn("Regional renderer publication failed; retaining its fallback",
-                            failure.orElseThrow());
-                    demand.publication = ref.previous();
-                    demand.previousPublication = null;
-                    demand.completedSlot = null;
-                    demand.activeWorkerSlot = -1;
-                    this.releaseRendererSlot(ref.slot());
-                    demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
-                    this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
-                    continue;
-                }
-                if (!demand.publication.activationFencePassed()) {
+                if (ref == null) break;
+                Demand demand = this.demands.get(ref.demand().key);
+                boolean current = demand == ref.demand() && demand.revision == ref.revision()
+                        && demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
+                        && demand.publication == ref.publication();
+                if (!current) ref.publication().close();
+                Optional<VoxyRenderSystem.UploadOutcome> outcome = ref.publication().takeUploadOutcome();
+                if (outcome.isEmpty()) {
                     this.publicationQueue.addLast(ref);
                     continue;
                 }
-                demand.candidate = SectionDemandTable.CandidateState.NONE;
-                demand.previousPublication = null;
-                this.setActiveGeometryBytes(demand, demand.geometryBytes);
-                if (!demand.installed) {
-                    demand.installed = true;
-                    this.activeCount++;
+                VoxyRenderSystem.UploadOutcome result = outcome.orElseThrow();
+                this.publicationOutcomes[result.status().ordinal()]++;
+                this.publishingGeometryBytes -= ref.bytes();
+                if (!current) {
+                    if (result.block() != null) result.block().geometry().free();
+                    this.releaseRendererSlot(ref.lease());
+                    continue;
                 }
-                if (demand.coverage) this.missingCoverage.remove(demand.key);
-                this.activated++;
-                this.uploadedSections++;
-                this.releaseAllGeometryAccounting(demand);
-                demand.completedSlot = null;
-                demand.activeWorkerSlot = -1;
-                this.releaseRendererSlot(ref.slot());
-                if (demand.pendingIndex != null) {
+                demand.publishingGeometryOwned = false;
+                demand.previousPublication = null;
+                switch (result.status()) {
+                    case RETURNED -> {
+                        demand.publication = ref.previous();
+                        demand.completedGeometry = result.block().geometry();
+                        demand.completedGeometryOwned = true;
+                        this.completedGeometryBytes += ref.bytes();
+                        demand.candidate = SectionDemandTable.CandidateState.WORKER_OWNED;
+                        this.blockPublication(demand, result.block());
+                    }
+                    case FAILED, CANCELLED -> {
+                        demand.publication = ref.previous();
+                        demand.workLease = null;
+                        this.releaseRendererSlot(ref.lease());
+                        demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
+                        this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
+                        if (result.failure() != null) Logger.warn(
+                                "Regional upload failed after rollback; retaining fallback", result.failure());
+                    }
+                    case ACTIVATED -> {
+                        demand.candidate = SectionDemandTable.CandidateState.NONE;
+                        this.setActiveGeometryBytes(demand, ref.bytes());
+                        if (!demand.installed) { demand.installed = true; this.activeCount++; }
+                        if (demand.coverage) this.missingCoverage.remove(demand.key);
+                        this.activated++;
+                        this.uploadedSections++;
+                        demand.workLease = null;
+                        this.releaseRendererSlot(ref.lease());
+                    }
+                }
+                if (demand.pendingIndex != null && (demand.workLease == null
+                        || demand.completedGeometry != null)) {
                     RegionalProtocol.RegionIndex index = demand.pendingIndex;
                     int ordinal = demand.pendingOrdinal;
-                    demand.pendingIndex = null; demand.pendingOrdinal = -1;
+                    demand.pendingIndex = null;
+                    demand.pendingOrdinal = -1;
                     this.bind(demand, index, ordinal);
                 }
-                this.retryRendererBlocked();
+            }
+            this.retryRendererBlocked();
+        }
+
+        void blockPublication(Demand demand, VoxyRenderSystem.AllocationBlock block) {
+            demand.blockedReason = block.status();
+            demand.blockedAt = block.observed();
+            demand.prerequisite = block.prerequisite();
+            demand.blockedRequiredBytes = block.requiredUnits() * 8L;
+            switch (block.status()) {
+                case NO_CONTIGUOUS_GEOMETRY_SPACE, NO_SECTION_ID -> {
+                    this.rendererBlocked.add(demand.key);
+                    this.requestBlockedRetirement(demand);
+                }
+                case TOPOLOGY_NOT_READY -> {
+                    this.rendererBlocked.add(demand.key);
+                    this.ensurePrerequisite(demand);
+                }
+                case STALE -> {
+                    this.discardCompletedGeometry(demand);
+                    demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
+                    this.rendererBlocked.add(demand.key);
+                }
+                case IMPOSSIBLE -> {
+                    this.discardCompletedGeometry(demand);
+                    demand.candidate = SectionDemandTable.CandidateState.NONE;
+                    Logger.warn("Regional mesh cannot fit configured arena; retaining fallback: key="
+                            + demand.key + " bytes=" + demand.blockedRequiredBytes);
+                }
             }
         }
 
-        void releaseRendererSlot(WorkerSlot slot) {
-            if (slot != null && slot.hasCompletion()) slot.releaseCompletion();
+        void requestBlockedRetirement(Demand demand) {
+            if (RendererWait.needsRetirement(demand.blockedReason,
+                    !this.pendingDormantEvictions.isEmpty() || !this.coarseningRoots.isEmpty())) {
+                this.evictDormant(demand.blockedReason == VoxyRenderSystem.AllocationStatus.NO_SECTION_ID
+                        ? 1 : demand.blockedRequiredBytes, true);
+            }
+        }
+
+        void ensurePrerequisite(Demand dependent) {
+            if (dependent.prerequisite == dependent.key || !hasTop(topAncestor(dependent.key))) return;
+            this.addDemand(dependent.prerequisite, dependent.pixelBucket);
+            Demand prerequisite = this.demands.get(dependent.prerequisite);
+            if (prerequisite == null) return;
+            if (prerequisite.candidate == SectionDemandTable.CandidateState.NONE
+                    && !prerequisite.installed && prerequisite.blockedReason == null
+                    && prerequisite.index != null) this.queueBound(prerequisite);
+        }
+
+        void releaseRendererSlot(WorkerResource.Lease lease) {
+            if (lease != null) this.sectionWorkers[lease.slot()].releaseCompletion(lease);
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
@@ -2046,9 +2147,6 @@ final class ClientSession {
             return region == null ? null : (RegionalProtocol.RegionIndex) region.index;
         }
 
-        void clearStageQueues() {
-            this.publicationQueue.clear();
-        }
 
         void putEvent(Event event) {
             if (this.open.get()) {
@@ -2082,7 +2180,7 @@ final class ClientSession {
         String snapshot() {
             int idleWorkers = 0, runningWorkers = 0, completedWorkers = 0;
             for (WorkerSlot worker : this.sectionWorkers) synchronized (worker) {
-                switch (worker.state) {
+                switch (worker.resource.state()) {
                     case IDLE -> idleWorkers++;
                     case RUNNING -> runningWorkers++;
                     case COMPLETED -> completedWorkers++;
@@ -2152,6 +2250,11 @@ final class ClientSession {
             if (this.quic != null) this.quic.close();
             NetworkReply reply;
             while ((reply = this.networkReplies.poll()) != null) reply.transferred();
+            this.publisher.clearProgressListener(this.rendererWake);
+            for (PublicationRef ref : this.publicationQueue) {
+                ref.publication().abandon(() -> this.releaseRendererSlot(ref.lease()));
+            }
+            this.publicationQueue.clear();
             for (WorkerSlot worker : this.sectionWorkers) worker.close();
             if (this.cache != null) this.cache.close();
             for (Demand demand : this.demands.values()) {
@@ -2174,7 +2277,6 @@ final class ClientSession {
             this.pendingDormantEvictionBytes = 0;
             this.completedGeometryBytes = 0;
             this.publishingGeometryBytes = 0;
-            this.clearStageQueues();
         }
     }
 
@@ -2182,12 +2284,13 @@ final class ClientSession {
     private record ReadyPublication(Demand demand, long revision) {}
     private record PreparedPublication(Demand demand, long revision, BuiltSection geometry,
                                        VoxyRenderSystem.SectionPublication previous) {}
-    private record PublicationRef(long key, long revision,
+    private record PublicationRef(Demand demand, long revision,
+                                  VoxyRenderSystem.SectionPublication publication,
                                   VoxyRenderSystem.SectionPublication previous,
-                                  Session.WorkerSlot slot) {}
+                                  WorkerResource.Lease lease, long bytes) {}
 
     private sealed interface Event permits CatalogReady, Coarsened,
-            CoarsenFailed, BatchComplete, BatchFailed, SnapshotRequest {}
+            CoarsenFailed, BatchComplete, BatchFailed, SessionObservation {}
     private record CatalogReady(RegionalProtocol.Hash32 fingerprint,
                                 RegionalSectionCodec.Mappings mappings,
                                 long connectionEpoch) implements Event {}
@@ -2196,7 +2299,7 @@ final class ClientSession {
     private record BatchComplete(long connectionEpoch, long reservedBytes,
                                  int sectionCount) implements Event {}
     private record BatchFailed(long connectionEpoch, Throwable failure) implements Event {}
-    private record SnapshotRequest(Consumer<PipelineSnapshot> receiver) implements Event {}
+    private record SessionObservation(Consumer<Session> receiver) implements Event {}
 
     private record CatalogTask(Session owner, CatalogCodec.Catalog catalog,
                                RegionalProtocol.Hash32 fingerprint,

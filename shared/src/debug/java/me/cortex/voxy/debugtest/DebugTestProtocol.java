@@ -16,7 +16,7 @@ public final class DebugTestProtocol {
 
     public enum CommandKind {
         BEGIN_RUN(1), EXPECT_POSE(2), START_TRACE(3), CAPTURE_CHECKPOINT(4),
-        CAPTURE_SCREENSHOT(5), END_RUN(6), ABORT_RUN(7);
+        CAPTURE_SCREENSHOT(5), END_RUN(6), ABORT_RUN(7), RECONNECT_QUIC(8);
 
         private final int wireId;
         CommandKind(int wireId) { this.wireId = wireId; }

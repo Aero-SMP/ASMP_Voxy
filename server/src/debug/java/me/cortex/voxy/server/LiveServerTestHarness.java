@@ -121,6 +121,8 @@ final class LiveServerTestHarness {
         root.then(Commands.literal("trace").then(traceRun));
 
         root.then(singleStep("checkpoint", LiveServerTestHarness::checkpoint));
+        root.then(singleStep("reconnect_quic", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.RECONNECT_QUIC)));
         root.then(singleStep("screenshot", LiveServerTestHarness::screenshot));
         root.then(singleStep("end", LiveServerTestHarness::end));
         root.then(singleStep("abort", LiveServerTestHarness::abort));
@@ -333,7 +335,7 @@ final class LiveServerTestHarness {
             case BEGIN_RUN -> result == DebugTestProtocol.ResultKind.CLIENT_READY;
             case EXPECT_POSE -> result == DebugTestProtocol.ResultKind.POSE_REACHED
                     || result == DebugTestProtocol.ResultKind.POSE_FAILED;
-            case START_TRACE, CAPTURE_CHECKPOINT ->
+            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC ->
                     result == DebugTestProtocol.ResultKind.CHECKPOINT_RESULT;
             case CAPTURE_SCREENSHOT -> result == DebugTestProtocol.ResultKind.SCREENSHOT_RESULT;
             case END_RUN -> result == DebugTestProtocol.ResultKind.RUN_COMPLETE;

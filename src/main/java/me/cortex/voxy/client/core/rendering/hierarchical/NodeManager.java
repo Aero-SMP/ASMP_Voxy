@@ -55,6 +55,7 @@ public class NodeManager {
     private final Map<StagedGeometryKey, StagedGeometry> stagedGeometry = new HashMap<>();
     private final Map<StagedGeometryKey, CommittedGeometry> committedGeometry = new HashMap<>();
     private final Map<Long, StagedGeometryKey> committedPositions = new HashMap<>();
+    private final Map<Long, Long> publishedRevisions = new HashMap<>();
     /** Candidate allocations detached by rollback but retained until its GPU pointer fence. */
     private final Map<StagedGeometryKey, Integer> rolledBackGeometry = new HashMap<>();
     /** Detached subtree geometry retained until the parent-leaf update crosses a GPU fence. */
@@ -196,6 +197,7 @@ public class NodeManager {
     RendererFence stageGeometryResult(BuiltSection sectionResult) {
         long pos = sectionResult.position;
         long sourceRevision = sectionResult.sourceRevision;
+        if (this.committedPositions.containsKey(pos)) return null;
         long geometryBytes = sectionResult.geometryBuffer == null ? 0
                 : sectionResult.geometryBuffer.size;
         if (this.activeSectionMap.get(pos) == -1) return null;
@@ -239,6 +241,32 @@ public class NodeManager {
         assertPosValid(position);
         while (SectionKey.level(position) < MAX_LOD_LAYER) position = makeParentPos(position);
         return this.topLevelNodes.contains(position);
+    }
+
+    /** Nearest ancestor whose upload/topology can make this section runnable. */
+    long publicationPrerequisite(long position) {
+        long cursor = position;
+        while (SectionKey.level(cursor) < MAX_LOD_LAYER) {
+            if (this.committedPositions.containsKey(cursor)) return cursor;
+            long parent = makeParentPos(cursor);
+            if (this.activeSectionMap.get(cursor) == -1
+                    && this.activeSectionMap.get(parent) != -1) return parent;
+            cursor = parent;
+        }
+        return cursor;
+    }
+
+    /** Metadata-only zero-child replacement; no slot or geometry-handoff capacity is needed. */
+    boolean retirePublication(long revision, long expectedRevision, long position) {
+        if (!Objects.equals(this.publishedRevisions.get(position), expectedRevision)) return true;
+        if (this.hasPendingGeometry(position)) return false;
+        for (CoarsenedGeometry pending : this.coarsenedGeometry.values()) {
+            if (contains(pending.parent, position) || contains(position, pending.parent)) return false;
+        }
+        if (this.activeSectionMap.get(position) == -1) return true;
+        this.stageGeometryResult(BuiltSection.emptyWithChildren(position, revision, (byte) 0));
+        this.commitStagedRoot(revision, Set.of(position));
+        return true;
     }
 
     private static long ancestorAtLevel(long position, int level) {
@@ -406,6 +434,7 @@ public class NodeManager {
                 removeGeometryIfAllocated(geometry.previousGeometry);
             }
             this.committedPositions.remove(entry.getKey().position, entry.getKey());
+            this.publishedRevisions.put(entry.getKey().position, sourceRevision);
             iterator.remove();
         }
         var staged = this.stagedGeometry.entrySet().iterator();
@@ -511,6 +540,9 @@ public class NodeManager {
         for (StagedGeometryKey key : this.committedPositions.values()) {
             if (contains(parent, key.position)) return true;
         }
+        for (StagedGeometryKey key : this.rolledBackGeometry.keySet()) {
+            if (contains(parent, key.position)) return true;
+        }
         return false;
     }
 
@@ -560,6 +592,7 @@ public class NodeManager {
             throw new IllegalStateException("Hierarchy owner changed at " + SectionKey.describe(position));
         }
         this.activeSectionMap.remove(position);
+        this.publishedRevisions.remove(position);
     }
 
     private void refreshParentLeafState(long position) {
@@ -836,6 +869,7 @@ public class NodeManager {
             nodeId = this.activeSectionMap.get(pos);
         } else {
             nodeId = this.activeSectionMap.remove(pos);
+            this.publishedRevisions.remove(pos);
         }
         if (nodeId == -1) {
             throw new IllegalStateException("Cannot remove pos that doesnt exist");
