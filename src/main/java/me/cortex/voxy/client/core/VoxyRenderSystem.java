@@ -6,6 +6,8 @@ import com.mojang.blaze3d.systems.RenderSystem;
 
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
+import me.cortex.voxy.client.core.gl.shader.AutoBindingShader;
+import net.irisshaders.iris.pipeline.VanillaRenderingPipeline;
 import me.cortex.voxy.client.core.rendering.ChunkBoundRenderer;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.Viewport;
@@ -57,7 +59,151 @@ import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
 
 public class VoxyRenderSystem {
+    private static final AtomicLong RESOURCE_GENERATION = new AtomicLong();
+    private static final AtomicLong RENDERER_IDENTITIES = new AtomicLong();
+    private final long rendererIdentity = RENDERER_IDENTITIES.incrementAndGet();
+    private final long modelResourceGeneration = RESOURCE_GENERATION.get();
+    private boolean constructing = true, destroyed;
+    private ShaderReloadCoordinator<ShaderGroup> shaderReload;
+    private ShaderReloadCoordinator<ShaderGroup>.Scope externalShaderReload;
+    private long historyInvalidations, resumedDraws;
+    private java.util.Map<?, ?> modelRenderTypes;
     private final CatalogMapper mapper;
+
+    public static void modelResourcesChanged() { RESOURCE_GENERATION.incrementAndGet(); }
+    public long rendererIdentity() { return this.rendererIdentity; }
+    public long shaderReloadGeneration() { return this.shaderReload == null ? 0 : this.shaderReload.generation(); }
+    public String shaderReloadStatus() { return this.shaderReload == null ? "CONSTRUCTING" : this.shaderReload.status().name(); }
+    public String shaderReloadReason() { return this.shaderReload == null ? "initial" : this.shaderReload.reason(); }
+    public long shaderReloadPauseNanos() { return this.shaderReload == null ? 0 : this.shaderReload.lastPauseNanos(); }
+    public long shaderHistoryInvalidations() { return this.historyInvalidations; }
+    public long shaderResumedDraws() { return this.resumedDraws; }
+    public long shaderMaterialUpdates() { return this.modelService == null ? 0 : this.modelService.factory.materialUpdates(); }
+
+    public boolean preservesShaderReload() {
+        return this.shaderReload != null && this.shaderReload.nestedReload()
+                && !this.destroyed && this.modelResourceGeneration == RESOURCE_GENERATION.get()
+                && VoxyConfig.CONFIG.enabled && VoxyConfig.CONFIG.isRenderingEnabled();
+    }
+
+    public ShaderReloadCoordinator<ShaderGroup>.Scope beginShaderReload(String reason) {
+        return this.shaderReload.begin(reason);
+    }
+
+    public void irisPipelineDestroyed(IrisVoxyRenderPipeline old) {
+        if (this.pipeline == old && !this.destroyed && this.externalShaderReload == null) {
+            this.externalShaderReload = this.beginShaderReload("Iris pipeline replacement");
+        }
+    }
+
+    public void irisPipelinePrepared(Throwable failure) {
+        var pending = this.externalShaderReload;
+        this.externalShaderReload = null;
+        if (pending != null) pending.finish(failure);
+    }
+
+    private boolean currentShaderOwner() {
+        return !this.destroyed && (this.constructing || IGetVoxyRenderSystem.getNullable() == this);
+    }
+
+    /** Shader objects only; terrain ownership belongs to the enclosing renderer. */
+    public final class ShaderGroup implements AutoCloseable {
+        private final ShaderResourceScope resources = new ShaderResourceScope();
+        private AbstractRenderPipeline preparedPipeline;
+        private AutoBindingShader traversalProgram, boundsProgram;
+        private boolean closed;
+
+        private ShaderGroup() {
+            try {
+                if (modelResourceGeneration != RESOURCE_GENERATION.get()) {
+                    throw new ShaderReloadCoordinator.Incompatible("Minecraft model/texture resources changed");
+                }
+                AbstractRenderPipeline selected = null;
+                if (IrisUtil.IRIS_INSTALLED) {
+                    var iris = Iris.getPipelineManager().getPipelineNullable();
+                    if (iris instanceof IGetIrisVoxyPipelineData patched && patched.voxy$getPipelineData() != null) {
+                        selected = new IrisVoxyRenderPipeline(patched.voxy$getPipelineData(), nodeManager, nodeCleaner, traversal);
+                    } else if (iris != null && !(iris instanceof VanillaRenderingPipeline)) {
+                        throw new IllegalStateException("Active Iris pack has no supported Voxy pipeline; terrain retained, drawing suspended");
+                    }
+                }
+                this.preparedPipeline = this.resources.own(selected != null ? selected
+                        : new NormalRenderPipeline(nodeManager, nodeCleaner, traversal), AbstractRenderPipeline::free);
+                java.util.Map<?, ?> renderTypes = selected instanceof IrisVoxyRenderPipeline
+                        ? net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings.INSTANCE.getBlockTypeIds()
+                        : java.util.Map.of();
+                if (renderTypes == null) renderTypes = java.util.Map.of();
+                if (modelRenderTypes != null && !modelRenderTypes.equals(renderTypes)) {
+                    throw new ShaderReloadCoordinator.Incompatible("Shader block render classification changed");
+                }
+                modelRenderTypes = java.util.Map.copyOf(renderTypes);
+                if (this.preparedPipeline instanceof IrisVoxyRenderPipeline) {
+                    this.preparedPipeline.setupExtraModelBakeryData(modelService);
+                } else {
+                    modelService.factory.setCustomBlockStateMapping(null);
+                }
+                this.preparedPipeline.setSectionRenderer(new MDICSectionRenderer(this.preparedPipeline,
+                        modelService.getStore(), geometryData));
+                this.traversalProgram = this.resources.own(traversal.compileProgram(this.preparedPipeline), AutoBindingShader::free);
+                this.boundsProgram = this.resources.own(chunkBoundRenderer.compileProgram(this.preparedPipeline), AutoBindingShader::free);
+                var target = Minecraft.getInstance().getMainRenderTarget();
+                float[] scale = this.preparedPipeline.getRenderScalingFactor();
+                int width = Math.max(1, (int)(target.width * (scale == null ? 1 : scale[0])));
+                int height = Math.max(1, (int)(target.height * (scale == null ? 1 : scale[1])));
+                this.preparedPipeline.prepareTargets(width, height);
+            } catch (RuntimeException | Error failure) {
+                this.resources.cleanupAfter(failure);
+                throw failure;
+            }
+        }
+
+        private void install() {
+            this.preparedPipeline.attach();
+            traversal.installProgram(this.traversalProgram, this.preparedPipeline);
+            chunkBoundRenderer.installProgram(this.boundsProgram, this.preparedPipeline);
+            viewport.invalidateShaderHistory();
+            historyInvalidations++;
+            IrisUtil.CAPTURED_VIEWPORT_PARAMETERS = null;
+            pipeline = this.preparedPipeline;
+            Logger.info("Voxy shader resources ready: renderer=" + rendererIdentity + " generation="
+                    + shaderReload.generation() + " pipeline=" + pipeline.getClass().getSimpleName());
+        }
+
+        @Override public void close() {
+            if (this.closed) return;
+            this.closed = true;
+            if (pipeline == this.preparedPipeline) pipeline = null;
+            traversal.clearProgram(this.traversalProgram);
+            chunkBoundRenderer.clearProgram(this.boundsProgram);
+            this.resources.close();
+        }
+    }
+
+    private void initializeShaders() {
+        this.shaderReload = new ShaderReloadCoordinator<>(new ShaderReloadCoordinator.Owner<ShaderGroup>() {
+            @Override public boolean current() { return currentShaderOwner(); }
+            @Override public void suspend() {
+                // Deliver committed selection actions in order before changing shader interpretation.
+                DownloadStream.INSTANCE.flushWaitClear();
+                glFinish();
+                IrisUtil.CAPTURED_VIEWPORT_PARAMETERS = null;
+            }
+            @Override public ShaderGroup prepare() { return new ShaderGroup(); }
+            @Override public void commit(ShaderGroup group) { group.install(); }
+            @Override public void failed(Throwable failure) {
+                Logger.error("Voxy shader reload failed; retained terrain is paused, renderer=" + rendererIdentity, failure);
+            }
+            @Override public void incompatible(String reason) {
+                Logger.warn("Voxy model/resource rebuild required: " + reason);
+                if (!constructing && currentShaderOwner()) {
+                    var owner = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
+                    owner.voxy$shutdownRenderer();
+                    owner.voxy$createRenderer();
+                }
+            }
+        });
+        this.shaderReload.begin("initial").finish(null);
+    }
     private ModelBakerySubsystem modelService;
     private BasicSectionGeometryData geometryData;
     private AsyncNodeManager nodeManager;
@@ -453,32 +599,9 @@ public class VoxyRenderSystem {
                 this.nodeManager.start();
             }
 
-            AbstractRenderPipeline pipeline = null;
-            if (IrisUtil.IRIS_INSTALLED) {
-                var irisPipeline = Iris.getPipelineManager().getPipelineNullable();
-                if (irisPipeline instanceof IGetIrisVoxyPipelineData voxyPipeline) {
-                    var data = voxyPipeline.voxy$getPipelineData();
-                    if (data != null) {
-                        Logger.info("Creating voxy iris render pipeline");
-                        try {
-                            pipeline = new IrisVoxyRenderPipeline(data, this.nodeManager, this.nodeCleaner, this.traversal);
-                        } catch (Exception e) {
-                            Logger.error("Failed to create iris render pipeline", e);
-                            IrisUtil.disableIrisShaders();
-                        }
-                    }
-                }
-            }
-            this.pipeline = pipeline != null ? pipeline : new NormalRenderPipeline(this.nodeManager, this.nodeCleaner, this.traversal);
-            this.pipeline.setupExtraModelBakeryData(this.modelService);//Configure the model service
-
-            //Late stage traversal compile for shaders with taa
-            this.traversal.lateStageCompile(this.pipeline);
-
-
-            var sectionRenderer = new MDICSectionRenderer(this.pipeline, this.modelService.getStore(), this.geometryData);
-            this.pipeline.setSectionRenderer(sectionRenderer);
             this.viewport = new Viewport(this.geometryData.getMaxSectionCount());
+            this.chunkBoundRenderer = new ChunkBoundRenderer();
+            this.initializeShaders();
 
             {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
@@ -498,9 +621,10 @@ public class VoxyRenderSystem {
                 this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
             }
 
-            this.chunkBoundRenderer = new ChunkBoundRenderer(this.pipeline);
 
-            Logger.info("Voxy render system created with " + this.geometryData.getGeometryCapacityBytes() + " geometry capacity, using pipeline '" + this.pipeline.getClass().getSimpleName() + "' with renderer '" + sectionRenderer.getClass().getSimpleName() + "'");
+            this.constructing = false;
+            Logger.info("Voxy render system created with " + this.geometryData.getGeometryCapacityBytes()
+                    + " geometry capacity; shader status=" + this.shaderReload.status());
         } catch (RuntimeException | Error failure) {
             this.releaseComponents(failure);
             throw failure;
@@ -558,7 +682,7 @@ public class VoxyRenderSystem {
     }
 
     public void renderOpaque(Viewport viewport) {
-        if (viewport == null) {
+        if (viewport == null || !this.shaderReload.drawable()) {
             return;
         }
         if (viewport.width <= 0 || viewport.height <= 0) {
@@ -595,6 +719,7 @@ public class VoxyRenderSystem {
 
         //The entire rendering pipeline (excluding the chunkbound thing)
         this.pipeline.runPipeline(viewport, boundFB, dims[2], dims[3]);
+        this.resumedDraws++;
 
         //As much dynamic runtime stuff here
         {
@@ -660,7 +785,7 @@ public class VoxyRenderSystem {
     }
 
     public Viewport getViewport() {
-        if (IrisUtil.irisShadowActive()) {
+        if (this.destroyed || this.shaderReload == null || !this.shaderReload.drawable() || IrisUtil.irisShadowActive()) {
             return null;
         }
         return this.viewport;
@@ -679,6 +804,9 @@ public class VoxyRenderSystem {
 
     /** Releases both fully initialized and constructor-partial renderer state exactly once. */
     private void releaseComponents(Throwable constructionFailure) {
+        this.destroyed = true;
+        this.externalShaderReload = null;
+        if (this.shaderReload != null) release("shader resources", this.shaderReload::close, constructionFailure);
         release("biome callback", () -> this.mapper.setBiomeCallback(null), constructionFailure);
         AsyncNodeManager nodes = this.nodeManager;
         this.nodeManager = null;
@@ -704,9 +832,6 @@ public class VoxyRenderSystem {
         Viewport oldViewport = this.viewport;
         this.viewport = null;
         if (oldViewport != null) release("viewport", oldViewport::delete, constructionFailure);
-        AbstractRenderPipeline oldPipeline = this.pipeline;
-        this.pipeline = null;
-        if (oldPipeline != null) release("render pipeline", oldPipeline::free, constructionFailure);
     }
 
     private static void release(String component, Runnable action, Throwable constructionFailure) {

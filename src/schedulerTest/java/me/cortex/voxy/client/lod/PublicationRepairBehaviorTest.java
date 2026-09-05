@@ -33,6 +33,9 @@ public final class PublicationRepairBehaviorTest {
         prerequisiteReclaimsOnlyWorkerOwnedDependent();
         randomizedOwnershipInterleavings();
         repeatedCompletionIsIdempotent();
+        dormancyRetirementDoesNotInvalidateBlockedSweep();
+        dormancyEpochsAndQuickWake();
+        measureDormancyBurstAllocation();
         System.out.println("publication ownership and priority behavior tests passed");
     }
 
@@ -69,6 +72,8 @@ public final class PublicationRepairBehaviorTest {
         final PublicationHandoff<List<Publication>> handoff = new PublicationHandoff<>();
         final List<Publication> created = new ArrayList<>();
         int preparations, evictions;
+        Runnable retirementDone;
+        Consumer<Throwable> retirementFailed;
         long topology, allocation, sectionIds;
         @Override public SubmissionAttempt tryPublishBatch(List<SectionSubmission> submissions) {
             List<Publication> accepted = this.handoff.trySubmit(() -> {
@@ -88,6 +93,8 @@ public final class PublicationRepairBehaviorTest {
         @Override public void clearProgressListener(Runnable listener) {}
         @Override public void coarsen(long parent, Runnable success, Consumer<Throwable> failure) {
             this.evictions++;
+            this.retirementDone = success;
+            this.retirementFailed = failure;
         }
     }
 
@@ -341,5 +348,128 @@ public final class PublicationRepairBehaviorTest {
             check(buffer.frees == 1 && resolved.get() == 1 && outcome.claim() == null,
                     "duplicate completion changed terminal ownership");
         }
+    }
+
+    private static ClientSession.Demand installed(ClientSession.Session s, long key) {
+        s.addDemand(key);
+        var d = s.demands.get(key);
+        Publication publication = new Publication(new SectionSubmission(key, BuiltSection.empty(key),
+                false, 1, Optional.empty(), () -> true, () -> {}));
+        publication.activate();
+        d.publication = publication;
+        d.installed = true;
+        s.activeCount++;
+        s.setActiveGeometryBytes(d, 1024);
+        return d;
+    }
+
+    private static CountedBuffer replacement(ClientSession.Session s, ClientSession.Demand d)
+            throws Exception {
+        var worker = s.idleWorker();
+        var ticket = d.ticket(s.id, worker.index);
+        d.workLease = worker.assign(new ClientSession.Session.EmptyWorkerTask(ticket, (byte) 0));
+        s.demands.owned(d, SectionDemandTable.CandidateState.WORKER_OWNED);
+        CountedBuffer buffer = new CountedBuffer();
+        worker.resource.complete(d.workLease, new ClientSession.Session.WorkerGeometry(ticket,
+                mesh(d.key, buffer), 1, true, 0));
+        s.drainWorkers();
+        return buffer;
+    }
+
+    private static void dormancyRetirementDoesNotInvalidateBlockedSweep() throws Exception {
+        for (AllocationStatus reason : List.of(AllocationStatus.NO_CONTIGUOUS_GEOMETRY_SPACE,
+                AllocationStatus.NO_SECTION_ID)) for (boolean success : new boolean[]{false, true}) {
+            Publisher p = new Publisher(); ClientSession.Session s = session(p, 3);
+            long parentKey = SectionKey.pack(1, 0, 0, 0);
+            var parent = installed(s, parentKey);
+            var fallback = parent.publication;
+            var a = installed(s, key(0)); var b = installed(s, key(1));
+            var unrelated = installed(s, key(8));
+            CountedBuffer first = replacement(s, a), second = replacement(s, b);
+            CountedBuffer third = replacement(s, unrelated);
+            s.scheduleReadyPublications();
+            for (Publication publication : p.handoff.take()) publication.giveBack(reason, p.progress());
+            s.pollPublications();
+            check(s.rendererBlocked.size() == 3 && p.evictions == 0, "pressure setup did not block");
+            s.markDormant(parentKey, 0, 1); // Removes two entries while walking rendererBlocked.
+            check(p.evictions == 1 && s.coarseningRoots.equals(Set.of(parentKey)),
+                    "dormancy did not schedule exactly one subtree retirement");
+            check(s.demands.get(a.key) == null && s.demands.get(b.key) == null
+                    && s.rendererBlocked.equals(Set.of(unrelated.key)), "removed demand membership survived");
+            check(s.demands.readyCount(SectionDemandTable.ReadyKind.RENDERER) == 0
+                    && first.frees == 1 && second.frees == 1 && third.frees == 0,
+                    "retirement leaked/doubled a replacement buffer or ready membership");
+            long occupied = Arrays.stream(s.sectionWorkers).filter(w -> !w.idle()).count();
+            check(occupied == 1 && parent.publication == fallback && fallback.activationFencePassed()
+                    && !fallback.retirementFencePassed(), "coarse fallback or operation lease lost");
+            check(s.pendingDormantEvictionBytes == 2048 && s.dormantBytesFreedAfterFences == 0,
+                    "pending physical bytes became free before a fence");
+            s.markDormant(parentKey, 0, 1); s.markDormant(parentKey, 0, 0);
+            s.wakeDormant(parentKey, 2);
+            check(p.evictions == 1, "duplicate/stale dormancy or quick wake repeated retirement");
+            if (success) {
+                p.allocation++; p.sectionIds++; p.retirementDone.run();
+            } else p.retirementFailed.accept(new IllegalStateException("injected retirement failure"));
+            s.drainEvents();
+            check(s.pendingDormantEvictionBytes == 0 && s.coarseningRoots.isEmpty()
+                    && s.dormantBytesFreedAfterFences == (success ? 2048 : 0), "fence accounting incorrect");
+            if (!success) {
+                check(s.rendererBlocked.contains(unrelated.key), "failure falsely released physical capacity");
+                p.allocation++; p.sectionIds++; s.retryRendererBlocked();
+            }
+            check(!s.rendererBlocked.contains(unrelated.key)
+                    && s.demands.readyCount(SectionDemandTable.ReadyKind.RENDERER) == 1,
+                    "unrelated blocked request lost its progress wake");
+            s.release();
+            check(first.frees == 1 && second.frees == 1 && third.frees == 1, "shutdown double free");
+        }
+    }
+
+    private static void measureDormancyBurstAllocation() {
+        var bean = java.lang.management.ManagementFactory.getThreadMXBean();
+        if (!(bean instanceof com.sun.management.ThreadMXBean allocation) || !allocation.isThreadAllocatedMemorySupported()) return;
+        allocation.setThreadAllocatedMemoryEnabled(true);
+        long thread = Thread.currentThread().threadId();
+        for (int blocked : new int[]{0, 256}) {
+            Publisher publisher = new Publisher();
+            ClientSession.Session s = session(publisher, 1);
+            long parent = SectionKey.pack(1, 0, 0, 0);
+            installed(s, parent); installed(s, key(0));
+            // The benchmark measures the real event sweep; the pressure correctness test above
+            // uses actual refused publications and leases. Topology waits do not evict here.
+            for (int i = 0; i < blocked; i++) {
+                long key = key(i + 32);
+                var waiting = s.demands.adopt(new ClientSession.Demand(key));
+                waiting.blockedReason = AllocationStatus.TOPOLOGY_NOT_READY;
+                s.rendererBlocked.add(key);
+            }
+            for (int epoch = 1; epoch <= 100; epoch++) s.markDormant(parent, 1, epoch);
+            long before = allocation.getThreadAllocatedBytes(thread);
+            long start = System.nanoTime();
+            for (int epoch = 101; epoch <= 1100; epoch++) s.markDormant(parent, 1, epoch);
+            long elapsed = System.nanoTime() - start;
+            long bytes = allocation.getThreadAllocatedBytes(thread) - before;
+            System.out.println("dormancy burst: events=1000 blocked=" + blocked + " allocatedBytes="
+                    + bytes + " elapsedNanos=" + elapsed);
+            check(publisher.evictions == 0, "benchmark topology waits evicted terrain");
+            s.release();
+        }
+    }
+
+    private static void dormancyEpochsAndQuickWake() {
+        Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
+        long key = SectionKey.pack(1, 0, 0, 0);
+        var parent = installed(s, key); installed(s, key(0));
+        s.markDormant(key, 1, 1); s.markDormant(key, 1, 1); s.markDormant(key, 1, 0);
+        check(s.dormancyTransitions == 1 && s.dormantGeometryBytes == 1024, "empty blocked sweep/epochs");
+        s.wakeDormant(key, 2);
+        check(!parent.dormant && s.dormantGeometryBytes == 0 && s.instantWakes == 1,
+                "quick return did not retain installed descendants");
+        // One blocked entry is also safe; it need not initiate an eviction for a topology wait.
+        parent.blockedReason = AllocationStatus.TOPOLOGY_NOT_READY;
+        s.rendererBlocked.add(key);
+        s.markDormant(key, 1, 3);
+        check(p.evictions == 0 && s.rendererBlocked.contains(key), "topology wait caused unrelated eviction");
+        s.release();
     }
 }

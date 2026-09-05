@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
+import me.cortex.voxy.client.core.ShaderResourceScope;
+import me.cortex.voxy.client.iris.IrisUtil;
+import net.irisshaders.iris.Iris;
+import net.irisshaders.iris.api.v0.IrisApi;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.debugtest.DebugTestCommandPayload;
 import me.cortex.voxy.debugtest.DebugLatestMailbox;
@@ -177,6 +181,41 @@ final class LiveClientTestHarness {
         }
         active.stepId = command.stepId();
         switch (command.kind()) {
+            case SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION -> {
+                if (!IrisUtil.IRIS_INSTALLED || active.renderer == null) {
+                    sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
+                    break;
+                }
+                try {
+                    if (active.shaderSettings == null) active.shaderSettings = new DebugShaderSettings();
+                    if (command.kind() == DebugTestProtocol.CommandKind.SHADER_OPTION) {
+                        active.shaderSettings.option(command.shaderOption(), command.shaderValue());
+                    } else if (command.kind() == DebugTestProtocol.CommandKind.SHADERS_ON
+                            || command.kind() == DebugTestProtocol.CommandKind.SHADERS_OFF) {
+                        IrisApi.getInstance().getConfig().setShadersEnabledAndApply(
+                                command.kind() == DebugTestProtocol.CommandKind.SHADERS_ON);
+                    } else if (command.kind() == DebugTestProtocol.CommandKind.SHADER_RELOAD_ALL_CHANGED) {
+                        var scope = active.renderer.beginShaderReload("debug Iris.reload with nested allChanged");
+                        Throwable failure = null;
+                        try { Iris.reload(); Minecraft.getInstance().levelRenderer.allChanged(); }
+                        catch (Throwable problem) { failure = problem; throw problem; }
+                        finally { scope.finish(failure); }
+                    } else {
+                        Iris.reload();
+                    }
+                    if (IGetVoxyRenderSystem.getNullable() != active.renderer) {
+                        failRun(DebugTestProtocol.Failure.RENDERER_REPLACED);
+                    } else if (!active.renderer.shaderReloadStatus().equals("READY")) {
+                        failRun(DebugTestProtocol.Failure.INTERNAL);
+                    } else {
+                        requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
+                                active.stepId, DebugTestProtocol.Failure.NONE, false);
+                    }
+                } catch (Throwable failure) {
+                    me.cortex.voxy.common.Logger.error("Debug shader reload failed", failure);
+                    failRun(DebugTestProtocol.Failure.INTERNAL);
+                }
+            }
             case RECONNECT_QUIC -> {
                 // Close only this Voxy transport on its owner. Normal connection-loss recovery
                 // must reconnect; neither Minecraft nor any other client is disconnected.
@@ -204,8 +243,25 @@ final class LiveClientTestHarness {
                     active.stepId, DebugTestProtocol.Failure.NONE, false);
             case CAPTURE_SCREENSHOT -> active.screenshot = new ScreenshotRequest(
                     "voxy-test-" + active.runId + '-' + active.stepId + ".png", renderedFrame);
-            case END_RUN -> requestResult(DebugTestProtocol.ResultKind.RUN_COMPLETE,
-                    active.runId, active.stepId, DebugTestProtocol.Failure.NONE, true);
+            case END_RUN -> {
+                try {
+                    if (active.shaderSettings != null) {
+                        active.shaderSettings.restore();
+                        active.shaderSettings = null;
+                    }
+                    if (IGetVoxyRenderSystem.getNullable() != active.renderer) {
+                        failRun(DebugTestProtocol.Failure.RENDERER_REPLACED);
+                    } else if (active.renderer != null && !active.renderer.shaderReloadStatus().equals("READY")) {
+                        failRun(DebugTestProtocol.Failure.INTERNAL);
+                    } else {
+                        requestResult(DebugTestProtocol.ResultKind.RUN_COMPLETE,
+                                active.runId, active.stepId, DebugTestProtocol.Failure.NONE, true);
+                    }
+                } catch (Throwable failure) {
+                    me.cortex.voxy.common.Logger.error("Debug shader settings restoration failed", failure);
+                    failRun(DebugTestProtocol.Failure.INTERNAL);
+                }
+            }
             case ABORT_RUN -> requestResult(DebugTestProtocol.ResultKind.RUN_FAILED,
                     active.runId, active.stepId, DebugTestProtocol.Failure.ABORTED, true);
             case BEGIN_RUN -> throw new AssertionError();
@@ -352,8 +408,7 @@ final class LiveClientTestHarness {
     private static void loadBuildIdentity() {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            Path path = Path.of(LiveClientTestHarness.class.getProtectionDomain()
-                    .getCodeSource().getLocation().toURI());
+            Path path = net.neoforged.fml.ModList.get().getModFileById("voxy").getFile().getFilePath();
             if (java.nio.file.Files.isRegularFile(path)) {
                 try (var input = java.nio.file.Files.newInputStream(path)) {
                     byte[] buffer = new byte[64 * 1024];
@@ -421,6 +476,7 @@ final class LiveClientTestHarness {
 
     private static DebugTestSnapshot snapshot(Pose pose, ClientSession.PipelineSnapshot pipeline) {
         ClientLodDebug.RenderCounters render = ClientLodDebug.renderCounters();
+        VoxyRenderSystem renderer = IGetVoxyRenderSystem.getNullable();
         long presence = pose.frame >= 0 ? DebugTestSnapshot.POSE_PRESENT : 0;
         if (pipeline != null) presence |= DebugTestSnapshot.SESSION_PRESENT
                 | DebugTestSnapshot.GEOMETRY_RETENTION_PRESENT;
@@ -482,11 +538,38 @@ final class LiveClientTestHarness {
                 pipeline == null ? 0 : pipeline.topologyGeneration(),
                 pipeline == null ? 0 : pipeline.allocationReleaseGeneration(),
                 pipeline == null ? 0 : pipeline.sectionIdReleaseGeneration(),
-                pipeline == null ? 0 : pipeline.handoffBusy());
+                pipeline == null ? 0 : pipeline.handoffBusy(),
+                renderer == null ? 0 : renderer.rendererIdentity(),
+                renderer == null ? 0 : renderer.shaderReloadGeneration(),
+                renderer == null ? "ABSENT" : renderer.shaderReloadStatus(),
+                renderer == null ? "" : boundedReason(renderer.shaderReloadReason()),
+                renderer == null ? 0 : renderer.shaderReloadPauseNanos(),
+                renderer == null ? 0 : renderer.shaderHistoryInvalidations(),
+                renderer == null ? 0 : renderer.shaderResumedDraws(),
+                renderer == null ? 0 : renderer.shaderMaterialUpdates(),
+                ShaderResourceScope.created(), ShaderResourceScope.freed(),
+                IrisUtil.IRIS_INSTALLED ? boundedReason(Iris.getCurrentPackName()) : "Iris absent",
+                Minecraft.getInstance().options.fov().get(),
+                pipeline == null ? 0 : pipeline.dormancyTransitions(),
+                pipeline == null ? 0 : pipeline.wakes(),
+                pipeline == null ? 0 : pipeline.instantWakes(),
+                pipeline == null ? 0 : pipeline.dormantEvictions());
+    }
+
+    private static String boundedReason(String value) {
+        return value == null ? "" : value.substring(0, Math.min(value.length(), 512));
     }
 
     private static void clearRun() {
+        Run previous = run;
         run = null;
+        if (previous != null && previous.shaderSettings != null && IrisUtil.IRIS_INSTALLED) {
+            try {
+                previous.shaderSettings.restore();
+            } catch (Throwable failure) {
+                me.cortex.voxy.common.Logger.error("Could not restore original shader enable state", failure);
+            }
+        }
         snapshotToken++;
         snapshotPending = false;
         TRACE_MAILBOX.clear();
@@ -497,6 +580,7 @@ final class LiveClientTestHarness {
         final UUID runId;
         final VoxyRenderSystem renderer;
         long stepId;
+        DebugShaderSettings shaderSettings;
         PoseExpectation pose;
         Trace trace;
         ScreenshotRequest screenshot;

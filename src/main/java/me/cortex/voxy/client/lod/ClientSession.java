@@ -135,7 +135,7 @@ final class ClientSession {
             long completedWorkerBytes, int idleLanes, int activeLanes,
             int activeLaneSections, long laneBodyBytes, long reconnects,
             long largestFreeGeometryUnits, int usedGeometrySections,
-            long handoffGeneration, long handoffOccupied, long publicationActivated, long publicationReturned, long publicationCancelled, long publicationFailed, long outstandingLeases, long pendingCoverageReplies, long pendingRefinementReplies, long blockedGeometry, long blockedSectionId, long blockedTopology, long blockedStale, long impossible, long topologyGeneration, long allocationReleaseGeneration, long sectionIdReleaseGeneration, long handoffBusy) {}
+            long handoffGeneration, long handoffOccupied, long publicationActivated, long publicationReturned, long publicationCancelled, long publicationFailed, long outstandingLeases, long pendingCoverageReplies, long pendingRefinementReplies, long blockedGeometry, long blockedSectionId, long blockedTopology, long blockedStale, long impossible, long topologyGeneration, long allocationReleaseGeneration, long sectionIdReleaseGeneration, long handoffBusy, long dormancyTransitions, long wakes, long instantWakes, long dormantEvictions) {}
 
     static void tick() {
         Minecraft minecraft = Minecraft.getInstance();
@@ -907,7 +907,7 @@ final class ClientSession {
                     blocked[AsyncNodeManager.RegionalAllocationStatus.TOPOLOGY_NOT_READY.ordinal()],
                     blocked[AsyncNodeManager.RegionalAllocationStatus.STALE.ordinal()],
                     blocked[AsyncNodeManager.RegionalAllocationStatus.IMPOSSIBLE.ordinal()],
-                    progress.topology(), progress.allocation(), progress.sectionIds(), this.handoffBusy);
+                    progress.topology(), progress.allocation(), progress.sectionIds(), this.handoffBusy, this.dormancyTransitions, this.wakes, this.instantWakes, this.capEvictions + this.admissionEvictions);
         }
 
         void drainDemand() {
@@ -1008,9 +1008,11 @@ final class ClientSession {
             if (previous != null) this.dormantGeometryBytes -= previous.bytes;
             this.dormantGeometryBytes += bytes;
             this.validateGeometryAccounting();
-            for (long blockedKey : this.rendererBlocked) {
+            // Retirement can synchronously remove several of these keys through coarsen().
+            for (Long blockedKey : List.copyOf(this.rendererBlocked)) {
                 Demand blocked = this.demands.get(blockedKey);
-                if (blocked != null) this.requestBlockedRetirement(blocked);
+                if (blocked != null && blocked.blockedReason != null
+                        && this.rendererBlocked.contains(blockedKey)) this.requestBlockedRetirement(blocked);
             }
         }
 

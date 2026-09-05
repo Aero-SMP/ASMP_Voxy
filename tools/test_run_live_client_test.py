@@ -16,6 +16,14 @@ class ScenarioValidationTest(unittest.TestCase):
         with self.assertRaises(runner.ScenarioError):
             runner.validate_scenario({"steps": [{"op": "checkpoint", "shell": "true"}]})
 
+    def test_shader_controls_are_narrow(self) -> None:
+        for name in ("shader_reload", "shader_reload_all_changed", "shaders_on", "shaders_off"):
+            runner.validate_scenario({"steps": [{"op": name}]})
+        runner.validate_scenario({"steps": [{"op": "shader_option", "option": "TAA", "value": "true"}]})
+        for option in ("../config", "TAA;stop", "", "TAA\nstop"):
+            with self.assertRaises(runner.ScenarioError):
+                runner.validate_scenario({"steps": [{"op": "shader_option", "option": option, "value": "true"}]})
+
     def test_accepts_every_declared_scenario(self) -> None:
         for path in Path("tools/scenarios").glob("*.json"):
             scenario, digest = runner.canonical_scenario(path)

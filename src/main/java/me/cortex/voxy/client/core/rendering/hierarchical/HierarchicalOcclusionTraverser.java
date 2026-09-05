@@ -101,14 +101,13 @@ public class HierarchicalOcclusionTraverser {
         this.nodeManager.setTLNAddRemoveCallbacks(this::addTLN, this::remTLN);
     }
 
-    public void lateStageCompile(AbstractRenderPipeline pipeline) {
+    public AutoBindingShader compileProgram(AbstractRenderPipeline pipeline) {
         String taa = pipeline.taaFunction("getTAA");
         var scr = ShaderLoader.parse("voxy:lod/hierarchical/traversal.comp");
         if (taa != null) {
             scr += "\n\n\n" + taa;
-            this.pipeline = pipeline;
         }
-        this.traversal = Shader.makeAuto()
+        AutoBindingShader compiled = Shader.makeAuto()
             .define("USE_ZERO_ONE_DEPTH")
             .define("MAX_ITERATIONS", MAX_ITERATIONS)
             .define("LOCAL_SIZE_BITS", LOCAL_WORK_SIZE_BITS)
@@ -135,12 +134,28 @@ public class HierarchicalOcclusionTraverser {
             .compile();
 
 
-        this.traversal
-                .ubo("SCENE_UNIFORM_BINDING", this.uniformBuffer)
-                .ssbo("DETAIL_ACTION_BINDING", this.detailActionBuffer)
-                .ssbo("NODE_DATA_BINDING", this.nodeBuffer)
-                .ssbo("NODE_QUEUE_META_BINDING", this.queueMetaBuffer)
-                .ssbo("RENDER_TRACKER_BINDING", this.nodeCleaner.visibilityBuffer);
+        try {
+            return compiled
+                    .ubo("SCENE_UNIFORM_BINDING", this.uniformBuffer)
+                    .ssbo("DETAIL_ACTION_BINDING", this.detailActionBuffer)
+                    .ssbo("NODE_DATA_BINDING", this.nodeBuffer)
+                    .ssbo("NODE_QUEUE_META_BINDING", this.queueMetaBuffer)
+                    .ssbo("RENDER_TRACKER_BINDING", this.nodeCleaner.visibilityBuffer);
+        } catch (RuntimeException | Error failure) {
+            compiled.free();
+            throw failure;
+        }
+    }
+
+    /** The renderer shader group owns the program; the traversal retains its node state. */
+    public void installProgram(AutoBindingShader program, AbstractRenderPipeline pipeline) {
+        this.traversal = program;
+        this.pipeline = program != null && pipeline.hasTAA() ? pipeline : null;
+        this.previousFrameNanos = 0;
+    }
+
+    public void clearProgram(AutoBindingShader expected) {
+        if (this.traversal == expected) { this.traversal = null; this.pipeline = null; }
     }
 
     private void addTLN(int id) {
@@ -369,7 +384,8 @@ public class HierarchicalOcclusionTraverser {
     }
 
     public void free() {
-        if (this.traversal != null) this.traversal.free();
+        this.traversal = null;
+        this.pipeline = null;
         this.detailActionBuffer.free();
         this.nodeBuffer.free();
         this.uniformBuffer.free();

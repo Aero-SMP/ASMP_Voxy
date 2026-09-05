@@ -33,9 +33,10 @@ import static org.lwjgl.opengl.GL45C.glBindTextureUnit;
 import static org.lwjgl.opengl.GL45C.glTextureParameterf;
 
 public class NormalRenderPipeline extends AbstractRenderPipeline {
+    private ShaderResourceScope targets = new ShaderResourceScope();
     private GlTexture colourTex;
     private GlTexture colourSSAOTex;
-    private final GlFramebuffer fbSSAO = new GlFramebuffer();
+    private final GlFramebuffer fbSSAO;
 
     private final boolean useEnvFog;
     private final FullscreenBlit finalBlit;
@@ -45,24 +46,30 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     protected NormalRenderPipeline(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal) {
         super(nodeManager, nodeCleaner, traversal);
         this.useEnvFog = VoxyConfig.CONFIG.useEnvironmentalFog;
-        this.finalBlit = new FullscreenBlit("voxy:post/blit_texture_depth_cutout.frag",
-                a->a.defineIf("USE_ENV_FOG", this.useEnvFog).define("EMIT_COLOUR"));
+        try {
+            this.fbSSAO = this.shaderResources.own(new GlFramebuffer(), GlFramebuffer::free);
+            this.finalBlit = this.shaderResources.own(new FullscreenBlit("voxy:post/blit_texture_depth_cutout.frag",
+                    a->a.defineIf("USE_ENV_FOG", this.useEnvFog).define("EMIT_COLOUR")), FullscreenBlit::delete);
 
 
-        this.ssao = SSAO.createSSAO(VoxyConfig.CONFIG.getSSAOMode());
+            this.ssao = this.shaderResources.own(SSAO.createSSAO(VoxyConfig.CONFIG.getSSAOMode()), SSAO::free);
+        } catch (RuntimeException | Error failure) {
+            this.shaderResources.cleanupAfter(failure);
+            throw failure;
+        }
     }
 
-    @Override
-    protected int setup(Viewport viewport, int sourceFB, int srcWidth, int srcHeight) {
-        if (this.colourTex == null || this.colourTex.getHeight() != viewport.height || this.colourTex.getWidth() != viewport.width) {
-            if (this.colourTex != null) {
-                this.colourTex.free();
-                this.colourSSAOTex.free();
-            }
-            this.fb.resize(viewport.width, viewport.height);
+    @Override public void prepareTargets(int width, int height) {
+        if (this.colourTex == null || this.colourTex.getHeight() != height || this.colourTex.getWidth() != width) {
+            this.targets.close();
+            this.targets = new ShaderResourceScope();
+            this.colourTex = this.colourSSAOTex = null;
+            this.fb.resize(width, height);
 
-            this.colourTex = new GlTexture().store(GL_RGBA8, 1, viewport.width, viewport.height);
-            this.colourSSAOTex = new GlTexture().store(GL_RGBA8, 1, viewport.width, viewport.height);
+            this.colourTex = this.targets.own(new GlTexture(), GlTexture::free);
+            this.colourTex.store(GL_RGBA8, 1, width, height);
+            this.colourSSAOTex = this.targets.own(new GlTexture(), GlTexture::free);
+            this.colourSSAOTex.store(GL_RGBA8, 1, width, height);
 
             this.fb.framebuffer.bind(GL_COLOR_ATTACHMENT0, this.colourTex).verify();
             this.fbSSAO.bind(this.fb.getDepthAttachmentType(), this.fb.getDepthTex()).bind(GL_COLOR_ATTACHMENT0, this.colourSSAOTex).verify();
@@ -74,6 +81,12 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
             glTextureParameterf(this.colourSSAOTex.id, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             glTextureParameterf(this.fb.getDepthTex().id, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_DEPTH_COMPONENT);
         }
+
+    }
+
+    @Override
+    protected int setup(Viewport viewport, int sourceFB, int srcWidth, int srcHeight) {
+        this.prepareTargets(viewport.width, viewport.height);
 
         this.initDepthStencil(sourceFB, this.fb.framebuffer.id, viewport.width, viewport.height, viewport.width, viewport.height);
 
@@ -138,16 +151,8 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
         glBindFramebuffer(GL_FRAMEBUFFER, this.fbSSAO.id);
     }
 
-    @Override
-    public void free() {
-        this.finalBlit.delete();
-        this.ssao.free();
-        this.fbSSAO.free();
-        if (this.colourTex != null) {
-            this.colourTex.free();
-            this.colourSSAOTex.free();
-        }
-        super.free0();
+    @Override public void free() {
+        if (this.isFreed()) return;
+        try { this.targets.close(); } finally { super.free0(); }
     }
-
 }

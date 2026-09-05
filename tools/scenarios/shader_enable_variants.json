@@ -1,0 +1,107 @@
+{
+  "name": "shader_enable_variants",
+  "steps": [
+    {
+      "op": "wait_until",
+      "field": "coverageMissing",
+      "comparison": "==",
+      "value": 0,
+      "timeout_ms": 120000
+    },
+    {
+      "op": "wait_until",
+      "field": "gpuDraws",
+      "comparison": ">",
+      "value": 0,
+      "timeout_ms": 120000
+    },
+    {
+      "op": "assert",
+      "field": "active",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "field": "shaderReloadStatus",
+      "comparison": "==",
+      "value": "READY"
+    },
+    {
+      "op": "checkpoint",
+      "name": "before"
+    },
+    {
+      "op": "shaders_off"
+    },
+    {
+      "op": "hold",
+      "duration_ms": 1000,
+      "cadence_ms": 100
+    },
+    {
+      "op": "shaders_on"
+    },
+    {
+      "op": "hold",
+      "duration_ms": 3000,
+      "cadence_ms": 100
+    },
+    {
+      "op": "checkpoint",
+      "name": "after"
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "rendererIdentity",
+      "from": "before",
+      "to": "after",
+      "comparison": "==",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "sessionGeneration",
+      "from": "before",
+      "to": "after",
+      "comparison": "==",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "shaderReloadGeneration",
+      "from": "before",
+      "to": "after",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "shaderResumedDraws",
+      "from": "before",
+      "to": "after",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "field": "shaderReloadStatus",
+      "comparison": "==",
+      "value": "READY"
+    },
+    {
+      "op": "assert",
+      "field": "gpuDraws",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "absence_of_failure"
+    }
+  ]
+}

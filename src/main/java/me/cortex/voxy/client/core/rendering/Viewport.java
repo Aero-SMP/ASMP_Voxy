@@ -67,6 +67,16 @@ public final class Viewport {
         this.visibilityBuffer = new GlBuffer(maxSectionCount * 4L);
     }
 
+    /** Frame-local state only. NodeCleaner dormancy, selection epochs and frameId survive. */
+    public void invalidateShaderHistory() {
+        this.hiZBuffer.invalidate();
+        this.refinedHiZBuffer.invalidate();
+        this.visibilityBuffer.zero();
+        this.drawCountCallBuffer.zero();
+        this.indirectLookupBuffer.zero();
+        if (this.depthBoundingBuffer.getDepthTex() != null) this.depthBoundingBuffer.clear(0.0f);
+    }
+
     public final void delete() {
         this.hiZBuffer.free();
         this.refinedHiZBuffer.free();

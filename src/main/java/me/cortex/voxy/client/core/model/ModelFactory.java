@@ -69,9 +69,9 @@ public class ModelFactory {
 
     //TODO: replace the fluid BlockState with a client model id integer of the fluidState, requires looking up
     // the fluid state in the mipper
-    private record ModelEntry(ColourDepthTextureData down, ColourDepthTextureData up, ColourDepthTextureData north, ColourDepthTextureData south, ColourDepthTextureData west, ColourDepthTextureData east, int fluidBlockStateId, int tintingColour) {
-        public ModelEntry(ColourDepthTextureData[] textures, int fluidBlockStateId, int tintingColour) {
-            this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour);
+    private record ModelEntry(ColourDepthTextureData down, ColourDepthTextureData up, ColourDepthTextureData north, ColourDepthTextureData south, ColourDepthTextureData west, ColourDepthTextureData east, int fluidBlockStateId, int tintingColour, int materialId) {
+        public ModelEntry(ColourDepthTextureData[] textures, int fluidBlockStateId, int tintingColour, int materialId) {
+            this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour, materialId);
         }
     }
 
@@ -137,6 +137,8 @@ public class ModelFactory {
     private final AtomicLong modelMappingPublication = new AtomicLong();
 
     private Object2IntMap<BlockState> customBlockStateIdMapping;
+    private int nextModelId;
+    private long materialUpdates;
 
     //TODO: NOTE!!! is it worth even uploading as a 16x16 texture, since automatic lod selection... doing 8x8 textures might be perfectly ok!!!
     // this _quarters_ the memory requirements for the texture atlas!!! WHICH IS HUGE saving
@@ -156,8 +158,44 @@ public class ModelFactory {
         this.addEntry(0);//Add air as the first entry
     }
 
-    public void setCustomBlockStateMapping(Object2IntMap<BlockState> mapping) {
-        this.customBlockStateIdMapping = mapping;
+    public synchronized void setCustomBlockStateMapping(Object2IntMap<BlockState> mapping) {
+        Object2IntMap<BlockState> effective = mapping == null
+                ? it.unimi.dsi.fastutil.objects.Object2IntMaps.emptyMap() : mapping;
+        if (effective.equals(this.customBlockStateIdMapping)) return;
+        // Bakes commit aliases under this same monitor. Validate the whole existing alias set
+        // before changing any model record, including records still waiting in uploadResults.
+        int[] materials = MaterialCompatibility.resolve(this.mapper.getBlockStateCount(),
+                this.nextModelId, state -> this.idMappings[state],
+                state -> material(effective, this.materialState(state)));
+        var snapshot = new Object2IntOpenHashMap<BlockState>(effective);
+        for (int id = 0; id < this.nextModelId; id++) {
+            ModelEntry old = this.modelEntriesById[id];
+            if (old.materialId == materials[id]) continue;
+            this.modelEntriesById[id] = new ModelEntry(old.down, old.up, old.north, old.south,
+                    old.west, old.east, old.fluidBlockStateId, old.tintingColour, materials[id]);
+            MemoryUtil.memPutInt(UploadStream.INSTANCE.upload(this.storage.modelBuffer,
+                    (long) id * MODEL_SIZE + 32, 4), materials[id]);
+            this.materialUpdates++;
+        }
+        // IDs stay stable even if formerly distinct records now have identical materials.
+        this.modelTexture2id.clear();
+        for (int id = 0; id < this.nextModelId; id++) {
+            this.modelTexture2id.putIfAbsent(this.modelEntriesById[id], id);
+        }
+        this.customBlockStateIdMapping = snapshot;
+        UploadStream.INSTANCE.commit();
+    }
+
+    public synchronized long materialUpdates() { return this.materialUpdates; }
+
+    private BlockState materialState(int blockId) {
+        BlockState state = this.mapper.getBlockStateFromBlockId(blockId);
+        return state.getBlock() instanceof StairBlock stairs
+                ? stairs.baseState.getBlock().withPropertiesOf(state) : state;
+    }
+
+    private static int material(Object2IntMap<BlockState> mapping, BlockState state) {
+        return mapping != null && mapping.containsKey(state) ? mapping.getInt(state) : 0;
     }
 
     private static final record BlockBake(int blockId, BlockState state) {
@@ -322,7 +360,7 @@ public class ModelFactory {
         return (this.blockStatesInFlight.size()!=0)||(!this.bakeQueue.isEmpty())||!this.biomeQueue.isEmpty();
     }
 
-    public void processUploads() {
+    public synchronized void processUploads() {
         var upload = this.uploadResults.poll();
         if (upload==null) return;
 
@@ -333,6 +371,10 @@ public class ModelFactory {
         do {
             int pendingModelId = upload instanceof ModelBakeResultUpload model
                     ? model.modelId : -1;
+            if (upload instanceof ModelBakeResultUpload model) {
+                MaterialCompatibility.patchUpload(model.model.address,
+                        this.modelEntriesById[model.modelId].materialId);
+            }
             upload.upload(this.storage);
             if (pendingModelId >= 0) this.modelIdsPendingUpload.remove(pendingModelId);
             upload.free();
@@ -389,7 +431,7 @@ public class ModelFactory {
         }
     }
 
-    private ModelBakeResultUpload processTextureBakeResult(int blockId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer) {
+    private synchronized ModelBakeResultUpload processTextureBakeResult(int blockId, BlockState blockState, ColourDepthTextureData[] textureData, boolean isShaded, boolean darkenedTinting, RenderType layer) {
         if (this.idMappings[blockId] != -1) {
             //This should be impossible to reach as it means that multiple bakes for the same blockId happened and where inflight at the same time!
             throw new IllegalStateException("Block id already added: " + blockId + " for state: " + blockState);
@@ -426,7 +468,8 @@ public class ModelFactory {
 
         ModelEntry entry;
         {//Deduplicate same entries
-            entry = new ModelEntry(textureData, clientFluidStateId, isBiomeColourDependent||colourProvider==null?-1:captureColourConstant(colourProvider, blockState, DEFAULT_BIOME)|0xFF000000);
+            entry = new ModelEntry(textureData, clientFluidStateId, isBiomeColourDependent||colourProvider==null?-1:captureColourConstant(colourProvider, blockState, DEFAULT_BIOME)|0xFF000000,
+                    material(this.customBlockStateIdMapping, blockState));
             int possibleDuplicate = this.modelTexture2id.getInt(entry);
             if (possibleDuplicate != -1) {//Duplicate found
                 this.idMappings[blockId] = possibleDuplicate;
@@ -435,7 +478,8 @@ public class ModelFactory {
                 this.checkInFlight(blockId, true);
                 return null;
             } else {//Not a duplicate so create a new entry
-                modelId = this.modelTexture2id.size();
+                modelId = this.nextModelId++;
+                if (modelId >= this.modelEntriesById.length) throw new IllegalStateException("model ID capacity exhausted");
                 //NOTE: we set the mapping at the very end so that race conditions with this and getMetadata dont occur
                 //this.idMappings[blockId] = modelId;
                 this.modelTexture2id.put(entry, modelId);
@@ -656,12 +700,7 @@ public class ModelFactory {
 
         //have 32 bytes of free space after here
 
-        //install the custom mapping id if it exists
-        if (this.customBlockStateIdMapping != null && this.customBlockStateIdMapping.containsKey(blockState)) {
-            MemoryUtil.memPutInt(uploadPtr, this.customBlockStateIdMapping.getInt(blockState));
-        } else {
-            MemoryUtil.memPutInt(uploadPtr, 0);
-        } uploadPtr += 4;
+        MemoryUtil.memPutInt(uploadPtr, entry.materialId); uploadPtr += 4;
 
 
         //Note: if the layer isSolid then need to fill all the points in the texture where alpha == 0 with the average colour

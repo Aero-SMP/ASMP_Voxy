@@ -4,19 +4,20 @@ import net.minecraft.resources.ResourceLocation;
 
 /** Constants shared only by matching debug client/server artifacts. */
 public final class DebugTestProtocol {
-    public static final int VERSION = 1;
-    public static final String REGISTRATION_VERSION = "voxy-debug-test-v1";
+    public static final int VERSION = 2;
+    public static final String REGISTRATION_VERSION = "voxy-debug-test-v2";
     public static final int MAX_DIMENSION_LENGTH = 256;
     public static final ResourceLocation COMMAND_ID = ResourceLocation.fromNamespaceAndPath(
-            "voxy", "debug_test_command_v1");
+            "voxy", "debug_test_command_v2");
     public static final ResourceLocation RESULT_ID = ResourceLocation.fromNamespaceAndPath(
-            "voxy", "debug_test_result_v1");
+            "voxy", "debug_test_result_v2");
 
     private DebugTestProtocol() {}
 
     public enum CommandKind {
         BEGIN_RUN(1), EXPECT_POSE(2), START_TRACE(3), CAPTURE_CHECKPOINT(4),
-        CAPTURE_SCREENSHOT(5), END_RUN(6), ABORT_RUN(7), RECONNECT_QUIC(8);
+        CAPTURE_SCREENSHOT(5), END_RUN(6), ABORT_RUN(7), RECONNECT_QUIC(8),
+        SHADER_RELOAD(9), SHADERS_ON(10), SHADERS_OFF(11), SHADER_RELOAD_ALL_CHANGED(12), SHADER_OPTION(13);
 
         private final int wireId;
         CommandKind(int wireId) { this.wireId = wireId; }

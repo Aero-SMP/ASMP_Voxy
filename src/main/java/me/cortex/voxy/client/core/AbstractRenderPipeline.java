@@ -43,9 +43,10 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
     protected MDICSectionRenderer sectionRenderer;
 
+    protected final ShaderResourceScope shaderResources = new ShaderResourceScope();
     private final FullscreenBlit depthStencilSetup;
 
-    public final DepthFramebuffer fb = new DepthFramebuffer(GL_DEPTH24_STENCIL8);
+    public final DepthFramebuffer fb;
 
     private static final int DEPTH_SAMPLER = glGenSamplers();
     static {
@@ -57,7 +58,14 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         this.nodeManager = nodeManager;
         this.nodeCleaner = nodeCleaner;
         this.traversal = traversal;
-        this.depthStencilSetup = new FullscreenBlit("voxy:post/fullscreen2.vert", "voxy:post/setup_stencil_depth.frag");
+        try {
+            this.fb = this.shaderResources.own(new DepthFramebuffer(GL_DEPTH24_STENCIL8), DepthFramebuffer::free);
+            this.depthStencilSetup = this.shaderResources.own(new FullscreenBlit(
+                    "voxy:post/fullscreen2.vert", "voxy:post/setup_stencil_depth.frag"), FullscreenBlit::delete);
+        } catch (RuntimeException | Error failure) {
+            this.shaderResources.cleanupAfter(failure);
+            throw failure;
+        }
     }
 
     //Allows pipelines to configure model baking system
@@ -65,8 +73,13 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
     public final void setSectionRenderer(MDICSectionRenderer sectionRenderer) {//Stupid java ordering not allowing something pre super
         if (this.sectionRenderer != null) throw new IllegalStateException();
-        this.sectionRenderer = sectionRenderer;
+        this.sectionRenderer = this.shaderResources.own(sectionRenderer, MDICSectionRenderer::free);
     }
+
+    public abstract void prepareTargets(int width, int height);
+
+    /** Link external samplers only after the complete shader group validates. */
+    public void attach() {}
 
     //Called before the pipeline starts running, used to update uniforms etc
     public void preSetup(Viewport viewport) {
@@ -182,10 +195,8 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
     @Override
     protected void free0() {
-        this.fb.free();
-        this.sectionRenderer.free();
-        this.depthStencilSetup.delete();
-        super.free0();
+        if (this.isFreed()) return;
+        try { this.shaderResources.close(); } finally { super.free0(); }
     }
 
     //Binds the framebuffer and any other bindings needed for rendering

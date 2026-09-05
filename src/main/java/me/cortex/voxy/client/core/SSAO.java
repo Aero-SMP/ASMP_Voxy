@@ -59,6 +59,7 @@ public class SSAO {
         }
     }
 
+    private final ShaderResourceScope resources = new ShaderResourceScope();
     private final Shader ssaoCompute;
     private final boolean isBetterSSAO;
     private final int spp;
@@ -101,20 +102,22 @@ public class SSAO {
             builder.replace("%%CONST_ARRAY%%", array);
         }
 
-        this.ssaoCompute = builder.compile();
+        try {
+            this.ssaoCompute = this.resources.own(builder.compile(), Shader::free);
 
-        this.depthSampler = glCreateSamplers();
-        //UHHHH IS THIS EVEN VALID FOR A DEPTH SAMPLER????
-        if (this.isBetterSSAO) {
-            glSamplerParameteri(this.depthSampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
-            glSamplerParameteri(this.depthSampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        } else {
-            glSamplerParameteri(this.depthSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glSamplerParameteri(this.depthSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        }
-        glSamplerParameteri(this.depthSampler, GL_TEXTURE_COMPARE_MODE, GL_NONE);
-        glSamplerParameteri(this.depthSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glSamplerParameteri(this.depthSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            this.depthSampler = this.resources.own(glCreateSamplers(), sampler -> glDeleteSamplers(sampler));
+            //UHHHH IS THIS EVEN VALID FOR A DEPTH SAMPLER????
+            if (this.isBetterSSAO) {
+                glSamplerParameteri(this.depthSampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+                glSamplerParameteri(this.depthSampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            } else {
+                glSamplerParameteri(this.depthSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glSamplerParameteri(this.depthSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            }
+            glSamplerParameteri(this.depthSampler, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+            glSamplerParameteri(this.depthSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glSamplerParameteri(this.depthSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        } catch (RuntimeException | Error failure) { this.resources.cleanupAfter(failure); throw failure; }
 
     }
 
@@ -164,8 +167,7 @@ public class SSAO {
     }
 
     public void free() {
-        glDeleteSamplers(this.depthSampler);
-        this.ssaoCompute.free();
+        this.resources.close();
     }
 
 }

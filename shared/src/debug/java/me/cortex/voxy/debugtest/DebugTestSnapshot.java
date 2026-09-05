@@ -25,7 +25,8 @@ public record DebugTestSnapshot(
         long pendingRetirementBytes, long physicalGeometryBytes,
         long rendererTargetBytes, long rendererAllocatedBytes,
         int gpuSelected, int gpuDraws, long gpuReadbackAgeNanos,
-        long handoffGeneration, long handoffOccupied, long publicationActivated, long publicationReturned, long publicationCancelled, long publicationFailed, long outstandingLeases, long pendingCoverageReplies, long pendingRefinementReplies, long blockedGeometry, long blockedSectionId, long blockedTopology, long blockedStale, long impossible, long topologyGeneration, long allocationReleaseGeneration, long sectionIdReleaseGeneration, long handoffBusy) {
+        long handoffGeneration, long handoffOccupied, long publicationActivated, long publicationReturned, long publicationCancelled, long publicationFailed, long outstandingLeases, long pendingCoverageReplies, long pendingRefinementReplies, long blockedGeometry, long blockedSectionId, long blockedTopology, long blockedStale, long impossible, long topologyGeneration, long allocationReleaseGeneration, long sectionIdReleaseGeneration, long handoffBusy,
+        long rendererIdentity, long shaderReloadGeneration, String shaderReloadStatus, String shaderReloadReason, long shaderReloadPauseNanos, long shaderHistoryInvalidations, long shaderResumedDraws, long shaderMaterialUpdates, long shaderResourcesCreated, long shaderResourcesFreed, String shaderPack, int configuredFov, long dormancyTransitions, long wakes, long instantWakes, long dormantEvictions) {
     public static final long POSE_PRESENT = 1L;
     public static final long SESSION_PRESENT = 1L << 1;
     public static final long GEOMETRY_RETENTION_PRESENT = 1L << 2;
@@ -36,7 +37,8 @@ public record DebugTestSnapshot(
                 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, "", "", 0, 0, 0, 0, 0, 0, "", 0, 0, 0, 0, 0);
     }
 
     static DebugTestSnapshot decode(RegistryFriendlyByteBuf input) {
@@ -71,7 +73,8 @@ public record DebugTestSnapshot(
                 counters[20], counters[21], counters[22], counters[23], counters[24],
                 counters[25], counters[26], input.readVarInt(), input.readVarInt(),
                 input.readVarLong(),
-                input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong());
+                input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(),
+                input.readVarLong(), input.readVarLong(), input.readUtf(512), input.readUtf(512), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readUtf(512), input.readVarInt(), input.readVarLong(), input.readVarLong(), input.readVarLong(), input.readVarLong());
     }
 
     void encode(RegistryFriendlyByteBuf output) {
@@ -116,9 +119,29 @@ public record DebugTestSnapshot(
         output.writeVarLong(this.allocationReleaseGeneration);
         output.writeVarLong(this.sectionIdReleaseGeneration);
         output.writeVarLong(this.handoffBusy);
+        output.writeVarLong(this.rendererIdentity);
+        output.writeVarLong(this.shaderReloadGeneration);
+        output.writeUtf(this.shaderReloadStatus, 512);
+        output.writeUtf(this.shaderReloadReason, 512);
+        output.writeVarLong(this.shaderReloadPauseNanos);
+        output.writeVarLong(this.shaderHistoryInvalidations);
+        output.writeVarLong(this.shaderResumedDraws);
+        output.writeVarLong(this.shaderMaterialUpdates);
+        output.writeVarLong(this.shaderResourcesCreated);
+        output.writeVarLong(this.shaderResourcesFreed);
+        output.writeUtf(this.shaderPack, 512);
+        output.writeVarInt(this.configuredFov);
+        output.writeVarLong(this.dormancyTransitions);
+        output.writeVarLong(this.wakes);
+        output.writeVarLong(this.instantWakes);
+        output.writeVarLong(this.dormantEvictions);
     }
 
     public DebugTestSnapshot {
+        if (shaderReloadStatus == null || shaderReloadReason == null || shaderPack == null
+                || shaderReloadStatus.length() > 512 || shaderReloadReason.length() > 512 || shaderPack.length() > 512) {
+            throw new IllegalArgumentException("invalid shader snapshot strings");
+        }
         if (dimension == null || dimension.length() > DebugTestProtocol.MAX_DIMENSION_LENGTH) {
             throw new IllegalArgumentException("invalid snapshot dimension");
         }

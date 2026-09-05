@@ -20,7 +20,8 @@ public record DebugTestCommandPayload(
         float pitch,
         long timeoutNanos,
         long durationNanos,
-        long cadenceNanos) implements CustomPacketPayload {
+        long cadenceNanos,
+        String shaderOption, String shaderValue) implements CustomPacketPayload {
     public static final Type<DebugTestCommandPayload> TYPE = new Type<>(
             DebugTestProtocol.COMMAND_ID);
     public static final StreamCodec<RegistryFriendlyByteBuf, DebugTestCommandPayload> CODEC =
@@ -37,7 +38,7 @@ public record DebugTestCommandPayload(
                             input.readUtf(DebugTestProtocol.MAX_DIMENSION_LENGTH),
                             input.readDouble(), input.readDouble(), input.readDouble(),
                             input.readFloat(), input.readFloat(), input.readVarLong(),
-                            input.readVarLong(), input.readVarLong());
+                            input.readVarLong(), input.readVarLong(), input.readUtf(128), input.readUtf(128));
                 }
 
                 @Override
@@ -58,10 +59,16 @@ public record DebugTestCommandPayload(
                     output.writeVarLong(payload.timeoutNanos);
                     output.writeVarLong(payload.durationNanos);
                     output.writeVarLong(payload.cadenceNanos);
+                    output.writeUtf(payload.shaderOption, 128);
+                    output.writeUtf(payload.shaderValue, 128);
                 }
             };
 
     public DebugTestCommandPayload {
+        if (shaderOption == null || shaderValue == null || shaderOption.length() > 128 || shaderValue.length() > 128
+                || (kind != DebugTestProtocol.CommandKind.SHADER_OPTION && (!shaderOption.isEmpty() || !shaderValue.isEmpty()))) {
+            throw new IllegalArgumentException("invalid debug shader option fields");
+        }
         if (kind == null || runId == null || dimension == null
                 || dimension.length() > DebugTestProtocol.MAX_DIMENSION_LENGTH
                 || stepId < 0 || connectionEpoch <= 0 || timeoutNanos < 0

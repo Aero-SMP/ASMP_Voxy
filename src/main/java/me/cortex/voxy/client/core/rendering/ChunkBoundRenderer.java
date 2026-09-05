@@ -35,30 +35,39 @@ public class ChunkBoundRenderer {
     private final GlBuffer uniformBuffer = new GlBuffer(128);
     private final Long2IntOpenHashMap chunk2idx = new Long2IntOpenHashMap(INIT_MAX_CHUNK_COUNT);
     private long[] idx2chunk = new long[INIT_MAX_CHUNK_COUNT];
-    private final Shader rasterShader;
+    private AutoBindingShader rasterShader;
     private final LongOpenHashSet addQueue = new LongOpenHashSet();
     private final LongOpenHashSet remQueue = new LongOpenHashSet();
 
-    private final AbstractRenderPipeline pipeline;
-    public ChunkBoundRenderer(AbstractRenderPipeline pipeline) {
+    private AbstractRenderPipeline pipeline;
+    public ChunkBoundRenderer() {
         this.chunk2idx.defaultReturnValue(-1);
+    }
+
+    public AutoBindingShader compileProgram(AbstractRenderPipeline pipeline) {
         String vert = ShaderLoader.parse("voxy:chunkoutline/outline.vsh");
         String taa = pipeline.taaFunction("getTAA");
         if (taa != null) {
-            this.pipeline = pipeline;
             vert = vert+"\n\n\n"+taa;
-        } else {
-            this.pipeline = null;
         }
 
-        this.rasterShader = Shader.makeAuto()
+        AutoBindingShader compiled = Shader.makeAuto()
                 .addSource(ShaderType.VERTEX, vert)
                 .defineIf("TAA", taa != null)
                 .add(ShaderType.FRAGMENT, "voxy:chunkoutline/outline.fsh")
                 .define("USE_ZERO_ONE_DEPTH")
-                .compile()
-                .ubo(0, this.uniformBuffer)
-                .ssbo(1, this.chunkPosBuffer);
+                .compile();
+        try { return compiled.ubo(0, this.uniformBuffer).ssbo(1, this.chunkPosBuffer); }
+        catch (RuntimeException | Error failure) { compiled.free(); throw failure; }
+    }
+
+    public void installProgram(AutoBindingShader program, AbstractRenderPipeline pipeline) {
+        this.rasterShader = program;
+        this.pipeline = program != null && pipeline.hasTAA() ? pipeline : null;
+    }
+
+    public void clearProgram(AutoBindingShader expected) {
+        if (this.rasterShader == expected) { this.rasterShader = null; this.pipeline = null; }
     }
 
     public void addSection(long pos) {
@@ -228,7 +237,8 @@ public class ChunkBoundRenderer {
     }
 
     public void free() {
-        this.rasterShader.free();
+        this.rasterShader = null;
+        this.pipeline = null;
         this.uniformBuffer.free();
         this.chunkPosBuffer.free();
     }

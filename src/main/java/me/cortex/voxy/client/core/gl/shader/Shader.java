@@ -173,7 +173,9 @@ public class Shader extends TrackedObject {
         public T compile() {
             this.defineIf("IS_INTEL", Capabilities.INSTANCE.isIntel);
             this.defineIf("IS_WINDOWS", Capabilities.INSTANCE.isWindows);
-            return this.constructor.apply(this, this.compileToProgram());
+            int program = this.compileToProgram();
+            try { return this.constructor.apply(this, program); }
+            catch (RuntimeException | Error failure) { glDeleteProgram(program); throw failure; }
         }
 
         private static void printProgramLinkLog(int program) {

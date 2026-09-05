@@ -1,0 +1,143 @@
+{
+  "name": "dormancy_pressure_look_away",
+  "steps": [
+    {
+      "op": "wait_until",
+      "field": "coverageMissing",
+      "comparison": "==",
+      "value": 0,
+      "timeout_ms": 120000
+    },
+    {
+      "op": "wait_until",
+      "field": "gpuDraws",
+      "comparison": ">",
+      "value": 0,
+      "timeout_ms": 120000
+    },
+    {
+      "op": "assert",
+      "field": "active",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "field": "shaderReloadStatus",
+      "comparison": "==",
+      "value": "READY"
+    },
+    {
+      "op": "wait_until",
+      "field": "blockedGeometry",
+      "comparison": ">",
+      "value": 0,
+      "timeout_ms": 120000
+    },
+    {
+      "op": "checkpoint",
+      "name": "before"
+    },
+    {
+      "op": "pose",
+      "dimension": "minecraft:overworld",
+      "x": 0.5,
+      "y": 100,
+      "z": 0.5,
+      "yaw": 180,
+      "pitch": 0
+    },
+    {
+      "op": "hold",
+      "duration_ms": 500,
+      "cadence_ms": 100
+    },
+    {
+      "op": "pose",
+      "dimension": "minecraft:overworld",
+      "x": 0.5,
+      "y": 100,
+      "z": 0.5,
+      "yaw": 0,
+      "pitch": 0
+    },
+    {
+      "op": "trace",
+      "duration_ms": 10000,
+      "cadence_ms": 100
+    },
+    {
+      "op": "checkpoint",
+      "name": "after"
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "dormancyTransitions",
+      "from": "before",
+      "to": "after",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "dormantEvictions",
+      "from": "before",
+      "to": "after",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "rendererIdentity",
+      "from": "before",
+      "to": "after",
+      "comparison": "==",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "sessionGeneration",
+      "from": "before",
+      "to": "after",
+      "comparison": "==",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "delta",
+      "field": "shaderResumedDraws",
+      "from": "before",
+      "to": "after",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "field": "shaderReloadStatus",
+      "comparison": "==",
+      "value": "READY"
+    },
+    {
+      "op": "assert",
+      "field": "gpuDraws",
+      "comparison": ">",
+      "value": 0
+    },
+    {
+      "op": "assert",
+      "mode": "absence_of_failure"
+    }
+  ],
+  "initial_pose": {
+    "dimension": "minecraft:overworld",
+    "x": 0.5,
+    "y": 100,
+    "z": 0.5,
+    "yaw": 0,
+    "pitch": 0
+  }
+}

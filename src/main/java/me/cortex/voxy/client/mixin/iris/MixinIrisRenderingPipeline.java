@@ -49,6 +49,14 @@ public class MixinIrisRenderingPipeline implements IGetVoxyPatchData, IGetIrisVo
         }
     }
 
+    @Inject(method = "destroy", at = @At("HEAD"))
+    private void voxy$beforeTargetsDestroyed(CallbackInfo ci) {
+        var renderer = IGetVoxyRenderSystem.getNullable();
+        if (renderer != null && this.pipeline != null && this.pipeline.thePipeline != null) {
+            renderer.irisPipelineDestroyed(this.pipeline.thePipeline);
+        }
+    }
+
     @Override
     public IrisShaderPatch voxy$getPatchData() {
         return this.patchData;

@@ -123,6 +123,24 @@ final class LiveServerTestHarness {
         root.then(singleStep("checkpoint", LiveServerTestHarness::checkpoint));
         root.then(singleStep("reconnect_quic", (source, run, step) ->
                 simple(source, run, step, DebugTestProtocol.CommandKind.RECONNECT_QUIC)));
+        root.then(Commands.literal("shader_option")
+                .then(Commands.argument("run", StringArgumentType.word())
+                .then(Commands.argument("step", LongArgumentType.longArg(1))
+                .then(Commands.argument("option", StringArgumentType.word())
+                .then(Commands.argument("value", StringArgumentType.word())
+                .executes(context -> shaderOption(context.getSource(),
+                        UUID.fromString(StringArgumentType.getString(context, "run")),
+                        LongArgumentType.getLong(context, "step"),
+                        StringArgumentType.getString(context, "option"),
+                        StringArgumentType.getString(context, "value"))))))));
+        root.then(singleStep("shader_reload", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.SHADER_RELOAD)));
+        root.then(singleStep("shaders_on", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.SHADERS_ON)));
+        root.then(singleStep("shaders_off", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.SHADERS_OFF)));
+        root.then(singleStep("shader_reload_all_changed", (source, run, step) ->
+                simple(source, run, step, DebugTestProtocol.CommandKind.SHADER_RELOAD_ALL_CHANGED)));
         root.then(singleStep("screenshot", LiveServerTestHarness::screenshot));
         root.then(singleStep("end", LiveServerTestHarness::end));
         root.then(singleStep("abort", LiveServerTestHarness::abort));
@@ -204,6 +222,19 @@ final class LiveServerTestHarness {
                 millisToNanos(cadenceMillis));
     }
 
+    private static int shaderOption(CommandSourceStack source, UUID runId, long step, String option, String value) {
+        ActiveRun run = requireReady(source, runId, step);
+        if (run == null) return 0;
+        if (!option.matches("[A-Za-z_][A-Za-z0-9_]{0,127}") || !value.matches("[A-Za-z0-9_.+-]{1,128}")) {
+            return fail(source, "invalid shader option syntax");
+        }
+        run.outstandingStep = step;
+        run.outstandingKind = DebugTestProtocol.CommandKind.SHADER_OPTION;
+        run.player.connection.send(new DebugTestCommandPayload(run.outstandingKind, runId, step,
+                run.connectionEpoch, "", 0, 0, 0, 0, 0, 0, 0, 0, option, value));
+        return 1;
+    }
+
     private static int checkpoint(CommandSourceStack source, UUID runId, long step) {
         return simple(source, runId, step, DebugTestProtocol.CommandKind.CAPTURE_CHECKPOINT);
     }
@@ -241,7 +272,7 @@ final class LiveServerTestHarness {
             long abortStep = Math.max(run.lastStep, run.outstandingStep) + 1;
             run.player.connection.send(new DebugTestCommandPayload(
                     DebugTestProtocol.CommandKind.ABORT_RUN, run.runId, abortStep,
-                    run.connectionEpoch, "", 0, 0, 0, 0, 0, 0, 0, 0));
+                    run.connectionEpoch, "", 0, 0, 0, 0, 0, 0, 0, 0, "", ""));
         }
         complete(run, status, DebugTestProtocol.Failure.NONE);
         success(source, "finalized " + runId + " as " + status);
@@ -274,7 +305,7 @@ final class LiveServerTestHarness {
         run.outstandingKind = kind;
         run.player.connection.send(new DebugTestCommandPayload(kind, run.runId, step,
                 run.connectionEpoch, dimension, x, y, z, yaw, pitch, timeoutNanos,
-                durationNanos, cadenceNanos));
+                durationNanos, cadenceNanos, "", ""));
         success(source, "started " + kind + " run=" + run.runId + " step=" + step);
         return 1;
     }
@@ -335,7 +366,7 @@ final class LiveServerTestHarness {
             case BEGIN_RUN -> result == DebugTestProtocol.ResultKind.CLIENT_READY;
             case EXPECT_POSE -> result == DebugTestProtocol.ResultKind.POSE_REACHED
                     || result == DebugTestProtocol.ResultKind.POSE_FAILED;
-            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC ->
+            case START_TRACE, CAPTURE_CHECKPOINT, RECONNECT_QUIC, SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION ->
                     result == DebugTestProtocol.ResultKind.CHECKPOINT_RESULT;
             case CAPTURE_SCREENSHOT -> result == DebugTestProtocol.ResultKind.SCREENSHOT_RESULT;
             case END_RUN -> result == DebugTestProtocol.ResultKind.RUN_COMPLETE;

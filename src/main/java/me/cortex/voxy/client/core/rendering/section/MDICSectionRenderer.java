@@ -2,6 +2,7 @@ package me.cortex.voxy.client.core.rendering.section;
 
 
 import me.cortex.voxy.client.core.AbstractRenderPipeline;
+import me.cortex.voxy.client.core.ShaderResourceScope;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.shader.Shader;
@@ -41,92 +42,104 @@ public final class MDICSectionRenderer {
     public static final int TEMPORAL_DRAW_COUNT = 100_000;//in draw calls
     private static final int TRANSLUCENT_OFFSET = OPAQUE_DRAW_COUNT;//in draw calls
     private static final int TEMPORAL_OFFSET = TRANSLUCENT_OFFSET+TRANSLUCENT_DRAW_COUNT;//in draw calls
+    private final ShaderResourceScope resources = new ShaderResourceScope();
     private final Shader terrainShader;
     private final Shader translucentTerrainShader;
     private final BasicSectionGeometryData geometryManager;
     private final ModelStore modelStore;
 
-    private final Shader commandGenShader = Shader.make()
-            .define("TRANSLUCENT_WRITE_BASE", 1024)
-            .define("TEMPORAL_OFFSET", TEMPORAL_OFFSET)
+    private final Shader commandGenShader;
 
-            .define("TRANSLUCENT_DISTANCE_BUFFER_BINDING", 7)
-
-            .add(ShaderType.COMPUTE, "voxy:lod/gl46/cmdgen.comp")
-            .compile();
-
-    private final Shader prepShader = Shader.make()
-            .add(ShaderType.COMPUTE, "voxy:lod/gl46/prep.comp")
-            .compile();
+    private final Shader prepShader;
 
     private final Shader cullShader;
 
-    private final Shader prefixSumShader = Shader.make()
-            //Use subgroup prefix sum if possible otherwise use dodgy... slow prefix sum
-            .add(ShaderType.COMPUTE, Capabilities.INSTANCE.subgroup?"voxy:util/prefixsum/initial.comp":"voxy:util/prefixsum/simple.comp")
-            .define("IO_BUFFER", 0)
-            .compile();
+    private final Shader prefixSumShader;
 
-    private final Shader translucentGenShader = Shader.make()
-            .add(ShaderType.COMPUTE, "voxy:lod/gl46/buildtranslucents.comp")
-            .define("TRANSLUCENT_WRITE_BASE", 1024)//The size of the prefix sum array
-            .define("TRANSLUCENT_DISTANCE_BUFFER_BINDING", 5)
-            .define("TRANSLUCENT_OFFSET", TRANSLUCENT_OFFSET)
+    private final Shader translucentGenShader;
 
-            .compile();
-
-    private final GlBuffer uniform = new GlBuffer(1024).zero();//TODO move to viewport?
+    private final GlBuffer uniform;//TODO move to viewport?
 
     //TODO: needs to be in the viewport, since it contains the compute indirect call/values
-    private final GlBuffer distanceCountBuffer = new GlBuffer(1024*4+TRANSLUCENT_DRAW_COUNT*4).zero();//TODO move to viewport?
+    private final GlBuffer distanceCountBuffer;//TODO move to viewport?
 
     private final AbstractRenderPipeline pipeline;
     public MDICSectionRenderer(AbstractRenderPipeline pipeline, ModelStore modelStore, BasicSectionGeometryData geometryData) {
         this.modelStore = modelStore;
         this.geometryManager = geometryData;
         this.pipeline = pipeline;
-        //The pipeline can be used to transform the renderer in abstract ways
+        try {
+            this.commandGenShader = this.resources.own(Shader.make()
+                .define("TRANSLUCENT_WRITE_BASE", 1024)
+                .define("TEMPORAL_OFFSET", TEMPORAL_OFFSET)
 
-        String vertex = ShaderLoader.parse("voxy:lod/gl46/quads3.vert");
-        String taa = pipeline.taaFunction("taaShift");
-        if (taa != null) {
-            vertex += "\n"+taa;//inject it at the end
-        }
-        var builder = Shader.make()
-                .define("USE_ZERO_ONE_DEPTH")
-                .defineIf("TAA_PATCH", taa != null)
+                .define("TRANSLUCENT_DISTANCE_BUFFER_BINDING", 7)
 
-                .addSource(ShaderType.VERTEX, vertex);
+                .add(ShaderType.COMPUTE, "voxy:lod/gl46/cmdgen.comp")
+                .compile(), Shader::free);
+            this.prepShader = this.resources.own(Shader.make()
+                .add(ShaderType.COMPUTE, "voxy:lod/gl46/prep.comp")
+                .compile(), Shader::free);
+            this.prefixSumShader = this.resources.own(Shader.make()
+                //Use subgroup prefix sum if possible otherwise use dodgy... slow prefix sum
+                .add(ShaderType.COMPUTE, Capabilities.INSTANCE.subgroup?"voxy:util/prefixsum/initial.comp":"voxy:util/prefixsum/simple.comp")
+                .define("IO_BUFFER", 0)
+                .compile(), Shader::free);
+            this.translucentGenShader = this.resources.own(Shader.make()
+                .add(ShaderType.COMPUTE, "voxy:lod/gl46/buildtranslucents.comp")
+                .define("TRANSLUCENT_WRITE_BASE", 1024)//The size of the prefix sum array
+                .define("TRANSLUCENT_DISTANCE_BUFFER_BINDING", 5)
+                .define("TRANSLUCENT_OFFSET", TRANSLUCENT_OFFSET)
 
-        //Apply per face tinting
-        addDirectionalFaceTint(builder, Minecraft.getInstance().level);
+                .compile(), Shader::free);
+            this.uniform = this.resources.own(new GlBuffer(1024).zero(), GlBuffer::free);
+            this.distanceCountBuffer = this.resources.own(new GlBuffer(1024*4+TRANSLUCENT_DRAW_COUNT*4).zero(), GlBuffer::free);
+            //The pipeline can be used to transform the renderer in abstract ways
 
-        String frag = ShaderLoader.parse("voxy:lod/gl46/quads.frag");
-
-        String opaqueFrag = pipeline.patchOpaqueShader(frag);
-        opaqueFrag = opaqueFrag==null?frag:opaqueFrag;
-
-        //TODO: find a more robust/nicer way todo this
-        this.terrainShader = tryCompilePatchedOrNormal(builder, opaqueFrag, frag);
-
-        String translucentFrag = pipeline.patchTranslucentShader(frag);
-        translucentFrag = translucentFrag==null?frag:translucentFrag;
-
-        this.translucentTerrainShader = tryCompilePatchedOrNormal(builder.define("TRANSLUCENT"), translucentFrag, frag);
-
-        if (this.pipeline.hasTAA()) {
-            this.cullShader = Shader.make()
+            String vertex = ShaderLoader.parse("voxy:lod/gl46/quads3.vert");
+            String taa = pipeline.taaFunction("taaShift");
+            if (taa != null) {
+                vertex += "\n"+taa;//inject it at the end
+            }
+            var builder = Shader.make()
                     .define("USE_ZERO_ONE_DEPTH")
-                    .addSource(ShaderType.VERTEX, ShaderLoader.parse("voxy:lod/gl46/cull/raster.vert")+"\n\n\n\n"+pipeline.taaFunction("getTAA"))
-                    .define("TAA")
-                    .add(ShaderType.FRAGMENT, "voxy:lod/gl46/cull/raster.frag")
-                    .compile();
-        } else {
-            this.cullShader = Shader.make()
-                    .define("USE_ZERO_ONE_DEPTH")
-                    .add(ShaderType.VERTEX, "voxy:lod/gl46/cull/raster.vert")
-                    .add(ShaderType.FRAGMENT, "voxy:lod/gl46/cull/raster.frag")
-                    .compile();
+                    .defineIf("TAA_PATCH", taa != null)
+
+                    .addSource(ShaderType.VERTEX, vertex);
+
+            //Apply per face tinting
+            addDirectionalFaceTint(builder, Minecraft.getInstance().level);
+
+            String frag = ShaderLoader.parse("voxy:lod/gl46/quads.frag");
+
+            String opaqueFrag = pipeline.patchOpaqueShader(frag);
+            opaqueFrag = opaqueFrag==null?frag:opaqueFrag;
+
+            //TODO: find a more robust/nicer way todo this
+            this.terrainShader = this.resources.own(compileFragment(builder, opaqueFrag, frag), Shader::free);
+
+            String translucentFrag = pipeline.patchTranslucentShader(frag);
+            translucentFrag = translucentFrag==null?frag:translucentFrag;
+
+            this.translucentTerrainShader = this.resources.own(compileFragment(builder.define("TRANSLUCENT"), translucentFrag, frag), Shader::free);
+
+            if (this.pipeline.hasTAA()) {
+                this.cullShader = this.resources.own(Shader.make()
+                        .define("USE_ZERO_ONE_DEPTH")
+                        .addSource(ShaderType.VERTEX, ShaderLoader.parse("voxy:lod/gl46/cull/raster.vert")+"\n\n\n\n"+pipeline.taaFunction("getTAA"))
+                        .define("TAA")
+                        .add(ShaderType.FRAGMENT, "voxy:lod/gl46/cull/raster.frag")
+                        .compile(), Shader::free);
+            } else {
+                this.cullShader = this.resources.own(Shader.make()
+                        .define("USE_ZERO_ONE_DEPTH")
+                        .add(ShaderType.VERTEX, "voxy:lod/gl46/cull/raster.vert")
+                        .add(ShaderType.FRAGMENT, "voxy:lod/gl46/cull/raster.frag")
+                        .compile(), Shader::free);
+            }
+        } catch (RuntimeException | Error failure) {
+            this.resources.cleanupAfter(failure);
+            throw failure;
         }
     }
 
@@ -327,17 +340,7 @@ public final class MDICSectionRenderer {
         this.renderTerrain(viewport, TEMPORAL_OFFSET*5*4, 4*5, Math.min(this.geometryManager.getSectionCount(), TEMPORAL_DRAW_COUNT));
     }
 
-    public void free() {
-        this.uniform.free();
-        this.distanceCountBuffer.free();
-        this.translucentTerrainShader.free();
-        this.terrainShader.free();
-        this.commandGenShader.free();
-        this.cullShader.free();
-        this.prepShader.free();
-        this.translucentGenShader.free();
-        this.prefixSumShader.free();
-    }
+    public void free() { this.resources.close(); }
 
     private static void addDirectionalFaceTint(Shader.Builder<?> builder, ClientLevel level) {
         builder.define("NO_SHADE_FACE_TINT", level.getShade(Direction.UP, false));
@@ -347,15 +350,9 @@ public final class MDICSectionRenderer {
         builder.define("X_AXIS_FACE_TINT", level.getShade(Direction.EAST, true));
     }
 
-    private static Shader tryCompilePatchedOrNormal(Shader.Builder<?> builder, String shader, String original) {
-        boolean patched = shader != original;
-        try {
-            return builder.clone().defineIf("PATCHED_SHADER", patched)
-                    .addSource(ShaderType.FRAGMENT, shader).compile();
-        } catch (RuntimeException exception) {
-            if (!patched) throw exception;
-            Logger.error("Failed to compile shader patch, using normal pipeline", exception);
-            return tryCompilePatchedOrNormal(builder, original, original);
-        }
+    private static Shader compileFragment(Shader.Builder<?> builder, String shader, String original) {
+        // A normal fragment is not a valid fallback for arbitrary Iris attachment layouts.
+        return builder.clone().defineIf("PATCHED_SHADER", shader != original)
+                .addSource(ShaderType.FRAGMENT, shader).compile();
     }
 }

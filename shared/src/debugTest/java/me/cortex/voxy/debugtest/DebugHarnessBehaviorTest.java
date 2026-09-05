@@ -18,6 +18,7 @@ public final class DebugHarnessBehaviorTest {
     public static void main(String[] arguments) {
         codecRoundTrips();
         snapshotCountersRoundTripIndividually();
+        everyCommandRoundTrips();
         malformedVersionIsRejected();
         orderingRejectsStaleAndFutureResults();
         yawWrapsAtTheSignedBoundary();
@@ -33,7 +34,7 @@ public final class DebugHarnessBehaviorTest {
         UUID run = UUID.randomUUID();
         var command = new DebugTestCommandPayload(DebugTestProtocol.CommandKind.EXPECT_POSE,
                 run, 7, 3, "minecraft:overworld", 1.25, -64, 9.5,
-                179, -30, 15_000_000_000L, 0, 0);
+                179, -30, 15_000_000_000L, 0, 0, "", "");
         RegistryFriendlyByteBuf commandBytes = buffer();
         DebugTestCommandPayload.CODEC.encode(commandBytes, command);
         check(command.equals(DebugTestCommandPayload.CODEC.decode(commandBytes)),
@@ -49,13 +50,27 @@ public final class DebugHarnessBehaviorTest {
                 "result codec changed a field");
     }
 
+    private static void everyCommandRoundTrips() {
+        for (var kind : DebugTestProtocol.CommandKind.values()) {
+            var command = new DebugTestCommandPayload(kind, UUID.randomUUID(), 1, 1, "",
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                    kind == DebugTestProtocol.CommandKind.SHADER_OPTION ? "TAA" : "",
+                    kind == DebugTestProtocol.CommandKind.SHADER_OPTION ? "true" : "");
+            var bytes = buffer();
+            DebugTestCommandPayload.CODEC.encode(bytes, command);
+            check(command.equals(DebugTestCommandPayload.CODEC.decode(bytes)) && !bytes.isReadable(),
+                    "new shader command did not round trip");
+            bytes.release();
+        }
+    }
+
     private static void malformedVersionIsRejected() {
         RegistryFriendlyByteBuf bytes = buffer();
         bytes.writeVarInt(DebugTestProtocol.VERSION + 1);
         expectFailure(() -> DebugTestCommandPayload.CODEC.decode(bytes),
                 "wrong protocol version was accepted");
         expectFailure(() -> new DebugTestCommandPayload(DebugTestProtocol.CommandKind.BEGIN_RUN,
-                        UUID.randomUUID(), -1, 1, "", 0, 0, 0, 0, 0, 0, 0, 0),
+                        UUID.randomUUID(), -1, 1, "", 0, 0, 0, 0, 0, 0, 0, 0, "", ""),
                 "negative step was accepted");
     }
 

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert", "reconnect_quic"}
+VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert", "reconnect_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option"}
 COMPARISONS = {"==", "!=", "<", "<=", ">", ">="}
 RESULT_KINDS = {
     "pose": "POSE_REACHED",
@@ -87,6 +87,12 @@ def validate_scenario(scenario: Any) -> None:
         elif operation == "checkpoint":
             if "name" in step and not isinstance(step["name"], str):
                 raise ScenarioError(f"step {index} checkpoint name must be a string")
+        elif operation == "shader_option":
+            import re
+            if not isinstance(step.get("option"), str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", step["option"]):
+                raise ScenarioError(f"step {index} has invalid shader option")
+            if not isinstance(step.get("value"), str) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,128}", step["value"]):
+                raise ScenarioError(f"step {index} has invalid shader value")
         elif operation == "assert":
             validate_assertion(step, index)
         allowed = {
@@ -97,6 +103,11 @@ def validate_scenario(scenario: Any) -> None:
             "checkpoint": {"op", "name"},
             "screenshot": {"op"},
             "reconnect_quic": {"op"},
+            "shader_reload": {"op"},
+            "shaders_on": {"op"},
+            "shaders_off": {"op"},
+            "shader_reload_all_changed": {"op"},
+            "shader_option": {"op", "option", "value"},
             "assert": {"op", "mode", "field", "comparison", "value", "from", "to", "direction"},
         }[operation]
         extras = set(step) - allowed
@@ -288,10 +299,11 @@ class ScenarioRun:
 
     def execute_step(self, operation: dict[str, Any], index: int) -> None:
         kind = operation["op"]
-        if kind == "reconnect_quic":
+        if kind in {"reconnect_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option"}:
             self.step += 1
-            self.command_and_wait(f"voxytest reconnect_quic {self.run_id} {self.step}",
-                                  {"CHECKPOINT_RESULT"}, 30, f"reconnect_quic[{index}]")
+            option_args = f" {operation['option']} {operation['value']}" if kind == "shader_option" else ""
+            self.command_and_wait(f"voxytest {kind} {self.run_id} {self.step}{option_args}",
+                                  {"CHECKPOINT_RESULT"}, 120, f"{kind}[{index}]")
         elif kind == "pose":
             self.do_pose(operation, f"pose[{index}]")
         elif kind in {"hold", "trace"}:

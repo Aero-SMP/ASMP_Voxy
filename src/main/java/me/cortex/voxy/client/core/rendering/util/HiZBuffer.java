@@ -112,6 +112,11 @@ public class HiZBuffer {
         glBindVertexArray(0);
     }
 
+    public void invalidate() {
+        if (this.texture != null) { this.texture.free(); this.texture = null; }
+        this.width = this.height = this.levels = 0;
+    }
+
     public void free() {
         this.fb.free();
         if (this.texture != null) {
