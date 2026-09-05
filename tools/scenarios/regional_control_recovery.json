@@ -1,7 +1,7 @@
 {
   "name": "regional-control-duplex-recovery",
   "steps": [
-    {"op": "wait_until", "field": "active", "comparison": ">", "value": 0, "timeout_ms": 120000, "cadence_ms": 1000},
+    {"op": "wait_until", "field": "gpuDraws", "comparison": ">", "value": 0, "timeout_ms": 120000, "cadence_ms": 1000},
     {"op": "checkpoint", "name": "loaded"},
     {"op": "reconnect_quic"},
     {"op": "trace", "duration_ms": 30000, "cadence_ms": 1000},
@@ -9,6 +9,8 @@
     {"op": "assert", "mode": "delta", "field": "connectionEpoch", "from": "loaded", "to": "reconnected", "comparison": "==", "value": 1},
     {"op": "assert", "mode": "delta", "field": "sessionGeneration", "from": "loaded", "to": "reconnected", "comparison": "==", "value": 0},
     {"op": "assert", "field": "active", "comparison": ">", "value": 0},
+    {"op": "assert", "field": "physicalGeometryBytes", "comparison": ">", "value": 0},
+    {"op": "assert", "field": "gpuDraws", "comparison": ">", "value": 0},
     {"op": "assert", "mode": "absence_of_failure"},
     {"op": "screenshot"}
   ]
