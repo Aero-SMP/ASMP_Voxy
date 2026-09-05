@@ -280,7 +280,7 @@ final class ClientSession {
         final Object wakeupLock = new Object();
         boolean wakePending;
         final WorkerSlot[] sectionWorkers;
-        final WorkerSlot metadataWorker = new WorkerSlot(-1);
+        final WorkerSlot metadataWorker;
         final int sectionWorkerCount;
         final Set<Long> waitingModels = new LinkedHashSet<>();
         final ConcurrentLinkedQueue<NetworkReply> networkReplies =
@@ -679,6 +679,7 @@ final class ClientSession {
         Session(long id, String dimension, VoxyRenderSystem renderer,
                 VoxyRenderSystem.SectionPublisher publisher, SectionMesher mesher, int workers) {
             this.id = id;
+            this.metadataWorker = new WorkerSlot(-1);
             this.demands = new SectionDemandTable<>(
                     HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT, id);
             this.dimension = dimension;

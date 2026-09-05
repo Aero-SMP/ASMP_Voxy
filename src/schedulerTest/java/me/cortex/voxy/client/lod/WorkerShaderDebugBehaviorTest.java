@@ -71,6 +71,8 @@ public final class WorkerShaderDebugBehaviorTest {
             if (blockAt.compareAndSet("REQUEST_MODELS", "NONE")) await(modelEntered, modelResume);
         });
         var session = new ClientSession.Session(88, "test", null, new CacheStartupBehaviorTest.Publisher(), mesher, 1);
+        check(((WorkerDebugTelemetry.Work) session.metadataWorker.debugWork).session == 88,
+                "metadata worker captured the uninitialized session identity");
         var worker = session.sectionWorkers[0]; worker.start();
         var work = (WorkerDebugTelemetry.Work) worker.debugWork;
         var demand = session.demands.adopt(new ClientSession.Demand(CacheStartupBehaviorTest.KEY));

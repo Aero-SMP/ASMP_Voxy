@@ -26,7 +26,8 @@ final class WorkerDebugTelemetry {
         String signature;
         Work(long session, int slot, long thread) { this.session = session; this.slot = slot; this.thread = thread; }
         synchronized void begin(long lease, String kind, long key, long revision, long regionVersion, String source) {
-            if (this.jobs > 0 && this.key == key && this.revision == revision && this.kind.equals(kind)) repeats++;
+            if (kind.equals("SectionWorkerTask") && this.jobs > 0 && this.key == key
+                    && this.revision == revision && this.kind.equals(kind)) repeats++;
             else repeats = 0;
             this.lease = lease; this.kind = kind; this.key = key; this.revision = revision;
             this.regionVersion = regionVersion; this.source = source;
