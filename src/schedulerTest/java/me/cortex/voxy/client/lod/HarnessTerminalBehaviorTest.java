@@ -12,6 +12,19 @@ final class HarnessTerminalBehaviorTest {
         Object replaced = failureType.getField("RENDERER_REPLACED").get(null);
         Object aborted = failureType.getField("ABORTED").get(null);
         Object disconnected = failureType.getField("DISCONNECTED").get(null);
+        Class<?> commandType = Class.forName("me.cortex.voxy.debugtest.DebugTestProtocol$CommandKind");
+        var reply = type.getDeclaredMethod("failureResult", commandType); reply.setAccessible(true);
+        for (Object command : commandType.getEnumConstants()) {
+            String expected = switch (command.toString()) {
+                case "BEGIN_RUN" -> "CLIENT_READY";
+                case "EXPECT_POSE" -> "POSE_FAILED";
+                case "CAPTURE_SCREENSHOT" -> "SCREENSHOT_RESULT";
+                case "END_RUN" -> "RUN_COMPLETE";
+                case "ABORT_RUN" -> "RUN_FAILED";
+                default -> "CHECKPOINT_RESULT";
+            };
+            check(reply.invoke(null, command).toString().equals(expected), "terminal reply rejected by operation routing");
+        }
         Class<?> runType = Class.forName(type.getName() + "$Run");
         var ctor = runType.getDeclaredConstructors()[0]; ctor.setAccessible(true);
         var fail = type.getDeclaredMethod("failRun", failureType,

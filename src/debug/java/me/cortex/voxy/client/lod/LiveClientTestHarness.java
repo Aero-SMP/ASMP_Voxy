@@ -190,6 +190,7 @@ final class LiveClientTestHarness {
         if (command.kind() == DebugTestProtocol.CommandKind.ABORT_RUN && active != null
                 && active.runId.equals(command.runId()) && command.stepId() > active.stepId) {
             active.stepId = command.stepId();
+            active.command = command.kind();
             failRun(DebugTestProtocol.Failure.ABORTED);
             return;
         }
@@ -199,6 +200,7 @@ final class LiveClientTestHarness {
             return;
         }
         active.stepId = command.stepId();
+        active.command = command.kind();
         switch (command.kind()) {
             case SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION -> {
                 if (!IrisUtil.IRIS_INSTALLED || active.renderer == null) {
@@ -400,7 +402,7 @@ final class LiveClientTestHarness {
 
     private static void sendFailure(DebugTestCommandPayload command,
                                     DebugTestProtocol.Failure failure) {
-        sendCritical(resultPayload(DebugTestProtocol.ResultKind.RUN_FAILED,
+        sendCritical(resultPayload(failureResult(command.kind()),
                 command.runId(), command.stepId(), connectionEpoch, failure,
                 Math.max(0, observedPose.frame), Math.max(0, observedPose.frame), 0,
                 snapshot(observedPose, null)));
@@ -412,11 +414,24 @@ final class LiveClientTestHarness {
                 localTerminal(active, reason, "debug channel unavailable; not sent");
                 return;
             }
-            sendCritical(resultPayload(DebugTestProtocol.ResultKind.RUN_FAILED, active.runId,
+            sendCritical(resultPayload(failureResult(active.command), active.runId,
                     active.stepId, connectionEpoch, reason,
                     Math.max(0, observedPose.frame), Math.max(0, observedPose.frame), 0,
                     snapshot(observedPose, null)));
         }, LiveClientTestHarness::restoreSettings);
+    }
+
+    // The existing receiver validates the operation's reply type before its failure field.
+    // A non-NONE failure on that typed reply terminates the run; RUN_FAILED is the abort reply.
+    static DebugTestProtocol.ResultKind failureResult(DebugTestProtocol.CommandKind command) {
+        return switch (command) {
+            case BEGIN_RUN -> DebugTestProtocol.ResultKind.CLIENT_READY;
+            case EXPECT_POSE -> DebugTestProtocol.ResultKind.POSE_FAILED;
+            case CAPTURE_SCREENSHOT -> DebugTestProtocol.ResultKind.SCREENSHOT_RESULT;
+            case END_RUN -> DebugTestProtocol.ResultKind.RUN_COMPLETE;
+            case ABORT_RUN -> DebugTestProtocol.ResultKind.RUN_FAILED;
+            default -> DebugTestProtocol.ResultKind.CHECKPOINT_RESULT;
+        };
     }
 
     // Terminal delivery does not request a SessionObservation. Detach before callbacks:
@@ -650,6 +665,7 @@ final class LiveClientTestHarness {
     static final class Run {
         final UUID runId;
         final VoxyRenderSystem renderer;
+        DebugTestProtocol.CommandKind command = DebugTestProtocol.CommandKind.BEGIN_RUN;
         long stepId;
         DebugShaderSettings shaderSettings;
         long shaderAwaitFrame = -1, shaderDrawMarker;
