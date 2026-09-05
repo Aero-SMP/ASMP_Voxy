@@ -2395,8 +2395,7 @@ final class ClientSession {
                             () -> demand.revision == revision
                                     && demand.candidate
                                     == SectionDemandTable.CandidateState.RENDERER_OWNED
-                                    && this.open.get(),
-                            () -> {}));
+                                    && this.open.get()));
                 }
                 if (prepared.isEmpty()) return;
                 for (PreparedPublication item : prepared) {
@@ -2451,7 +2450,8 @@ final class ClientSession {
             BuiltSection geometry = demand.completedGeometry;
             demand.completedGeometry = null;
             WorkerResource.Lease lease = demand.workLease;
-            // Renderer-owned buffers and their leases belong to PublicationRef until its outcome.
+            // Renderer-owned buffers belong to the publication. Its detachable lease stays
+            // with PublicationRef until real nonempty admission or a terminal outcome.
             if (geometry != null) {
                 geometry.free();
                 this.releaseRendererSlot(lease);
@@ -2498,6 +2498,13 @@ final class ClientSession {
                         && demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
                         && demand.publication == ref.publication();
                 if (!current) ref.publication().close();
+                if (ref.bytes() > 0 && ref.publication().rendererAdmitted()) {
+                    WorkerResource.Lease lease = this.detachPublicationLease(ref);
+                    if (lease != null) {
+                        this.releaseRendererSlot(lease);
+                        ClientLodDebug.admissionReleased(this, ref.demand().meshCompletedNanos);
+                    }
+                }
                 Optional<VoxyRenderSystem.UploadOutcome> outcome = ref.publication().takeUploadOutcome();
                 if (outcome.isEmpty()) {
                     this.publicationQueue.addLast(ref);
@@ -2508,7 +2515,7 @@ final class ClientSession {
                 this.publishingGeometryBytes -= ref.bytes();
                 if (!current) {
                     if (result.block() != null) result.block().geometry().free();
-                    this.releaseRendererSlot(ref.lease());
+                    this.releaseRendererSlot(this.detachPublicationLease(ref));
                     continue;
                 }
                 demand.publishingGeometryOwned = false;
@@ -2524,8 +2531,7 @@ final class ClientSession {
                     }
                     case FAILED, CANCELLED -> {
                         demand.publication = ref.previous();
-                        demand.workLease = null;
-                        this.releaseRendererSlot(ref.lease());
+                        this.releaseRendererSlot(this.detachPublicationLease(ref));
                         demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                         this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                         if (result.failure() != null) Logger.warn(
@@ -2539,8 +2545,7 @@ final class ClientSession {
                         this.activated++;
                         ClientLodDebug.startupEvent(this, this.helloAccepted ? "activation" : "localActivation", 0);
                         this.uploadedSections++;
-                        demand.workLease = null;
-                        this.releaseRendererSlot(ref.lease());
+                        this.releaseRendererSlot(this.detachPublicationLease(ref));
                     }
                 }
                 if (demand.pendingIndex != null && (demand.workLease == null
@@ -2605,6 +2610,17 @@ final class ClientSession {
 
         void releaseRendererSlot(WorkerResource.Lease lease) {
             if (lease != null) this.sectionWorkers[lease.slot()].releaseCompletion(lease);
+        }
+
+        /** Owner-thread-only detach; asynchronous cleanup receives only the exact identity. */
+        private WorkerResource.Lease detachPublicationLease(PublicationRef ref) {
+            WorkerResource.Lease lease = ref.lease;
+            ref.lease = null;
+            if (lease != null && this.demands.get(ref.demand().key) == ref.demand()
+                    && lease.equals(ref.demand().workLease)) {
+                ref.demand().workLease = null;
+            }
+            return lease;
         }
 
         RegionalProtocol.RegionIndex indexFor(long key) {
@@ -2724,7 +2740,8 @@ final class ClientSession {
             while ((reply = this.networkReplies.poll()) != null) reply.transferred();
             this.publisher.clearProgressListener(this.rendererWake);
             for (PublicationRef ref : this.publicationQueue) {
-                ref.publication().abandon(() -> this.releaseRendererSlot(ref.lease()));
+                WorkerResource.Lease lease = this.detachPublicationLease(ref);
+                ref.publication().abandon(() -> this.releaseRendererSlot(lease));
             }
             this.publicationQueue.clear();
             for (WorkerSlot worker : this.sectionWorkers) worker.close();
@@ -2756,10 +2773,28 @@ final class ClientSession {
     private record ReadyPublication(Demand demand, long revision) {}
     private record PreparedPublication(Demand demand, long revision, BuiltSection geometry,
                                        VoxyRenderSystem.SectionPublication previous) {}
-    private record PublicationRef(Demand demand, long revision,
-                                  VoxyRenderSystem.SectionPublication publication,
-                                  VoxyRenderSystem.SectionPublication previous,
-                                  WorkerResource.Lease lease, long bytes) {}
+    private static final class PublicationRef {
+        private final Demand demand;
+        private final long revision;
+        private final VoxyRenderSystem.SectionPublication publication, previous;
+        private final long bytes;
+        private WorkerResource.Lease lease;
+
+        PublicationRef(Demand demand, long revision,
+                       VoxyRenderSystem.SectionPublication publication,
+                       VoxyRenderSystem.SectionPublication previous,
+                       WorkerResource.Lease lease, long bytes) {
+            this.demand = demand; this.revision = revision;
+            this.publication = publication; this.previous = previous;
+            this.lease = lease; this.bytes = bytes;
+        }
+
+        Demand demand() { return this.demand; }
+        long revision() { return this.revision; }
+        VoxyRenderSystem.SectionPublication publication() { return this.publication; }
+        VoxyRenderSystem.SectionPublication previous() { return this.previous; }
+        long bytes() { return this.bytes; }
+    }
 
     private sealed interface Event permits CatalogReady, Coarsened,
             CoarsenFailed, BatchComplete, BatchFailed, SessionObservation {}

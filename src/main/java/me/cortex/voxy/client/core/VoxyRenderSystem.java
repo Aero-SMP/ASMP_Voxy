@@ -244,6 +244,7 @@ public class VoxyRenderSystem {
     }
 
     public interface SectionPublication extends AutoCloseable {
+        boolean rendererAdmitted();
         boolean activationFencePassed();
         Optional<UploadOutcome> takeUploadOutcome();
         void abandon(Runnable resolved);
@@ -267,12 +268,11 @@ public class VoxyRenderSystem {
     public record SectionSubmission(long position, BuiltSection geometry, boolean coverage,
                                     long meshCompletedNanos,
                                     Optional<SectionPublication> previous,
-                                    BooleanSupplier current, Runnable reserved) {
+                                    BooleanSupplier current) {
         public SectionSubmission {
             Objects.requireNonNull(geometry, "geometry");
             Objects.requireNonNull(previous, "previous");
             Objects.requireNonNull(current, "current");
-            Objects.requireNonNull(reserved, "reserved");
         }
     }
 
@@ -368,7 +368,7 @@ public class VoxyRenderSystem {
                         .orElse(null);
                 PreparedRegionalSection prepared = this.prepareRegionalSection(submission.position(),
                         submission.geometry(), previous, submission.coverage(),
-                        submission.meshCompletedNanos(), submission.current(), submission.reserved());
+                        submission.meshCompletedNanos(), submission.current());
                 rendererSubmissions.add(prepared.submission());
                 handles.add(prepared.publication());
             }
@@ -381,10 +381,9 @@ public class VoxyRenderSystem {
     private PreparedRegionalSection prepareRegionalSection(
             long position, BuiltSection geometry, RegionalSectionPublication previous,
             boolean coverage, long meshCompletedNanos,
-            BooleanSupplier current, Runnable reserved) {
+            BooleanSupplier current) {
         Objects.requireNonNull(geometry, "geometry");
         Objects.requireNonNull(current, "current");
-        Objects.requireNonNull(reserved, "reserved");
         long revision = this.regionalSectionRevision.getAndIncrement();
         if (revision <= 0) throw new IllegalStateException("regional-section revision exhausted");
         BuiltSection queued = new BuiltSection(position, revision, geometry.childExistence,
@@ -395,7 +394,7 @@ public class VoxyRenderSystem {
         AsyncNodeManager.RegionalSectionSubmission submission =
                 new AsyncNodeManager.RegionalSectionSubmission(queued, previousRevision,
                 () -> current.getAsBoolean() && publication.acceptsUpload(),
-                reserved, publication, () ->
+                publication::markRendererAdmitted, publication, () ->
                 this.nodeManager.finalizeStagedRoot(revision, () -> {
                     publication.recordActivationFencePassed(System.nanoTime());
                     publication.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));

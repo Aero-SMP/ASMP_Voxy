@@ -14,6 +14,7 @@ import java.util.Set;
 public final class PublicationTopologyBehaviorTest {
     private PublicationTopologyBehaviorTest() {}
     public static void run() {
+        RendererAdmissionBehaviorTest.run();
         retirementsProgressIndependentlyAndRespectRevision();
         cancellationDuringStagingWaitsForRollbackFence();
         fragmentedAndSectionIdAllocation();
@@ -165,6 +166,8 @@ public final class PublicationTopologyBehaviorTest {
         List<Publication> retirements = new ArrayList<>();
         Publication upload = new Publication(key(0), 2, 3, retirements);
         upload.close(); upload.close();
+        upload.markRendererAdmitted();
+        check(upload.rendererAdmitted() && !upload.activationFencePassed(), "admission bypassed activation fence");
         check(retirements.isEmpty() && allocator.getSectionCount() == 2, "close overtook staged upload");
         nodes.rollbackStagedRoot(2);
         check(!candidate.isFreed() && !fallback.isFreed(), "rollback freed before pointer fence");

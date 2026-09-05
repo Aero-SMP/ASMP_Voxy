@@ -26,6 +26,13 @@ public final class PublicationRepairBehaviorTest {
         returnCancellationOrderings();
         abandonedLateReturnAndWorkerReuse();
         independentlyCompletedPublicationPipelinesNextBatch();
+        admissionPipelinesOneWorkerWithoutActivation();
+        lateAdmittedOutcomesCannotReleaseSuccessor();
+        admissionBeforeInsertionAndBeforePoll();
+        emptyAdmissionRetainsWorker();
+        admittedGenerationChangeStaysDeferred();
+        admittedShutdownDetachesBeforeLateOutcome();
+        randomizedAdmissionLeaseInterleavings();
         everyRefusalAndLostWakeOrdering();
         coveragePassesBlockedRefinement();
         waitingRepliesUseCurrentPriorityAndIdentity();
@@ -62,6 +69,10 @@ public final class PublicationRepairBehaviorTest {
             this.input.previous().ifPresent(previous -> ((Publication) previous).markRetired());
             this.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
         }
+        void fail(UploadStatus status) {
+            this.input.geometry().free(); // Explicit renderer rollback/disposal completion.
+            this.completeUpload(new UploadOutcome(status, null, null));
+        }
         void giveBack(AllocationStatus reason, PublicationProgress observed) {
             this.completeUpload(new UploadOutcome(UploadStatus.RETURNED,
                     new AllocationBlock(this.input.geometry(), reason, 128, 0,
@@ -76,11 +87,14 @@ public final class PublicationRepairBehaviorTest {
         Runnable retirementDone;
         Consumer<Throwable> retirementFailed;
         long topology, allocation, sectionIds;
+        boolean admitBeforeReturn, finishBeforeReturn;
         @Override public SubmissionAttempt tryPublishBatch(List<SectionSubmission> submissions) {
             List<Publication> accepted = this.handoff.trySubmit(() -> {
                 this.preparations++;
                 List<Publication> batch = submissions.stream().map(Publication::new).toList();
                 this.created.addAll(batch);
+                if (this.admitBeforeReturn) batch.forEach(SectionPublicationState::markRendererAdmitted);
+                if (this.finishBeforeReturn) batch.forEach(Publication::activate);
                 return batch;
             });
             return accepted == null ? new SubmissionAttempt(SubmissionStatus.BUSY, List.of())
@@ -267,6 +281,158 @@ public final class PublicationRepairBehaviorTest {
         s.pollPublications(); s.release();
     }
 
+    private static void admissionPipelinesOneWorkerWithoutActivation() throws Exception {
+        Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
+        ClientSession.Demand a = installed(s, SectionKey.pack(4, 0, 0, 0));
+        Publication fallback = (Publication) a.publication;
+        CountedBuffer first = replacement(s, a);
+        s.missingCoverage.add(a.key);
+        s.scheduleReadyPublications();
+        Publication pa = p.handoff.take().getFirst();
+        s.pollPublications();
+        check(s.idleWorker() == null, "handoff acceptance released the only worker");
+        pa.markRendererAdmitted(); pa.markRendererAdmitted();
+        s.pollPublications(); s.pollPublications();
+        check(a.workLease == null && s.idleWorker() != null, "admission did not release worker");
+        check(a.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
+                && !pa.activationFencePassed() && s.missingCoverage.contains(a.key)
+                && !fallback.retirementFencePassed() && s.activeGeometryBytes == 1024,
+                "admission prematurely activated replacement or retired coverage/fallback");
+        CountedBuffer second = new CountedBuffer();
+        ClientSession.Demand b = ready(s, key(1), second);
+        s.scheduleReadyPublications();
+        Publication pb = p.handoff.take().getFirst();
+        check(!pa.activationFencePassed() && !pb.activationFencePassed()
+                && s.publicationQueue.size() == 2 && b.workLease != null,
+                "one worker did not pipeline two pending activations");
+        pa.activate(); s.pollPublications();
+        check(s.sectionWorkers[0].resource.matches(b.workLease), "A released B at activation");
+        pb.markRendererAdmitted(); s.pollPublications(); pb.activate(); s.pollPublications();
+        check(!s.missingCoverage.contains(a.key) && fallback.retirementFencePassed(),
+                "normal activation did not advance coverage/fallback");
+        s.release();
+        check(first.frees == 1 && second.frees == 1, "overlap native buffers leaked");
+    }
+
+    private static void lateAdmittedOutcomesCannotReleaseSuccessor() throws Exception {
+        for (UploadStatus status : List.of(UploadStatus.ACTIVATED, UploadStatus.FAILED, UploadStatus.CANCELLED)) {
+            for (boolean sameKey : new boolean[]{false, true}) {
+                Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
+                CountedBuffer first = new CountedBuffer(), second = new CountedBuffer();
+                ClientSession.Demand a = ready(s, key(1), first);
+                var oldLease = a.workLease;
+                s.scheduleReadyPublications(); Publication pa = p.handoff.take().getFirst();
+                if (sameKey) s.retireDemand(a.key); // Admission can arrive after demand removal.
+                pa.markRendererAdmitted(); s.pollPublications();
+                ClientSession.Demand b = ready(s, key(sameKey ? 1 : 2), second);
+                var newLease = b.workLease;
+                if (status == UploadStatus.ACTIVATED) pa.activate(); else pa.fail(status);
+                s.pollPublications(); s.pollPublications(); s.releaseRendererSlot(oldLease);
+                check(newLease.equals(b.workLease) && s.sectionWorkers[0].resource.matches(newLease)
+                        && second.frees == 0 && b.completedGeometry != null,
+                        "late " + status + " mutated successor worker/demand");
+                if (!sameKey && status != UploadStatus.ACTIVATED) {
+                    check(a.workLease == null && a.candidate == SectionDemandTable.CandidateState.READY_SOURCE,
+                            "admitted failure reused the detached lease instead of reacquiring");
+                }
+                s.release();
+                check(first.frees == 1 && second.frees == 1, "late outcome leaked native geometry");
+            }
+        }
+    }
+
+    private static void admissionBeforeInsertionAndBeforePoll() throws Exception {
+        for (boolean terminal : new boolean[]{false, true}) {
+            Publisher p = new Publisher(); p.admitBeforeReturn = true; p.finishBeforeReturn = terminal;
+            ClientSession.Session s = session(p, 1);
+            CountedBuffer buffer = new CountedBuffer();
+            var d = ready(s, key(1), buffer);
+            s.scheduleReadyPublications(); Publication publication = p.handoff.take().getFirst();
+            check(d.workLease != null, "renderer callback mutated the owner-thread lease");
+            s.pollPublications();
+            check(s.idleWorker() != null && d.workLease == null, "early acknowledgement was lost");
+            if (!terminal) publication.activate();
+            s.pollPublications(); s.release();
+            check(buffer.frees == 1, "early completion double disposed geometry");
+        }
+    }
+
+    private static void emptyAdmissionRetainsWorker() throws Exception {
+        Publisher p = new Publisher(); ClientSession.Session s = session(p, 2);
+        var empty = ready(s, key(1), null);
+        var full = ready(s, key(2), new CountedBuffer());
+        s.scheduleReadyPublications(); List<Publication> batch = p.handoff.take();
+        batch.forEach(SectionPublicationState::markRendererAdmitted); s.pollPublications();
+        check(empty.workLease != null && full.workLease == null, "empty mesh bypassed worker backpressure");
+        ready(s, key(3), null);
+        check(s.idleWorker() == null, "mixed batch lost its worker bound");
+        batch.forEach(Publication::activate); s.pollPublications(); s.release();
+    }
+
+    private static void admittedGenerationChangeStaysDeferred() throws Exception {
+        Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
+        var d = ready(s, key(0), new CountedBuffer());
+        var original = emptyIndex(); d.index = original; d.ordinal = original.ordinal(d.key);
+        s.scheduleReadyPublications(); Publication publication = p.handoff.take().getFirst();
+        publication.markRendererAdmitted(); s.pollPublications();
+        var newer = emptyIndex();
+        var catalog = new RegionalSectionCodec.BoundCatalog(RegionalProtocol.Hash32.ZERO, null);
+        long revision = d.revision;
+        s.bind(d, newer, newer.ordinal(d.key), catalog);
+        check(d.index == original && d.pendingIndex == newer && d.revision == revision
+                && d.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED,
+                "detached lease bypassed renderer-owned pending-index guard");
+        publication.fail(UploadStatus.FAILED); s.pollPublications();
+        check(d.pendingIndex == null && d.index == newer && d.workLease == null,
+                "failed admission lost deferred generation/reacquisition");
+        s.release();
+    }
+
+    private static void admittedShutdownDetachesBeforeLateOutcome() throws Exception {
+        for (boolean poll : new boolean[]{false, true}) {
+            Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
+            CountedBuffer buffer = new CountedBuffer();
+            var a = ready(s, key(1), buffer);
+            s.scheduleReadyPublications(); Publication pa = p.handoff.take().getFirst();
+            pa.markRendererAdmitted();
+            if (poll) { s.pollPublications(); ready(s, key(2), null); }
+            s.release();
+            check(a.workLease == null && buffer.frees == 0, "shutdown prematurely disposed renderer mesh");
+            pa.markRendererAdmitted(); pa.fail(UploadStatus.CANCELLED); pa.close();
+            check(buffer.frees == 1, "late admitted shutdown leaked/double-freed mesh");
+        }
+    }
+
+    private static void randomizedAdmissionLeaseInterleavings() throws Exception {
+        for (int seed = 0; seed < 128; seed++) {
+            Random random = new Random(seed);
+            Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
+            CountedBuffer buffer = new CountedBuffer();
+            var a = ready(s, key(1), buffer);
+            s.scheduleReadyPublications(); Publication pa = p.handoff.take().getFirst();
+            if (random.nextBoolean()) s.retireDemand(a.key);
+            pa.markRendererAdmitted();
+            if (random.nextBoolean()) pa.markRendererAdmitted();
+            boolean terminalFirst = random.nextBoolean();
+            boolean success = random.nextBoolean();
+            if (terminalFirst) { if (success) pa.activate(); else pa.fail(UploadStatus.FAILED); }
+            s.pollPublications();
+            CountedBuffer successorBuffer = new CountedBuffer();
+            var successor = ready(s, key(2), successorBuffer);
+            var lease = successor.workLease;
+            if (random.nextBoolean()) s.release();
+            if (!terminalFirst) { if (success) pa.activate(); else pa.fail(UploadStatus.CANCELLED); }
+            if (s.sectionWorkers[0].resource.state() != WorkerResource.State.CLOSED) {
+                s.pollPublications(); s.pollPublications();
+                check(lease.equals(successor.workLease) && s.sectionWorkers[0].resource.matches(lease),
+                        "randomized admission released successor: " + seed);
+                s.release();
+            }
+            check(buffer.frees == 1 && successorBuffer.frees == 1,
+                    "randomized admission disposal failed: " + seed);
+        }
+    }
+
     private static void everyRefusalAndLostWakeOrdering() throws Exception {
         for (AllocationStatus reason : AllocationStatus.values()) {
             Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
@@ -387,7 +553,7 @@ public final class PublicationRepairBehaviorTest {
                 for (int i = 0; i < 50; i++) {
                     CountedBuffer buffer = new CountedBuffer();
                     Publication p = new Publication(new SectionSubmission(key(1), mesh(key(1), buffer),
-                            false, 1, Optional.empty(), () -> true, () -> {}));
+                            false, 1, Optional.empty(), () -> true));
                     AtomicInteger resolved = new AtomicInteger();
                     boolean abandonFirst = random.nextBoolean();
                     if (abandonFirst) p.abandon(resolved::incrementAndGet);
@@ -426,7 +592,7 @@ public final class PublicationRepairBehaviorTest {
         s.addDemand(key);
         var d = s.demands.get(key);
         Publication publication = new Publication(new SectionSubmission(key, BuiltSection.empty(key),
-                false, 1, Optional.empty(), () -> true, () -> {}));
+                false, 1, Optional.empty(), () -> true));
         publication.activate();
         d.publication = publication;
         d.installed = true;

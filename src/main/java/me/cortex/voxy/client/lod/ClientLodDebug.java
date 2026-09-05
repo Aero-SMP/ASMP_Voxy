@@ -10,6 +10,7 @@ public final class ClientLodDebug {
     static void tick() {}
     static boolean connectionAllowed() { return true; }
     static void startupEvent(ClientSession.Session session, String event, long bytes) {}
+    static void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {}
     static String startupSnapshot(ClientSession.Session session) { return ""; }
     public static void captureRender(int frameId, int geometrySections,
                                      int renderListBuffer, int drawCountBuffer) {}

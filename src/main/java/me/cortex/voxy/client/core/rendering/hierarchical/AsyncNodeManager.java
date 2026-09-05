@@ -580,14 +580,8 @@ public class AsyncNodeManager {
                 return true;
             }
             PublicationProgress observed = this.publicationProgress();
-            long geometryBytes = geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size;
-            long stagedBytes = UploadStream.alignUp(geometryBytes,
-                    UploadStream.BASE_ALLOCATION_ALIGNEMENT)
-                    + UploadStream.alignUp(16, UploadStream.BASE_ALLOCATION_ALIGNEMENT);
-            if (stagedBytes > UploadStream.CAPACITY_BYTES) {
-                throw new IllegalArgumentException("one regional section exceeds the render "
-                        + "upload safety ceiling: " + geometryBytes + " bytes");
-            }
+            // The atomic batch handoff already validates every section against the
+            // exact upload ceiling before accepting ownership.
             if (publication.previousRevision() >= 0) {
                 if (!this.manager.finalizeStagedRoot(publication.previousRevision())) {
                     publication.blocked().accept(new RegionalAllocationBlock(geometry,
@@ -641,10 +635,13 @@ public class AsyncNodeManager {
             }
             transferred = true;
             this.usedGeometryAmount = this.geometryManager.getGeometryUsedBytes();
-            publication.reserved.run();
             this.manager.commitStagedRoot(geometry.sourceRevision, Set.of(geometry.position));
             this.completedRegionalSectionPublications.add(publication);
+            publication.admitted.run();
         } catch (Throwable failure) {
+            // A failing acknowledgement notification must not later run the success
+            // path as well as rollback (ownership may already have been acknowledged).
+            this.completedRegionalSectionPublications.remove(publication);
             if (!transferred) geometry.free();
             try {
                 this.manager.rollbackStagedRoot(geometry.sourceRevision);
@@ -909,7 +906,7 @@ public class AsyncNodeManager {
                                           long prerequisite, PublicationProgress observed) {}
 
     public record RegionalSectionSubmission(BuiltSection geometry, long previousRevision,
-                                            BooleanSupplier current, Runnable reserved,
+                                            BooleanSupplier current, Runnable admitted,
                                             RegionalPublicationTiming timing, Runnable success,
                                             Runnable canceled,
                                             Consumer<RegionalAllocationBlock> blocked,
@@ -917,7 +914,7 @@ public class AsyncNodeManager {
         public RegionalSectionSubmission {
             Objects.requireNonNull(geometry, "geometry");
             Objects.requireNonNull(current, "current");
-            Objects.requireNonNull(reserved, "reserved");
+            Objects.requireNonNull(admitted, "admitted");
             Objects.requireNonNull(timing, "timing");
             Objects.requireNonNull(success, "success");
             Objects.requireNonNull(canceled, "canceled");
@@ -927,7 +924,7 @@ public class AsyncNodeManager {
     }
 
     private record RegionalSectionPublication(BuiltSection geometry, long previousRevision,
-                                             BooleanSupplier current, Runnable reserved,
+                                             BooleanSupplier current, Runnable admitted,
                                              RegionalPublicationTiming timing, Runnable success,
                                              Runnable canceled,
                                              Consumer<RegionalAllocationBlock> blocked,
@@ -1132,7 +1129,7 @@ public class AsyncNodeManager {
                         throw new IllegalArgumentException("regional section exceeds upload ceiling");
                     }
                     publications[index] = new RegionalSectionPublication(geometry,
-                            submission.previousRevision(), submission.current(), submission.reserved(),
+                            submission.previousRevision(), submission.current(), submission.admitted(),
                             submission.timing(), submission.success(), submission.canceled(),
                             submission.blocked(), submission.failure());
                 }
@@ -1523,7 +1520,7 @@ public class AsyncNodeManager {
         //This is done here as it enables easily doing scratch data resizing
         private int allocScratchDataPos(int size) {
             int pos = (int) this.arena.alloc(size);
-            if (this.scratchDataBuffer.size <= (pos+size)*8L) {
+            if (this.scratchDataBuffer.size < (pos+size)*8L) {
                 //We must resize :cri:
                 long newSize = Math.max(this.scratchDataBuffer.size*2, (pos+size)*8L);
                 Logger.info("Resizing scratch data buffer to: " + newSize);

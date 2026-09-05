@@ -10,6 +10,7 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
                 if (result.block() != null) result.block().geometry().free();
             });
     private VoxyRenderSystem.UploadStatus status;
+    private boolean admitted;
     private boolean closed;
     private boolean retired;
     private boolean retirementRequested;
@@ -18,6 +19,20 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
     protected abstract void stateChanged();
 
     public synchronized boolean acceptsUpload() { return !this.closed; }
+    @Override public synchronized boolean rendererAdmitted() { return this.admitted; }
+
+    /** Allocation, hierarchy commit and completion registration have all succeeded.
+     * This acknowledges ownership, not activation; closure must not erase that fact. */
+    public void markRendererAdmitted() {
+        synchronized (this) {
+            if (this.admitted) return;
+            if (this.status == VoxyRenderSystem.UploadStatus.RETURNED) {
+                throw new IllegalStateException("returned geometry cannot be renderer admitted");
+            }
+            this.admitted = true;
+        }
+        this.stateChanged();
+    }
     @Override public synchronized boolean activationFencePassed() {
         return this.status == VoxyRenderSystem.UploadStatus.ACTIVATED;
     }
@@ -30,6 +45,9 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
         boolean retire;
         synchronized (this) {
             if (this.status != null) return;
+            if (this.admitted && result.status() == VoxyRenderSystem.UploadStatus.RETURNED) {
+                throw new IllegalStateException("admitted geometry cannot be returned to a worker");
+            }
             this.status = result.status();
             if (this.status != VoxyRenderSystem.UploadStatus.ACTIVATED) this.retired = true;
             retire = this.claimRetirement();

@@ -10,6 +10,7 @@ import java.util.concurrent.TimeUnit;
 public final class PublicationShutdownBehaviorTest {
     public static void run() {
         concurrentRetirementAndRendererInspection();
+        admissionInterleavings();
         for (boolean closeBeforeUpload : new boolean[]{false, true}) {
             var state = new State();
             if (closeBeforeUpload) state.close();
@@ -48,6 +49,50 @@ public final class PublicationShutdownBehaviorTest {
                     "abandoned upload released ownership more than once");
         }
         System.out.println("renderer shutdown and publication callback lock-order tests passed");
+    }
+
+    private static void admissionInterleavings() {
+        for (boolean admittedFirst : new boolean[]{false, true}) {
+            State state = new State();
+            if (admittedFirst) state.markRendererAdmitted();
+            state.rendererStopped();
+            state.markRendererAdmitted(); state.markRendererAdmitted();
+            check(state.rendererAdmitted() && !state.activationFencePassed()
+                    && state.retirementFencePassed(), "shutdown erased admission or activated geometry");
+            check(state.takeUploadOutcome().orElseThrow().status() == UploadStatus.CANCELLED,
+                    "late admission changed terminal outcome");
+        }
+        for (boolean admissionFirst : new boolean[]{false, true}) {
+            State state = new State();
+            if (admissionFirst) state.markRendererAdmitted();
+            else state.completeUpload(new UploadOutcome(UploadStatus.RETURNED, null, null));
+            boolean rejected = false;
+            try {
+                if (admissionFirst) state.completeUpload(new UploadOutcome(UploadStatus.RETURNED, null, null));
+                else state.markRendererAdmitted();
+            } catch (IllegalStateException expected) { rejected = true; }
+            check(rejected, "RETURNED and admitted were allowed on the same attempt");
+        }
+        for (int iteration = 0; iteration < 128; iteration++) {
+            State state = new State();
+            AtomicReference<Throwable> error = new AtomicReference<>();
+            CountDownLatch start = new CountDownLatch(1);
+            Thread admitting = Thread.ofPlatform().daemon().unstarted(() -> {
+                try { start.await(); state.markRendererAdmitted(); state.markRendererAdmitted(); }
+                catch (Throwable failure) { error.set(failure); }
+            });
+            Thread stopping = Thread.ofPlatform().daemon().unstarted(() -> {
+                try { start.await(); state.rendererStopped(); state.close(); }
+                catch (Throwable failure) { error.set(failure); }
+            });
+            admitting.start(); stopping.start(); start.countDown();
+            try { admitting.join(5_000); stopping.join(5_000); }
+            catch (InterruptedException failure) { throw new AssertionError(failure); }
+            check(!admitting.isAlive() && !stopping.isAlive(), "admission/shutdown deadlocked");
+            if (error.get() != null) throw new AssertionError(error.get());
+            check(state.rendererAdmitted() && state.retirementFencePassed() && state.requests == 0,
+                    "racing admission/shutdown lost ownership");
+        }
     }
 
     private static void concurrentRetirementAndRendererInspection() {

@@ -61,6 +61,7 @@ public final class ClientLodDebug {
     private static final class StartupStats {
         final long start = System.nanoTime();
         long firstLocal, hello, localViews, localActivations, validated, replacements, invalidations, metadataBytes;
+        long admissionReleases, meshToLeaseReleaseNanos, maxMeshToLeaseReleaseNanos;
     }
 
     static boolean connectionAllowed() { return !transportHeld; }
@@ -94,13 +95,31 @@ public final class ClientLodDebug {
         }
     }
 
+    static synchronized void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {
+        var stats = STARTUP.computeIfAbsent(session, ignored -> new StartupStats());
+        long elapsed = Math.max(0, System.nanoTime() - meshCompletedNanos);
+        stats.admissionReleases++;
+        stats.meshToLeaseReleaseNanos += elapsed;
+        stats.maxMeshToLeaseReleaseNanos = Math.max(stats.maxMeshToLeaseReleaseNanos, elapsed);
+    }
+
     static synchronized String startupSnapshot(ClientSession.Session session) {
         var stats = STARTUP.get(session);
+        long admittedPending = 0;
+        for (var demand : session.demands.values()) {
+            if (demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
+                    && demand.geometryBytes > 0 && demand.workLease == null
+                    && demand.publication != null && demand.publication.rendererAdmitted()) admittedPending++;
+        }
         return stats == null ? "" : " transportHeld=" + transportHeld + " localViews=" + stats.localViews
                 + " localActivations=" + stats.localActivations + " firstLocalNanos=" + stats.firstLocal
                 + " firstHelloNanos=" + stats.hello + " validatedViews=" + stats.validated
                 + " replacements=" + stats.replacements + " invalidations=" + stats.invalidations
-                + " metadataNetworkBytes=" + stats.metadataBytes;
+                + " metadataNetworkBytes=" + stats.metadataBytes
+                + " admissionReleases=" + stats.admissionReleases
+                + " admittedPending=" + admittedPending
+                + " meshToLeaseReleaseNanos=" + stats.meshToLeaseReleaseNanos
+                + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos;
     }
 
     static {
