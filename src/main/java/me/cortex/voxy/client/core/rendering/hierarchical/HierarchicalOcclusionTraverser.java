@@ -2,6 +2,7 @@ package me.cortex.voxy.client.core.rendering.hierarchical;
 
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.config.LodPixelSize;
 import me.cortex.voxy.client.core.AbstractRenderPipeline;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.shader.AutoBindingShader;
@@ -83,6 +84,7 @@ public class HierarchicalOcclusionTraverser {
     private double averageFrameNanos = 16_666_667.0;
     private int coarsenGraceFrames = 120;
     private int actionEpoch;
+    private float detailThresholdScale = LodPixelSize.DEFAULT * 0.5f;
 
     public HierarchicalOcclusionTraverser(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner) {
         this.nodeCleaner = nodeCleaner;
@@ -238,6 +240,9 @@ public class HierarchicalOcclusionTraverser {
         ptr += 4;
         MemoryUtil.memPutInt(ptr, this.coarsenGraceFrames);
         ptr += 4;
+        // std140 offset 216; the block rounds to 224 bytes. Both passes use
+        // the target captured by doTraversal(), not a second config read.
+        MemoryUtil.memPutFloat(ptr, this.detailThresholdScale);
 
     }
 
@@ -251,6 +256,7 @@ public class HierarchicalOcclusionTraverser {
     }
 
     public void doTraversal(Viewport viewport) {
+        this.detailThresholdScale = VoxyConfig.CONFIG.getSubDivisionSize() * 0.5f;
         long now = System.nanoTime();
         if (this.previousFrameNanos != 0) {
             long elapsed = now - this.previousFrameNanos;

@@ -12,6 +12,7 @@ public final class SectionDemandTableBehaviorTest {
 
     public static void main(String[] arguments) throws Exception {
         me.cortex.voxy.client.config.GeometryMemoryOptionsBehaviorTest.run();
+        me.cortex.voxy.client.config.LodPixelSizeBehaviorTest.run();
         retainsOneHundredThousandDetailTransitions();
         coalescesNewestUnsignedEpoch();
         priorityMovesOneMembership();

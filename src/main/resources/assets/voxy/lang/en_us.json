@@ -12,6 +12,9 @@
   "voxy.config.general.renderDistance": "Render distance",
   "voxy.config.general.renderDistance.tooltip": "Render distance of voxy in chunks",
 
+  "voxy.config.general.subDivisionSize": "LOD pixel size",
+  "voxy.config.general.subDivisionSize.tooltip": "Approximate target projected section size in render pixels. Smaller = finer terrain and more work; larger = coarser terrain and less work. Zooming still increases detail. GPU memory may limit the requested quality. This is not the width of an individual block.",
+
   "voxy.config.general.geometry_memory": "GPU Memory",
   "voxy.config.general.geometry_memory.tooltip": "Controls how much GPU memory Voxy can use for LOD geometry. Larger values allow more detailed LODs to stay loaded, but consequently reduce FPS. The default is selected automatically for your GPU; unsafe sizes are hidden.",
 

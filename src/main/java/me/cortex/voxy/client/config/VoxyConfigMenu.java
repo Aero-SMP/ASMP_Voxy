@@ -67,6 +67,8 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setImpact(OptionImpact.MEDIUM)
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
+        var pixelSize = pixelSizeOption(builder);
+
         int[] geometryMemoryChoices = GeometryMemoryOptions.available(
                 RenderResourceReuse.getSafeGeometryMemoryLimitBytes());
         Logger.info("GPU Memory slider maximum is "
@@ -130,7 +132,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         options.addPage(builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
-                .addOptionGroup(group(builder, renderDistance, geometryMemory))
+                .addOptionGroup(group(builder, renderDistance, pixelSize, geometryMemory))
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
                 .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));
@@ -168,6 +170,17 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 }
             }
         }, IRIS_RELOAD, ENABLED, RENDERING, RENDER_DISTANCE);
+    }
+
+    static IntegerOptionBuilder pixelSizeOption(ConfigBuilder builder) {
+        return option(builder.createIntegerOption(id("subdivsize")),
+                "voxy.config.general.subDivisionSize",
+                () -> LodPixelSize.toSlider(CFG.getSubDivisionSize()),
+                value -> CFG.subDivisionSize = LodPixelSize.fromSlider(value))
+                .setRange(new Range(0, LodPixelSize.SLIDER_MAX, 1))
+                .setValueFormatter(value -> Component.literal(LodPixelSize.label(value, CFG.getSubDivisionSize())))
+                .setImpact(OptionImpact.HIGH)
+                .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
     }
 
     private static <T, B extends StatefulOptionBuilder<T>> B option(B builder, String translation,

@@ -26,6 +26,7 @@ layout(binding = SCENE_UNIFORM_BINDING, std140) uniform SceneUniform {
     float renderDistance;
     uint finalPass;
     uint coarsenGraceFrames;
+    float detailThresholdScale;
 };
 
 #import <voxy:lod/hierarchical/queue.glsl>
@@ -142,10 +143,10 @@ void traverse(in UnpackedNode node) {
     if (hasChildren(node) && !childListIsEmpty(node)) {
         bool parentRenderable = hasMesh(node) && !isEmptyMesh(node);
         bool dormant = isDormant(node);
-        if (!parentRenderable || score >= DESCEND_DETAIL_SCORE) {
+        if (!parentRenderable || score >= DESCEND_DETAIL_SCORE * detailThresholdScale) {
             setDormant(node, false, bucket);
             enqueueChildren(node);
-        } else if (score <= RETAIN_DETAIL_SCORE) {
+        } else if (score <= RETAIN_DETAIL_SCORE * detailThresholdScale) {
             setDormant(node, true, bucket);
             enqueueSelfForRender(node);
         } else if (dormant) {
@@ -159,7 +160,7 @@ void traverse(in UnpackedNode node) {
     // A retained parent is the complete fallback until its child group becomes active.
     setDormant(node, false, bucket);
     if (hasMesh(node)) enqueueSelfForRender(node);
-    if (finalPass != 0u && node.lodLevel != 0u && !isTerminal(node) && score >= 1.0f) {
+    if (finalPass != 0u && node.lodLevel != 0u && !isTerminal(node) && score >= detailThresholdScale) {
         addDetailAction(node, ACTION_REFINE, bucket);
     }
 }

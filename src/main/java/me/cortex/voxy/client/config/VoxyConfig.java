@@ -28,6 +28,7 @@ public class VoxyConfig {
     // Zero selects the highest GPU Memory option permitted by this GPU.
     public int geometryMemoryMib = 0;
     public float sectionRenderDistance = 256F / 32F;
+    public float subDivisionSize = LodPixelSize.DEFAULT;
     public int skyFogDistance = 96;
     public float fogIntensity = 1.0f;
     public float fogDensity = 0.0f;
@@ -77,6 +78,7 @@ public class VoxyConfig {
     }
 
     public void save() {
+        this.subDivisionSize = this.getSubDivisionSize();
         if (!VoxyClient.isAvailable()) {
             Logger.info("Not saving config because Voxy is unavailable");
             return;
@@ -87,6 +89,10 @@ public class VoxyConfig {
         } catch (IOException e) {
             Logger.error("Failed to write config file", e);
         }
+    }
+
+    public float getSubDivisionSize() {
+        return LodPixelSize.validate(this.subDivisionSize);
     }
 
     private static Path getConfigPath() {

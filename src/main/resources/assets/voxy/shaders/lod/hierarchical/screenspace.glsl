@@ -149,8 +149,8 @@ bool isCulledByHiz() {
 
 
 
-// Approximate the visible error removed by one subdivision in physical pixels. The score is
-// continuous; policy is applied by the CPU frontier after quantization, never as a quality slider.
+// Continuous projected section-size priority, in render pixels, with a center bias.
+// The quality target scales traversal eligibility thresholds, never this score or its buckets.
 float projectedDetailScore() {
     float diameterPixels = sqrt(max(_screenSize * viewportArea, 0.0f));
     vec2 center = (_minBB.xy + _maxBB.xy) * 0.5f;
