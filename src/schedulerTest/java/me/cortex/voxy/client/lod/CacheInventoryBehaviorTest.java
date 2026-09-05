@@ -13,9 +13,101 @@ final class CacheInventoryBehaviorTest {
     static void run() throws Exception {
         foregroundDuringInventory();
         failedAndUnstableInventory();
+        inventoryOrderingAndGarbage();
+        changedBetweenPasses();
         oversizedAndPinnedCleanup();
         ownershipAndReopen();
         System.out.println("background inventory, read-only repair guards, accounting, pins and ownership tests passed");
+    }
+
+    private static void inventoryOrderingAndGarbage() throws Exception {
+        for (String mode : List.of("under", "garbage", "aged", "ties", "protected")) {
+            Path root = Files.createTempDirectory("voxy-inventory-" + mode + '-');
+            try {
+                List<Path> payloads = new ArrayList<>();
+                for (int i = 0; i < 5; i++) {
+                    Path path = root.resolve("part-" + i + ".vxcache");
+                    Files.write(path, new byte[100]); payloads.add(path);
+                    Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(
+                            mode.equals("ties") ? 1000 : (i + 1) * 1000));
+                }
+                // Observe this fixture's actual encounter order; never assume lexical directory order.
+                List<Path> encounter;
+                try (var paths = Files.walk(root)) { encounter = paths.filter(payloads::contains).toList(); }
+                if (mode.equals("garbage")) {
+                    Files.write(root.resolve("orphan.vxcat"), new byte[200]);
+                    Files.write(root.resolve("leftover.vxmeta.pending"), new byte[200]);
+                }
+                long limit = mode.equals("under") || mode.equals("garbage") ? 500 : 300;
+                Path catalog = root.resolve("referenced.vxcat");
+                if (mode.equals("protected")) {
+                    Files.write(catalog, new byte[10]);
+                    Files.write(root.resolve("owner.vxmeta"), new byte[10]);
+                    Files.setLastModifiedTime(catalog, java.nio.file.attribute.FileTime.fromMillis(0));
+                    limit = 320;
+                }
+                var budget = new RegionalDiskBudget(root, limit, path -> catalog);
+                List<Path> attempts = Collections.synchronizedList(new ArrayList<>());
+                // Real deletion uses registered lease callbacks; record attempts without replacing eviction.
+                synchronized (budget) {
+                    for (Path path : payloads) budget.register(path, null, () -> {
+                        attempts.add(path);
+                        return !mode.equals("protected") || !path.equals(payloads.get(1));
+                    });
+                }
+                try (var pin = budget.pin(mode.equals("protected") ? payloads.get(0) : root.resolve("unused"));
+                     var store = new RegionalMetadataStore(budget)) {
+                    awaitInventory(budget);
+                    check(budget.bytes == diskBytes(root), mode + " accounting mismatch");
+                    if (mode.equals("under") || mode.equals("garbage")) {
+                        check(payloads.stream().allMatch(Files::exists) && attempts.isEmpty(), "unnecessary pressure eviction");
+                        check(budget.bytes == 500, "garbage did not bring cache under budget");
+                    } else if (mode.equals("protected")) {
+                        check(Files.exists(payloads.get(0)) && Files.exists(payloads.get(1)) && Files.exists(catalog),
+                                "pin, busy lease or referenced catalog evicted");
+                        check(!Files.exists(payloads.get(2)) && !Files.exists(payloads.get(3)) && Files.exists(payloads.get(4)),
+                                "oldest eligible payloads not evicted");
+                        check(budget.bytes == 320, "protected files misaccounted");
+                    } else {
+                        List<Path> order = mode.equals("ties") ? encounter : payloads;
+                        check(attempts.equals(order.subList(0, 2)), "age/stable encounter ordering changed: " + attempts);
+                        check(budget.bytes == 300, "pressure deletion accounting mismatch");
+                    }
+                }
+            } finally { cleanup(root); }
+        }
+    }
+
+    private static void changedBetweenPasses() throws Exception {
+        for (String change : List.of("added", "removed", "replaced", "same-size-modified")) {
+            Path root = Files.createTempDirectory("voxy-inventory-change-");
+            Path descriptor = root.resolve("change.vxmeta"), garbage = root.resolve("keep.vxcat");
+            Files.write(descriptor, new byte[10]); Files.write(garbage, new byte[10]);
+            var time = java.nio.file.attribute.FileTime.fromMillis(1000);
+            Files.setLastModifiedTime(descriptor, time);
+            var budget = new RegionalDiskBudget(root, 1, path -> {
+                switch (change) {
+                    case "added" -> Files.write(root.resolve("added.vxcache"), new byte[10]);
+                    case "removed" -> Files.delete(path);
+                    case "replaced" -> {
+                        // Keep old inode alive so replacement cannot immediately reuse its identity.
+                        Files.move(path, root.resolve("old.unmanaged"));
+                        Files.write(path, new byte[10]); Files.setLastModifiedTime(path, time);
+                    }
+                    case "same-size-modified" -> {
+                        Files.write(path, new byte[]{1, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+                        Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(2000));
+                    }
+                    default -> throw new AssertionError(change);
+                }
+                return null;
+            });
+            try (var store = new RegionalMetadataStore(budget)) {
+                until(() -> budget.snapshot().contains("cacheInventory=FAILED"));
+                check(budget.bytes == -1 && Files.exists(garbage) && !budget.ensure(1, Set.of()),
+                        "partially validated inventory deleted files or authorized growth: " + change);
+            } finally { cleanup(root); }
+        }
     }
 
     private static void foregroundDuringInventory() throws Exception {
@@ -128,6 +220,12 @@ final class CacheInventoryBehaviorTest {
                 synchronized (next) { next.unregister(catalogPath, cache); }
             }
             check(next.bytes == diskBytes(root), "failed deletion lost accounting");
+            Path nonempty = Files.createDirectory(root.resolve("undeletable.vxcache"));
+            Files.write(nonempty.resolve("child"), new byte[10]);
+            next.bytes += 10;
+            synchronized (next) {
+                check(!next.delete(nonempty) && next.bytes == diskBytes(root), "IOException deletion lost accounting");
+            }
         } finally { cleanup(root); }
     }
 

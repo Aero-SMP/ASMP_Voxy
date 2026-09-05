@@ -250,7 +250,8 @@ final class RegionalCache implements AutoCloseable {
                 throws IOException {
             RandomAccessFile file = new RandomAccessFile(path.toFile(), writable ? "rw" : "r");
             try {
-                if (file.length() < HEADER_BYTES || file.length() > MAX_SHARD_BYTES) {
+                long extent = file.length();
+                if (extent < HEADER_BYTES || extent > MAX_SHARD_BYTES) {
                     return closeNull(file);
                 }
                 byte[] header = new byte[HEADER_BYTES];
@@ -266,7 +267,7 @@ final class RegionalCache implements AutoCloseable {
                 Map<CacheKey, Long> records = new HashMap<>();
                 long offset = HEADER_BYTES;
                 ByteBuffer record = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-                while (offset + RECORD_BYTES <= file.length()) {
+                while (offset + RECORD_BYTES <= extent) {
                     record.clear();
                     readFully(file.getChannel(), offset, record);
                     record.flip();
@@ -280,12 +281,12 @@ final class RegionalCache implements AutoCloseable {
                         records.remove(key);
                         offset += RECORD_BYTES;
                     } else {
-                        if (offset + RECORD_BYTES + length > file.length()) break;
+                        if (offset + RECORD_BYTES + length > extent) break;
                         records.put(key, offset + RECORD_BYTES);
                         offset += RECORD_BYTES + length;
                     }
                 }
-                if (writable && offset != file.length()) file.setLength(offset);
+                if (writable && offset != extent) file.setLength(offset);
                 if (writable) Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(
                         System.currentTimeMillis()));
                 return new Shard(path, file, records, writable);

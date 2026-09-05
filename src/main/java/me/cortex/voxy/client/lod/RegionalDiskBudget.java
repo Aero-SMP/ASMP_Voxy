@@ -137,7 +137,7 @@ final class RegionalDiskBudget {
             List<Path> candidates;
             try (var files = Files.walk(this.root)) {
                 candidates = files.filter(RegionalDiskBudget::inventoryFile)
-                        .sorted(Comparator.comparingLong(RegionalDiskBudget::modified)).toList();
+                        .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
             }
             if (candidates.size() != observed.size()) throw new IOException("cache changed during inventory");
             for (Path path : candidates) {
@@ -165,10 +165,20 @@ final class RegionalDiskBudget {
                 if (path.toString().endsWith(".pending") || path.toString().endsWith(".vxcat")
                         && !this.catalogReferences.containsKey(path)) deleteKnown(path);
             }
-            for (Path path : candidates) synchronized (this) {
+            boolean overBudget;
+            synchronized (this) {
                 checkInventory();
-                if (this.bytes <= this.limit) break;
-                if (!path.toString().endsWith(".vxcat") || !this.catalogReferences.containsKey(path)) deleteKnown(path);
+                overBudget = this.bytes > this.limit;
+            }
+            if (overBudget) {
+                checkInventory();
+                candidates.sort(Comparator.comparingLong(path -> observed.get(path).lastModifiedTime().toMillis()));
+                checkInventory();
+                for (Path path : candidates) synchronized (this) {
+                    checkInventory();
+                    if (this.bytes <= this.limit) break;
+                    if (!path.toString().endsWith(".vxcat") || !this.catalogReferences.containsKey(path)) deleteKnown(path);
+                }
             }
             synchronized (this) {
                 checkInventory();

@@ -23,6 +23,9 @@ final class CacheStartupBehaviorTest {
     static final RegionalSectionCodec.Mappings MAPPINGS = new RegionalSectionCodec.Mappings(new int[]{15}, new int[]{0});
 
     static void run() throws Exception {
+        shardReconstruction();
+        overlappingShardOwners();
+        trimmedShardsReopen();
         CacheInventoryBehaviorTest.run();
         localActivationAndValidation();
         cachedRefinementWhileHeld();
@@ -38,7 +41,163 @@ final class CacheStartupBehaviorTest {
     record Fixture(RegionalProtocol.CatalogMessage catalog, RegionalProtocol.RegionMessage message,
                    RegionalProtocol.RegionIndex index, byte[] payload) {}
 
+    private static void shardReconstruction() throws Exception {
+        Path root = Files.createTempDirectory("voxy-shard-open-");
+        Path path = root.resolve("r.0.0.vxcache");
+        byte[] header = buffer(64).put(new byte[]{'V','X','Y','S','E','C',0,0})
+                .putLong(1).putLong(2).putLong(3).putLong(4).putInt(0).putInt(0).putLong(0).array();
+        try {
+            Files.write(path, new byte[0]);
+            check(openShard(path, false) == null, "empty file accepted");
+            Files.write(path, header);
+            try (var shard = openShard(path, false)) {
+                check(shard != null && shardValue(shard, 1, 2) == null, "header-only shard rejected");
+            }
+            // Same fingerprint with different lengths, last-record wins, and a reinsert after a tombstone.
+            byte[] records = buffer(64 + 7 * 20 + 2 + 3 + 2 + 2 + 4)
+                    .put(header).put(record(1, 2, new byte[]{1, 1}))
+                    .put(record(1, 3, new byte[]{3, 3, 3}))
+                    .put(record(1, 2, new byte[]{2, 2})).put(record(1, -2, new byte[0]))
+                    .put(record(1, 2, new byte[]{4, 4})).put(record(2, 4, new byte[]{5, 5, 5, 5}))
+                    .put(record(2, -4, new byte[0])).array();
+            Files.write(path, Arrays.copyOf(records, records.length - 20));
+            try (var shard = openShard(path, false)) {
+                check(Arrays.equals(shardValue(shard, 2, 4), new byte[]{5, 5, 5, 5}), "exact-end payload lost");
+            }
+            List<byte[]> suffixes = new ArrayList<>();
+            suffixes.add(new byte[0]); suffixes.add(new byte[]{7, 8, 9});
+            suffixes.add(record(3, 4, new byte[]{7})); // incomplete payload
+            for (int invalid : new int[]{0, Integer.MIN_VALUE, RegionalProtocol.MAX_SECTION_BYTES + 1,
+                    -RegionalProtocol.MAX_SECTION_BYTES - 1}) suffixes.add(record(3, invalid, new byte[0]));
+            for (byte[] suffix : suffixes) {
+                Files.write(path, buffer(records.length + suffix.length).put(records).put(suffix).array());
+                var modified = java.nio.file.attribute.FileTime.fromMillis(123456000);
+                Files.setLastModifiedTime(path, modified);
+                byte[] before = Files.readAllBytes(path);
+                for (int reopen = 0; reopen < 3; reopen++) try (var shard = openShard(path, false)) {
+                    check(Arrays.equals(shardValue(shard, 1, 2), new byte[]{4, 4}), "reinsert/duplicate lost");
+                    check(Arrays.equals(shardValue(shard, 1, 3), new byte[]{3, 3, 3}), "length keys conflated");
+                    check(shardValue(shard, 2, 4) == null, "exact-end tombstone lost");
+                }
+                check(Arrays.equals(before, Files.readAllBytes(path)) && Files.getLastModifiedTime(path).equals(modified),
+                        "read-only scan repaired or touched file");
+                try (var shard = openShard(path, true)) {
+                    check(Files.size(path) == records.length && shardValue(shard, 1, 2) != null, "suffix repair changed prefix");
+                    var field = shard.getClass().getDeclaredField("file"); field.setAccessible(true);
+                    var file = (java.io.RandomAccessFile) field.get(shard);
+                    shard.close(); check(!file.getFD().valid(), "closed shard leaked file handle");
+                }
+                try (var shard = openShard(path, true)) {
+                    check(Files.size(path) == records.length, "repeated repair changed exact end");
+                }
+            }
+            for (int offset : new int[]{0, 8, 40, 44, 48}) {
+                byte[] invalid = header.clone(); invalid[offset] ^= 1; Files.write(path, invalid);
+                check(openShard(path, false) == null, "malformed magic/world/coordinates/reserved field accepted");
+            }
+            Files.write(path, Arrays.copyOf(header, 63));
+            check(openShard(path, false) == null, "short header accepted");
+            try (var file = new java.io.RandomAccessFile(path.toFile(), "rw")) { file.setLength(256L * 1024 * 1024 + 1); }
+            check(openShard(path, false) == null, "oversized shard accepted");
+            // Real positional reads still fail if the underlying payload disappears after opening.
+            Files.write(path, records);
+            try (var shard = openShard(path, false)) {
+                Files.write(path, header);
+                try { shardValue(shard, 1, 2); throw new AssertionError("truncated read accepted"); }
+                catch (IOException expected) { check(expected.getMessage().contains("truncated"), "wrong read failure"); }
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void trimmedShardsReopen() throws Exception {
+        Path root = Files.createTempDirectory("voxy-shard-trim-");
+        var budget = new RegionalDiskBudget(root, 1024 * 1024);
+        try (var store = new RegionalMetadataStore(budget); var cache = new RegionalCache(root, WORLD, budget)) {
+            awaitInventory(budget);
+            List<Fixture> fixtures = new ArrayList<>();
+            for (int x = 0; x < 66; x++) {
+                var f = fixture(1, 0, 1, 1, x, 0); fixtures.add(f);
+                cache.put(f.index(), 340, f.payload());
+            }
+            var field = RegionalCache.class.getDeclaredField("shards"); field.setAccessible(true);
+            Map<?, ?> handles = (Map<?, ?>) field.get(cache);
+            check(handles.size() == 64 && !handles.containsKey(0L), "open shard limit not exercised");
+            for (int pass = 0; pass < 3; pass++) for (var f : fixtures) {
+                check(!handles.containsKey(Integer.toUnsignedLong(f.index().regionX())), "fixture unexpectedly hit open handle");
+                check(Arrays.equals(cache.get(f.index(), 340), f.payload()), "trimmed shard reconstruction lost payload");
+            }
+            long total;
+            try (var paths = Files.walk(root)) { total = paths.filter(Files::isRegularFile).mapToLong(RegionalDiskBudget::size).sum(); }
+            check(budget.bytes == total, "repeated real shard reopen drifted accounting");
+        } finally { cleanup(root); }
+    }
+
+    private static byte[] record(long fingerprint, int length, byte[] payload) {
+        return buffer(20 + payload.length).putLong(fingerprint).putLong(0).putInt(length).put(payload).array();
+    }
+
+    // Exercise the actual private parser, without substituting its file operations or reconstruction.
+    private static AutoCloseable openShard(Path path, boolean writable) throws Exception {
+        var type = Class.forName(RegionalCache.class.getName() + "$Shard");
+        var method = type.getDeclaredMethod("open", Path.class, RegionalProtocol.Hash32.class, int.class, int.class, boolean.class);
+        method.setAccessible(true);
+        return (AutoCloseable) invoke(method, null, path, WORLD, 0, 0, writable);
+    }
+    private static byte[] shardValue(AutoCloseable shard, long fingerprint, int length) throws Exception {
+        var keyType = Class.forName(RegionalCache.class.getName() + "$CacheKey");
+        var constructor = keyType.getDeclaredConstructor(RegionalProtocol.Fingerprint.class, int.class);
+        constructor.setAccessible(true);
+        var key = constructor.newInstance(new RegionalProtocol.Fingerprint(fingerprint, 0), length);
+        var method = shard.getClass().getDeclaredMethod("get", keyType); method.setAccessible(true);
+        return (byte[]) invoke(method, shard, key);
+    }
+    private static Object invoke(java.lang.reflect.Method method, Object target, Object... args) throws Exception {
+        try { return method.invoke(target, args); }
+        catch (java.lang.reflect.InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception cause) throw cause;
+            throw failure;
+        }
+    }
+
+    private static void overlappingShardOwners() throws Exception {
+        Path root = Files.createTempDirectory("voxy-shard-owners-");
+        var first = fixture(1, 0, 1, 1); var second = fixture(1, 0, 2, 1);
+        var budget = new RegionalDiskBudget(root, 1024 * 1024);
+        try (var store = new RegionalMetadataStore(budget)) {
+            awaitInventory(budget);
+            for (int repeat = 0; repeat < 3; repeat++) {
+                try (var a = new RegionalCache(root, WORLD, budget); var b = new RegionalCache(root, WORLD, budget)) {
+                    // Force both handles to open before either append starts.
+                    a.put(first.index(), 340, first.payload()); b.get(first.index(), 340);
+                    var start = new CountDownLatch(1);
+                    var executor = Executors.newFixedThreadPool(2);
+                    try {
+                        var x = executor.submit(() -> { start.await(); a.quarantine(first.index(), 340); return null; });
+                        var y = executor.submit(() -> { start.await(); b.put(second.index(), 340, second.payload()); return null; });
+                        start.countDown(); x.get(5, TimeUnit.SECONDS); y.get(5, TimeUnit.SECONDS);
+                    } finally { start.countDown(); executor.shutdownNow(); }
+                }
+                try (var reopened = new RegionalCache(root, WORLD, budget)) {
+                    check(reopened.get(first.index(), 340) == null, "overlapping tombstone lost");
+                    check(Arrays.equals(reopened.get(second.index(), 340), second.payload()), "overlapping append lost");
+                }
+                check(budget.bytes == Files.size(root.resolve("r.0.0.vxcache")), "overlapping accounting drift");
+            }
+            Path broken = root.resolve("r.0.0.vxcache"); Files.delete(broken); Files.createDirectory(broken);
+            try (var cache = new RegionalCache(root, WORLD, budget)) {
+                try { cache.get(first.index(), 340); throw new AssertionError("directory opened as usable shard"); }
+                catch (IOException expected) { /* Open failure must never register a shard. */ }
+                var field = RegionalCache.class.getDeclaredField("shards"); field.setAccessible(true);
+                check(((Map<?, ?>) field.get(cache)).isEmpty(), "failed open registered a shard");
+            }
+        } finally { cleanup(root); }
+    }
+
     static Fixture fixture(long generation, int children, int light, long catalogId) throws Exception {
+        return fixture(generation, children, light, catalogId, 0, 0);
+    }
+
+    private static Fixture fixture(long generation, int children, int light, long catalogId, int x, int z) throws Exception {
         byte[] block = "minecraft:stone".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] biome = "minecraft:plains".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         ByteBuffer cat = buffer(46 + block.length + biome.length);
@@ -50,7 +209,7 @@ final class CacheStartupBehaviorTest {
         byte[] payload = compress(cells);
         int count = 341;
         ByteBuffer index = buffer(36 + count * 48);
-        index.put("VXYRIDX\0".getBytes()).putInt(0).putInt(0).putLong(generation)
+        index.put("VXYRIDX\0".getBytes()).putInt(x).putInt(z).putLong(generation)
                 .putInt(0).putShort((short) 1).put((byte) 5).put((byte) 0).putInt(count);
         // One nonempty top-level section is sufficient to exercise real decode and greedy mesh.
         for (int ordinal : new int[]{0, 256, 320, 336, 340}) {
@@ -60,7 +219,7 @@ final class CacheStartupBehaviorTest {
                 .put(fingerprint(cells).bytes()).putInt(0);
         }
         var hash = fingerprint(index.array());
-        var message = new RegionalProtocol.RegionMessage(0, 0, generation, hash, catalog.fingerprint(), compress(index.array()));
+        var message = new RegionalProtocol.RegionMessage(x, z, generation, hash, catalog.fingerprint(), compress(index.array()));
         return new Fixture(catalog, message, RegionalProtocol.decodeIndex(index.array(), hash), payload);
     }
 
