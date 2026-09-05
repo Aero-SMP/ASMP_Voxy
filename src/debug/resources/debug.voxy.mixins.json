@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "me.cortex.voxy.client.debugmixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["OkZoomerMixin", "WorldFovMixin"],
+  "injectors": {"defaultRequire": 1}
+}

@@ -1,0 +1,26 @@
+{
+  "name": "ok-zoomer-real-camera-cycle",
+  "steps": [
+    {"op":"assert","field":"zoomAvailable","comparison":"==","value":true},
+    {"op":"zoom_out"},
+    {"op":"trace","duration_ms":1000,"cadence_ms":100},
+    {"op":"checkpoint","name":"normal"},
+    {"op":"zoom_in"},
+    {"op":"trace","duration_ms":15000,"cadence_ms":250},
+    {"op":"checkpoint","name":"zoomed"},
+    {"op":"assert","field":"zoomActive","comparison":"==","value":true},
+    {"op":"assert","mode":"delta","field":"worldFov","from":"normal","to":"zoomed","comparison":"<","value":0},
+    {"op":"assert","field":"active","comparison":">","value":0},
+    {"op":"screenshot"},
+    {"op":"zoom_out"},
+    {"op":"trace","duration_ms":15000,"cadence_ms":250},
+    {"op":"checkpoint","name":"unzoomed"},
+    {"op":"assert","field":"zoomActive","comparison":"==","value":false},
+    {"op":"assert","mode":"delta","field":"worldFov","from":"zoomed","to":"unzoomed","comparison":">","value":0},
+    {"op":"assert","mode":"delta","field":"worldFov","from":"normal","to":"unzoomed","comparison":"==","value":0},
+    {"op":"assert","mode":"delta","field":"sessionGeneration","from":"normal","to":"unzoomed","comparison":"==","value":0},
+    {"op":"assert","field":"coverageMissing","comparison":"==","value":0},
+    {"op":"assert","mode":"absence_of_failure"},
+    {"op":"screenshot"}
+  ]
+}

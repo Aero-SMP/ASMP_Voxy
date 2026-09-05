@@ -16,6 +16,7 @@ public final class DebugHarnessBehaviorTest {
     private DebugHarnessBehaviorTest() {}
 
     public static void main(String[] arguments) {
+        me.cortex.voxy.client.lod.DebugZoomBehaviorTest.run();
         codecRoundTrips();
         snapshotCountersRoundTripIndividually();
         everyCommandRoundTrips();

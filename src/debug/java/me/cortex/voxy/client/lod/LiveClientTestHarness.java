@@ -107,6 +107,10 @@ final class LiveClientTestHarness {
             return;
         }
         long now = System.nanoTime();
+        if (active.zoomPending && now >= active.zoomDeadline) {
+            failRun(DebugTestProtocol.Failure.ZOOM_TIMEOUT);
+            return;
+        }
         if (active.pose != null && now - active.pose.deadlineNanos >= 0) {
             active.pose = null;
             requestResult(DebugTestProtocol.ResultKind.POSE_FAILED, active.runId,
@@ -129,6 +133,11 @@ final class LiveClientTestHarness {
         observedPose = observePose();
         Run active = run;
         if (active == null) return;
+        if (active.zoomPending && active.zoomControl.observed()) {
+            active.zoomPending = false;
+            requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
+                    active.stepId, DebugTestProtocol.Failure.NONE, false);
+        }
         if (active.shaderAwaitFrame >= 0 && renderedFrame > active.shaderAwaitFrame) {
             var renderer = IGetVoxyRenderSystem.getNullable();
             if (renderer != active.renderer) { failRun(DebugTestProtocol.Failure.RENDERER_REPLACED); return; }
@@ -202,6 +211,16 @@ final class LiveClientTestHarness {
         active.stepId = command.stepId();
         active.command = command.kind();
         switch (command.kind()) {
+            case ZOOM_IN, ZOOM_OUT -> {
+                if (!DebugZoomControl.available() || DebugZoomControl.worldFov() <= 0) {
+                    sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
+                    break;
+                }
+                if (active.zoomControl == null) active.zoomControl = DebugZoomControl.begin();
+                active.zoomControl.select(command.kind() == DebugTestProtocol.CommandKind.ZOOM_IN);
+                active.zoomDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+                active.zoomPending = true;
+            }
             case SHADER_RELOAD, SHADERS_ON, SHADERS_OFF, SHADER_RELOAD_ALL_CHANGED, SHADER_OPTION -> {
                 if (!IrisUtil.IRIS_INSTALLED || active.renderer == null) {
                     sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
@@ -274,6 +293,7 @@ final class LiveClientTestHarness {
             case CAPTURE_SCREENSHOT -> active.screenshot = new ScreenshotRequest(
                     "voxy-test-" + active.runId + '-' + active.stepId + ".png", renderedFrame);
             case END_RUN -> {
+                releaseZoom(active);
                 active.shaderDrawMarker = active.renderer == null ? 0 : active.renderer.shaderResumedDraws();
                 try {
                     if (active.shaderSettings != null) {
@@ -628,7 +648,8 @@ final class LiveClientTestHarness {
                 pipeline == null ? 0 : pipeline.dormancyTransitions(),
                 pipeline == null ? 0 : pipeline.wakes(),
                 pipeline == null ? 0 : pipeline.instantWakes(),
-                pipeline == null ? 0 : pipeline.dormantEvictions());
+                pipeline == null ? 0 : pipeline.dormantEvictions(),
+                DebugZoomControl.available(), DebugZoomControl.zoomActive(), DebugZoomControl.worldFov());
     }
 
     private static String boundedReason(String value) {
@@ -645,6 +666,7 @@ final class LiveClientTestHarness {
     }
 
     private static void restoreSettings(Run previous) {
+        releaseZoom(previous);
         if (previous != null && previous.shaderSettings != null && IrisUtil.IRIS_INSTALLED) {
             var settings = previous.shaderSettings;
             previous.shaderSettings = null;
@@ -653,6 +675,14 @@ final class LiveClientTestHarness {
             } catch (Throwable failure) {
                 me.cortex.voxy.common.Logger.error("Could not restore original shader enable state", failure);
             }
+        }
+    }
+
+    private static void releaseZoom(Run previous) {
+        if (previous != null && previous.zoomControl != null) {
+            previous.zoomControl.close();
+            previous.zoomControl = null;
+            previous.zoomPending = false;
         }
     }
 
@@ -668,6 +698,9 @@ final class LiveClientTestHarness {
         DebugTestProtocol.CommandKind command = DebugTestProtocol.CommandKind.BEGIN_RUN;
         long stepId;
         DebugShaderSettings shaderSettings;
+        DebugZoomControl zoomControl;
+        boolean zoomPending;
+        long zoomDeadline;
         long shaderAwaitFrame = -1, shaderDrawMarker;
         boolean endingShaderRestore;
         PoseExpectation pose;
@@ -677,7 +710,7 @@ final class LiveClientTestHarness {
             this.runId = runId; this.stepId = stepId; this.renderer = renderer;
         }
         boolean hasOutstandingOperation() {
-            return this.shaderAwaitFrame >= 0 || this.pose != null || this.trace != null || this.screenshot != null
+            return this.zoomPending || this.shaderAwaitFrame >= 0 || this.pose != null || this.trace != null || this.screenshot != null
                     || snapshotPending;
         }
     }

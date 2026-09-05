@@ -10,6 +10,19 @@ from tools import run_live_client_test as runner
 
 
 class ScenarioValidationTest(unittest.TestCase):
+    def test_zoom_controls_are_narrow_and_dispatched(self) -> None:
+        for name in ("zoom_in", "zoom_out"):
+            runner.validate_scenario({"steps": [{"op": name}]})
+            with self.assertRaises(runner.ScenarioError):
+                runner.validate_scenario({"steps": [{"op": name, "command": "arbitrary"}]})
+            run = object.__new__(runner.ScenarioRun)
+            run.step = 7
+            run.run_id = "zoom-test"
+            run.command_and_wait = mock.Mock()
+            run.execute_step({"op": name}, 0)
+            run.command_and_wait.assert_called_once_with(
+                f"voxytest {name} zoom-test 8", {"CHECKPOINT_RESULT"}, 120, f"{name}[0]")
+
     def test_rejects_executable_or_unknown_operations(self) -> None:
         with self.assertRaises(runner.ScenarioError):
             runner.validate_scenario({"steps": [{"op": "python", "code": "pass"}]})
