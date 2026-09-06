@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const REGION_MAGIC: &[u8; 8] = b"VXYRGN\0\0";
+const REGION_MAGIC: &[u8; 8] = b"VXYRGN\0\x01";
 const REGION_HEADER_BYTES: usize = 256;
 pub(crate) const SECTION_ENTRY_BYTES: usize = 48;
 const ZSTD_LEVEL: i32 = 1;
@@ -212,6 +212,11 @@ impl RegionSectionEntry {
         self.flags & SECTION_FLAG_EMPTY != 0
     }
 
+    /// Payload presence is independent of geometry. Only validated entries may be read.
+    pub fn has_payload(self) -> bool {
+        self.payload_offset != 0
+    }
+
     pub(crate) fn encode(self) -> [u8; SECTION_ENTRY_BYTES] {
         let mut output = [0u8; SECTION_ENTRY_BYTES];
         output[0..2].copy_from_slice(&self.flags.to_le_bytes());
@@ -252,26 +257,22 @@ impl RegionSectionEntry {
             }
             return Ok(());
         }
-        if self.non_empty_children != 0 && !self.is_present() {
-            bail!("absent regional section advertises children");
-        }
-        if self.is_empty() {
-            if self.payload_offset != 0
+        if !self.has_payload() {
+            if !self.is_empty()
                 || self.compressed_length != 0
                 || self.canonical_length != 0
                 || self.compressed_crc != 0
                 || self.fingerprint != [0; 16]
             {
-                bail!("empty regional section has a stored payload");
+                bail!("payload-free regional section has invalid metadata");
             }
-        } else if self.payload_offset == 0
-            || self.compressed_length == 0
+        } else if self.compressed_length == 0
             || self.canonical_length == 0
             || self.compressed_length as usize > MAX_SECTION_COMPRESSED_BYTES
             || self.canonical_length as usize > MAX_SECTION_CANONICAL_BYTES
             || self.fingerprint == [0; 16]
         {
-            bail!("non-empty regional section has invalid payload metadata");
+            bail!("regional section has invalid payload metadata");
         }
         Ok(())
     }
@@ -376,7 +377,7 @@ impl RegionFileBuilder {
             non_empty_children: frame.non_empty_children,
             ..RegionSectionEntry::default()
         };
-        let payload = if frame.is_empty() {
+        let payload = if frame.is_default_air() {
             None
         } else {
             let canonical = frame.encode()?;
@@ -418,7 +419,7 @@ impl RegionFileBuilder {
         if !entry.is_present() {
             return Ok(());
         }
-        let payload = if entry.is_empty() {
+        let payload = if !entry.has_payload() {
             None
         } else {
             Some(PreparedPayload::Reused {
@@ -473,6 +474,7 @@ impl RegionFileBuilder {
         let mut directory_bytes =
             Vec::with_capacity(published_sections.len() * SECTION_ENTRY_BYTES);
         for section in &published_sections {
+            section.validate_shape()?;
             directory_bytes.extend_from_slice(&section.encode());
         }
         let published_header = Header {
@@ -684,7 +686,7 @@ impl RegionFile {
         let payload_end = length;
         let mut expected_offset = header.payload_offset;
         for entry in &sections {
-            if entry.is_present() && !entry.is_empty() {
+            if entry.has_payload() {
                 if entry.payload_offset != expected_offset {
                     bail!("regional section payloads are not contiguous and canonical");
                 }
@@ -770,7 +772,7 @@ impl RegionFile {
 
     pub fn read_compressed(&self, coordinate: SectionCoordinate) -> Result<Option<Vec<u8>>> {
         let entry = self.entry(coordinate)?;
-        if !entry.is_present() || entry.is_empty() {
+        if !entry.has_payload() {
             return Ok(None);
         }
         let mut compressed = vec![0u8; entry.compressed_length as usize];
@@ -785,7 +787,7 @@ impl RegionFile {
 
     pub fn read_compressed_ordinal(&self, ordinal: u32) -> Result<Option<Vec<u8>>> {
         let entry = self.entry_ordinal(ordinal)?;
-        if !entry.is_present() || entry.is_empty() {
+        if !entry.has_payload() {
             return Ok(None);
         }
         let mut compressed = vec![0u8; entry.compressed_length as usize];
@@ -803,12 +805,12 @@ impl RegionFile {
         if !entry.is_present() {
             return Ok(None);
         }
-        let mut frame = if entry.is_empty() {
+        let mut frame = if !entry.has_payload() {
             SectionFrame::empty(entry.non_empty_children)?
         } else {
             let compressed = self
                 .read_compressed(coordinate)?
-                .expect("non-empty entry has compressed payload");
+                .expect("stored entry has compressed payload");
             let canonical = zstd::bulk::decompress(&compressed, entry.canonical_length as usize)
                 .context("decompress regional section")?;
             if canonical.len() != entry.canonical_length as usize
@@ -877,6 +879,250 @@ mod tests {
             let coordinate = layout.coordinate(-4, 7, index).unwrap();
             assert_eq!(layout.index(-4, 7, coordinate).unwrap(), index);
         }
+    }
+
+    #[test]
+    fn air_cells_reuse_and_replacements_preserve_every_field_and_extent() {
+        let temporary = TemporaryDirectory::new();
+        let layout = RegionLayout::new(-2, 12, 5).unwrap();
+        let at = |ordinal| layout.coordinate(-2, 3, ordinal).unwrap();
+        let mut first = builder(1);
+        let mut expected = vec![SectionFrame::empty(0).unwrap()];
+        for (count, light, biome) in [
+            (1, 15, 0),
+            (1, 0xf0, 0),
+            (1, 0, 19),
+            (3, 0, 0),
+            (257, 0, 0),
+            (SECTION_VOLUME, 0, 0),
+        ] {
+            expected.push(
+                SectionFrame::new(
+                    0xa5,
+                    (0..SECTION_VOLUME)
+                        .map(|i| Cell {
+                            block: 0,
+                            biome: biome + (i % count) as u32,
+                            light: if count == 1 { light } else { (i % count) as u8 },
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+        }
+        expected.push(
+            SectionFrame::new(
+                0,
+                vec![
+                    Cell {
+                        block: 1,
+                        biome: 2,
+                        light: 3
+                    };
+                    SECTION_VOLUME
+                ],
+            )
+            .unwrap(),
+        );
+        for (i, frame) in expected.iter().enumerate() {
+            first.insert(at(i), frame.clone()).unwrap();
+        }
+        let path = temporary.0.join("first.vxregion");
+        drop(first.write_atomic(&path).unwrap());
+        let first = RegionFile::open(&path).unwrap();
+        assert_eq!(&fs::read(&path).unwrap()[..8], b"VXYRGN\0\x01");
+        assert!(!first.entry(at(0)).unwrap().has_payload());
+        assert!(first.read_section(at(expected.len())).unwrap().is_none());
+        let mut second = builder(2);
+        // Move all reused payloads by replacing omitted air with an ordinary solid body.
+        second
+            .insert(at(0), expected.last().unwrap().clone())
+            .unwrap();
+        for (i, frame) in expected.iter().enumerate().skip(1) {
+            assert_eq!(first.read_section(at(i)).unwrap().as_ref(), Some(frame));
+            assert_eq!(first.entry(at(i)).unwrap().is_empty(), frame.is_empty());
+            second.copy_ordinal_from(&first, i).unwrap();
+        }
+        let second_path = temporary.0.join("second.vxregion");
+        drop(second.write_atomic(&second_path).unwrap());
+        let second = RegionFile::open(&second_path).unwrap();
+        let wire = RegionIndex::from_file(&second);
+        for (i, frame) in expected.iter().enumerate().skip(1) {
+            let a = first.entry(at(i)).unwrap();
+            let b = second.entry(at(i)).unwrap();
+            assert_ne!(a.payload_offset, b.payload_offset);
+            assert_eq!(
+                (a.fingerprint, a.non_empty_children),
+                (b.fingerprint, b.non_empty_children)
+            );
+            assert_eq!(
+                first.read_compressed(at(i)).unwrap(),
+                second.read_compressed_ordinal(i as u32).unwrap()
+            );
+            assert_eq!(second.read_section(at(i)).unwrap().as_ref(), Some(frame));
+            if frame.is_empty() {
+                assert!(b.has_payload());
+                assert_eq!(
+                    wire.entries[i],
+                    RegionSectionEntry {
+                        flags: b.flags,
+                        non_empty_children: b.non_empty_children,
+                        ..Default::default()
+                    }
+                );
+            } else {
+                assert_eq!(wire.entries[i], b);
+            }
+        }
+        let mut third = builder(3);
+        third.insert(at(0), expected[1].clone()).unwrap(); // solid -> lit air
+        third.insert(at(1), expected[0].clone()).unwrap(); // lit air -> default
+        third
+            .insert(at(2), expected.last().unwrap().clone())
+            .unwrap(); // air -> solid
+        let third_path = temporary.0.join("third.vxregion");
+        drop(third.write_atomic(&third_path).unwrap());
+        let third = RegionFile::open(&third_path).unwrap();
+        assert_eq!(
+            third.read_section(at(0)).unwrap(),
+            Some(expected[1].clone())
+        );
+        assert_eq!(
+            third.read_section(at(1)).unwrap(),
+            Some(expected[0].clone())
+        );
+        assert!(third.read_compressed(at(1)).unwrap().is_none());
+        assert_eq!(third.read_section(at(2)).unwrap(), expected.last().cloned());
+        assert!(!third.entry(at(3)).unwrap().is_present());
+    }
+
+    #[test]
+    fn malformed_air_metadata_extents_and_bodies_are_rejected() {
+        let temporary = TemporaryDirectory::new();
+        let at = RegionLayout::new(-2, 12, 5)
+            .unwrap()
+            .coordinate(-2, 3, 0)
+            .unwrap();
+        let path = temporary.0.join("air.vxregion");
+        let mut build = builder(1);
+        build
+            .insert(
+                at,
+                SectionFrame::new(
+                    0,
+                    vec![
+                        Cell {
+                            block: 0,
+                            biome: 7,
+                            light: 15
+                        };
+                        SECTION_VOLUME
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let original = build.write_atomic(&path).unwrap();
+        let entry = original.entry(at).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        // Shape checks, including the valid zero-CRC case.
+        let mut zero_crc = entry;
+        zero_crc.compressed_crc = 0;
+        assert!(zero_crc.validate_shape().is_ok());
+        for field in 0..7 {
+            let mut invalid = entry;
+            match field {
+                0 => invalid.flags = 0,
+                1 => invalid.payload_offset = 0,
+                2 => invalid.compressed_length = 0,
+                3 => invalid.canonical_length = 0,
+                4 => invalid.fingerprint = [0; 16],
+                5 => invalid.compressed_length = MAX_SECTION_COMPRESSED_BYTES as u32 + 1,
+                _ => invalid.canonical_length = MAX_SECTION_CANONICAL_BYTES as u32 + 1,
+            }
+            assert!(invalid.validate_shape().is_err());
+        }
+        for partial in [
+            RegionSectionEntry {
+                compressed_crc: 1,
+                ..Default::default()
+            },
+            RegionSectionEntry {
+                fingerprint: [1; 16],
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                RegionSectionEntry {
+                    flags: REGION_ENTRY_PRESENT | SECTION_FLAG_EMPTY,
+                    ..partial
+                }
+                .validate_shape()
+                .is_err()
+            );
+        }
+        // Rewrite authenticated directory/header to reach deeper checks, not just CRC rejection.
+        let rewrite = |entry: RegionSectionEntry, mut data: Vec<u8>| {
+            data[256..304].copy_from_slice(&entry.encode());
+            let end = original.header.payload_offset as usize;
+            let crc = crc32c(&data[256..end]);
+            data[136..140].copy_from_slice(&crc.to_le_bytes());
+            let crc = crc32c(&data[..252]);
+            data[252..256].copy_from_slice(&crc.to_le_bytes());
+            fs::write(&path, data).unwrap();
+        };
+        for offset in [1, entry.payload_offset + 1, u64::MAX] {
+            rewrite(
+                RegionSectionEntry {
+                    payload_offset: offset,
+                    ..entry
+                },
+                bytes.clone(),
+            );
+            assert!(RegionFile::open(&path).is_err());
+        }
+        rewrite(
+            RegionSectionEntry {
+                compressed_length: entry.compressed_length + 1,
+                ..entry
+            },
+            bytes.clone(),
+        );
+        assert!(RegionFile::open(&path).is_err());
+        rewrite(
+            RegionSectionEntry {
+                fingerprint: [1; 16],
+                ..entry
+            },
+            bytes.clone(),
+        );
+        assert!(RegionFile::open(&path).unwrap().read_section(at).is_err());
+        rewrite(
+            RegionSectionEntry {
+                flags: REGION_ENTRY_PRESENT,
+                ..entry
+            },
+            bytes.clone(),
+        );
+        assert!(RegionFile::open(&path).unwrap().read_section(at).is_err());
+        let mut corrupt = bytes.clone();
+        corrupt[entry.payload_offset as usize] ^= 0xff;
+        rewrite(entry, corrupt);
+        let corrupt = RegionFile::open(&path).unwrap();
+        assert!(corrupt.read_section(at).is_err());
+        let mut reuse = builder(2);
+        reuse.copy_ordinal_from(&corrupt, 0).unwrap();
+        assert!(
+            reuse
+                .write_atomic(temporary.0.join("corrupt-copy.vxregion"))
+                .is_err()
+        );
+        fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(RegionFile::open(&path).is_err());
+        let mut extra = bytes;
+        extra.push(0);
+        fs::write(&path, extra).unwrap();
+        assert!(RegionFile::open(&path).is_err());
     }
 
     #[test]

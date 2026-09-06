@@ -29,11 +29,12 @@ impl SectionFrame {
         self.cells.iter().all(|cell| cell.is_air())
     }
 
+    pub fn is_default_air(&self) -> bool {
+        self.cells.iter().all(|cell| *cell == Cell::AIR)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        if self.is_empty() {
-            bail!("empty regional sections have no canonical payload");
-        }
         let mut palette = Vec::<Cell>::new();
         let mut palette_ids = HashMap::<Cell, u16>::new();
         let mut indexes = Vec::with_capacity(SECTION_VOLUME);
@@ -109,9 +110,6 @@ impl SectionFrame {
             cells,
         };
         frame.validate()?;
-        if frame.is_empty() {
-            bail!("empty regional section unexpectedly has a payload");
-        }
         Ok(frame)
     }
 
@@ -290,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_lengths_counts_and_all_air_are_rejected() {
+    fn malformed_lengths_and_counts_are_rejected_and_air_is_lossless() {
         let frame = SectionFrame::new(
             0,
             vec![
@@ -331,16 +329,10 @@ mod tests {
             bytes.extend_from_slice(&cell.block.to_le_bytes());
             bytes.extend_from_slice(&cell.biome.to_le_bytes());
             bytes.push(cell.light);
-            assert!(
-                SectionFrame::decode(&bytes).is_err(),
-                "air metadata made an empty payload nonempty"
-            );
-            assert!(
-                SectionFrame::new(0, vec![cell; SECTION_VOLUME])
-                    .unwrap()
-                    .encode()
-                    .is_err()
-            );
+            let expected = SectionFrame::new(0, vec![cell; SECTION_VOLUME]).unwrap();
+            assert_eq!(SectionFrame::decode(&bytes).unwrap(), expected);
+            assert_eq!(expected.encode().unwrap(), bytes);
+            assert!(expected.is_empty());
         }
         // A 16-bit palette is representable in the header but cannot have all entries used
         // in a 32^3 section. Reach the real all-used check with otherwise valid packed data.

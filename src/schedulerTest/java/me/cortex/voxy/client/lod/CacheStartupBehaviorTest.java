@@ -30,6 +30,8 @@ final class CacheStartupBehaviorTest {
         CacheInventoryBehaviorTest.run();
         RuntimeCachePressureBehaviorTest.run();
         localActivationAndValidation();
+        storedAirProjectionSkipsPayloadWork();
+        lowerAuthoritativeGenerationReplacesChangedCachedLighting();
         cachedRefinementWhileHeld();
         missesDoNotSpin();
         corruptPayloadAndLateMapping();
@@ -423,6 +425,94 @@ final class CacheStartupBehaviorTest {
                 restarted.until(() -> restarted.session.metadataWorker.idle() && restarted.session.cacheOpened
                         && restarted.session.demands.region(0).localTried);
                 check(restarted.session.activeCount == 0, "deleted terrain resurrected on restart");
+            }
+        } finally { cleanup(root); }
+    }
+
+    static void storedAirProjectionSkipsPayloadWork() throws Exception {
+        byte[] canonical = new byte[36 + 341 * 48];
+        RegionalProtocol.Fingerprint expected = null;
+        for (String line : Files.readAllLines(Path.of("test-fixtures/regional-air-index.txt"))) {
+            String[] fields = line.split("\\|");
+            byte[] bytes = HexFormat.of().parseHex(fields[1]);
+            if (fields[0].equals("hash")) {
+                expected = RegionalProtocol.Fingerprint.read(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN));
+            } else {
+                int offset = fields[0].equals("header") ? 0 : 36 + Integer.parseInt(fields[0]) * 48;
+                System.arraycopy(bytes, 0, canonical, offset, bytes.length);
+            }
+        }
+        check(fingerprint(canonical).equals(expected), "Rust normalized index hash differs in Java");
+        var index = RegionalProtocol.decodeIndex(canonical, expected);
+        check(index.isEmpty(0) && index.isEmpty(1) && index.isEmpty(340)
+                && !index.isEmpty(2) && index.childMask(340) == 0xa5,
+                "stored-air wire semantics changed");
+        // Storage permits this metadata; the unchanged Java wire validator must not.
+        byte[] malformed = canonical.clone();
+        System.arraycopy(canonical, 36 + 2 * 48 + 8, malformed, 36 + 48 + 8, 36);
+        try {
+            RegionalProtocol.decodeIndex(malformed, fingerprint(malformed));
+            throw new AssertionError("storage-only air metadata accepted on wire");
+        } catch (IOException expectedFailure) { }
+        Path root = Files.createTempDirectory("voxy-stored-air-");
+        try {
+            var catalog = fixture(1, 0, 15, 1).catalog();
+            var message = new RegionalProtocol.RegionMessage(0, 0, 1, expected, catalog.fingerprint(), compress(canonical));
+            var store = new RegionalMetadataStore(root);
+            persist(store, new Fixture(catalog, message, index, new byte[0]), false);
+            try (var driver = new Driver(root)) {
+                var s = driver.session;
+                s.connector = () -> { throw new IOException("no terrain server for empty fixture"); };
+                driver.until(() -> s.activated == 1);
+                check(s.demands.get(KEY).installed && s.demands.get(KEY).index.childMask(340) == 0xa5,
+                        "empty hierarchy was not completed");
+                check(s.cacheReads == 0 && s.cacheHits == 0 && s.cacheMisses == 0 && s.cacheBytes == 0
+                        && s.receivedBytes == 0 && s.decodedSections == 0 && s.meshedSections == 0,
+                        "stored air caused payload I/O, decoding or meshing");
+                check(driver.publisher.publications.size() == 1, "empty hierarchy publication missing");
+                check(!Files.exists(store.namespace(WORLD, DIMENSION).resolve("r.0.0.vxcache")),
+                        "stored air created a section payload cache file");
+            }
+        } finally { cleanup(root); }
+    }
+
+    static void lowerAuthoritativeGenerationReplacesChangedCachedLighting() throws Exception {
+        Path root = Files.createTempDirectory("voxy-air-upgrade-");
+        try {
+            var old = fixture(900, 0, 0, 1);
+            var corrected = fixture(1, 0, 15, 1);
+            var store = new RegionalMetadataStore(root);
+            persist(store, old, true);
+            // Corrected content may already exist by exact fingerprint, independent of index generation.
+            try (var cache = new RegionalCache(store.namespace(WORLD, DIMENSION), WORLD, store.budget)) {
+                cache.put(corrected.index(), 340, corrected.payload());
+                check(Arrays.equals(cache.get(fixture(1, 0, 0, 1).index(), 340), old.payload()),
+                        "unchanged content stopped hitting cache after generation reset");
+            }
+            try (var driver = new Driver(root)) {
+                var s = driver.session;
+                s.connector = () -> { throw new IOException("endpoint deliberately held offline"); };
+                driver.until(() -> s.activated == 1);
+                check(!s.helloAccepted && s.receivedBytes == 0 && s.cacheHits == 1,
+                        "old cached terrain could not display provisionally");
+                var oldPublication = driver.publisher.publications.getFirst();
+                var demand = s.demands.get(KEY);
+                long revision = demand.revision;
+                s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, corrected.catalog().fingerprint()));
+                s.demands.region(0).subscribed = true;
+                check(s.acceptRegion(corrected.message()), "lower authoritative index was not admitted");
+                driver.until(() -> s.activated == 2);
+                check(demand.index.generation() == 1 && demand.revision != revision && demand.installed
+                        && demand.index.sectionFingerprint(340).equals(corrected.index().sectionFingerprint(340)),
+                        "higher provisional generation prevented corrected lighting replacement");
+                check(s.cacheHits == 2 && s.meshedSections == 2 && s.receivedBytes == 0,
+                        "corrected cached payload was not reused");
+                check(oldPublication != demand.publication && oldPublication.retirementFencePassed(),
+                        "old publication was not replaced");
+                long activated = s.activated;
+                for (int i = 0; i < 50; i++) driver.step();
+                check(s.activated == activated && s.helloAccepted && s.failure == null,
+                        "authoritative validation entered a replacement/reconnect loop");
             }
         } finally { cleanup(root); }
     }

@@ -22,7 +22,22 @@ impl RegionIndex {
             region_z: file.region().1,
             generation: file.generation(),
             layout: file.layout(),
-            entries: file.entries().to_vec(),
+            entries: file
+                .entries()
+                .iter()
+                .map(|entry| {
+                    if entry.is_empty() {
+                        // Air lighting is server-only mip input, never a client payload.
+                        RegionSectionEntry {
+                            flags: entry.flags,
+                            non_empty_children: entry.non_empty_children,
+                            ..RegionSectionEntry::default()
+                        }
+                    } else {
+                        *entry
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -52,7 +67,7 @@ impl RegionIndex {
         output.push(0);
         output.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for entry in &self.entries {
-            entry.validate_packed()?;
+            validate_wire_entry(*entry)?;
             output.extend_from_slice(&entry.encode());
         }
         debug_assert_eq!(output.len(), length);
@@ -85,7 +100,11 @@ impl RegionIndex {
         }
         let entries = bytes[INDEX_HEADER_BYTES..]
             .chunks_exact(INDEX_ENTRY_BYTES)
-            .map(RegionSectionEntry::decode)
+            .map(|bytes| {
+                let entry = RegionSectionEntry::decode(bytes)?;
+                validate_wire_entry(entry)?;
+                Ok(entry)
+            })
             .collect::<Result<Vec<_>>>()?;
         let index = Self {
             region_x: i32::from_le_bytes(bytes[8..12].try_into().unwrap()),
@@ -109,6 +128,14 @@ impl RegionIndex {
     pub fn compressed(&self) -> Result<Vec<u8>> {
         Ok(zstd::bulk::compress(&self.encode()?, 1)?)
     }
+}
+
+fn validate_wire_entry(entry: RegionSectionEntry) -> Result<()> {
+    entry.validate_packed()?;
+    if entry.is_empty() && entry.has_payload() {
+        bail!("empty regional wire entry has a stored payload");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -145,5 +172,11 @@ mod tests {
             expected
         );
         assert_ne!(expected.fingerprint().unwrap(), [0; 16]);
+        let mut storage_only = expected.clone();
+        storage_only.entries[4].flags |= SECTION_FLAG_EMPTY;
+        assert!(storage_only.encode().is_err());
+        let mut malformed = expected.encode().unwrap();
+        malformed[INDEX_HEADER_BYTES + 4 * INDEX_ENTRY_BYTES] |= SECTION_FLAG_EMPTY as u8;
+        assert!(RegionIndex::decode(&malformed).is_err());
     }
 }
