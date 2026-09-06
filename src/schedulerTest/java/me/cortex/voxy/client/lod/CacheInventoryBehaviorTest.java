@@ -17,6 +17,9 @@ final class CacheInventoryBehaviorTest {
         changedBetweenPasses();
         oversizedAndPinnedCleanup();
         ownershipAndReopen();
+        nestedAndLinks();
+        sharedCatalogReferences();
+        if (InventoryQueryAgent.active) queryBenchmark();
         System.out.println("background inventory, read-only repair guards, accounting, pins and ownership tests passed");
     }
 
@@ -79,7 +82,7 @@ final class CacheInventoryBehaviorTest {
     }
 
     private static void changedBetweenPasses() throws Exception {
-        for (String change : List.of("added", "removed", "replaced", "same-size-modified")) {
+        for (String change : List.of("added", "removed", "replaced", "same-size-modified", "size", "directory", "renamed")) {
             Path root = Files.createTempDirectory("voxy-inventory-change-");
             Path descriptor = root.resolve("change.vxmeta"), garbage = root.resolve("keep.vxcat");
             Files.write(descriptor, new byte[10]); Files.write(garbage, new byte[10]);
@@ -89,6 +92,9 @@ final class CacheInventoryBehaviorTest {
                 switch (change) {
                     case "added" -> Files.write(root.resolve("added.vxcache"), new byte[10]);
                     case "removed" -> Files.delete(path);
+                    case "size" -> Files.write(path, new byte[1], StandardOpenOption.APPEND);
+                    case "directory" -> { Files.delete(path); Files.createDirectory(path); }
+                    case "renamed" -> Files.move(path, root.resolve("different.vxmeta"));
                     case "replaced" -> {
                         // Keep old inode alive so replacement cannot immediately reuse its identity.
                         Files.move(path, root.resolve("old.unmanaged"));
@@ -260,6 +266,86 @@ final class CacheInventoryBehaviorTest {
         try { latch.await(); } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt(); throw new IOException("inventory interrupted", interrupted);
         }
+    }
+
+    private static void nestedAndLinks() throws Exception {
+        for (int files : new int[]{0, 3, 2048}) {
+            Path root = Files.createTempDirectory("voxy-inventory-nested-");
+            try {
+                Path nested = Files.createDirectories(root.resolve("a/b/looks.vxcache"));
+                Files.write(nested.resolve("ignored.txt"), new byte[91]);
+                long expected = 0;
+                for (int i = 0; i < files; i++) {
+                    Files.write(nested.resolve(i + ".vxcache"), new byte[i % 17 + 1]); expected += i % 17 + 1;
+                }
+                if (files > 0) {
+                    try {
+                        Files.createSymbolicLink(root.resolve("link.vxcache"), nested.resolve("0.vxcache"));
+                        expected++;
+                    } catch (UnsupportedOperationException | java.nio.file.FileSystemException unsupported) {
+                        System.out.println("SKIP inventory symlink fixture: " + unsupported);
+                    }
+                }
+                var budget = new RegionalDiskBudget(root, Long.MAX_VALUE);
+                try (var store = new RegionalMetadataStore(budget)) {
+                    awaitInventory(budget);
+                    check(budget.bytes == expected, "nested regular-file/link accounting differs");
+                    check(Files.isDirectory(nested), "managed-looking directory removed");
+                }
+            } finally { cleanup(root); }
+        }
+        Path root = Files.createTempDirectory("voxy-inventory-broken-link-");
+        try {
+            try { Files.createSymbolicLink(root.resolve("broken.vxcache"), root.resolve("absent")); }
+            catch (UnsupportedOperationException | java.nio.file.FileSystemException unsupported) {
+                System.out.println("SKIP failed-attribute symlink fixture: " + unsupported); return;
+            }
+            Files.write(root.resolve("preserve.vxcat"), new byte[5]);
+            var budget = new RegionalDiskBudget(root, 0);
+            try (var store = new RegionalMetadataStore(budget)) {
+                until(() -> budget.snapshot().contains("cacheInventory=FAILED"));
+                check(budget.bytes == -1 && Files.exists(root.resolve("preserve.vxcat")) && !budget.writable(),
+                        "attribute failure authorized cleanup");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void queryBenchmark() throws Exception {
+        Path root = Files.createTempDirectory("voxy-inventory-query-");
+        try {
+            int files = 4096;
+            Path directory = Files.createDirectory(root.resolve("directory.vxcache"));
+            for (int i = 0; i < files; i++) Files.write(directory.resolve(i + ".vxcache"), new byte[16]);
+            for (int run = 0; run < 9; run++) {
+                var budget = new RegionalDiskBudget(root, Long.MAX_VALUE);
+                try (var store = new RegionalMetadataStore(budget)) {
+                    awaitInventory(budget);
+                    until(() -> InventoryQueryAgent.elapsedNanos > 0);
+                    check(budget.bytes == files * 16L, "query fixture accounting");
+                    long expected = files * Long.getLong("voxy.inventoryExpectedReadsPerFile", 2) + 2;
+                    check(InventoryQueryAgent.reads == expected, "explicit reads: " + InventoryQueryAgent.reads + " != " + expected);
+                    System.out.println("INVENTORY_BENCH run=" + run + " files=" + files + " explicitReads=" + InventoryQueryAgent.reads
+                            + " ns=" + InventoryQueryAgent.elapsedNanos + " heap=" + InventoryQueryAgent.heapBytes);
+                }
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void sharedCatalogReferences() throws Exception {
+        Path root = Files.createTempDirectory("voxy-inventory-shared-catalog-");
+        Path catalog = root.resolve("shared.vxcat"), a = root.resolve("a.vxmeta"), b = root.resolve("b.vxmeta");
+        try {
+            for (Path path : List.of(catalog, a, b)) Files.write(path, new byte[10]);
+            var budget = new RegionalDiskBudget(root, 100, ignored -> catalog);
+            try (var store = new RegionalMetadataStore(budget)) {
+                awaitInventory(budget);
+                check(budget.bytes == 30, "shared catalog was double counted");
+                synchronized (budget) {
+                    check(budget.delete(a) && Files.exists(catalog) && budget.bytes == 20, "first reference lost catalog");
+                    check(budget.delete(b) && !Files.exists(catalog) && budget.bytes == 0, "final reference retained catalog");
+                }
+            }
+        } finally { cleanup(root); }
     }
     private static void until(java.util.function.BooleanSupplier condition) throws Exception {
         long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);

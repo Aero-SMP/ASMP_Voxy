@@ -1,0 +1,20 @@
+// Optional instrumentation of the existing scheduler runner; never packaged in game jars.
+allprojects {
+    afterEvaluate {
+        if (project == rootProject) {
+            def agent = tasks.register('inventoryQueryAgentJar', Jar) {
+                dependsOn tasks.named('schedulerTestClasses')
+                from(sourceSets.schedulerTest.output) { include '**/InventoryQueryAgent*.class' }
+                destinationDirectory.set(layout.buildDirectory.dir('inventory-query-probe'))
+                archiveFileName.set('agent.jar')
+                manifest { attributes('Premain-Class': 'me.cortex.voxy.client.lod.InventoryQueryAgent') }
+            }
+            tasks.named('schedulerBehaviorTest', JavaExec) {
+                dependsOn agent
+                systemProperty 'voxy.simplificationBench', 'true'
+                jvmArgs "-javaagent:${layout.buildDirectory.file('inventory-query-probe/agent.jar').get().asFile}"
+                systemProperty 'voxy.inventoryExpectedReadsPerFile', System.getProperty('voxy.inventoryExpectedReadsPerFile', '2')
+            }
+        }
+    }
+}

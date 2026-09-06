@@ -728,7 +728,7 @@ fn parse_chunk(
                 block_states
                     .data
                     .as_ref()
-                    .map(|data| data.iter().copied().collect::<Vec<_>>()),
+                    .map(|data| &data[..]),
             )
         } else {
             // Minecraft may retain only light/biome information for an all-air section.
@@ -757,11 +757,10 @@ fn parse_chunk(
             .biomes
             .as_ref()
             .and_then(|biomes| biomes.data.as_ref())
-            .map(|data| data.iter().copied().collect::<Vec<_>>());
+            .map(|data| &data[..]);
         // Validate packed cardinality and every index before mutating the durable registry.
-        let block_indexes =
-            unpack_anvil_palette(block_data.as_deref(), block_names.len(), 4096, 4)?;
-        let biome_indexes = unpack_anvil_palette(biome_data.as_deref(), biome_names.len(), 64, 1)?;
+        let block_indexes = unpack_anvil_palette(block_data, block_names.len(), 4096, 4)?;
+        let biome_indexes = unpack_anvil_palette(biome_data, biome_names.len(), 64, 1)?;
         let (block_ids, biome_ids) = {
             let mut registry = write_lock(registry)?;
             let blocks = block_names
@@ -777,11 +776,11 @@ fn parse_chunk(
         let block_light = section
             .block_light
             .as_ref()
-            .map(|data| data.iter().copied().collect::<Vec<_>>());
+            .map(|data| &data[..]);
         let sky_light = section
             .sky_light
             .as_ref()
-            .map(|data| data.iter().copied().collect::<Vec<_>>());
+            .map(|data| &data[..]);
         if block_light.as_ref().is_some_and(|data| data.len() != 2048)
             || sky_light.as_ref().is_some_and(|data| data.len() != 2048)
         {
@@ -799,8 +798,8 @@ fn parse_chunk(
             } else {
                 biome_ids[biome_indexes[biome_index]]
             };
-            let block_value = nibble(block_light.as_deref(), index, 0);
-            let sky_value = nibble(sky_light.as_deref(), index, default_sky_light);
+            let block_value = nibble(block_light, index, 0);
+            let sky_value = nibble(sky_light, index, default_sky_light);
             cells.push(Cell {
                 block,
                 biome,
@@ -922,6 +921,10 @@ fn nibble(data: Option<&[i8]>, index: usize, missing: u8) -> u8 {
     };
     ((byte as u8) >> ((index & 1) * 4)) & 15
 }
+
+#[cfg(test)]
+#[path = "anvil_array_tests.rs"]
+mod array_tests;
 
 #[cfg(test)]
 mod region_boundary_tests {

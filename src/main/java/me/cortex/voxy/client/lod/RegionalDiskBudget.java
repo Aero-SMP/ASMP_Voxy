@@ -128,9 +128,12 @@ final class RegionalDiskBudget {
             Map<Path, Integer> counts = new HashMap<>();
             long total = 0;
             try (var files = Files.walk(this.root)) {
-                for (Path path : files.filter(RegionalDiskBudget::inventoryFile).toList()) {
+                for (var iterator = files.iterator(); iterator.hasNext();) {
                     checkInventory();
+                    Path path = iterator.next();
+                    if (!managedName(path)) continue;
                     var attributes = Files.readAttributes(path, BasicFileAttributes.class);
+                    if (!attributes.isRegularFile()) continue;
                     observed.put(path, attributes);
                     total = Math.addExact(total, attributes.size());
                     if (path.toString().endsWith(".vxmeta")) {
@@ -142,21 +145,23 @@ final class RegionalDiskBudget {
                     }
                 }
             }
-            List<Path> candidates;
+            List<Path> candidates = new ArrayList<>();
             try (var files = Files.walk(this.root)) {
-                candidates = files.filter(RegionalDiskBudget::inventoryFile)
-                        .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+                for (var iterator = files.iterator(); iterator.hasNext();) {
+                    checkInventory();
+                    Path path = iterator.next();
+                    if (!managedName(path)) continue;
+                    var current = Files.readAttributes(path, BasicFileAttributes.class);
+                    if (!current.isRegularFile()) continue;
+                    var old = observed.get(path);
+                    if (old == null || old.size() != current.size()
+                            || !old.lastModifiedTime().equals(current.lastModifiedTime())
+                            || !Objects.equals(old.fileKey(), current.fileKey()))
+                        throw new IOException("cache changed during inventory");
+                    candidates.add(path);
+                }
             }
             if (candidates.size() != observed.size()) throw new IOException("cache changed during inventory");
-            for (Path path : candidates) {
-                checkInventory();
-                var old = observed.get(path);
-                var current = Files.readAttributes(path, BasicFileAttributes.class);
-                if (old == null || old.size() != current.size()
-                        || !old.lastModifiedTime().equals(current.lastModifiedTime())
-                        || !Objects.equals(old.fileKey(), current.fileKey()))
-                    throw new IOException("cache changed during inventory");
-            }
             synchronized (this) {
                 checkInventory();
                 this.bytes = total;
@@ -320,11 +325,6 @@ final class RegionalDiskBudget {
 
     static long size(Path path) {
         try { return Files.size(path); } catch (IOException missing) { return 0; }
-    }
-    private static boolean inventoryFile(Path path) {
-        if (!managedName(path)) return false;
-        try { return Files.readAttributes(path, BasicFileAttributes.class).isRegularFile(); }
-        catch (IOException unknown) { throw new java.io.UncheckedIOException(unknown); }
     }
     private static boolean managedName(Path path) {
         String name = path.getFileName().toString();
