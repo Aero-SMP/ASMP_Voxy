@@ -11,7 +11,6 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Properties;
 import java.util.concurrent.Callable;
@@ -69,6 +68,14 @@ final class RustBackend {
     static void ensureConfig(Path config) throws IOException {
         // Preserve existing files, including invalid configs and symlinks. Never truncate.
         if (Files.exists(config, LinkOption.NOFOLLOW_LINKS)) return;
+        try (InputStream defaults = RustBackend.class.getResourceAsStream("/voxy-rust-default.toml")) {
+            if (defaults == null) throw new IOException("embedded default Rust configuration is missing");
+            try { Files.copy(defaults, config); }
+            catch (FileAlreadyExistsException concurrentCreation) { /* Keep the existing config. */ }
+        }
+    }
+
+    static int minecraftPort(Path config) throws IOException {
         Properties properties = new Properties();
         try (InputStream input = Files.newInputStream(config.resolveSibling("server.properties"))) {
             properties.load(input);
@@ -80,13 +87,7 @@ final class RustBackend {
         } catch (NumberFormatException invalid) {
             throw new IOException("server.properties server-port must be between 1 and 65535", invalid);
         }
-        try (InputStream defaults = RustBackend.class.getResourceAsStream("/voxy-rust-default.toml")) {
-            if (defaults == null) throw new IOException("embedded default Rust configuration is missing");
-            String text = new String(defaults.readAllBytes(), StandardCharsets.UTF_8)
-                    .replace("@SERVER_PORT@", Integer.toString(port));
-            try { Files.writeString(config, text, StandardOpenOption.CREATE_NEW); }
-            catch (FileAlreadyExistsException concurrentCreation) { /* Keep the existing config. */ }
-        }
+        return port;
     }
 
     static void start() { start(new Owner(CONFIG)); }
@@ -135,7 +136,8 @@ final class RustBackend {
 
     private static Process launch(Owner owned) throws Exception {
         if (owned.launch != null) return owned.launch.call();
-        var builder = new ProcessBuilder(owned.binary.toString(), "--config", owned.config.toString())
+        var builder = new ProcessBuilder(owned.binary.toString(), "--config", owned.config.toString(),
+                "--minecraft-port", Integer.toString(minecraftPort(owned.config)))
                 .redirectErrorStream(true);
         builder.environment().put("MALLOC_ARENA_MAX", "2");
         return builder.start();

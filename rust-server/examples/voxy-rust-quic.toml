@@ -4,6 +4,8 @@ poll_ms = 2000
 rayon_threads = 16
 
 [quic]
-listen = "0.0.0.0:25587"
+# Empty resolves to --minecraft-port + 2000 on startup (27565 without the option).
+# The Java controller supplies the current server.properties server-port each launch.
+listen = ""
 advertise_host = ""
 advertise_port = 0

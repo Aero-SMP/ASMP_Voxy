@@ -19,27 +19,36 @@ public final class SupervisorRustIntegrationTest {
         Files.createDirectories(root.resolve("world/region"));
         Path config = root.resolve("voxy-rust.toml");
         RustBackend.ensureConfig(config);
-        // Parse the real generated defaults in Rust, isolating only paths and listener.
+        // Keep listen empty: change only isolated paths and Minecraft's port source.
         Files.writeString(config, Files.readString(config)
                 .replace("world = \"world\"", "world = \"" + root.resolve("world") + "\"")
-                .replace("data = \"voxy-rust/data\"", "data = \"" + root.resolve("data") + "\"")
-                .replace("0.0.0.0:25565", "127.0.0.1:0"));
+                .replace("data = \"voxy-rust/data\"", "data = \"" + root.resolve("data") + "\""));
+        byte[] unchangedConfig = Files.readAllBytes(config);
+        int firstPort = availableUdpPort();
+        Files.writeString(root.resolve("server.properties"), "server-port=" + (firstPort - 2000) + "\n");
         var owned = new RustBackend.Owner(config);
         try {
             RustBackend.start(owned);
             SupervisorRecoveryBehaviorTest.until(() -> RustBackend.ready() != null);
             var firstReady = RustBackend.ready();
+            SupervisorRecoveryBehaviorTest.check(firstReady.udpPort() == firstPort, "automatic initial UDP port incorrect");
             Process first = owned.child;
             Path executable = owned.binary;
             byte[] certificate = Files.readAllBytes(root.resolve("data/quic/certificate.der"));
             byte[] key = Files.readAllBytes(root.resolve("data/quic/private-key.der"));
             byte[] catalog = probe(firstReady);
+            int secondPort = availableUdpPort();
+            Files.writeString(root.resolve("server.properties"), "server-port=" + (secondPort - 2000) + "\n");
             // Process.destroy() also closes Java's pipes. Signal like the live PID test,
             // leaving output draining to the supervisor until the child actually exits.
             SupervisorRecoveryBehaviorTest.check(first.toHandle().destroy(), "isolated child signal failed");
             SupervisorRecoveryBehaviorTest.until(() -> owned.child != null && owned.child != first && RustBackend.ready() != null);
             Process second = owned.child;
             var secondReady = RustBackend.ready();
+            SupervisorRecoveryBehaviorTest.check(secondReady.udpPort() == secondPort && firstPort != secondPort,
+                    "restart did not follow changed Minecraft port");
+            SupervisorRecoveryBehaviorTest.check(Arrays.equals(unchangedConfig, Files.readAllBytes(config)),
+                    "automatic port resolution rewrote the TOML");
             SupervisorRecoveryBehaviorTest.check(!first.isAlive() && second.isAlive(), "bundled Rust overlap or no replacement");
             SupervisorRecoveryBehaviorTest.check(first.exitValue() == 0, "isolated Rust did not exit cleanly on SIGTERM");
             SupervisorRecoveryBehaviorTest.check(Arrays.equals(firstReady.certificateSha256(), secondReady.certificateSha256()), "identity changed after replacement");
@@ -51,6 +60,7 @@ public final class SupervisorRustIntegrationTest {
             SupervisorRecoveryBehaviorTest.check(!first.isAlive() && !second.isAlive() && !Files.exists(executable)
                     && owned.child == null && !owned.thread.isAlive(), "bundled Rust stop leaked ownership");
             System.out.println("Bundled Rust interop PASS: PIDs " + first.pid() + " -> " + second.pid()
+                    + "; UDP " + firstPort + " -> " + secondPort + " with unchanged empty-listen TOML"
                     + "; same certificate/private key; pinned QUIC handshake and " + catalog.length
                     + " catalog bytes transferred before/after; no child/executable after stop");
         } finally {
@@ -60,6 +70,14 @@ public final class SupervisorRustIntegrationTest {
                     for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
                 }
             }
+        }
+    }
+
+    private static int availableUdpPort() throws IOException {
+        try (var socket = new java.net.DatagramSocket(0)) {
+            int port = socket.getLocalPort();
+            if (port <= 2000) throw new IOException("ephemeral test port is below automatic offset");
+            return port;
         }
     }
 
