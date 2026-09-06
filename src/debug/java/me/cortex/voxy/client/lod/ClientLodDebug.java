@@ -311,6 +311,29 @@ public final class ClientLodDebug {
         emit("VOXY_SHUTDOWN renderer=" + renderer.rendererIdentity()
                 + " phase=" + phase + " outcome=" + outcome
                 + " monotonicNanos=" + System.nanoTime() + " durationNanos=" + nanos);
+        if (phase.equals("resources") && outcome.equals("END")) {
+            // One terminal census, not another sampler. No stacks or renderer graphs retained.
+            var threads = java.lang.management.ManagementFactory.getThreadMXBean();
+            int owners = 0, sections = 0, metadata = 0, hierarchy = 0, models = 0;
+            for (var thread : threads.getThreadInfo(threads.getAllThreadIds(), 0)) {
+                if (thread == null) continue;
+                String name = thread.getThreadName();
+                if (name.equals("Voxy regional owner")) owners++;
+                else if (name.equals("Voxy regional section worker--1")) metadata++;
+                else if (name.startsWith("Voxy regional section worker-")) sections++;
+                else if (name.equals("Async Node Manager")) hierarchy++;
+                else if (name.equals("Model factory processor")) models++;
+            }
+            long direct = 0;
+            for (var pool : java.lang.management.ManagementFactory.getPlatformMXBeans(java.lang.management.BufferPoolMXBean.class)) {
+                if (pool.getName().equals("direct")) direct = pool.getMemoryUsed();
+            }
+            emit("VOXY_SHUTDOWN_OWNERS renderer=" + renderer.rendererIdentity()
+                    + " owners=" + owners + " sectionWorkers=" + sections + " metadataWorkers=" + metadata
+                    + " hierarchyWorkers=" + hierarchy + " modelWorkers=" + models
+                    + " heapUsed=" + java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed()
+                    + " directBufferBytes=" + direct);
+        }
     }
 
     static boolean snapshotLog(Path destination) throws IOException, InterruptedException {
