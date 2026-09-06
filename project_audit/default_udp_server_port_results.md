@@ -30,5 +30,11 @@ The old .205 jar is retained in `Mod_Testing/deploy-backups/server-port-206/`. D
 uses graceful shutdown and the existing `printer_session:1.0` / `bash ./run.sh` workflow.
 Worlds, derived data and certificate are preserved. No players were online before restart.
 
+Verified after deployment: `.206` discovered by the actual Minecraft loader, Done at
+14:13:07.364 UTC and Rust VOXY_READY at 14:13:07.458. JVM 2480948 owns Rust 2482016;
+the UDP 25587 listener belongs to that child. TOML and certificate hashes stayed unchanged.
+Installed release JAR SHA-256:
+`2a9cf5fadf52a03407b0248dd4b57c0324e26675d5405f5f7883919e0af9f23f`.
+
 Local commits exclude unrelated `.gitignore` changes. Remote push remains blocked by the
 earlier tool-review destination approval restriction; no bypass was attempted.
