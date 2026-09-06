@@ -397,6 +397,7 @@ final class LiveClientTestHarness {
     private static void requestResult(DebugTestProtocol.ResultKind kind, UUID resultRun,
                                       long step, DebugTestProtocol.Failure failure,
                                       boolean clearAfter) {
+        GeometryEndpointTelemetry.checkpoint();
         if (snapshotPending) {
             failRun(DebugTestProtocol.Failure.INTERNAL);
             return;
