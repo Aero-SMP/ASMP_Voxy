@@ -18,6 +18,10 @@
   authorization for unrelated destructive work or bypass tool permission controls.
 - Report deployment and actual live-test outcomes separately from build/unit-test results.
   Preserve failed tests and never relax hard safety ceilings or assertions to claim success.
+- Verify the actual running client and server versions/build identities before drawing
+  live-test conclusions. State the intended version pairing explicitly, including when a
+  server-only change intentionally retains an older compatible client; do not infer the
+  running version from staged artifacts or updater publication alone.
 
 ## Phone notifications
 
