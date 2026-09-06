@@ -8,8 +8,9 @@ poll_ms = 2000
 rayon_threads = 0
 
 [quic]
-# Each simultaneously running Voxy server needs a distinct UDP listener.
-listen = "0.0.0.0:25587"
+# Initial UDP port matches server.properties server-port (Minecraft uses TCP).
+# This saved setting remains editable and is not overwritten on subsequent starts.
+listen = "0.0.0.0:@SERVER_PORT@"
 # Empty host uses the Minecraft server address; zero advertises the bound UDP port.
 advertise_host = ""
 advertise_port = 0

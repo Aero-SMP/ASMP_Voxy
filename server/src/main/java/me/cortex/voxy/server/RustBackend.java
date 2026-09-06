@@ -9,8 +9,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Properties;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -66,9 +69,22 @@ final class RustBackend {
     static void ensureConfig(Path config) throws IOException {
         // Preserve existing files, including invalid configs and symlinks. Never truncate.
         if (Files.exists(config, LinkOption.NOFOLLOW_LINKS)) return;
+        Properties properties = new Properties();
+        try (InputStream input = Files.newInputStream(config.resolveSibling("server.properties"))) {
+            properties.load(input);
+        } catch (NoSuchFileException absent) { /* Minecraft defaults to port 25565. */ }
+        int port;
+        try {
+            port = Integer.parseInt(properties.getProperty("server-port", "25565").trim());
+            if (port < 1 || port > 65535) throw new NumberFormatException("out of range");
+        } catch (NumberFormatException invalid) {
+            throw new IOException("server.properties server-port must be between 1 and 65535", invalid);
+        }
         try (InputStream defaults = RustBackend.class.getResourceAsStream("/voxy-rust-default.toml")) {
             if (defaults == null) throw new IOException("embedded default Rust configuration is missing");
-            try { Files.copy(defaults, config); }
+            String text = new String(defaults.readAllBytes(), StandardCharsets.UTF_8)
+                    .replace("@SERVER_PORT@", Integer.toString(port));
+            try { Files.writeString(config, text, StandardOpenOption.CREATE_NEW); }
             catch (FileAlreadyExistsException concurrentCreation) { /* Keep the existing config. */ }
         }
     }

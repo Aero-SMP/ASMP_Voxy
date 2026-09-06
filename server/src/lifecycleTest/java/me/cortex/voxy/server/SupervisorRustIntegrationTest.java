@@ -23,7 +23,7 @@ public final class SupervisorRustIntegrationTest {
         Files.writeString(config, Files.readString(config)
                 .replace("world = \"world\"", "world = \"" + root.resolve("world") + "\"")
                 .replace("data = \"voxy-rust/data\"", "data = \"" + root.resolve("data") + "\"")
-                .replace("0.0.0.0:25587", "127.0.0.1:0"));
+                .replace("0.0.0.0:25565", "127.0.0.1:0"));
         var owned = new RustBackend.Owner(config);
         try {
             RustBackend.start(owned);

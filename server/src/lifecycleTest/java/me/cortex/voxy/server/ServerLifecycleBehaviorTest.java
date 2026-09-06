@@ -39,10 +39,30 @@ public final class ServerLifecycleBehaviorTest {
             var config = new com.electronwill.nightconfig.toml.TomlParser().parse(generated);
             check("world".equals(config.get("world")), "wrong default world");
             check("voxy-rust/data".equals(config.get("data")), "wrong default data directory");
-            check("0.0.0.0:25587".equals(config.get("quic.listen")), "wrong default listener");
+            check("0.0.0.0:25565".equals(config.get("quic.listen")), "wrong fallback listener");
             check(config.getInt("poll_ms") == 2000 && config.getInt("rayon_threads") == 0, "wrong worker/poll defaults");
             RustBackend.ensureConfig(file);
             check(generated.equals(java.nio.file.Files.readString(file)), "second startup rewrote config");
+            var properties = directory.resolve("server.properties");
+            for (String value : new String[]{"25582", "1", "65535"}) {
+                java.nio.file.Files.delete(file);
+                java.nio.file.Files.writeString(properties, "server-port=" + value + "\n");
+                RustBackend.ensureConfig(file);
+                check(java.nio.file.Files.readString(file).contains("listen = \"0.0.0.0:" + value + "\""), "ignored server-port");
+            }
+            java.nio.file.Files.writeString(properties, "server-port=25583\n");
+            RustBackend.ensureConfig(file);
+            check(java.nio.file.Files.readString(file).contains("0.0.0.0:65535"), "rewrote existing listener after server-port changed");
+            for (String value : new String[]{"0", "65536", "-1", "abc", ""}) {
+                java.nio.file.Files.deleteIfExists(file);
+                java.nio.file.Files.writeString(properties, "server-port=" + value + "\n");
+                boolean rejected = false;
+                try { RustBackend.ensureConfig(file); } catch (java.io.IOException expected) { rejected = true; }
+                check(rejected && !java.nio.file.Files.exists(file), "invalid server-port created configuration");
+            }
+            java.nio.file.Files.writeString(properties, "# no server-port\nlevel-name=world\n");
+            RustBackend.ensureConfig(file);
+            check(java.nio.file.Files.readString(file).contains("0.0.0.0:25565"), "missing property did not use Minecraft default");
             for (String existing : new String[]{"# custom\nworld = \"other-world\"\n", "invalid toml [[", ""}) {
                 java.nio.file.Files.writeString(file, existing);
                 RustBackend.ensureConfig(file);
@@ -50,6 +70,7 @@ public final class ServerLifecycleBehaviorTest {
             }
         } finally {
             java.nio.file.Files.deleteIfExists(file);
+            java.nio.file.Files.deleteIfExists(directory.resolve("server.properties"));
             java.nio.file.Files.delete(directory);
         }
     }
