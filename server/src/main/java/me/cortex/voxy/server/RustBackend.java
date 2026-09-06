@@ -4,221 +4,373 @@ import me.cortex.voxy.network.QuicEndpointPayload;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
-/** Keeps the Rust backend alive for exactly the lifetime of the Minecraft server. */
+/** One Java-owned supervisor/child; failed ownership is retained until exit is proven. */
 final class RustBackend {
     private static final Logger LOGGER = LoggerFactory.getLogger("Voxy Rust Backend");
     private static final String READY_MARKER = "VOXY_READY";
     static final Path CONFIG = Path.of("voxy-rust.toml").toAbsolutePath();
+    // Minecraft redirects System.err into Log4j. This descriptor bypasses that redirection.
+    // Never close it. Output remains best-effort, not allocation-free or exhaustion-proof.
+    private static final OutputStream RAW_ERROR = new FileOutputStream(FileDescriptor.err);
+    private static final byte[] LOG_DISABLED = "Voxy Rust: diagnostic route disabled; supervision continues.\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] FATAL = "Voxy Rust: supervisor FAILED; manual recovery/server restart required.\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] OWNED = "Voxy Rust: cleanup incomplete; child/executable ownership retained; restart refused.\n".getBytes(StandardCharsets.US_ASCII);
 
-    private static volatile boolean running;
-    private static ReadyRecord ready;
-    private static Process process;
-    private static Thread supervisor;
-    private static Path directory;
-    private static Path binary;
+    enum State { STARTING, READY, EXITED, RETRYING, STOPPING, STOPPED, FAILED }
+    enum Failure { NONE, IO, RUNTIME, INTERRUPTED, OUT_OF_MEMORY, ERROR, TERMINATION, CLEANUP, THREAD_START }
+    record Status(State state, boolean wanted, boolean supervisorAlive, long pid, boolean childAlive,
+                  Integer exitCode, Failure failure, boolean loggerEnabled, boolean debugEnabled,
+                  boolean ownsExecutable, ReadyRecord ready) {}
+
+    /** Only this context may mutate its child, readiness and extracted files. */
+    static final class Owner {
+        final Path config;
+        final Object termination = new Object();
+        volatile boolean wanted = true;
+        volatile State state = State.STARTING;
+        volatile Failure failure = Failure.NONE;
+        volatile boolean fatal;
+        volatile Process child;
+        volatile ReadyRecord ready;
+        volatile Integer exitCode;
+        volatile Path directory, binary;
+        Thread thread;
+        volatile boolean loggerEnabled = true, debugEnabled = true;
+        // Narrow boundaries used by the production-behavior fixtures; no alternate supervisor.
+        Callable<Process> launch;
+        Runnable retry;
+        Consumer<Runnable> logger = Runnable::run, debug = Runnable::run;
+        Consumer<byte[]> fallback = RustBackend::rawWrite;
+        Owner(Path config) { this.config = config; }
+    }
+
+    private static volatile Owner owner;
+    static Consumer<Thread> startThread = Thread::start;
 
     static {
         Runtime.getRuntime().addShutdownHook(new Thread(RustBackend::stop, "Voxy Rust shutdown"));
     }
-
     private RustBackend() {}
 
-    static void start() {
-        Thread thread;
+    static void start() { start(new Owner(CONFIG)); }
+
+    static void start(Owner next) {
+        Throwable failure = null;
         synchronized (RustBackend.class) {
-            if (running) return;
-            extract();
-            ServerDebug.rustStarting();
-            running = true;
-            ready = null;
-            thread = Thread.ofPlatform().daemon().name("Voxy Rust supervisor")
-                    .unstarted(RustBackend::supervise);
-            supervisor = thread;
-        }
-        try {
-            thread.start();
-        } catch (RuntimeException failure) {
-            synchronized (RustBackend.class) {
-                running = false;
-                supervisor = null;
-            }
-            cleanup();
-            throw new IllegalStateException("Could not start the Rust supervisor", failure);
-        }
-    }
-
-    private static void extract() {
-        try {
-            if (!Files.isRegularFile(CONFIG) || !Files.isReadable(CONFIG)) {
-                throw new IOException("missing or unreadable configuration " + CONFIG);
-            }
-            directory = Files.createTempDirectory("voxy-rust-");
-            binary = directory.resolve("voxy-rust-server");
-            try (InputStream input = RustBackend.class.getResourceAsStream(
-                    "/native/linux-x86_64/voxy-rust-server")) {
-                if (input == null) throw new IOException("embedded Rust server is missing");
-                Files.copy(input, binary);
-            }
-            Files.setPosixFilePermissions(binary, PosixFilePermissions.fromString("rwx------"));
-        } catch (IOException | RuntimeException exception) {
-            cleanup();
-            throw new IllegalStateException("Could not prepare the embedded Rust server", exception);
-        }
-    }
-
-    private static void supervise() {
-        while (running) {
-            Process child = null;
-            try {
-                var builder = new ProcessBuilder(binary.toString(), "--config", CONFIG.toString())
-                        .redirectErrorStream(true);
-                // glibc otherwise creates an allocator arena for each busy Rayon/Tokio thread.
-                // Large temporary generation batches then leave many mostly empty 64–128 MiB
-                // arenas resident even after Rust drops every object they contained.
-                builder.environment().put("MALLOC_ARENA_MAX", "2");
-                child = builder.start();
-                synchronized (RustBackend.class) {
-                    if (!running) {
-                        terminateChild(child);
-                        return;
-                    }
-                    process = child;
-                    ready = null;
+            Owner previous = owner;
+            if (previous != null) {
+                if (alive(previous)) return;
+                if (previous.child != null || previous.directory != null || previous.binary != null) {
+                    throw new IllegalStateException("Rust supervisor still owns cleanup; restart refused");
                 }
-                try (var output = new BufferedReader(new InputStreamReader(
-                        child.getInputStream(), StandardCharsets.UTF_8))) {
+            }
+            owner = next;
+            // Publication and start are serialized with stop; a NEW thread cannot escape it.
+            try {
+                next.thread = Thread.ofPlatform().daemon().name("Voxy Rust supervisor")
+                        .unstarted(() -> supervise(next));
+                startThread.accept(next.thread);
+            }
+            catch (RuntimeException | Error error) {
+                fail(next, error, Failure.THREAD_START);
+                failure = error;
+            }
+        }
+        if (failure != null) {
+            terminalReport(next);
+            if (failure instanceof Error error) throw error;
+            throw (RuntimeException) failure;
+        }
+    }
+
+    private static void extract(Owner owned) throws IOException {
+        if (!Files.isRegularFile(owned.config) || !Files.isReadable(owned.config)) {
+            throw new IOException("missing or unreadable configuration " + owned.config);
+        }
+        owned.directory = Files.createTempDirectory("voxy-rust-");
+        owned.binary = owned.directory.resolve("voxy-rust-server");
+        try (InputStream input = RustBackend.class.getResourceAsStream("/native/linux-x86_64/voxy-rust-server")) {
+            if (input == null) throw new IOException("embedded Rust server is missing");
+            Files.copy(input, owned.binary);
+        }
+        Files.setPosixFilePermissions(owned.binary, PosixFilePermissions.fromString("rwx------"));
+    }
+
+    private static Process launch(Owner owned) throws Exception {
+        if (owned.launch != null) return owned.launch.call();
+        var builder = new ProcessBuilder(owned.binary.toString(), "--config", owned.config.toString())
+                .redirectErrorStream(true);
+        builder.environment().put("MALLOC_ARENA_MAX", "2");
+        return builder.start();
+    }
+
+    private static void supervise(Owner owned) {
+        try {
+            if (!owned.wanted) return;
+            if (owned.launch == null) extract(owned);
+            event(owned, State.STARTING);
+            while (owned.wanted) {
+                try {
+                    // Assignment immediately retains even a child returned after stop was requested.
+                    owned.child = launch(owned);
+                    owned.exitCode = null;
+                    if (!owned.wanted) break;
+                    Process child = owned.child;
+                    var output = new BufferedReader(new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8));
                     String line;
-                    while ((line = output.readLine()) != null) {
-                        LOGGER.info("[Rust] {}", line);
-                        if (line.equals(READY_MARKER) || line.startsWith(READY_MARKER + " ")) {
-                            ReadyRecord announced = parseReady(line);
+                    while (owned.wanted && (line = output.readLine()) != null) {
+                        boolean announced = line.equals(READY_MARKER) || line.startsWith(READY_MARKER + " ");
+                        if (announced) {
+                            ReadyRecord record = parseReady(line);
                             synchronized (RustBackend.class) {
-                                if (running && process == child) {
-                                    if (ready != null) {
-                                        throw new IllegalStateException(
-                                                "Rust backend emitted more than one readiness record");
-                                    }
-                                    ready = announced;
-                                    ServerDebug.rustReady(announced);
+                                if (owned.wanted && owned.child == child) {
+                                    if (owned.ready != null) throw new IllegalStateException("duplicate Rust readiness");
+                                    owned.ready = record;
+                                    owned.state = State.READY;
                                 }
                             }
                         }
+                        // Control processing precedes presentation; degraded logging still drains.
+                        String message = line;
+                        if (owned.loggerEnabled) report(owned, false, () -> LOGGER.info("[Rust] {}", message));
+                        if (announced && owned.wanted) reportState(owned);
+                    }
+                    // EOF is not proof of exit. stop() can terminate this owned child while we wait.
+                    if (owned.wanted) owned.exitCode = child.waitFor();
+                    owned.ready = null;
+                    if (!terminate(owned)) break;
+                    if (owned.wanted) event(owned, State.EXITED);
+                } catch (IOException | RuntimeException failure) {
+                    owned.ready = null;
+                    owned.failure = classify(failure);
+                    if (!terminate(owned)) break;
+                    if (owned.wanted && owned.loggerEnabled) report(owned, false,
+                            () -> LOGGER.error("Rust backend failed; retrying after one second", failure));
+                } catch (InterruptedException interrupted) {
+                    owned.ready = null;
+                    owned.failure = Failure.INTERRUPTED;
+                    if (!terminate(owned)) break;
+                    // Interruption is consumed for a recoverable retry, retained on terminal exit.
+                    if (!owned.wanted) { Thread.currentThread().interrupt(); break; }
+                }
+                if (owned.wanted) {
+                    event(owned, State.RETRYING);
+                    if (owned.retry != null) owned.retry.run();
+                    else pause(owned);
+                }
+            }
+        } catch (Throwable failure) {
+            // Not an Error retry loop: any escape is terminal and never reaches the logger.
+            fail(owned, failure, classify(failure));
+        } finally {
+            owned.wanted = false;
+            owned.ready = null;
+            if (terminate(owned)) cleanup(owned);
+            owned.state = owned.fatal ? State.FAILED : State.STOPPED;
+            terminalReport(owned);
+        }
+    }
+
+    private static void event(Owner owned, State state) {
+        synchronized (RustBackend.class) {
+            if (!owned.wanted) return;
+            owned.state = state;
+        }
+        reportState(owned);
+    }
+
+    private static void reportState(Owner owned) {
+        if (owned.debugEnabled) report(owned, true, () -> ServerDebug.rustState(snapshot(owned)));
+    }
+
+    private static void report(Owner owned, boolean debug, Runnable action) {
+        if (debug ? !owned.debugEnabled : !owned.loggerEnabled) return;
+        boolean interrupted = Thread.interrupted();
+        try { (debug ? owned.debug : owned.logger).accept(action); }
+        catch (RuntimeException | StackOverflowError brokenDiagnostic) {
+            if (debug) owned.debugEnabled = false;
+            else owned.loggerEnabled = false;
+            // Failure of this fallback must not recursively call either logging route.
+            try { owned.fallback.accept(LOG_DISABLED); }
+            catch (RuntimeException | StackOverflowError ignored) {}
+            // Other Errors, including logging OOM, propagate to the terminal finalizer.
+        } finally { if (interrupted) Thread.currentThread().interrupt(); }
+    }
+
+    private static void rawWrite(byte[] message) {
+        try { RAW_ERROR.write(message); RAW_ERROR.flush(); }
+        catch (IOException ignored) {}
+    }
+
+    private static void terminalReport(Owner owned) {
+        if (!owned.fatal) {
+            try { reportState(owned); }
+            catch (Throwable failure) { fail(owned, failure, classify(failure)); }
+        }
+        if (owned.fatal) {
+            try { owned.fallback.accept(owned.child != null || owned.binary != null || owned.directory != null ? OWNED : FATAL); }
+            catch (Throwable ignored) {} // Last-resort fatal sink only; never recurse into logging.
+        }
+    }
+
+    private static Failure classify(Throwable failure) {
+        if (failure instanceof OutOfMemoryError) return Failure.OUT_OF_MEMORY;
+        if (failure instanceof Error) return Failure.ERROR;
+        if (failure instanceof IOException) return Failure.IO;
+        if (failure instanceof InterruptedException) return Failure.INTERRUPTED;
+        return Failure.RUNTIME;
+    }
+
+    private static void fail(Owner owned, Throwable failure, Failure category) {
+        if (!owned.fatal) owned.failure = failure instanceof Error ? classify(failure) : category;
+        owned.fatal = true;
+        owned.wanted = false;
+        owned.ready = null;
+        owned.state = State.FAILED;
+    }
+
+    /** Only this lock serializes termination; no lifecycle lock or thread join is held here. */
+    private static boolean terminate(Owner owned) {
+        synchronized (owned.termination) {
+            Process child = owned.child;
+            if (child == null) return true;
+            owned.ready = null;
+            boolean interrupted = Thread.interrupted();
+            try {
+                if (child.isAlive()) {
+                    try {
+                        child.destroy();
+                        if (!child.waitFor(10, TimeUnit.SECONDS)) child.destroyForcibly();
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                        child.destroyForcibly();
+                    } catch (RuntimeException | Error failure) {
+                        // A broken graceful route does not prevent independent force cleanup.
+                        if (failure instanceof Error) fail(owned, failure, classify(failure));
+                        child.destroyForcibly();
+                    }
+                    while (child.isAlive()) {
+                        try { child.waitFor(); }
+                        catch (InterruptedException ignored) { interrupted = true; }
                     }
                 }
-                int exit = child.waitFor();
-                clearProcess(child);
-                if (running) {
-                    ServerDebug.rustExited(exit, true);
-                    LOGGER.error("Rust backend exited with code {}; restarting", exit);
-                    pause();
-                }
-            } catch (IOException | RuntimeException exception) {
-                terminateChild(child);
-                if (running) {
-                    ServerDebug.rustFailed(exception, true);
-                    LOGGER.error("Could not start the Rust backend; retrying", exception);
-                }
-                pause();
-            } catch (InterruptedException exception) {
-                boolean retry = running;
-                terminateChild(child);
-                if (!retry) return;
-                ServerDebug.rustFailed(exception, true);
-                LOGGER.warn("Rust backend supervisor was interrupted; retrying", exception);
-                pause();
+                owned.exitCode = child.exitValue();
+                // Exit is proven before relinquishing ownership, even if a pipe close fails.
+                for (int pipe = 0; pipe < 3; pipe++) closePipe(owned, child, pipe);
+                owned.child = null;
+                return true;
+            } catch (Throwable failure) {
+                fail(owned, failure, Failure.TERMINATION);
+                return false; // Retain child and executable; never launch a duplicate.
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
             }
         }
     }
 
-    private static void clearProcess(Process child) {
+    private static void closePipe(Owner owned, Process child, int pipe) {
+        try {
+            switch (pipe) {
+                case 0 -> child.getInputStream().close();
+                case 1 -> child.getErrorStream().close();
+                case 2 -> child.getOutputStream().close();
+                default -> throw new AssertionError();
+            }
+        }
+        catch (Throwable failure) { fail(owned, failure, Failure.CLEANUP); }
+    }
+
+    private static void pause(Owner owned) {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (owned.wanted) {
+            long remaining = until - System.nanoTime();
+            if (remaining <= 0) return;
+            try { TimeUnit.NANOSECONDS.sleep(remaining); }
+            catch (InterruptedException ignored) {
+                if (!owned.wanted) { Thread.currentThread().interrupt(); return; }
+            }
+        }
+    }
+
+    static ReadyRecord ready() {
+        Owner owned = owner;
+        if (owned == null) return null;
         synchronized (RustBackend.class) {
-            if (process == child) {
-                process = null;
-                ready = null;
-            }
+            Process child = owned.child;
+            ReadyRecord record = owned.ready;
+            return owned.wanted && owned.state == State.READY && alive(owned)
+                    && record != null && child != null && child.isAlive()
+                    && owned.child == child && owned.ready == record ? record : null;
         }
     }
 
-    /** Never relinquishes process ownership until the child has actually exited. */
-    private static void terminateChild(Process child) {
-        if (child == null) return;
-        boolean interrupted = false;
-        child.destroy();
-        try {
-            if (!child.waitFor(10, TimeUnit.SECONDS)) child.destroyForcibly();
-        } catch (InterruptedException exception) {
-            interrupted = true;
-            child.destroyForcibly();
-        }
-        while (child.isAlive()) {
-            try {
-                child.waitFor();
-            } catch (InterruptedException exception) {
-                interrupted = true;
-                child.destroyForcibly();
-            }
-        }
-        clearProcess(child);
-        if (interrupted) Thread.currentThread().interrupt();
+    static Status status() {
+        Owner owned = owner;
+        return owned == null ? new Status(State.STOPPED, false, false, -1, false, null,
+                Failure.NONE, true, true, false, null) : snapshot(owned);
     }
 
-    private static void pause() {
-        try {
-            Thread.sleep(1_000);
-        } catch (InterruptedException ignored) {
-            if (!running) Thread.currentThread().interrupt();
+    private static Status snapshot(Owner owned) {
+        Process child = owned.child;
+        long pid = -1;
+        boolean alive = false;
+        if (child != null) {
+            alive = child.isAlive();
+            try { pid = child.pid(); } catch (UnsupportedOperationException ignored) {}
         }
-    }
-
-    static synchronized ReadyRecord ready() {
-        return running && ready != null && process != null && process.isAlive()
-                ? ready : null;
+        return new Status(owned.state, owned.wanted, alive(owned), pid, alive,
+                owned.exitCode, owned.failure, owned.loggerEnabled, owned.debugEnabled,
+                owned.binary != null || owned.directory != null,
+                owned.wanted && owned.state == State.READY && alive ? owned.ready : null);
     }
 
     static void stop() {
-        Process child;
-        Thread thread;
+        Owner owned;
         synchronized (RustBackend.class) {
-            if (!running && supervisor == null) return;
-            running = false;
-            ready = null;
-            child = process;
-            thread = supervisor;
-            supervisor = null;
+            owned = owner;
+            if (owned == null) return;
+            owned.wanted = false;
+            owned.ready = null;
+            if (!owned.fatal && owned.state != State.STOPPED) owned.state = State.STOPPING;
         }
-        terminateChild(child);
-        if (thread != null) {
-            thread.interrupt();
-            try {
-                thread.join(5_000);
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
+        // Reentrant diagnostic stop requests must not join their own supervisor.
+        if (owned.thread == Thread.currentThread()) return;
+        boolean interrupted = Thread.interrupted();
+        try {
+            if (owned.thread != null) owned.thread.interrupt();
+            terminate(owned);
+            while (alive(owned)) {
+                try { owned.thread.join(); }
+                catch (InterruptedException ignored) { interrupted = true; }
             }
+            // A previous failed-owned terminal context may be cleaned by a later explicit stop.
+            if (terminate(owned)) cleanup(owned);
+            owned.state = owned.fatal ? State.FAILED : State.STOPPED;
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
-        cleanup();
     }
 
-    private static void cleanup() {
-        try {
-            if (binary != null) Files.deleteIfExists(binary);
-            if (directory != null) Files.deleteIfExists(directory);
-        } catch (IOException | RuntimeException exception) {
-            LOGGER.warn("Could not remove the temporary Rust server", exception);
-        } finally {
-            binary = null;
-            directory = null;
+    private static void cleanup(Owner owned) {
+        synchronized (owned.termination) {
+            if (owned.child != null || alive(owned) && owned.thread != Thread.currentThread()) return;
+            try {
+                if (owned.binary != null) { Files.deleteIfExists(owned.binary); owned.binary = null; }
+                if (owned.directory != null) { Files.deleteIfExists(owned.directory); owned.directory = null; }
+            } catch (Throwable failure) { fail(owned, failure, Failure.CLEANUP); }
         }
     }
+
+    private static boolean alive(Owner owned) { return owned.thread != null && owned.thread.isAlive(); }
 
     private static ReadyRecord parseReady(String line) {
         String[] fields = line.split(" ", -1);

@@ -28,11 +28,34 @@ sourceSets {
     }
 }
 
+repositories { mavenCentral() }
+dependencies { lifecycleTestImplementation 'tech.kwik:kwik:0.10.10' }
+
+tasks.register('serverRustIntegrationTest', JavaExec) {
+    dependsOn tasks.named('lifecycleTestClasses'), tasks.named('debugClasses')
+    classpath = files(sourceSets.debug.output) + sourceSets.lifecycleTest.runtimeClasspath
+    mainClass = 'me.cortex.voxy.server.SupervisorRustIntegrationTest'
+}
+
 tasks.register('serverLifecycleTest', JavaExec) {
     dependsOn tasks.named('lifecycleTestClasses')
     classpath = sourceSets.lifecycleTest.runtimeClasspath
     mainClass = 'me.cortex.voxy.server.ServerLifecycleBehaviorTest'
     workingDir = layout.buildDirectory.dir('lifecycle-test').get().asFile
+    doFirst {
+        workingDir.mkdirs()
+        copy {
+            from 'src/lifecycleTest/resources/voxy-rust.toml'
+            into workingDir
+        }
+    }
+}
+
+tasks.register('debugServerLifecycleTest', JavaExec) {
+    dependsOn tasks.named('lifecycleTestClasses'), tasks.named('debugClasses')
+    classpath = files(sourceSets.debug.output) + sourceSets.lifecycleTest.runtimeClasspath
+    mainClass = 'me.cortex.voxy.server.ServerLifecycleBehaviorTest'
+    workingDir = layout.buildDirectory.dir('debug-lifecycle-test').get().asFile
     doFirst {
         workingDir.mkdirs()
         copy {

@@ -19,22 +19,13 @@ final class ServerDebug {
         LiveServerTestHarness.register(modBus);
     }
 
-    static void rustStarting() {
-        LOGGER.info("VOXY_RUST state=STARTING");
-    }
-
-    static void rustReady(RustBackend.ReadyRecord ready) {
-        LOGGER.info("VOXY_RUST state=READY udpPort={} alpn={} certSha256={}",
-                ready.udpPort(), ready.alpn(),
-                HexFormat.of().formatHex(ready.certificateSha256()));
-    }
-
-    static void rustExited(int exit, boolean restarting) {
-        LOGGER.warn("VOXY_RUST state=EXITED exitCode={} restarting={}", exit, restarting);
-    }
-
-    static void rustFailed(Throwable failure, boolean restarting) {
-        LOGGER.error("VOXY_RUST state=FAILED restarting={}", restarting, failure);
+    static void rustState(RustBackend.Status status) {
+        LOGGER.info("VOXY_RUST state={} wanted={} supervisorAlive={} pid={} childAlive={} exitCode={} failure={} ownsExecutable={}",
+                status.state(), status.wanted(), status.supervisorAlive(), status.pid(), status.childAlive(),
+                status.exitCode(), status.failure(), status.ownsExecutable());
+        var ready = status.ready();
+        if (ready != null) LOGGER.info("VOXY_RUST endpoint udpPort={} alpn={} certSha256={}",
+                ready.udpPort(), ready.alpn(), HexFormat.of().formatHex(ready.certificateSha256()));
     }
 
     static void endpointAdvertised(String player, String host, int port, String alpn) {

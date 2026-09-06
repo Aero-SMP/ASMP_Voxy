@@ -7,9 +7,6 @@ final class ServerDebug {
     private ServerDebug() {}
 
     static void initialize(IEventBus modBus) {}
-    static void rustStarting() {}
-    static void rustReady(RustBackend.ReadyRecord ready) {}
-    static void rustExited(int exit, boolean restarting) {}
-    static void rustFailed(Throwable failure, boolean restarting) {}
+    static void rustState(RustBackend.Status status) {}
     static void endpointAdvertised(String player, String host, int port, String alpn) {}
 }
