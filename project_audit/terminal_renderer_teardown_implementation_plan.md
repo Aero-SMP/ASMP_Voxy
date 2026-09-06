@@ -1,8 +1,9 @@
 # Terminal renderer teardown without mass section retirement
 
-Status: implementation plan only, 2026-09-06. Reviewed through `b58b1714` plus the
-current worktree. The cache-key/neighbor/metadata simplifications are being implemented
-separately; preserve those changes and recheck the baseline before execution.
+Status: implemented and deployed as debug .202, 2026-09-06; scoped verification results and
+remaining validation limits are in `terminal_renderer_teardown_results.md`. Originally reviewed
+through `b58b1714`; implementation baseline was `1b888899`, preserving the separately completed
+cache-key/neighbor/metadata simplifications.
 
 ## Goal and scope
 
