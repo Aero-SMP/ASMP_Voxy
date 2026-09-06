@@ -72,11 +72,14 @@ public final class VoxyServer {
     }
 
     private static AdvertisedAddress loadAdvertisedAddress() {
-        try (Reader input = Files.newBufferedReader(RustBackend.CONFIG)) {
-            var config = new TomlParser().parse(input);
-            String host = config.getOrElse("quic.advertise_host", "");
-            return new AdvertisedAddress(QuicEndpointPayload.canonicalHost(host),
-                    advertisedPort(config.get("quic.advertise_port")));
+        try {
+            RustBackend.ensureConfig(RustBackend.CONFIG);
+            try (Reader input = Files.newBufferedReader(RustBackend.CONFIG)) {
+                var config = new TomlParser().parse(input);
+                String host = config.getOrElse("quic.advertise_host", "");
+                return new AdvertisedAddress(QuicEndpointPayload.canonicalHost(host),
+                        advertisedPort(config.get("quic.advertise_port")));
+            }
         } catch (IOException | RuntimeException exception) {
             throw new IllegalStateException("Cannot read " + RustBackend.CONFIG, exception);
         }

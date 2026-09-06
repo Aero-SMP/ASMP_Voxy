@@ -1,0 +1,15 @@
+# Generated on first startup. Paths are relative to the server working directory.
+# Change world if server.properties uses a different level-name.
+world = "world"
+data = "voxy-rust/data"
+dimension = "minecraft:overworld"
+poll_ms = 2000
+# Zero lets Rayon choose its default worker count.
+rayon_threads = 0
+
+[quic]
+# Each simultaneously running Voxy server needs a distinct UDP listener.
+listen = "0.0.0.0:25587"
+# Empty host uses the Minecraft server address; zero advertises the bound UDP port.
+advertise_host = ""
+advertise_port = 0

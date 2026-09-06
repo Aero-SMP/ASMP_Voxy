@@ -10,6 +10,7 @@ import static me.cortex.voxy.server.SupervisorRecoveryBehaviorTest.*;
 /** Real NeoForge normal/crash-only stop events and the production supervisor regression matrix. */
 public final class ServerLifecycleBehaviorTest {
     public static void main(String[] args) throws Exception {
+        defaultConfiguration();
         new VoxyServer(BusBuilder.builder().build());
         NeoForge.EVENT_BUS.start();
         SupervisorRecoveryBehaviorTest.run();
@@ -27,5 +28,29 @@ public final class ServerLifecycleBehaviorTest {
             check(!(boolean) field.get(null), "endpoint advertised after server exit");
         }
         System.out.println("normal and crash-only server lifecycle cleanup passed; assertions=" + assertions.get());
+    }
+
+    private static void defaultConfiguration() throws Exception {
+        var directory = java.nio.file.Files.createTempDirectory("voxy-default-config-");
+        var file = directory.resolve("voxy-rust.toml");
+        try {
+            RustBackend.ensureConfig(file);
+            String generated = java.nio.file.Files.readString(file);
+            var config = new com.electronwill.nightconfig.toml.TomlParser().parse(generated);
+            check("world".equals(config.get("world")), "wrong default world");
+            check("voxy-rust/data".equals(config.get("data")), "wrong default data directory");
+            check("0.0.0.0:25587".equals(config.get("quic.listen")), "wrong default listener");
+            check(config.getInt("poll_ms") == 2000 && config.getInt("rayon_threads") == 0, "wrong worker/poll defaults");
+            RustBackend.ensureConfig(file);
+            check(generated.equals(java.nio.file.Files.readString(file)), "second startup rewrote config");
+            for (String existing : new String[]{"# custom\nworld = \"other-world\"\n", "invalid toml [[", ""}) {
+                java.nio.file.Files.writeString(file, existing);
+                RustBackend.ensureConfig(file);
+                check(existing.equals(java.nio.file.Files.readString(file)), "overwrote existing configuration");
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(file);
+            java.nio.file.Files.delete(directory);
+        }
     }
 }

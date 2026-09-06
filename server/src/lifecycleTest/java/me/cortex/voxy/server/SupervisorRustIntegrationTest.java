@@ -18,8 +18,12 @@ public final class SupervisorRustIntegrationTest {
         Path root = Files.createTempDirectory("voxy-supervisor-interop-");
         Files.createDirectories(root.resolve("world/region"));
         Path config = root.resolve("voxy-rust.toml");
-        Files.writeString(config, "world = \"" + root.resolve("world") + "\"\ndata = \""
-                + root.resolve("data") + "\"\nrayon_threads = 1\n[quic]\nlisten = \"127.0.0.1:0\"\n");
+        RustBackend.ensureConfig(config);
+        // Parse the real generated defaults in Rust, isolating only paths and listener.
+        Files.writeString(config, Files.readString(config)
+                .replace("world = \"world\"", "world = \"" + root.resolve("world") + "\"")
+                .replace("data = \"voxy-rust/data\"", "data = \"" + root.resolve("data") + "\"")
+                .replace("0.0.0.0:25587", "127.0.0.1:0"));
         var owned = new RustBackend.Owner(config);
         try {
             RustBackend.start(owned);

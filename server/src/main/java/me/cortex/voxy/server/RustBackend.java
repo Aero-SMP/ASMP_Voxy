@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.concurrent.Callable;
@@ -60,6 +62,16 @@ final class RustBackend {
         Runtime.getRuntime().addShutdownHook(new Thread(RustBackend::stop, "Voxy Rust shutdown"));
     }
     private RustBackend() {}
+
+    static void ensureConfig(Path config) throws IOException {
+        // Preserve existing files, including invalid configs and symlinks. Never truncate.
+        if (Files.exists(config, LinkOption.NOFOLLOW_LINKS)) return;
+        try (InputStream defaults = RustBackend.class.getResourceAsStream("/voxy-rust-default.toml")) {
+            if (defaults == null) throw new IOException("embedded default Rust configuration is missing");
+            try { Files.copy(defaults, config); }
+            catch (FileAlreadyExistsException concurrentCreation) { /* Keep the existing config. */ }
+        }
+    }
 
     static void start() { start(new Owner(CONFIG)); }
 
