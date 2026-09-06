@@ -128,17 +128,28 @@ public final class SectionMesher {
 
     private void fillPlane(long[] cells, Workspace workspace, int face, int depth,
                            boolean fluidLayer) {
+        int delta = switch (face) {
+            case 0 -> -1024;
+            case 1 -> 1024;
+            case 2 -> -32;
+            case 3 -> 32;
+            case 4 -> -1;
+            case 5 -> 1;
+            default -> throw new IllegalArgumentException("invalid face");
+        };
+        // Zero denotes an outside plane; every interior neighbor has a nonzero stride.
+        if (depth == ((face & 1) == 0 ? 0 : EDGE - 1)) delta = 0;
         for (int v = 0; v < EDGE; v++) {
             for (int u = 0; u < EDGE; u++) {
                 int cell = cellIndex(face >>> 1, depth, u, v);
                 workspace.plane[u + v * EDGE] = faceData(cell, face, cells,
-                        workspace.modelIds, workspace.metadata, fluidLayer);
+                        workspace.modelIds, workspace.metadata, fluidLayer, delta);
             }
         }
     }
 
     private long faceData(int cell, int face, long[] cells, int[] modelIds,
-                          long[] metadata, boolean fluidLayer) {
+                          long[] metadata, boolean fluidLayer, int delta) {
         int model = modelIds[cell];
         long own = metadata[cell];
         if (fluidLayer) {
@@ -148,7 +159,7 @@ public final class SectionMesher {
         }
         if (model == 0 || !ModelQueries.faceExists(own, face)) return 0;
 
-        int neighbor = neighbor(cell, face);
+        int neighbor = delta == 0 ? -1 : cell + delta;
         // Deliberately omit even exposed water walls here; sections remain independent.
         // Inspect the original state, not a deduplicated model or the solid waterlogged face.
         if (neighbor < 0 && face >= 2 && ModelQueries.isFluid(own)
@@ -237,19 +248,6 @@ public final class SectionMesher {
         int z = axis == 0 ? v : axis == 1 ? depth : v;
         return face | (width - 1) << 3 | (height - 1) << 7
                 | x << 21 | y << 16 | z << 11;
-    }
-
-    private static int neighbor(int index, int face) {
-        int x = index & 31, z = index >>> 5 & 31, y = index >>> 10;
-        return switch (face) {
-            case 0 -> y == 0 ? -1 : index - 1024;
-            case 1 -> y == 31 ? -1 : index + 1024;
-            case 2 -> z == 0 ? -1 : index - 32;
-            case 3 -> z == 31 ? -1 : index + 32;
-            case 4 -> x == 0 ? -1 : index - 1;
-            case 5 -> x == 31 ? -1 : index + 1;
-            default -> throw new IllegalArgumentException("invalid face");
-        };
     }
 
     private static int aabb(long[] cells) {

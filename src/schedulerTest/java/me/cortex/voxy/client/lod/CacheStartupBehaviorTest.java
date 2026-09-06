@@ -36,6 +36,7 @@ final class CacheStartupBehaviorTest {
         missesDoNotSpin();
         corruptPayloadAndLateMapping();
         metadataIntegrityAndBudget();
+        CacheKeyMetadataBehaviorTest.run();
         connectorCancellation();
         lateConnectionSuccessIsClosed();
         wireAbsence();
@@ -180,7 +181,7 @@ final class CacheStartupBehaviorTest {
     }
 
     // Exercise the actual private parser, without substituting its file operations or reconstruction.
-    private static AutoCloseable openShard(Path path, boolean writable) throws Exception {
+    static AutoCloseable openShard(Path path, boolean writable) throws Exception {
         var type = Class.forName(RegionalCache.class.getName() + "$Shard");
         var method = type.getDeclaredMethod("open", Path.class, RegionalProtocol.Hash32.class, int.class, int.class, boolean.class);
         method.setAccessible(true);
@@ -191,13 +192,16 @@ final class CacheStartupBehaviorTest {
         var method = shard.getClass().getDeclaredMethod("get", key.getClass()); method.setAccessible(true);
         return (byte[]) invoke(method, shard, key);
     }
-    private static Object shardKey(long fingerprint, int length) throws Exception {
-        var keyType = Class.forName(RegionalCache.class.getName() + "$CacheKey");
-        var constructor = keyType.getDeclaredConstructor(RegionalProtocol.Fingerprint.class, int.class);
-        constructor.setAccessible(true);
-        return constructor.newInstance(new RegionalProtocol.Fingerprint(fingerprint, 0), length);
+    static Object shardKey(long fingerprint, int length) throws Exception {
+        return shardKey(fingerprint, 0, length);
     }
-    private static Object invoke(java.lang.reflect.Method method, Object target, Object... args) throws Exception {
+    static Object shardKey(long low, long high, int length) throws Exception {
+        var keyType = Class.forName(RegionalCache.class.getName() + "$CacheKey");
+        var constructor = keyType.getDeclaredConstructor(long.class, long.class, int.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(low, high, length);
+    }
+    static Object invoke(java.lang.reflect.Method method, Object target, Object... args) throws Exception {
         try { return method.invoke(target, args); }
         catch (java.lang.reflect.InvocationTargetException failure) {
             if (failure.getCause() instanceof Exception cause) throw cause;

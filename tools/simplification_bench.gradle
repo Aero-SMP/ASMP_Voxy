@@ -12,6 +12,12 @@ allprojects {
             tasks.named('schedulerBehaviorTest', JavaExec) {
                 dependsOn agent
                 systemProperty 'voxy.simplificationBench', 'true'
+                systemProperty 'voxy.baselineKeys', System.getProperty('voxy.baselineKeys', 'false')
+                systemProperty 'voxy.metadataReadSizeQueries', System.getProperty('voxy.metadataReadSizeQueries', '1')
+                systemProperty 'voxy.metadataReferenceSizeQueries', System.getProperty('voxy.metadataReferenceSizeQueries', '1')
+                ['voxy.cacheInteropInput', 'voxy.cacheInteropOutput'].each { key ->
+                    if (System.getProperty(key) != null) systemProperty key, System.getProperty(key)
+                }
                 jvmArgs "-javaagent:${layout.buildDirectory.file('inventory-query-probe/agent.jar').get().asFile}"
                 systemProperty 'voxy.inventoryExpectedReadsPerFile', System.getProperty('voxy.inventoryExpectedReadsPerFile', '2')
             }

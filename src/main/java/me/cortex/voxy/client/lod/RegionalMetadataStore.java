@@ -167,12 +167,13 @@ final class RegionalMetadataStore implements AutoCloseable {
         try (var pin = this.budget.pin(path)) {
         if (!Files.isRegularFile(path)) return null;
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            if (channel.size() < HEADER || channel.size() > HEADER + (long) maximum) return null;
+            long extent = channel.size();
+            if (extent < HEADER || extent > HEADER + (long) maximum) return null;
             ByteBuffer header = buffer(new byte[HEADER]);
             readFully(channel, header); header.flip();
             if (header.getLong() != MAGIC || header.getInt() != VERSION || header.getInt() != kind) return null;
             int length = header.getInt(), crc = header.getInt();
-            if (length < 0 || length > maximum || channel.size() != HEADER + (long) length) return null;
+            if (length < 0 || length > maximum || extent != HEADER + (long) length) return null;
             byte[] body = new byte[length]; readFully(channel, ByteBuffer.wrap(body));
             return RegionalProtocol.crc32c(body) == crc ? body : null;
         }
@@ -182,13 +183,14 @@ final class RegionalMetadataStore implements AutoCloseable {
     // Startup catalog-reference accounting reads fixed prefixes only, never eager region indexes.
     static Path referencedCatalog(Path descriptor) throws IOException {
         try (FileChannel channel = FileChannel.open(descriptor, StandardOpenOption.READ)) {
-            if (channel.size() < HEADER + REGION_FIXED) return null;
+            long extent = channel.size();
+            if (extent < HEADER + REGION_FIXED) return null;
             ByteBuffer prefix = buffer(new byte[HEADER + REGION_FIXED]);
             readFully(channel, prefix); prefix.flip();
             if (prefix.getLong() != MAGIC || prefix.getInt() != VERSION || prefix.getInt() != REGION) return null;
             int length = prefix.getInt();
             if (length < REGION_FIXED || length > REGION_FIXED + RegionalProtocol.MAX_INDEX_BYTES
-                    || channel.size() != HEADER + (long) length) return null;
+                    || extent != HEADER + (long) length) return null;
             prefix.position(HEADER + 64);
             var hash = RegionalProtocol.Hash32.read(prefix);
             return hash.equals(RegionalProtocol.Hash32.ZERO) ? null

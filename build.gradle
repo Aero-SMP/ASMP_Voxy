@@ -308,7 +308,9 @@ tasks.register('verifyDebugHarnessArtifacts') {
             if (protocol.empty) throw new GradleException("debug-test protocol missing from ${artifact}")
         }
         [clientNormal, serverNormal, clientDebug, serverDebug].each { artifact ->
-            if (!zipTree(artifact).matching { include '**/*BehaviorTest*' }.files.empty) {
+            if (!zipTree(artifact).matching {
+                include '**/*BehaviorTest*', '**/InventoryQueryAgent*'
+            }.files.empty) {
                 throw new GradleException("offline behavior tests leaked into ${artifact}")
             }
         }

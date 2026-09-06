@@ -121,16 +121,20 @@ public final class MeshBoundsBehaviorTest {
 
     private static void benchmark(Map<String, long[]> fixtures) {
         ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
+        boolean allocationSupported = bean.isThreadAllocatedMemorySupported() && bean.isThreadAllocatedMemoryEnabled();
+        boolean cpuSupported = bean.isCurrentThreadCpuTimeSupported() && bean.isThreadCpuTimeEnabled();
         for (String name : List.of("dense", "air", "sparse", "model-4", "model-6", "model-7")) {
             var mesher = new SectionMesher(MODELS, ignored -> {});
             var section = new SectionData(0, 0, fixtures.get(name), new int[0]);
             for (int i = 0; i < 400; i++) mesher.mesh(section, 0).free();
             for (int sample = 0; sample < 7; sample++) {
-                long allocation = bean.getThreadAllocatedBytes(Thread.currentThread().threadId()), start = System.nanoTime();
+                long allocation = allocationSupported ? bean.getThreadAllocatedBytes(Thread.currentThread().threadId()) : -1;
+                long cpu = cpuSupported ? bean.getCurrentThreadCpuTime() : -1, start = System.nanoTime();
                 for (int i = 0; i < 200; i++) mesher.mesh(section, 0).free();
                 long nanos = System.nanoTime() - start;
                 System.out.println("MESH_BENCH " + name + " ns/job=" + nanos / 200
-                        + " heap/job=" + (bean.getThreadAllocatedBytes(Thread.currentThread().threadId()) - allocation) / 200);
+                        + " heap/job=" + (allocationSupported ? (bean.getThreadAllocatedBytes(Thread.currentThread().threadId()) - allocation) / 200 : -1)
+                        + " cpu/job=" + (cpuSupported ? (bean.getCurrentThreadCpuTime() - cpu) / 200 : -1));
             }
         }
     }

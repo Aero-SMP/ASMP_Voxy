@@ -220,7 +220,8 @@ final class RegionalCache implements AutoCloseable {
     }
 
     private static CacheKey key(RegionalProtocol.RegionIndex index, int ordinal) {
-        return new CacheKey(index.sectionFingerprint(ordinal), index.compressedLength(ordinal));
+        var fingerprint = index.sectionFingerprint(ordinal);
+        return new CacheKey(fingerprint.low(), fingerprint.high(), index.compressedLength(ordinal));
     }
 
     private static long regionKey(int x, int z) {
@@ -228,7 +229,7 @@ final class RegionalCache implements AutoCloseable {
     }
 
 
-    private record CacheKey(RegionalProtocol.Fingerprint fingerprint, int length) {}
+    private record CacheKey(long low, long high, int length) {}
 
     private static final class Shard implements AutoCloseable {
         final Path path;
@@ -272,12 +273,12 @@ final class RegionalCache implements AutoCloseable {
                     record.clear();
                     readFully(file.getChannel(), offset, record);
                     record.flip();
-                    RegionalProtocol.Fingerprint fingerprint = RegionalProtocol.Fingerprint.read(record);
+                    long low = record.getLong(), high = record.getLong();
                     int signedLength = record.getInt();
                     if (signedLength == 0 || signedLength == Integer.MIN_VALUE) break;
                     int length = Math.abs(signedLength);
                     if (length > RegionalProtocol.MAX_SECTION_BYTES) break;
-                    CacheKey key = new CacheKey(fingerprint, length);
+                    CacheKey key = new CacheKey(low, high, length);
                     if (signedLength < 0) {
                         records.removeLong(key);
                         offset += RECORD_BYTES;
@@ -338,7 +339,7 @@ final class RegionalCache implements AutoCloseable {
             if (this.records.containsKey(key)) return false;
             long offset = this.file.length();
             ByteBuffer header = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            header.putLong(key.fingerprint.low()).putLong(key.fingerprint.high());
+            header.putLong(key.low).putLong(key.high);
             header.putInt(key.length).flip();
             try {
                 writeFully(this.channel, offset, header);
@@ -355,7 +356,7 @@ final class RegionalCache implements AutoCloseable {
             if (this.records.removeLong(key) == 0) return;
             long offset = this.file.length();
             ByteBuffer tombstone = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            tombstone.putLong(key.fingerprint.low()).putLong(key.fingerprint.high());
+            tombstone.putLong(key.low).putLong(key.high);
             tombstone.putInt(-key.length).flip();
             try { writeFully(this.channel, offset, tombstone); }
             catch (IOException failure) { this.file.setLength(offset); throw failure; }
