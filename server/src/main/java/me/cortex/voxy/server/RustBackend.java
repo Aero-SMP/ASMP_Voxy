@@ -248,15 +248,15 @@ final class RustBackend {
             try {
                 if (child.isAlive()) {
                     try {
-                        child.destroy();
-                        if (!child.waitFor(10, TimeUnit.SECONDS)) child.destroyForcibly();
+                        signal(child, false);
+                        if (!child.waitFor(10, TimeUnit.SECONDS)) signal(child, true);
                     } catch (InterruptedException ignored) {
                         interrupted = true;
-                        child.destroyForcibly();
+                        signal(child, true);
                     } catch (RuntimeException | Error failure) {
                         // A broken graceful route does not prevent independent force cleanup.
                         if (failure instanceof Error) fail(owned, failure, classify(failure));
-                        child.destroyForcibly();
+                        signal(child, true);
                     }
                     while (child.isAlive()) {
                         try { child.waitFor(); }
@@ -274,6 +274,19 @@ final class RustBackend {
             } finally {
                 if (interrupted) Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    private static void signal(Process child, boolean force) {
+        // Process.destroy() closes the parent's pipes immediately. Rust can still be
+        // reporting its graceful shutdown, so signal without closing until exit is proven.
+        try {
+            if (force) child.toHandle().destroyForcibly();
+            else child.toHandle().destroy();
+        } catch (UnsupportedOperationException unsupportedHandle) {
+            // Non-native Process implementations need not expose an OS handle.
+            if (force) child.destroyForcibly();
+            else child.destroy();
         }
     }
 

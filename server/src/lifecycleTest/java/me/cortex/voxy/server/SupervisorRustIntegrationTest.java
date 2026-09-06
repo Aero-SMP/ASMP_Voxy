@@ -43,6 +43,7 @@ public final class SupervisorRustIntegrationTest {
                     && Arrays.equals(key, Files.readAllBytes(root.resolve("data/quic/private-key.der"))), "persisted identity rewritten");
             SupervisorRecoveryBehaviorTest.check(Arrays.equals(catalog, probe(secondReady)), "catalog transfer changed across restart");
             RustBackend.stop();
+            SupervisorRecoveryBehaviorTest.check(second.exitValue() == 0, "supervisor closed Rust shutdown pipes before clean exit");
             SupervisorRecoveryBehaviorTest.check(!first.isAlive() && !second.isAlive() && !Files.exists(executable)
                     && owned.child == null && !owned.thread.isAlive(), "bundled Rust stop leaked ownership");
             System.out.println("Bundled Rust interop PASS: PIDs " + first.pid() + " -> " + second.pid()
@@ -50,8 +51,10 @@ public final class SupervisorRustIntegrationTest {
                     + " catalog bytes transferred before/after; no child/executable after stop");
         } finally {
             RustBackend.stop();
-            try (var paths = Files.walk(root)) {
-                for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
+            if (owned.child == null && (owned.thread == null || !owned.thread.isAlive())) {
+                try (var paths = Files.walk(root)) {
+                    for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
+                }
             }
         }
     }
