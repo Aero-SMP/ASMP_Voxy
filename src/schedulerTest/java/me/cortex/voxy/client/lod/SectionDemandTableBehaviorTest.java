@@ -20,6 +20,7 @@ public final class SectionDemandTableBehaviorTest {
         me.cortex.voxy.client.config.GeometryMemoryOptionsBehaviorTest.run();
         me.cortex.voxy.client.config.LodPixelSizeBehaviorTest.run();
         DebugSnapshotShutdownBehaviorTest.run();
+        TerminalRendererTeardownBehaviorTest.run();
         retainsOneHundredThousandDetailTransitions();
         coalescesNewestUnsignedEpoch();
         priorityMovesOneMembership();

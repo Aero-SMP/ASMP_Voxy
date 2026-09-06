@@ -5,6 +5,10 @@ import net.neoforged.bus.api.IEventBus;
 /** No-op facade replaced by the compile-time debug implementation in debug client JARs. */
 public final class ClientLodDebug {
     private ClientLodDebug() {}
+    public static void shutdownPhase(me.cortex.voxy.client.core.VoxyRenderSystem renderer,
+                                     String phase, String outcome, long nanos) {}
+    public static void shutdownWork(int nodeManager, int transactions, int publications,
+                                    int gpuCompletions, boolean handoff) {}
 
     static void init(IEventBus modBus) {}
     static void tick() {}

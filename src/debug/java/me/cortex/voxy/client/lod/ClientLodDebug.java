@@ -299,6 +299,20 @@ public final class ClientLodDebug {
 
     static void updaterEvent(String message) { emit("VOXY_UPDATER " + message); }
 
+    public static void shutdownWork(int nodeManager, int transactions, int publications,
+                                    int gpuCompletions, boolean handoff) {
+        emit("VOXY_SHUTDOWN_WORK nodes=" + nodeManager + " cancelledTransactions=" + transactions
+                + " pendingPublications=" + publications + " gpuCompletions=" + gpuCompletions
+                + " handoff=" + handoff);
+    }
+
+    public static void shutdownPhase(me.cortex.voxy.client.core.VoxyRenderSystem renderer,
+                                     String phase, String outcome, long nanos) {
+        emit("VOXY_SHUTDOWN renderer=" + renderer.rendererIdentity()
+                + " phase=" + phase + " outcome=" + outcome
+                + " monotonicNanos=" + System.nanoTime() + " durationNanos=" + nanos);
+    }
+
     static boolean snapshotLog(Path destination) throws IOException, InterruptedException {
         try {
             return WRITER.submit(() -> {

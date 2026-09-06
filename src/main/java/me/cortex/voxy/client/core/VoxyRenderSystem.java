@@ -664,7 +664,8 @@ public class VoxyRenderSystem {
             Logger.info("Voxy render system created with " + this.geometryData.getGeometryCapacityBytes()
                     + " geometry capacity; shader status=" + this.shaderReload.status());
         } catch (RuntimeException | Error failure) {
-            this.releaseComponents(failure);
+            try { this.releaseComponents(failure); }
+            catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
             throw failure;
         } finally {
             for (int i = 0; i < oldBufferBindings.length; i++) {
@@ -829,57 +830,96 @@ public class VoxyRenderSystem {
         return this.viewport;
     }
 
+    private Runnable regionalQuiescence = () -> {};
+    private boolean stopping, disposed;
+
+    /** The latest session retains this waiter even after detaching itself on failure/logout. */
+    public void setRegionalQuiescence(Runnable quiescence) {
+        if (this.stopping) throw new IllegalStateException("renderer stopping");
+        this.regionalQuiescence = Objects.requireNonNull(quiescence);
+    }
+
+    /** Render-thread terminal boundary. No resource is disposed by this operation. */
+    public void beginStopping() {
+        if (this.stopping) return;
+        this.stopping = true;
+        this.destroyed = true;
+        me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "begin", "BEGIN", 0);
+        if (this.nodeManager != null) this.nodeManager.beginStopping();
+        if (this.modelService != null) this.modelService.beginStopping();
+        if (this.traversal != null) this.traversal.setDetailActionListener((key, action, bucket, epoch) -> {});
+        ClientLodClient.stopRenderer(this);
+        me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "begin", "END", 0);
+    }
+
     public void shutdown() {
-        Logger.info("Flushing download stream");
-        DownloadStream.INSTANCE.flushWaitClear();
+        if (this.disposed) return;
+        this.beginStopping();
         Logger.info("Shutting down rendering");
         this.releaseComponents(null);
-
-        Logger.info("Flushing download stream");
-        DownloadStream.INSTANCE.flushWaitClear();
         Logger.info("Render shutdown completed");
     }
 
     /** Releases both fully initialized and constructor-partial renderer state exactly once. */
     private void releaseComponents(Throwable constructionFailure) {
-        me.cortex.voxy.client.lod.ClientLodDebug.shaderEnd(this, "CLOSED", "renderer released during reload");
-        this.destroyed = true;
+        if (this.disposed) return;
+        this.beginStopping();
+        // Failure at a quiescence barrier must not fall through to dependent disposal.
+        this.shutdownPhase("regional-workers", this.regionalQuiescence);
+        this.regionalQuiescence = () -> {};
+        AsyncNodeManager nodes = this.nodeManager;
+        ModelBakerySubsystem models = this.modelService;
+        if (nodes != null) this.shutdownPhase("hierarchy-join", nodes::awaitStopped);
+        if (models != null) this.shutdownPhase("model-join", models::awaitStopped);
+        // This existing stream drain performs glFinish, including callback-created readbacks.
+        // All CPU producers are quiescent; GPU/model storage is not yet freed or reusable.
+        var cleanup = new me.cortex.voxy.common.util.Cleanup();
+        this.shutdownPhase("gpu-readbacks", () -> DownloadStream.INSTANCE.flushWaitClear(cleanup));
+        this.disposed = true;
+
+        me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "resources", "BEGIN", 0);
+        cleanup.run(() -> me.cortex.voxy.client.lod.ClientLodDebug.shaderEnd(this, "CLOSED", "renderer released during reload"));
         this.externalShaderReload = null;
         this.pendingIrisMappings = null;
-        if (this.shaderReload != null) release("shader resources", this.shaderReload::close, constructionFailure);
-        release("biome callback", () -> this.mapper.setBiomeCallback(null), constructionFailure);
-        AsyncNodeManager nodes = this.nodeManager;
+        cleanup.run(() -> this.mapper.setBiomeCallback(null));
+        if (nodes != null) cleanup.run(() -> this.shutdownPhase("hierarchy-disposal", nodes::stop));
         this.nodeManager = null;
-        if (nodes != null) release("node manager", nodes::stop, constructionFailure);
-        ModelBakerySubsystem models = this.modelService;
+        if (this.shaderReload != null) cleanup.run(this.shaderReload::close);
+        if (models != null) cleanup.run(() -> this.shutdownPhase("model-disposal", models::shutdown));
         this.modelService = null;
-        if (models != null) release("model bakery", models::shutdown, constructionFailure);
-        HierarchicalOcclusionTraverser traverser = this.traversal;
+        if (this.traversal != null) cleanup.run(this.traversal::free);
         this.traversal = null;
-        if (traverser != null) release("hierarchy traversal", traverser::free, constructionFailure);
-        NodeCleaner cleaner = this.nodeCleaner;
+        if (this.nodeCleaner != null) cleanup.run(this.nodeCleaner::free);
         this.nodeCleaner = null;
-        if (cleaner != null) release("node cleaner", cleaner::free, constructionFailure);
         BasicSectionGeometryData geometry = this.geometryData;
         this.geometryData = null;
-        if (geometry != null) release("geometry data", () -> {
+        if (geometry != null) cleanup.run(() -> {
             geometry.free();
             RenderResourceReuse.giveBackGeometryBuffer(geometry.getGeometryBuffer());
-        }, constructionFailure);
-        ChunkBoundRenderer bounds = this.chunkBoundRenderer;
+        });
+        if (this.chunkBoundRenderer != null) cleanup.run(this.chunkBoundRenderer::free);
         this.chunkBoundRenderer = null;
-        if (bounds != null) release("chunk bounds", bounds::free, constructionFailure);
-        Viewport oldViewport = this.viewport;
+        if (this.viewport != null) cleanup.run(this.viewport::delete);
         this.viewport = null;
-        if (oldViewport != null) release("viewport", oldViewport::delete, constructionFailure);
+        try {
+            cleanup.rethrow();
+            me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "resources", "END", 0);
+        } catch (RuntimeException | Error failure) {
+            me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "resources", "FAILED", 0);
+            if (constructionFailure == null) throw failure;
+            if (constructionFailure != failure) constructionFailure.addSuppressed(failure);
+        }
     }
 
-    private static void release(String component, Runnable action, Throwable constructionFailure) {
+    private void shutdownPhase(String phase, Runnable operation) {
+        long start = System.nanoTime();
+        me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, phase, "BEGIN", 0);
         try {
-            action.run();
-        } catch (RuntimeException | Error cleanupFailure) {
-            if (constructionFailure != null) constructionFailure.addSuppressed(cleanupFailure);
-            else Logger.error("Error releasing " + component, cleanupFailure);
+            operation.run();
+            me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, phase, "END", System.nanoTime() - start);
+        } catch (RuntimeException | Error failure) {
+            me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, phase, "FAILED", System.nanoTime() - start);
+            throw failure;
         }
     }
 

@@ -19,10 +19,15 @@ public class ModelBakerySubsystem {
     private volatile Throwable processingThreadException;
     public ModelBakerySubsystem(CatalogMapper mapper) {
         this.mapper = mapper;
-        this.factory = new ModelFactory(mapper, this.storage);
+        try { this.factory = new ModelFactory(mapper, this.storage); }
+        catch (RuntimeException | Error failure) {
+            try { this.storage.free(); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
         this.processingThread = new Thread(()->{//TODO replace this with something good/integrate it into the async processor so that we just have less threads overall
             while (this.isRunning) {
-                while (this.factory.processAllThings());
+                while (this.isRunning && this.factory.processOneThing());
                 LockSupport.park();
             }
         }, "Model factory processor");
@@ -33,7 +38,12 @@ public class ModelBakerySubsystem {
             }
             this.processingThreadException = e;
         });
-        this.processingThread.start();
+        try { this.processingThread.start(); }
+        catch (RuntimeException | Error failure) {
+            try { this.shutdown(); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
     }
 
     public void tick() {
@@ -44,17 +54,26 @@ public class ModelBakerySubsystem {
         this.factory.processUploads();
     }
 
-    public void shutdown() {
+    public void beginStopping() {
         this.isRunning = false;
         LockSupport.unpark(this.processingThread);
-        try {
-            this.processingThread.join();
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
+    }
 
-        this.factory.free();
-        this.storage.free();
+    public void awaitStopped() {
+        this.beginStopping();
+        me.cortex.voxy.common.util.Cleanup.join(this.processingThread);
+    }
+
+    private boolean disposed;
+    public void shutdown() {
+        if (this.disposed) return;
+        this.awaitStopped();
+        this.disposed = true;
+
+        var cleanup = new me.cortex.voxy.common.util.Cleanup();
+        cleanup.run(this.factory::free);
+        cleanup.run(this.storage::free);
+        cleanup.rethrow();
     }
 
     //This is on this side only and done like this as only worker threads call this code

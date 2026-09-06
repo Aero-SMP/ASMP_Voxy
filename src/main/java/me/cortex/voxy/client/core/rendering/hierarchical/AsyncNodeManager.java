@@ -92,7 +92,9 @@ public class AsyncNodeManager {
     private final ArrayDeque<GpuCompletion> gpuCompletions = new ArrayDeque<>();
 
     @SuppressWarnings("FieldMayBeFinal")
-    private volatile SyncResults results = null, resultCache1 = new SyncResults(), resultCache2 = new SyncResults();
+    private volatile SyncResults results, resultCache1, resultCache2;
+    // Remains reachable for terminal disposal if packing an update fails midway.
+    private SyncResults assemblingResult;
 
 
     //locals for during iteration
@@ -185,6 +187,25 @@ public class AsyncNodeManager {
                 }
             }
         });
+        // Acquire fallible native/GL owners only once terminal cleanup is initialized.
+        try {
+            this.resultCache1 = new SyncResults();
+            this.resultCache2 = new SyncResults();
+            this.scatterWrite = Shader.make()
+                    .define("INPUT_BUFFER_BINDING", 0)
+                    .define("OUTPUT_BUFFER1_BINDING", 1)
+                    .define("OUTPUT_BUFFER2_BINDING", 2)
+                    .add(ShaderType.COMPUTE, "voxy:util/scatter.comp").compile();
+            this.multiMemcpy = Shader.make()
+                    .define("INPUT_HEADER_BUFFER_BINDING", 0)
+                    .define("INPUT_DATA_BUFFER_BINDING", 1)
+                    .define("OUTPUT_BUFFER_BINDING", 2)
+                    .add(ShaderType.COMPUTE, "voxy:util/memcpy.comp").compile();
+        } catch (RuntimeException | Error failure) {
+            try { this.stop(); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
     }
 
     /**
@@ -239,19 +260,8 @@ public class AsyncNodeManager {
         return resultSet;
     }
 
-    private final Shader scatterWrite = Shader.make()
-            .define("INPUT_BUFFER_BINDING", 0)
-            .define("OUTPUT_BUFFER1_BINDING", 1)
-            .define("OUTPUT_BUFFER2_BINDING", 2)
-            .add(ShaderType.COMPUTE, "voxy:util/scatter.comp")
-            .compile();
-
-    private final Shader multiMemcpy = Shader.make()
-            .define("INPUT_HEADER_BUFFER_BINDING", 0)
-            .define("INPUT_DATA_BUFFER_BINDING", 1)
-            .define("OUTPUT_BUFFER_BINDING", 2)
-            .add(ShaderType.COMPUTE, "voxy:util/memcpy.comp")
-            .compile();
+    private Shader scatterWrite;
+    private Shader multiMemcpy;
 
     private void run() {
         if (!this.running) {
@@ -280,7 +290,7 @@ public class AsyncNodeManager {
             int work = 0;
             if (rem != null) {
                 var iter = rem.longIterator();
-                while (iter.hasNext()) {
+                while (this.running && iter.hasNext()) {
                     this.manager.removeTopLevelNode(iter.nextLong());
                     work++;
                 }
@@ -288,7 +298,7 @@ public class AsyncNodeManager {
 
             if (add != null) {
                 var iter = add.longIterator();
-                while (iter.hasNext()) {
+                while (this.running && iter.hasNext()) {
                     this.manager.insertTopLevelNode(iter.nextLong());
                     work++;
                 }
@@ -300,7 +310,7 @@ public class AsyncNodeManager {
 
         int rendererTransactions = this.rendererTransactionQueue.size();
         boolean topologyDeferred = false;
-        while (rendererTransactions-- > 0) {
+        while (this.running && rendererTransactions-- > 0) {
             RendererTransaction transaction = this.rendererTransactionQueue.poll();
             if (transaction == null) break;
             try {
@@ -342,7 +352,7 @@ public class AsyncNodeManager {
         // reclaimed.
         {
             int coarsenings = this.coarsenQueue.size();
-            while (coarsenings-- > 0) {
+            while (this.running && coarsenings-- > 0) {
                 RendererTransaction transaction = this.coarsenQueue.peek();
                 if (transaction == null) break;
                 try {
@@ -364,7 +374,7 @@ public class AsyncNodeManager {
         }
 
         boolean regionalBatchLimited = false;
-        while (!regionalBatchLimited) {
+        while (this.running && !regionalBatchLimited) {
             RegionalSectionPublication publication = this.peekRegionalSectionPublication();
             if (publication == null) break;
             if (!publication.current.getAsBoolean()) {
@@ -383,7 +393,7 @@ public class AsyncNodeManager {
             hierarchyAdvanced |= this.processRegionalSectionPublication(publication);
         }
 
-        if (workDone == 0) return;
+        if (!this.running || workDone == 0) return;
         // Retry topology commands only after real hierarchy/fence/input progress.
         if (hierarchyAdvanced) {
             this.topologyGeneration.incrementAndGet();
@@ -403,13 +413,14 @@ public class AsyncNodeManager {
             }
             this.waitingForRenderSync = false;
         }
-
+        if (!this.running) return;
 
         var prev = (SyncResults) RESULT_HANDLE.getAndSet(this, null);
         SyncResults results = null;
         if (prev == null) {
             this.needsWaitForSync = false;
             results = this.getMakeResultObject();
+            this.assemblingResult = results;
             //Clear old data (if it exists), create a new result set
             results.tlnDelta.addAll(this.tlnIdChange);
             this.tlnIdChange.clear();
@@ -429,6 +440,7 @@ public class AsyncNodeManager {
             results.cleanerOperations.addAll(this.cleanerIdResetClear); this.cleanerIdResetClear.clear();
         } else {
             results = prev;
+            this.assemblingResult = results;
             // merge with the previous result set
 
             if (!this.tlnIdChange.isEmpty()) {//Merge top level node id changes
@@ -529,6 +541,7 @@ public class AsyncNodeManager {
         if (!RESULT_HANDLE.compareAndSet(this, null, results)) {
             throw new IllegalArgumentException("Should always have null");
         }
+        this.assemblingResult = null;
 
     }
 
@@ -655,6 +668,7 @@ public class AsyncNodeManager {
     private IntConsumer tlnAddCallback; private IntConsumer tlnRemoveCallback;
     //Render thread synchronization
     public void tick(GlBuffer nodeBuffer, NodeCleaner cleaner) {//TODO: dont pass nodeBuffer here??, do something else thats better
+        if (this.stopping) return;
         if (this.uncaughtException != null) {
             throw new RuntimeException(this.uncaughtException);//Propagate internal exception
         }
@@ -878,7 +892,9 @@ public class AsyncNodeManager {
         if (this.progressListener == listener) this.progressListener = () -> {};
     }
 
-    public void notifyPublicationProgress() { this.progressListener.run(); }
+    public void notifyPublicationProgress() {
+        if (!this.stopping) this.progressListener.run();
+    }
     /** Worker-owned cursor into the one atomically published producer batch being drained. */
     private RegionalPublicationBatch activeRegionalBatch;
     private int activeRegionalBatchIndex;
@@ -971,13 +987,13 @@ public class AsyncNodeManager {
                         parent, RendererOperation.RELEASE_COARSEN, success, failure)),
                 failure);
         synchronized (this.submissionLock) {
-            if (!this.running) {
-                failure.accept(new IllegalStateException("Voxy renderer is not running"));
+            if (this.running) {
+                this.coarsenQueue.add(transaction);
+                this.signalWork();
                 return;
             }
-            this.coarsenQueue.add(transaction);
         }
-        this.signalWork();
+        failure.accept(new IllegalStateException("Voxy renderer is not running"));
     }
 
     public void retirePublication(long revision, long expectedRevision, long position,
@@ -990,14 +1006,13 @@ public class AsyncNodeManager {
 
     private void submitRendererTransaction(RendererTransaction transaction) {
         synchronized (this.submissionLock) {
-            if (!this.running) {
-                transaction.failure.accept(
-                        new IllegalStateException("Voxy renderer is not running"));
+            if (this.running) {
+                this.rendererTransactionQueue.add(transaction);
+                this.signalWork();
                 return;
             }
-            this.rendererTransactionQueue.add(transaction);
         }
-        this.signalWork();
+        transaction.failure.accept(new IllegalStateException("Voxy renderer is not running"));
     }
 
     private final StampedLock tlnLock = new StampedLock();
@@ -1169,117 +1184,117 @@ public class AsyncNodeManager {
     //==================================================================================================================
 
     public void start() {
-        this.thread.start();
+        synchronized (this.submissionLock) {
+            if (!this.stopping) this.thread.start();
+        }
     }
 
     private volatile boolean stopping;
+    // Final disposal is render-thread-owned and distinct from the nonblocking stop marker.
+    private boolean disposed;
 
     public boolean isStopping() { return this.stopping; }
 
-    public void stop() {
+    public void beginStopping() {
         synchronized (this.submissionLock) {
             if (this.stopping) return;
             this.stopping = true;
             this.running = false;
             this.regionalBatchHandoff.stop(new IllegalStateException("renderer stopped"));
         }
-        this.notifyPublicationProgress();
         LockSupport.unpark(this.thread);
-        try {
-            while (this.thread.isAlive()) {
-                LockSupport.unpark(this.thread);
-                this.thread.join(1000);
-            }
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
+    }
 
-        // A failed worker may have staged native meshes without reaching the sync upload.
-        // No worker can touch them after join; queued publications below own different buffers.
+    public void awaitStopped() {
+        this.beginStopping();
+        me.cortex.voxy.common.util.Cleanup.join(this.thread);
+    }
+
+    public void stop() {
+        this.awaitStopped();
+        if (this.disposed) return;
+        this.disposed = true;
+        var cleanup = new me.cortex.voxy.common.util.Cleanup();
+        Throwable stopped = new IllegalStateException("Voxy renderer stopped");
+        me.cortex.voxy.client.lod.ClientLodDebug.shutdownWork(System.identityHashCode(this),
+                this.rendererTransactionQueue.size() + this.coarsenQueue.size() + this.completedRendererTransactions.size(),
+                this.completedRegionalSectionPublications.size() + (this.activeRegionalBatch == null ? 0
+                        : this.activeRegionalBatch.publications().length - this.activeRegionalBatchIndex),
+                this.gpuCompletions.size(), this.regionalBatchHandoff.occupied());
+
+        // These staged buffers are no longer accessible to the joined hierarchy worker.
         for (var buffer : this.geometryManager.getUploads().values()) {
-            if (!buffer.isFreed()) buffer.free();
+            cleanup.run(() -> { if (!buffer.isFreed()) buffer.free(); });
         }
         this.geometryManager.getUploads().clear();
         this.geometryManager.uploadsDrained();
 
         if (this.activeRegionalBatch != null) {
-            RegionalSectionPublication[] publications =
-                    this.activeRegionalBatch.publications();
+            var publications = this.activeRegionalBatch.publications();
             while (this.activeRegionalBatchIndex < publications.length) {
-                this.failUnsubmittedPublication(
-                        publications[this.activeRegionalBatchIndex++]);
+                this.disposeUnsubmitted(publications[this.activeRegionalBatchIndex++], cleanup, stopped);
             }
             this.activeRegionalBatch = null;
             this.activeRegionalBatchIndex = 0;
         }
         RegionalPublicationBatch handoff = this.regionalBatchHandoff.take();
         if (handoff != null) {
-            for (RegionalSectionPublication publication : handoff.publications()) {
-                this.failUnsubmittedPublication(publication);
-            }
+            for (var publication : handoff.publications()) this.disposeUnsubmitted(publication, cleanup, stopped);
         }
         while (!this.completedRegionalSectionPublications.isEmpty()) {
-            this.completedRegionalSectionPublications.removeLast().failure().accept(
-                    new IllegalStateException("Voxy renderer stopped before its GPU fence"));
+            var publication = this.completedRegionalSectionPublications.removeLast();
+            cleanup.run(() -> publication.failure().accept(stopped));
         }
-
-        while (true) {
-            RendererTransaction transaction = this.rendererTransactionQueue.poll();
-            if (transaction == null) break;
-            transaction.failure.accept(new IllegalStateException("Voxy renderer stopped"));
+        RendererTransaction transaction;
+        while ((transaction = this.rendererTransactionQueue.poll()) != null) {
+            var owned = transaction;
+            cleanup.run(() -> owned.failure.accept(stopped));
         }
-        while (true) {
-            RendererTransaction transaction = this.coarsenQueue.poll();
-            if (transaction == null) break;
-            transaction.failure.accept(new IllegalStateException("Voxy renderer stopped"));
+        while ((transaction = this.coarsenQueue.poll()) != null) {
+            var owned = transaction;
+            cleanup.run(() -> owned.failure.accept(stopped));
         }
         while (!this.completedRendererTransactions.isEmpty()) {
-            this.completedRendererTransactions.removeLast().failure.accept(
-                    new IllegalStateException("Voxy renderer stopped before its GPU fence"));
+            var owned = this.completedRendererTransactions.removeLast();
+            cleanup.run(() -> owned.failure.accept(stopped));
         }
-
         while (!this.gpuCompletions.isEmpty()) {
-            GpuCompletion completion = this.gpuCompletions.removeFirst();
-            completion.fence.free();
-            this.failGpuCompletion(completion,
-                    new IllegalStateException("Voxy renderer stopped before its GPU fence"));
+            var completion = this.gpuCompletions.removeFirst();
+            cleanup.run(completion.fence::free);
+            this.disposeCompletions(completion.rendererTransactions, completion.regionalSectionPublications, cleanup, stopped);
         }
-
-        if (RESULT_HANDLE.get(this) != null) {
-            var result = (SyncResults)RESULT_HANDLE.getAndSet(this, null);
-            for (RendererTransaction transaction : result.rendererTransactions) {
-                transaction.failure.accept(new IllegalStateException(
-                        "Voxy renderer stopped before its GPU fence"));
-            }
-            result.rendererTransactions.clear();
-            for (RegionalSectionPublication publication : result.regionalSectionPublications) {
-                publication.failure().accept(new IllegalStateException(
-                        "Voxy renderer stopped before its GPU fence"));
-            }
-            result.regionalSectionPublications.clear();
-            result.geometryUpload.free();
-            result.scatterWriteBuffer.free();
-        }
-
-        if (RESULT_CACHE_1_HANDLE.get(this) != null) {//Clear cache 1
-            var result = (SyncResults)RESULT_CACHE_1_HANDLE.getAndSet(this, null);
-            result.geometryUpload.free();
-            result.scatterWriteBuffer.free();
-        }
-
-        if (RESULT_CACHE_2_HANDLE.get(this) != null) {//Clear cache 2
-            var result = (SyncResults)RESULT_CACHE_2_HANDLE.getAndSet(this, null);
-            result.geometryUpload.free();
-            result.scatterWriteBuffer.free();
-        }
-
-        this.scatterWrite.free();
-        this.multiMemcpy.free();
+        this.disposeResult((SyncResults) RESULT_HANDLE.getAndSet(this, null), true, cleanup, stopped);
+        this.disposeResult(this.assemblingResult, true, cleanup, stopped);
+        this.assemblingResult = null;
+        // Cached result lists were copied into GPU completions when uploaded; do not resolve twice.
+        this.disposeResult((SyncResults) RESULT_CACHE_1_HANDLE.getAndSet(this, null), false, cleanup, stopped);
+        this.disposeResult((SyncResults) RESULT_CACHE_2_HANDLE.getAndSet(this, null), false, cleanup, stopped);
+        if (this.scatterWrite != null) cleanup.run(this.scatterWrite::free);
+        if (this.multiMemcpy != null) cleanup.run(this.multiMemcpy::free);
+        cleanup.rethrow();
     }
 
-    private void failUnsubmittedPublication(RegionalSectionPublication publication) {
-        publication.geometry().free();
-        publication.failure().accept(new IllegalStateException("Voxy renderer stopped"));
+    private void disposeUnsubmitted(RegionalSectionPublication publication,
+                                   me.cortex.voxy.common.util.Cleanup cleanup, Throwable stopped) {
+        cleanup.run(publication.geometry()::free);
+        cleanup.run(() -> publication.failure().accept(stopped));
+    }
+
+    private void disposeCompletions(ArrayList<RendererTransaction> transactions,
+                                    ArrayList<RegionalSectionPublication> publications,
+                                    me.cortex.voxy.common.util.Cleanup cleanup, Throwable stopped) {
+        for (var transaction : transactions) cleanup.run(() -> transaction.failure.accept(stopped));
+        transactions.clear();
+        for (var publication : publications) cleanup.run(() -> publication.failure().accept(stopped));
+        publications.clear();
+    }
+
+    private void disposeResult(SyncResults result, boolean pending,
+                               me.cortex.voxy.common.util.Cleanup cleanup, Throwable stopped) {
+        if (result == null) return;
+        if (pending) this.disposeCompletions(result.rendererTransactions, result.regionalSectionPublications, cleanup, stopped);
+        cleanup.run(result.geometryUpload::free);
+        cleanup.run(result.scatterWriteBuffer::free);
     }
 
     private static final class LatencyCounters {
@@ -1325,14 +1340,14 @@ public class AsyncNodeManager {
         //Deltas for geometry store
         private int geometrySectionCount;
         private long usedGeometry;
-        private final ComputeMemoryCopy geometryUpload = new ComputeMemoryCopy();
+        private final ComputeMemoryCopy geometryUpload;
 
         //Gpu geometry downloads
 
 
 
         //Scatter writes for both geometry and node metadata
-        private MemoryBuffer scatterWriteBuffer = new MemoryBuffer(8192*2);
+        private MemoryBuffer scatterWriteBuffer;
         private final Int2IntOpenHashMap scatterWriteLocationMap = new Int2IntOpenHashMap(1024);
         {this.scatterWriteLocationMap.defaultReturnValue(-1);}
 
@@ -1341,6 +1356,16 @@ public class AsyncNodeManager {
         private final ArrayList<RendererTransaction> rendererTransactions = new ArrayList<>();
         private final ArrayList<RegionalSectionPublication> regionalSectionPublications =
                 new ArrayList<>();
+
+        SyncResults() {
+            this.geometryUpload = new ComputeMemoryCopy();
+            try { this.scatterWriteBuffer = new MemoryBuffer(8192 * 2); }
+            catch (RuntimeException | Error failure) {
+                try { this.geometryUpload.free(); }
+                catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
+        }
 
         public void reset() {
             this.cleanerOperations.clear();
@@ -1396,12 +1421,22 @@ public class AsyncNodeManager {
     private static class ComputeMemoryCopy {
         public int currentElemCopyAmount;
         public long maxElementAccess;
-        private MemoryBuffer scratchHeaderBuffer = new MemoryBuffer(1<<16);
-        private MemoryBuffer scratchDataBuffer = new MemoryBuffer(1<<20);
+        private MemoryBuffer scratchHeaderBuffer;
+        private MemoryBuffer scratchDataBuffer;
 
         private final AllocationArena arena = new AllocationArena();
         private final Int2IntOpenHashMap dataUploadPoints = new Int2IntOpenHashMap();//Points to the header index
         {this.dataUploadPoints.defaultReturnValue(-1);}
+
+        ComputeMemoryCopy() {
+            this.scratchHeaderBuffer = new MemoryBuffer(1 << 16);
+            try { this.scratchDataBuffer = new MemoryBuffer(1 << 20); }
+            catch (RuntimeException | Error failure) {
+                try { this.scratchHeaderBuffer.free(); }
+                catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
+        }
 
 
         public void remove(int point) {
@@ -1530,8 +1565,12 @@ public class AsyncNodeManager {
         }
 
         public void free() {
-            this.scratchHeaderBuffer.free(); this.scratchHeaderBuffer = null;
-            this.scratchDataBuffer.free(); this.scratchDataBuffer = null;
+            var cleanup = new me.cortex.voxy.common.util.Cleanup();
+            if (this.scratchHeaderBuffer != null) cleanup.run(this.scratchHeaderBuffer::free);
+            this.scratchHeaderBuffer = null;
+            if (this.scratchDataBuffer != null) cleanup.run(this.scratchDataBuffer::free);
+            this.scratchDataBuffer = null;
+            cleanup.rethrow();
         }
     }
 }

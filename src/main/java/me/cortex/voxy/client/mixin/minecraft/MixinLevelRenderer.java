@@ -53,8 +53,8 @@ public abstract class MixinLevelRenderer implements IGetVoxyRenderSystem {
         if (this.renderer != null) {
             // Stop regional decode, meshing, publication, and GPU fences while every renderer
             // and model resource they own is still valid.
-            ClientLodClient.rendererLifecycleChanged();
             VoxyRenderSystem closing = this.renderer;
+            closing.beginStopping();
             this.renderer = null;
             closing.shutdown();
         }

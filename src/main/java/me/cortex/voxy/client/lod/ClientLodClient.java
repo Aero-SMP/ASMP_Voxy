@@ -28,7 +28,15 @@ public final class ClientLodClient {
     }
 
     public static void disconnect() {
+        // LoggingOut may precede LevelRenderer.setLevel(null). Publish the terminal boundary
+        // before that earlier hook closes any active section publications.
+        var renderer = me.cortex.voxy.client.core.IGetVoxyRenderSystem.getNullable();
+        if (renderer != null) renderer.beginStopping();
         ClientSession.disconnect();
+    }
+
+    public static void stopRenderer(me.cortex.voxy.client.core.VoxyRenderSystem renderer) {
+        ClientSession.stopRenderer(renderer);
     }
 
     /** Supplies the bounded LOD4 coverage window; finer demand still comes from the GPU. */

@@ -31,12 +31,17 @@ final class WorkerResource<T> {
                 && this.state != State.IDLE && this.state != State.CLOSED;
     }
 
-    synchronized void complete(Lease lease, T value) {
+    void complete(Lease lease, T value) {
         Objects.requireNonNull(value);
-        if (!matches(lease)) { this.dispose.accept(value); return; }
-        if (this.state != State.RUNNING) throw new IllegalStateException("duplicate worker completion");
-        this.result = value;
-        this.state = State.COMPLETED;
+        synchronized (this) {
+            if (matches(lease)) {
+                if (this.state != State.RUNNING) throw new IllegalStateException("duplicate worker completion");
+                this.result = value;
+                this.state = State.COMPLETED;
+                return;
+            }
+        }
+        this.dispose.accept(value);
     }
 
     synchronized Completion<T> claim() {
@@ -56,9 +61,13 @@ final class WorkerResource<T> {
     synchronized State state() { return this.state; }
     synchronized T pendingResult() { return this.result; }
 
-    synchronized void close() {
-        this.state = State.CLOSED;
-        if (this.result != null) this.dispose.accept(this.result);
-        this.result = null;
+    void close() {
+        T owned;
+        synchronized (this) {
+            this.state = State.CLOSED;
+            owned = this.result;
+            this.result = null;
+        }
+        if (owned != null) this.dispose.accept(owned);
     }
 }

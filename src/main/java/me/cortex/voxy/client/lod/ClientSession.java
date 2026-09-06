@@ -201,6 +201,17 @@ final class ClientSession {
         }
     }
 
+    /** Detach under LIFECYCLE, but never join while holding it. The renderer keeps the waiter. */
+    static void stopRenderer(VoxyRenderSystem renderer) {
+        synchronized (LIFECYCLE) {
+            Session current = active;
+            if (current == null || current.renderer != renderer) return;
+            stopLocked(current);
+            activeDimension = null;
+            activeRenderer = null;
+        }
+    }
+
     private static void stopLocked(Session session) {
         if (active == session) active = null;
         session.close();
@@ -658,10 +669,12 @@ final class ClientSession {
 
             synchronized void close() {
                 ClientLodDebug.workerClosing(this.debugWork);
-                this.resource.close();
-                this.task = null;
-                this.notifyAll();
-                this.workerThread.interrupt();
+                try { this.resource.close(); }
+                finally {
+                    this.task = null;
+                    this.notifyAll();
+                    this.workerThread.interrupt();
+                }
             }
         }
 
@@ -699,6 +712,7 @@ final class ClientSession {
         }
 
         void start() {
+            if (this.renderer != null) this.renderer.setRegionalQuiescence(this::awaitRendererQuiescence);
             ClientLodDebug.startupEvent(this, "start", 0);
             this.publisher.setProgressListener(this.rendererWake);
             this.metadataWorker.start();
@@ -753,7 +767,12 @@ final class ClientSession {
                 }
             } finally {
                 this.open.set(false);
-                this.release();
+                try { this.release(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (this.failure == null) this.failure = cleanup;
+                    else if (this.failure != cleanup) this.failure.addSuppressed(cleanup);
+                    Logger.error("Regional Voxy session cleanup failed", cleanup);
+                }
             }
         }
 
@@ -2764,39 +2783,58 @@ final class ClientSession {
         @Override public void close() {
             if (!this.open.getAndSet(false)) return;
             ++this.viewRevision;
-            if (this.connectionAttempt != null) this.connectionAttempt.close();
+            var cleanup = new me.cortex.voxy.common.util.Cleanup();
+            if (this.connectionAttempt != null) cleanup.run(this.connectionAttempt::close);
             signal();
             this.thread.interrupt();
-            if (this.quic != null) this.quic.close();
+            if (this.quic != null) cleanup.run(this.quic::close);
+            cleanup.rethrow();
+        }
+
+        void awaitRendererQuiescence() {
+            var cleanup = new me.cortex.voxy.common.util.Cleanup();
+            cleanup.run(this::close);
+            me.cortex.voxy.common.util.Cleanup.join(this.thread);
+            // WorkerResource.CLOSED rejects/disposes results; only thread exit proves that
+            // a cache/mesh/model operation has stopped using the renderer's dependencies.
+            for (WorkerSlot worker : this.sectionWorkers) cleanup.run(worker::close);
+            for (WorkerSlot worker : this.sectionWorkers) {
+                me.cortex.voxy.common.util.Cleanup.join(worker.workerThread);
+            }
+            cleanup.rethrow();
         }
 
         void release() {
-            if (this.connectionAttempt != null) this.connectionAttempt.close();
-            this.metadataWorker.close();
+            var cleanup = new me.cortex.voxy.common.util.Cleanup();
+            // Stop every renderer-using producer before callbacks can throw during cleanup.
+            for (WorkerSlot worker : this.sectionWorkers) cleanup.run(worker::close);
+            for (WorkerSlot worker : this.sectionWorkers) {
+                me.cortex.voxy.common.util.Cleanup.join(worker.workerThread);
+            }
+            if (this.connectionAttempt != null) cleanup.run(this.connectionAttempt::close);
+            cleanup.run(this.metadataWorker::close);
             if (this.pendingCatalogTask != null) CATALOG_TASK.compareAndSet(this.pendingCatalogTask, null);
             this.metadataWrites.clear();
-            if (this.quic != null) this.quic.close();
+            if (this.quic != null) cleanup.run(this.quic::close);
             NetworkReply reply;
             while ((reply = this.networkReplies.poll()) != null) reply.transferred();
-            this.publisher.clearProgressListener(this.rendererWake);
+            cleanup.run(() -> this.publisher.clearProgressListener(this.rendererWake));
             for (PublicationRef ref : this.publicationQueue) {
                 WorkerResource.Lease lease = this.detachPublicationLease(ref);
-                ref.publication().abandon(() -> this.releaseRendererSlot(lease));
+                cleanup.run(() -> ref.publication().abandon(() -> this.releaseRendererSlot(lease)));
             }
             this.publicationQueue.clear();
-            for (WorkerSlot worker : this.sectionWorkers) worker.close();
-            if (this.cache != null) this.cache.close();
+            if (this.cache != null) cleanup.run(this.cache::close);
             for (Demand demand : this.demands.values()) {
-                this.discardCompletedGeometry(demand);
-                if (demand.publication != null) demand.publication.close();
-                if (demand.previousPublication != null) demand.previousPublication.close();
+                cleanup.run(() -> this.discardCompletedGeometry(demand));
+                if (demand.publication != null) cleanup.run(demand.publication::close);
+                if (demand.previousPublication != null) cleanup.run(demand.previousPublication::close);
             }
             Event event;
             while ((event = this.events.poll()) != null) discardEvent(event);
             this.demands.clear();
             this.demandsByTop.clear();
             this.missingCoverage.clear();
-            this.demands.clear();
             this.coarseningRoots.clear();
             this.rendererBlocked.clear();
             this.dormantRoots.clear();
@@ -2806,6 +2844,7 @@ final class ClientSession {
             this.pendingDormantEvictionBytes = 0;
             this.completedGeometryBytes = 0;
             this.publishingGeometryBytes = 0;
+            cleanup.rethrow();
         }
     }
 

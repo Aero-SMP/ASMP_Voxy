@@ -374,9 +374,9 @@ public class ModelFactory implements SectionMesher.Models {
         this.biomeQueue.add(biome);
     }
 
-    public boolean processAllThings() {
+    public boolean processOneThing() {
         var biomeEntry = this.biomeQueue.poll();
-        while (biomeEntry != null) {
+        if (biomeEntry != null) {
             var biomeRegistry = Minecraft.getInstance().level.registryAccess().registryOrThrow(Registries.BIOME);
             var mcbiomeEntry = biomeRegistry.getOptional(ResourceLocation.parse(biomeEntry.biome));
             if (!mcbiomeEntry.isPresent()) {
@@ -386,11 +386,11 @@ public class ModelFactory implements SectionMesher.Models {
             if (res != null) {
                 this.uploadResults.add(res);
             }
-            biomeEntry = this.biomeQueue.poll();
+            return true;
         }
 
-        while (this.processModelResult());
-        return (this.blockStatesInFlight.size()!=0)||(!this.bakeQueue.isEmpty())||!this.biomeQueue.isEmpty();
+        return this.processModelResult() || (this.blockStatesInFlight.size()!=0)
+                || !this.biomeQueue.isEmpty();
     }
 
     public synchronized void processUploads() {
@@ -1180,11 +1180,14 @@ public class ModelFactory implements SectionMesher.Models {
 
 
     public void free() {
-        this.bakery2.free();
-        MemoryUtil.nmemFree(this.bakeScratchBuffer);
+        var cleanup = new me.cortex.voxy.common.util.Cleanup();
+        cleanup.run(this.bakery2::free);
+        cleanup.run(() -> MemoryUtil.nmemFree(this.bakeScratchBuffer));
         while (!this.uploadResults.isEmpty()) {
-            this.uploadResults.poll().free();
+            var result = this.uploadResults.poll();
+            cleanup.run(result::free);
         }
+        cleanup.rethrow();
     }
 
 

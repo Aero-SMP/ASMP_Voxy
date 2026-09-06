@@ -139,7 +139,7 @@ final class DebugSnapshotShutdownBehaviorTest {
         return new WeakReference<>(session);
     }
 
-    private static AsyncNodeManager manager() throws Exception {
+    static AsyncNodeManager manager() throws Exception {
         var nodes = allocate(AsyncNodeManager.class);
         set(nodes, "submissionLock", new Object());
         set(nodes, "regionalBatchHandoff", new PublicationHandoff<>());
@@ -267,14 +267,14 @@ final class DebugSnapshotShutdownBehaviorTest {
                 && (long) get(transaction, "position") == position, "transaction lost exact section identity");
     }
 
-    private static <T> T allocate(Class<T> type) throws Exception {
+    static <T> T allocate(Class<T> type) throws Exception {
         Field field = Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
         return type.cast(((Unsafe) field.get(null)).allocateInstance(type));
     }
-    private static void set(Object object, String name, Object value) throws Exception {
+    static void set(Object object, String name, Object value) throws Exception {
         Field field = object.getClass().getDeclaredField(name); field.setAccessible(true); field.set(object, value);
     }
-    private static Object get(Object object, String name) throws Exception {
+    static Object get(Object object, String name) throws Exception {
         Field field = object.getClass().getDeclaredField(name); field.setAccessible(true); return field.get(object);
     }
     private static void check(boolean value, String message) { if (!value) throw new AssertionError(message); }

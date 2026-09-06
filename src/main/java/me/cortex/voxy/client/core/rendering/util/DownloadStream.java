@@ -121,6 +121,12 @@ public class DownloadStream {
     }
 
     public void tick() {
+        var cleanup = new me.cortex.voxy.common.util.Cleanup();
+        this.tick(cleanup);
+        cleanup.rethrow();
+    }
+
+    private void tick(me.cortex.voxy.common.util.Cleanup cleanup) {
         this.commit();
         if (!this.thisFrameAllocations.isEmpty()) {
             this.frames.add(new DownloadFrame(new GlFence(), new LongArrayList(this.thisFrameAllocations), new ArrayList<>(this.thisFrameDownloadList)));
@@ -140,16 +146,24 @@ public class DownloadStream {
 
             //Apply all the callbacks
             for (var data : frame.data) {
-                data.resultConsumer.consume(this.downloadBuffer.addr() + data.downloadStreamOffset, data.size);
+                cleanup.run(() -> data.resultConsumer.consume(
+                        this.downloadBuffer.addr() + data.downloadStreamOffset, data.size));
             }
 
-            frame.allocations.forEach(this.allocationArena::free);
-            frame.fence.free();
+            frame.allocations.forEach(address -> cleanup.run(() -> this.allocationArena.free(address)));
+            cleanup.run(frame.fence::free);
         }
     }
 
 
     public void flushWaitClear() {
+        var cleanup = new me.cortex.voxy.common.util.Cleanup();
+        this.flushWaitClear(cleanup);
+        cleanup.rethrow();
+    }
+
+    /** Callback failures accumulate; a failed GL completion barrier still throws immediately. */
+    public void flushWaitClear(me.cortex.voxy.common.util.Cleanup cleanup) {
         // A completed frame's callback may enqueue another download. Since tick() creates the
         // new frame fence after the preceding glFinish(), one additional flush is not enough:
         // the callback-created frame is necessarily unsignaled and used to crash teardown.
@@ -157,7 +171,7 @@ public class DownloadStream {
         // queue owns work reaches a finite fixed point while preserving every callback.
         do {
             glFinish();
-            this.tick();
+            this.tick(cleanup);
         } while (!this.frames.isEmpty()
                 || !this.downloadList.isEmpty()
                 || !this.thisFrameAllocations.isEmpty()
