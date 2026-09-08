@@ -121,8 +121,8 @@ fn resolve_listen(configured: &str, minecraft_port: u16) -> Result<SocketAddr> {
         return configured.parse().context("invalid quic.listen address");
     }
     let port = minecraft_port
-        .checked_add(2000)
-        .context("Minecraft port + 2000 exceeds 65535; set an explicit quic.listen address")?;
+        .checked_add(200)
+        .context("Minecraft port + 200 exceeds 65535; set an explicit quic.listen address")?;
     Ok(SocketAddr::from(([0, 0, 0, 0], port)))
 }
 
@@ -133,13 +133,13 @@ mod tests {
     #[test]
     fn automatic_listener_is_resolved_without_persisting_the_port() {
         let text = include_str!("../../server/src/main/resources/voxy-rust-default.toml");
-        for (minecraft, expected) in [(25565, 27565), (25586, 27586), (1, 2001), (63535, 65535)] {
+        for (minecraft, expected) in [(25565, 25765), (25586, 25786), (1, 201), (65335, 65535)] {
             let file: FileConfig = toml::from_str(text).unwrap();
             assert_eq!(file.quic.listen, "");
             let config = Config::from_file(file, false, minecraft).unwrap();
             assert_eq!(config.listen, SocketAddr::from(([0, 0, 0, 0], expected)));
         }
-        assert!(resolve_listen("", 63536).is_err());
+        assert!(resolve_listen("", 65336).is_err());
         assert!(resolve_listen("", 65535).is_err());
         assert_eq!(
             resolve_listen("127.0.0.1:12345", 65535).unwrap().port(),

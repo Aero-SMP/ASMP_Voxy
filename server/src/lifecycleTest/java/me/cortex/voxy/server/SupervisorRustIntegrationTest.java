@@ -25,7 +25,7 @@ public final class SupervisorRustIntegrationTest {
                 .replace("data = \"voxy-rust/data\"", "data = \"" + root.resolve("data") + "\""));
         byte[] unchangedConfig = Files.readAllBytes(config);
         int firstPort = availableUdpPort();
-        Files.writeString(root.resolve("server.properties"), "server-port=" + (firstPort - 2000) + "\n");
+        Files.writeString(root.resolve("server.properties"), "server-port=" + (firstPort - 200) + "\n");
         var owned = new RustBackend.Owner(config);
         try {
             RustBackend.start(owned);
@@ -38,7 +38,7 @@ public final class SupervisorRustIntegrationTest {
             byte[] key = Files.readAllBytes(root.resolve("data/quic/private-key.der"));
             byte[] catalog = probe(firstReady);
             int secondPort = availableUdpPort();
-            Files.writeString(root.resolve("server.properties"), "server-port=" + (secondPort - 2000) + "\n");
+            Files.writeString(root.resolve("server.properties"), "server-port=" + (secondPort - 200) + "\n");
             // Process.destroy() also closes Java's pipes. Signal like the live PID test,
             // leaving output draining to the supervisor until the child actually exits.
             SupervisorRecoveryBehaviorTest.check(first.toHandle().destroy(), "isolated child signal failed");
@@ -76,7 +76,7 @@ public final class SupervisorRustIntegrationTest {
     private static int availableUdpPort() throws IOException {
         try (var socket = new java.net.DatagramSocket(0)) {
             int port = socket.getLocalPort();
-            if (port <= 2000) throw new IOException("ephemeral test port is below automatic offset");
+            if (port <= 200) throw new IOException("ephemeral test port is below automatic offset");
             return port;
         }
     }
