@@ -34,8 +34,7 @@ rayon_threads = 0
 
 [quic]
 listen = ""
-advertise_host = ""
-advertise_port = 0
+advertise = ""
 ```
 
 The source is always `./world`, with dimensions in their standard directories. Generated LOD
@@ -50,12 +49,22 @@ current `server-port + 200`, resolved at every backend launch without rewriting 
 An explicit address such as `0.0.0.0:25786` overrides that automatic choice. `127.0.0.1` binds
 only loopback; `0.0.0.0` is a bind address, not an address to give remote players.
 
-`advertise_host` controls the **address sent to clients**, not the listening socket. Empty
-reuses the authenticated Minecraft peer address; a hostname/IP overrides that destination.
-`advertise_port = 0` sends the actual bound UDP port. Set a public port only when NAT or a
-proxy maps it to a different internal UDP port. For example, local `0.0.0.0:25786` may be
-reachable as `lod.example.com:30000`; advertise that host and port while forwarding UDP30000
-to UDP25786. Advertisement does not create forwarding, open a firewall or move a socket.
+`advertise` controls the **address sent to clients**, not the listening socket:
+
+| Value | Client destination |
+| --- | --- |
+| `""` | Minecraft connection's peer address and the actual bound UDP port |
+| `"lod.example.com"` | Override host only; keep the bound UDP port |
+| `":30000"` | Override port only; keep the Minecraft peer address |
+| `"lod.example.com:30000"` | Override both |
+| `"[2001:db8::1]:30000"` | IPv6 and explicit port; `[2001:db8::1]` keeps the bound port |
+
+Explicit ports must be 1–65535; omit the port to inherit it. IPv6 must be bracketed.
+For example, local `0.0.0.0:25786` may be reachable as `lod.example.com:30000`; advertise
+that address while forwarding UDP30000 to UDP25786. Advertisement does not create forwarding,
+open a firewall or move a socket. Restart Minecraft after changing the configuration.
+When upgrading, replace `advertise_host` and `advertise_port` with `advertise` using the
+forms above (old port zero means omit the port). The old keys are no longer accepted.
 The Minecraft connection authenticates the endpoint and pins Rust's persistent certificate.
 
 The controller starts Rust, forwards its output, restarts it after an unexpected exit, and removes

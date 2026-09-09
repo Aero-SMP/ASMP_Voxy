@@ -76,27 +76,14 @@ public final class VoxyServer {
             RustBackend.ensureConfig(RustBackend.CONFIG);
             try (Reader input = Files.newBufferedReader(RustBackend.CONFIG)) {
                 var config = new TomlParser().parse(input);
-                String host = config.getOrElse("quic.advertise_host", "");
-                return new AdvertisedAddress(QuicEndpointPayload.canonicalHost(host),
-                        advertisedPort(config.get("quic.advertise_port")));
+                if (config.contains("quic.advertise_host") || config.contains("quic.advertise_port")) {
+                    throw new IllegalArgumentException("Replace quic.advertise_host/advertise_port with quic.advertise");
+                }
+                return AdvertisedAddress.parse(config.getOrElse("quic.advertise", ""));
             }
         } catch (IOException | RuntimeException exception) {
             throw new IllegalStateException("Cannot read " + RustBackend.CONFIG, exception);
         }
     }
 
-    private static int advertisedPort(Object configured) {
-        if (configured == null) return 0;
-        if (!(configured instanceof Byte || configured instanceof Short
-                || configured instanceof Integer || configured instanceof Long)) {
-            throw new IllegalArgumentException("quic.advertise_port must be an integer");
-        }
-        long port = ((Number) configured).longValue();
-        if (port < 0 || port > 65535) {
-            throw new IllegalArgumentException("quic.advertise_port must be zero or valid");
-        }
-        return (int) port;
-    }
-
-    private record AdvertisedAddress(String host, int udpPortOverride) {}
 }

@@ -7,6 +7,6 @@ rayon_threads = 0
 # Empty uses 0.0.0.0:(current Minecraft server-port + 200) on every backend start.
 # Set an explicit address such as "0.0.0.0:25786" to override automatic selection.
 listen = ""
-# Empty host uses the Minecraft server address; zero advertises the bound UDP port.
-advertise_host = ""
-advertise_port = 0
+# Empty uses the Minecraft server address and bound UDP port.
+# Overrides: "lod.example.com", ":30000", "lod.example.com:30000", "[2001:db8::1]:30000".
+advertise = ""

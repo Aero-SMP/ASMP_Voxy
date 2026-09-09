@@ -36,16 +36,18 @@ rayon_threads = 0
 
 [quic]
 listen = ""
-advertise_host = ""
-advertise_port = 0
+advertise = ""
 ```
 
 ## Network
 
 Empty `listen` binds all IPv4 interfaces at `--minecraft-port + 200`; an explicit socket
 address overrides it. The Java controller supplies Minecraft's current port automatically.
-`advertise_host`/`advertise_port` only tell clients the reachable address through the controller;
-they do not bind a socket or configure NAT/firewall rules. See the root README for examples.
+`advertise` only tells clients the reachable address through the controller; it does not bind
+a socket or configure NAT/firewall rules. Empty inherits the Minecraft peer and bound port;
+`host`, `:port`, `host:port`, `[IPv6]` and `[IPv6]:port` override the corresponding parts.
+Java validates this controller-only setting; standalone Rust does not use it.
+Replace the old `advertise_host`/`advertise_port` keys when upgrading. See the root README.
 
 Rust creates a persistent certificate below `voxy-data/quic` and emits one readiness record after the
 UDP endpoint is live:

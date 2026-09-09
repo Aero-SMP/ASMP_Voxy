@@ -1,2 +1,2 @@
 [quic]
-advertise_host = ""
+advertise = ""

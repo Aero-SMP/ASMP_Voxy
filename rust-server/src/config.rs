@@ -26,17 +26,14 @@ struct QuicConfig {
     listen: String,
     /// Advertised by the authenticated Minecraft controller; the native listener does not use
     /// it, but accepting it keeps one strict shared configuration file for both processes.
-    advertise_host: String,
-    /// Public port advertised by the controller. Zero uses the actual UDP port in VOXY_READY.
-    advertise_port: u16,
+    advertise: String,
 }
 
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
             listen: String::new(),
-            advertise_host: String::new(),
-            advertise_port: 0,
+            advertise: String::new(),
         }
     }
 }
@@ -75,10 +72,8 @@ impl Config {
     }
 
     fn from_file(file: FileConfig, once: bool, minecraft_port: u16) -> Result<Self> {
-        if file.quic.advertise_host.len() > 253 {
-            bail!("quic.advertise_host is too long");
-        }
-        let _advertise_port = file.quic.advertise_port;
+        // Only Java uses/validates the public endpoint; Rust binds `listen` independently.
+        let _advertise = file.quic.advertise;
         if file.rayon_threads > 256 {
             bail!("rayon_threads must be between 1 and 256, or 0 for the Rayon default");
         }
@@ -114,6 +109,7 @@ mod tests {
         for (minecraft, expected) in [(25565, 25765), (25586, 25786), (1, 201), (65335, 65535)] {
             let file: FileConfig = toml::from_str(text).unwrap();
             assert_eq!(file.quic.listen, "");
+            assert_eq!(file.quic.advertise, "");
             let config = Config::from_file(file, false, minecraft).unwrap();
             assert_eq!(config.listen, SocketAddr::from(([0, 0, 0, 0], expected)));
         }
@@ -132,6 +128,18 @@ mod tests {
         assert!(toml::from_str::<FileConfig>("").is_ok());
         for setting in ["world = 'other'", "data = 'other'", "dimension = 'other:world'", "poll_ms = 100"] {
             assert!(toml::from_str::<FileConfig>(setting).is_err(), "accepted removed setting: {setting}");
+        }
+        for setting in ["advertise_host = ''", "advertise_port = 0"] {
+            assert!(toml::from_str::<FileConfig>(&format!("[quic]\n{setting}")).is_err());
+        }
+    }
+
+    #[test]
+    fn public_endpoint_does_not_change_listener() {
+        for advertise in ["", "lod.example.com", ":30000", "lod.example.com:30000", "[2001:db8::1]:30000"] {
+            let file: FileConfig = toml::from_str(&format!("[quic]\nadvertise = '{advertise}'")).unwrap();
+            assert_eq!(Config::from_file(file, false, 25586).unwrap().listen,
+                SocketAddr::from(([0, 0, 0, 0], 25786)));
         }
     }
 }
