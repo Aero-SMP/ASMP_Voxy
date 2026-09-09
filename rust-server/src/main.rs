@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use std::{
     collections::{BTreeMap, HashSet},
+    path::Path,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use voxy_rust_server::{
     anvil::{AnvilWorld, discover_dimensions},
@@ -29,9 +31,10 @@ async fn main() -> Result<()> {
             .build_global()
             .context("configure Rayon worker pool")?;
     }
-    let registry = Arc::new(RwLock::new(Registry::open(config.data.join("catalog"))?));
+    let data = Path::new("voxy-data");
+    let registry = Arc::new(RwLock::new(Registry::open(data.join("catalog"))?));
     let catalog_id = read_lock(&registry)?.catalog_id();
-    let discovered = discover_dimensions(&config.world, &config.dimension)?;
+    let discovered = discover_dimensions(Path::new("world"))?;
     let mut dimensions = BTreeMap::new();
     let mut paths = HashSet::new();
     for dimension in discovered {
@@ -45,7 +48,7 @@ async fn main() -> Result<()> {
         );
     }
     let service = Arc::new(RegionalService::open(
-        &config.data,
+        data,
         &dimensions,
         registry.clone(),
     )?);
@@ -53,10 +56,10 @@ async fn main() -> Result<()> {
         while service.refresh_all()? {}
         return Ok(());
     }
-    service.start(config.poll_interval)?;
+    service.start(Duration::from_secs(2))?;
     let state = Arc::new(ServerState::new(&dimensions, catalog_id, service.clone()));
 
-    let quic_identity = config.data.join("quic");
+    let quic_identity = data.join("quic");
     server::serve(state, config.listen, &quic_identity, shutdown_signal()).await
 }
 

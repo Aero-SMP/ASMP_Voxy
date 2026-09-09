@@ -545,19 +545,8 @@ impl LevelZeroGroup {
     }
 }
 
-pub fn discover_dimensions(root: &Path, fallback_dimension: &str) -> Result<Vec<DimensionSpec>> {
+pub fn discover_dimensions(root: &Path) -> Result<Vec<DimensionSpec>> {
     let mut out = Vec::new();
-    let looks_like_world_root = root.join("level.dat").is_file()
-        || root.join("DIM-1").is_dir()
-        || root.join("DIM1").is_dir()
-        || root.join("dimensions").is_dir();
-    if root.join("region").is_dir() && !looks_like_world_root {
-        out.push(DimensionSpec {
-            id: fallback_dimension.to_owned(),
-            root: root.to_owned(),
-        });
-        return Ok(out);
-    }
     for (id, relative) in [
         ("minecraft:overworld", ""),
         ("minecraft:the_nether", "DIM-1"),

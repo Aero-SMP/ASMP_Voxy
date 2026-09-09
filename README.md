@@ -27,25 +27,36 @@ The client JAR is written to `build/libs/`. The matching server-controller JAR i
 
 ## Server configuration
 
-Place `voxy-rust.toml` in the Minecraft server working directory:
+The controller creates `voxy-rust.toml` in the Minecraft server working directory if absent:
 
 ```toml
-world = "/path/to/minecraft/world"
-data = "/path/to/voxy-data"
-dimension = "minecraft:overworld"
-poll_ms = 2000
-rayon_threads = 16
+rayon_threads = 0
 
 [quic]
-listen = "0.0.0.0:25587"
+listen = ""
 advertise_host = ""
 advertise_port = 0
 ```
 
-An empty advertised host reuses the authenticated Minecraft peer address. Port zero uses the UDP
-port reported by Rust; set a public port only when NAT or a proxy remaps it. Minecraft TCP and Voxy
-UDP may use the same number. The Minecraft connection authenticates the endpoint and pins Rust's
-persistent certificate for the client session.
+The source is always `./world`, with dimensions in their standard directories. Generated LOD
+data, catalogs and certificate identity live in `./voxy-data`. Saved terrain polling is fixed
+at two seconds once background work is caught up; pending work continues immediately.
+`world`, `data`, `dimension` and `poll_ms` are no longer TOML settings. When upgrading, remove
+those keys and move the old data directory to `voxy-data` while the server is stopped, preserving
+its contents and certificate. Do not merge it with an existing unrelated data directory.
+
+`listen` controls the **local UDP socket**. Empty means all IPv4 interfaces on Minecraft's
+current `server-port + 200`, resolved at every backend launch without rewriting the config.
+An explicit address such as `0.0.0.0:25786` overrides that automatic choice. `127.0.0.1` binds
+only loopback; `0.0.0.0` is a bind address, not an address to give remote players.
+
+`advertise_host` controls the **address sent to clients**, not the listening socket. Empty
+reuses the authenticated Minecraft peer address; a hostname/IP overrides that destination.
+`advertise_port = 0` sends the actual bound UDP port. Set a public port only when NAT or a
+proxy maps it to a different internal UDP port. For example, local `0.0.0.0:25786` may be
+reachable as `lod.example.com:30000`; advertise that host and port while forwarding UDP30000
+to UDP25786. Advertisement does not create forwarding, open a firewall or move a socket.
+The Minecraft connection authenticates the endpoint and pins Rust's persistent certificate.
 
 The controller starts Rust, forwards its output, restarts it after an unexpected exit, and removes
 the advertised endpoint whenever that process is unavailable. See

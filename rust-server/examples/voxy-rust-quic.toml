@@ -1,7 +1,5 @@
-world = "/srv/minecraft/world"
-data = "/srv/minecraft/voxy-rust"
-poll_ms = 2000
-rayon_threads = 16
+# Run from the server directory: ./world is the source, ./voxy-data is generated data.
+rayon_threads = 0
 
 [quic]
 # Empty resolves to --minecraft-port + 200 on startup (25765 without the option).

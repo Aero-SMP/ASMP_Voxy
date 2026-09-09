@@ -138,6 +138,7 @@ final class RustBackend {
         if (owned.launch != null) return owned.launch.call();
         var builder = new ProcessBuilder(owned.binary.toString(), "--config", owned.config.toString(),
                 "--minecraft-port", Integer.toString(minecraftPort(owned.config)))
+                .directory(owned.config.toAbsolutePath().getParent().toFile())
                 .redirectErrorStream(true);
         builder.environment().put("MALLOC_ARENA_MAX", "2");
         return builder.start();

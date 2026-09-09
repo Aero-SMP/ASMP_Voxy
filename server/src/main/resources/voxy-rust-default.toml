@@ -1,9 +1,5 @@
-# Generated on first startup. Paths are relative to the server working directory.
-# Change world if server.properties uses a different level-name.
-world = "world"
-data = "voxy-rust/data"
-dimension = "minecraft:overworld"
-poll_ms = 2000
+# World: ./world with standard dimension folders. Generated data: ./voxy-data.
+# Saved terrain is checked every two seconds once background work is caught up.
 # Zero lets Rayon choose its default worker count.
 rayon_threads = 0
 

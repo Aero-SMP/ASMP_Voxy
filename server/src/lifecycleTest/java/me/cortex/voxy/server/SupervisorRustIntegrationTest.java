@@ -17,12 +17,12 @@ public final class SupervisorRustIntegrationTest {
     public static void main(String[] args) throws Exception {
         Path root = Files.createTempDirectory("voxy-supervisor-interop-");
         Files.createDirectories(root.resolve("world/region"));
+        Files.createDirectories(root.resolve("world/DIM-1/region"));
+        Files.createDirectories(root.resolve("world/DIM1/region"));
+        Files.createDirectories(root.resolve("world/dimensions/test/nested/custom/region"));
         Path config = root.resolve("voxy-rust.toml");
         RustBackend.ensureConfig(config);
-        // Keep listen empty: change only isolated paths and Minecraft's port source.
-        Files.writeString(config, Files.readString(config)
-                .replace("world = \"world\"", "world = \"" + root.resolve("world") + "\"")
-                .replace("data = \"voxy-rust/data\"", "data = \"" + root.resolve("data") + "\""));
+        // Run the unmodified generated config in an isolated server directory.
         byte[] unchangedConfig = Files.readAllBytes(config);
         int firstPort = availableUdpPort();
         Files.writeString(root.resolve("server.properties"), "server-port=" + (firstPort - 200) + "\n");
@@ -34,9 +34,13 @@ public final class SupervisorRustIntegrationTest {
             SupervisorRecoveryBehaviorTest.check(firstReady.udpPort() == firstPort, "automatic initial UDP port incorrect");
             Process first = owned.child;
             Path executable = owned.binary;
-            byte[] certificate = Files.readAllBytes(root.resolve("data/quic/certificate.der"));
-            byte[] key = Files.readAllBytes(root.resolve("data/quic/private-key.der"));
+            byte[] certificate = Files.readAllBytes(root.resolve("voxy-data/quic/certificate.der"));
+            byte[] key = Files.readAllBytes(root.resolve("voxy-data/quic/private-key.der"));
             byte[] catalog = probe(firstReady);
+            for (String dimension : new String[]{"minecraft:the_nether", "minecraft:the_end", "test:nested/custom"}) {
+                SupervisorRecoveryBehaviorTest.check(Arrays.equals(catalog, probe(firstReady, dimension)),
+                        "normal dimension discovery/catalog failed for " + dimension);
+            }
             int secondPort = availableUdpPort();
             Files.writeString(root.resolve("server.properties"), "server-port=" + (secondPort - 200) + "\n");
             // Process.destroy() also closes Java's pipes. Signal like the live PID test,
@@ -52,8 +56,8 @@ public final class SupervisorRustIntegrationTest {
             SupervisorRecoveryBehaviorTest.check(!first.isAlive() && second.isAlive(), "bundled Rust overlap or no replacement");
             SupervisorRecoveryBehaviorTest.check(first.exitValue() == 0, "isolated Rust did not exit cleanly on SIGTERM");
             SupervisorRecoveryBehaviorTest.check(Arrays.equals(firstReady.certificateSha256(), secondReady.certificateSha256()), "identity changed after replacement");
-            SupervisorRecoveryBehaviorTest.check(Arrays.equals(certificate, Files.readAllBytes(root.resolve("data/quic/certificate.der")))
-                    && Arrays.equals(key, Files.readAllBytes(root.resolve("data/quic/private-key.der"))), "persisted identity rewritten");
+            SupervisorRecoveryBehaviorTest.check(Arrays.equals(certificate, Files.readAllBytes(root.resolve("voxy-data/quic/certificate.der")))
+                    && Arrays.equals(key, Files.readAllBytes(root.resolve("voxy-data/quic/private-key.der"))), "persisted identity rewritten");
             SupervisorRecoveryBehaviorTest.check(Arrays.equals(catalog, probe(secondReady)), "catalog transfer changed across restart");
             RustBackend.stop();
             SupervisorRecoveryBehaviorTest.check(second.exitValue() == 0, "supervisor closed Rust shutdown pipes before clean exit");
@@ -62,7 +66,8 @@ public final class SupervisorRustIntegrationTest {
             System.out.println("Bundled Rust interop PASS: PIDs " + first.pid() + " -> " + second.pid()
                     + "; UDP " + firstPort + " -> " + secondPort + " with unchanged empty-listen TOML"
                     + "; same certificate/private key; pinned QUIC handshake and " + catalog.length
-                    + " catalog bytes transferred before/after; no child/executable after stop");
+                    + " catalog bytes transferred before/after; standard/custom dimensions discovered;"
+                    + " voxy-data used; no child/executable after stop");
         } finally {
             RustBackend.stop();
             if (owned.child == null && (owned.thread == null || !owned.thread.isAlive())) {
@@ -82,6 +87,10 @@ public final class SupervisorRustIntegrationTest {
     }
 
     private static byte[] probe(RustBackend.ReadyRecord ready) throws Exception {
+        return probe(ready, "minecraft:overworld");
+    }
+
+    private static byte[] probe(RustBackend.ReadyRecord ready, String dimensionId) throws Exception {
         var connection = QuicClientConnection.newBuilder().host("voxy.local").proxy("127.0.0.1")
                 .port(ready.udpPort()).applicationProtocol(ready.alpn()).connectTimeout(Duration.ofSeconds(5))
                 .customTrustManager(new X509TrustManager() {
@@ -101,7 +110,7 @@ public final class SupervisorRustIntegrationTest {
                 var stream = connection.createStream(true);
                 var output = stream.getOutputStream();
                 output.write(0); // Production regional control stream.
-                byte[] dimension = "minecraft:overworld".getBytes(StandardCharsets.UTF_8);
+                byte[] dimension = dimensionId.getBytes(StandardCharsets.UTF_8);
                 byte[] hello = ByteBuffer.allocate(7 + dimension.length).order(ByteOrder.LITTLE_ENDIAN)
                         .put((byte) 1).putInt(2 + dimension.length).putShort((short) dimension.length).put(dimension).array();
                 output.write(hello); output.flush();

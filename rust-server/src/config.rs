@@ -1,14 +1,10 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub world: PathBuf,
-    pub data: PathBuf,
     pub listen: SocketAddr,
-    pub dimension: String,
-    pub poll_interval: Duration,
     pub rayon_threads: usize,
     pub once: bool,
 }
@@ -16,12 +12,6 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
-    world: PathBuf,
-    data: PathBuf,
-    #[serde(default = "default_dimension")]
-    dimension: String,
-    #[serde(default = "default_poll_ms")]
-    poll_ms: u64,
     #[serde(default)]
     rayon_threads: usize,
     #[serde(default)]
@@ -89,23 +79,11 @@ impl Config {
             bail!("quic.advertise_host is too long");
         }
         let _advertise_port = file.quic.advertise_port;
-        if file.poll_ms < 100 {
-            bail!("poll_ms must be at least 100");
-        }
         if file.rayon_threads > 256 {
             bail!("rayon_threads must be between 1 and 256, or 0 for the Rayon default");
         }
-        if file.dimension.is_empty()
-            || file.dimension.len() > crate::regional::wire::MAX_DIMENSION_BYTES
-        {
-            bail!("dimension is outside the length limit");
-        }
         Ok(Self {
-            world: file.world,
-            data: file.data,
             listen: resolve_listen(&file.quic.listen, minecraft_port)?,
-            dimension: file.dimension,
-            poll_interval: Duration::from_millis(file.poll_ms),
             rayon_threads: file.rayon_threads,
             once: once || file.once,
         })
@@ -148,11 +126,12 @@ mod tests {
         assert_eq!(resolve_listen("[::1]:12345", 25565).unwrap().port(), 12345);
         assert!(resolve_listen("not an address", 25565).is_err());
     }
-}
 
-fn default_dimension() -> String {
-    "minecraft:overworld".to_owned()
-}
-fn default_poll_ms() -> u64 {
-    2_000
+    #[test]
+    fn removed_settings_are_not_part_of_the_config() {
+        assert!(toml::from_str::<FileConfig>("").is_ok());
+        for setting in ["world = 'other'", "data = 'other'", "dimension = 'other:world'", "poll_ms = 100"] {
+            assert!(toml::from_str::<FileConfig>(setting).is_err(), "accepted removed setting: {setting}");
+        }
+    }
 }

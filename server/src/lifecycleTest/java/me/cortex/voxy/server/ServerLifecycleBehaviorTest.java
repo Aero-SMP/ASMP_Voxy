@@ -37,11 +37,12 @@ public final class ServerLifecycleBehaviorTest {
             RustBackend.ensureConfig(file);
             String generated = java.nio.file.Files.readString(file);
             var config = new com.electronwill.nightconfig.toml.TomlParser().parse(generated);
-            check("world".equals(config.get("world")), "wrong default world");
-            check("voxy-rust/data".equals(config.get("data")), "wrong default data directory");
+            for (String removed : new String[]{"world", "data", "dimension", "poll_ms"}) {
+                check(!config.contains(removed), "removed setting remains in generated config: " + removed);
+            }
             check("".equals(config.get("quic.listen")), "automatic listener must remain empty");
             check(RustBackend.minecraftPort(file) == 25565, "wrong missing-file fallback port");
-            check(config.getInt("poll_ms") == 2000 && config.getInt("rayon_threads") == 0, "wrong worker/poll defaults");
+            check(config.getInt("rayon_threads") == 0, "wrong worker default");
             RustBackend.ensureConfig(file);
             check(generated.equals(java.nio.file.Files.readString(file)), "second startup rewrote config");
             var properties = directory.resolve("server.properties");
