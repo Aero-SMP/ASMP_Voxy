@@ -47,13 +47,9 @@ async fn main() -> Result<()> {
             Arc::new(AnvilWorld::new(dimension.id, dimension.root)),
         );
     }
-    let service = Arc::new(RegionalService::open(
-        data,
-        &dimensions,
-        registry.clone(),
-    )?);
+    let service = Arc::new(RegionalService::open(data, &dimensions, registry.clone())?);
     if config.once {
-        while service.refresh_all()? {}
+        service.refresh_once()?;
         return Ok(());
     }
     service.start(Duration::from_secs(2))?;

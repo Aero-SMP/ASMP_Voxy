@@ -150,7 +150,11 @@ impl RegionSourceTable {
                 .open(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+            #[cfg(test)]
+            super::faults::hit("source_before_rename", path)?;
             fs::rename(&temporary, path)?;
+            #[cfg(test)]
+            super::faults::hit("source_after_rename", path)?;
             sync_parent(path)
         })();
         if result.is_err() {

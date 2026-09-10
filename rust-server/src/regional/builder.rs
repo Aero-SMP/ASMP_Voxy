@@ -27,6 +27,32 @@ pub struct RegionalBuildStats {
     pub output_bytes: u64,
 }
 
+/// Terrain replacement may have happened even when its final sync/reopen failed.
+/// The runtime reconciles it before attempting the separate source-table publication.
+pub struct RegionalBuild {
+    pub terrain: Result<RegionFile>,
+    pub source: RegionSourceTable,
+    pub stats: RegionalBuildStats,
+}
+
+#[derive(Debug)]
+pub(crate) struct SourceChanged;
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Anvil source snapshot changed")
+    }
+}
+impl std::error::Error for SourceChanged {}
+
+#[derive(Debug)]
+pub(crate) struct UnusableBaseline;
+impl std::fmt::Display for UnusableBaseline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incremental baseline is unusable")
+    }
+}
+impl std::error::Error for UnusableBaseline {}
+
 /// Publishes a normal saved-world update by rebuilding only changed 2x2-chunk groups and their
 /// ancestors. Every unaffected section keeps its exact compressed representation.
 #[allow(clippy::too_many_arguments)]
@@ -38,11 +64,12 @@ pub fn rebuild_region_incremental(
     source_table: &RegionSourceTable,
     changed_groups: &BTreeSet<(i32, i32)>,
     output: impl AsRef<Path>,
-    source_output: impl AsRef<Path>,
     world_identity: [u8; 32],
     generation: u64,
     layout: RegionLayout,
-) -> Result<(RegionFile, RegionalBuildStats)> {
+) -> Result<RegionalBuild> {
+    #[cfg(test)]
+    super::faults::hit("incremental", output.as_ref())?;
     if changed_groups.is_empty()
         || previous.region() != (header.region_x, header.region_z)
         || previous.layout() != layout
@@ -102,17 +129,15 @@ pub fn rebuild_region_incremental(
     for ordinal in 0..layout.entry_count()? {
         let coordinate = layout.coordinate(header.region_x, header.region_z, ordinal)?;
         if !affected_horizontal[coordinate.level as usize].contains(&(coordinate.x, coordinate.z)) {
-            file.copy_ordinal_from(previous, ordinal)?;
+            file.copy_ordinal_from(previous, ordinal)
+                .context(UnusableBaseline)?;
             stats.reused_sections +=
                 usize::from(previous.entry_ordinal(ordinal as u32)?.is_present());
         }
     }
 
-    verify_header(source, header, "incremental regional rebuild")?;
-    let region = file.write_atomic(output)?;
-    source_table.write_atomic(source_output)?;
-    stats.output_bytes = region.path().metadata()?.len();
-    Ok((region, stats))
+    verify_header(source, header)?;
+    publish(file, output.as_ref(), source_table.clone(), stats)
 }
 
 type SectionColumn = BTreeMap<i32, Section>;
@@ -186,14 +211,14 @@ fn rebuild_changed_column(
             if !changed_children.contains_key(&horizontal)
                 && stored_y(layout, child.level, child.y)?
             {
-                loaded[slot] =
-                    previous
-                        .read_section(SectionCoordinate::from(child))?
-                        .map(|frame| Section {
-                            key: child,
-                            non_empty_children: frame.non_empty_children,
-                            cells: frame.cells,
-                        });
+                loaded[slot] = previous
+                    .read_section(SectionCoordinate::from(child))
+                    .context(UnusableBaseline)?
+                    .map(|frame| Section {
+                        key: child,
+                        non_empty_children: frame.non_empty_children,
+                        cells: frame.cells,
+                    });
             }
         }
         let inputs = std::array::from_fn(|slot| {
@@ -233,11 +258,12 @@ pub fn rebuild_region(
     registry: &Arc<RwLock<Registry>>,
     header: &RegionHeader,
     output: impl AsRef<Path>,
-    source_output: impl AsRef<Path>,
     world_identity: [u8; 32],
     generation: u64,
     layout: RegionLayout,
-) -> Result<(RegionFile, RegionalBuildStats)> {
+) -> Result<RegionalBuild> {
+    #[cfg(test)]
+    super::faults::hit("full", output.as_ref())?;
     if header.entries.len() != 1024 {
         bail!("regional rebuild requires exactly 1024 Anvil header entries");
     }
@@ -378,13 +404,31 @@ pub fn rebuild_region(
 
     // Publication must describe one source snapshot. A changed marker/header aborts this bounded
     // transaction; the caller retries the region rather than publishing mixed old/new cells.
-    verify_header(source, header, "regional rebuild")?;
-    let region = file.write_atomic(output)?;
-    // Terrain is durable first. If this smaller publication fails or the process stops here, the
-    // old source marker causes one safe regional rebuild on restart.
-    source_table.write_atomic(source_output)?;
-    stats.output_bytes = region.path().metadata()?.len();
-    Ok((region, stats))
+    verify_header(source, header)?;
+    publish(file, output.as_ref(), source_table, stats)
+}
+
+fn publish(
+    file: RegionFileBuilder,
+    output: &Path,
+    source: RegionSourceTable,
+    mut stats: RegionalBuildStats,
+) -> Result<RegionalBuild> {
+    let terrain = file.write_atomic(output).and_then(|region| {
+        stats.output_bytes = region.path().metadata()?.len();
+        Ok(region)
+    });
+    if terrain
+        .as_ref()
+        .is_err_and(|error| error.is::<UnusableBaseline>())
+    {
+        return Err(terrain.err().unwrap()); // Copy failed before rename; full fallback is safe.
+    }
+    Ok(RegionalBuild {
+        terrain,
+        source,
+        stats,
+    })
 }
 
 fn child_refs(
@@ -436,12 +480,14 @@ fn stored_y(layout: RegionLayout, level: u8, y: i32) -> Result<bool> {
     Ok(layout.level_y_range(level)?.contains(&y))
 }
 
-fn verify_header(source: &AnvilWorld, header: &RegionHeader, operation: &str) -> Result<()> {
+pub(crate) fn verify_header(source: &AnvilWorld, header: &RegionHeader) -> Result<()> {
+    #[cfg(test)]
+    super::faults::hit("verify_header", &source.root)?;
     let current = source
         .region_header(header.region_x, header.region_z)?
-        .with_context(|| format!("Anvil region disappeared during {operation}"))?;
+        .ok_or(SourceChanged)?;
     if current.file_marker != header.file_marker || current.entries != header.entries {
-        bail!("Anvil region changed during {operation}");
+        return Err(SourceChanged.into());
     }
     Ok(())
 }

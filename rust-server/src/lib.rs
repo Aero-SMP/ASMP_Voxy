@@ -10,18 +10,28 @@ pub mod server;
 
 pub const MAX_LOD: u8 = 4;
 
+/// A poisoned shared owner must not be treated as a retryable region-local I/O error.
+#[derive(Debug)]
+pub struct UnsafeState(pub &'static str);
+impl std::fmt::Display for UnsafeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for UnsafeState {}
+
 pub fn read_lock<T>(
     lock: &std::sync::RwLock<T>,
 ) -> anyhow::Result<std::sync::RwLockReadGuard<'_, T>> {
     lock.read()
-        .map_err(|_| anyhow::anyhow!("read lock poisoned"))
+        .map_err(|_| UnsafeState("read lock poisoned").into())
 }
 
 pub(crate) fn write_lock<T>(
     lock: &std::sync::RwLock<T>,
 ) -> anyhow::Result<std::sync::RwLockWriteGuard<'_, T>> {
     lock.write()
-        .map_err(|_| anyhow::anyhow!("write lock poisoned"))
+        .map_err(|_| UnsafeState("write lock poisoned").into())
 }
 
 pub fn safe_dimension_name(name: &str) -> String {

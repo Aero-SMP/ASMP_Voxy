@@ -162,11 +162,134 @@ fn compare(actual: &RegionFile, expected: &RegionFile) {
 }
 
 #[test]
+fn corrupt_incremental_reuse_falls_back_once_and_matches_clean_full_build() {
+    use std::{cell::RefCell, os::unix::fs::FileExt, rc::Rc};
+    for x in [-15, -8] {
+        let f = Fixture::new();
+        f.save(0);
+        let runtime = f.runtime();
+        runtime.refresh(0).unwrap();
+        let old = runtime.region(-1, -1).unwrap().unwrap();
+        let coordinate = SectionCoordinate {
+            level: 0,
+            x,
+            y: 0,
+            z: -16,
+        };
+        let entry = old.entry(coordinate).unwrap();
+        assert!(entry.has_payload());
+        let file = fs::OpenOptions::new().write(true).open(old.path()).unwrap();
+        file.write_all_at(&[0xff], entry.payload_offset).unwrap();
+        file.sync_all().unwrap();
+        f.save(1);
+        let counts = Rc::new(RefCell::new((0, 0)));
+        let seen = counts.clone();
+        let guard = super::faults::set(move |stage, _| {
+            if stage == "incremental" {
+                seen.borrow_mut().0 += 1;
+            }
+            if stage == "full" {
+                seen.borrow_mut().1 += 1;
+            }
+            Ok(())
+        });
+        let start = std::time::Instant::now();
+        let report = runtime.refresh(1).unwrap();
+        eprintln!(
+            "corrupt reuse x={x} recovery_us={}",
+            start.elapsed().as_micros()
+        );
+        assert_eq!(report.changed, vec![(-1, -1, 2)]);
+        assert!(!report.incomplete);
+        assert_eq!(*counts.borrow(), (1, 1));
+        drop(guard);
+        let fresh = f.source.region_header(-1, -1).unwrap().unwrap();
+        let full = rebuild_region(
+            &f.source,
+            &f.registry,
+            &fresh,
+            f.root.join("clean.vxregion"),
+            old.world_identity(),
+            100,
+            old.layout(),
+        )
+        .unwrap()
+        .terrain
+        .unwrap();
+        compare(&runtime.region(-1, -1).unwrap().unwrap(), &full);
+    }
+}
+
+#[test]
+fn final_full_and_incremental_snapshot_changes_defer_without_stale_fallback() {
+    use std::{cell::RefCell, rc::Rc};
+    for incremental in [false, true] {
+        let f = Fixture::new();
+        f.save(0);
+        let runtime = f.runtime();
+        if incremental {
+            runtime.refresh(0).unwrap();
+            f.save(1);
+        }
+        let source_path = f.source.root.join("region/r.-1.-1.mca");
+        let counts = Rc::new(RefCell::new((0, 0, 0)));
+        let seen = counts.clone();
+        let guard = super::faults::set(move |stage, _| {
+            if stage == "incremental" {
+                seen.borrow_mut().0 += 1;
+            }
+            if stage == "full" {
+                seen.borrow_mut().1 += 1;
+            }
+            if stage == "verify_header" {
+                seen.borrow_mut().2 += 1;
+                if !incremental || seen.borrow().2 == 2 {
+                    let mut bytes = fs::read(&source_path)?;
+                    bytes[4096] ^= 1;
+                    fs::write(&source_path, bytes)?;
+                }
+            }
+            Ok(())
+        });
+        let report = runtime.refresh(1).unwrap();
+        assert!(report.incomplete && report.changed.is_empty());
+        assert_eq!(counts.borrow().0, usize::from(incremental));
+        assert_eq!(counts.borrow().1, usize::from(!incremental));
+        assert_eq!(runtime.region(-1, -1).unwrap().is_some(), incremental);
+        drop(guard);
+        assert!(!runtime.refresh(2).unwrap().incomplete);
+    }
+}
+
+#[test]
+fn unreadable_source_probe_does_not_trigger_equivalent_full_work() {
+    let f = Fixture::new();
+    f.save(0);
+    let runtime = f.runtime();
+    runtime.refresh(0).unwrap();
+    let path = f.source.root.join("region/r.-1.-1.mca");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[4096] ^= 1;
+    bytes[8192..8196].fill(0);
+    fs::write(&path, bytes).unwrap();
+    let guard = super::faults::set(|stage, _| {
+        assert_ne!(stage, "incremental");
+        assert_ne!(stage, "full");
+        Ok(())
+    });
+    assert!(runtime.refresh(1).unwrap().incomplete);
+    assert_eq!(runtime.region(-1, -1).unwrap().unwrap().generation(), 1);
+    drop(guard);
+    f.save(1);
+    assert_eq!(runtime.refresh(2).unwrap().changed, vec![(-1, -1, 2)]);
+}
+
+#[test]
 fn saved_lighting_updates_match_full_build_after_reopening_at_every_lod() {
     let f = Fixture::new();
     f.save(0);
     let mut runtime = f.runtime();
-    assert_eq!(runtime.refresh().unwrap().changed.len(), 1);
+    assert_eq!(runtime.refresh(0).unwrap().changed.len(), 1);
     let first = runtime.region(-1, -1).unwrap().unwrap();
     let world = first.world_identity();
     let layout = first.layout();
@@ -178,27 +301,32 @@ fn saved_lighting_updates_match_full_build_after_reopening_at_every_lod() {
         f.save(revision);
         runtime = f.runtime();
         // Real source-table/header probe must recognize a lighting-only saved change.
-        let refreshed = runtime.refresh().unwrap();
+        let refreshed = runtime.refresh(0).unwrap();
         assert_eq!(refreshed.metadata_only, 0);
         assert_eq!(refreshed.changed, vec![(-1, -1, revision as u64 + 1)]);
         let live = runtime.region(-1, -1).unwrap().unwrap();
         let header = f.source.region_headers().unwrap().valid.remove(0);
         let start = std::time::Instant::now();
-        let (full, full_stats) = rebuild_region(
+        let full_build = rebuild_region(
             &f.source,
             &f.registry,
             &header,
             f.root.join("full.vxregion"),
-            f.root.join("full.vxsource"),
             world,
             100 + revision as u64,
             layout,
         )
         .unwrap();
+        let full = full_build.terrain.unwrap();
+        let full_stats = full_build.stats;
+        full_build
+            .source
+            .write_atomic(f.root.join("full.vxsource"))
+            .unwrap();
         let full_time = start.elapsed();
         let table = RegionSourceTable::open(f.root.join("full.vxsource")).unwrap();
         let start = std::time::Instant::now();
-        let (incremental, stats) = rebuild_region_incremental(
+        let incremental_build = rebuild_region_incremental(
             &f.source,
             &f.registry,
             &header,
@@ -206,12 +334,17 @@ fn saved_lighting_updates_match_full_build_after_reopening_at_every_lod() {
             &table,
             &BTreeSet::from([(-16, -16)]),
             f.root.join(format!("incremental-{revision}.vxregion")),
-            f.root.join("incremental.vxsource"),
             world,
             table.terrain_generation,
             layout,
         )
         .unwrap();
+        let incremental = incremental_build.terrain.unwrap();
+        let stats = incremental_build.stats;
+        incremental_build
+            .source
+            .write_atomic(f.root.join("incremental.vxsource"))
+            .unwrap();
         let incremental_time = start.elapsed();
         assert!(stats.reused_sections > 0);
         assert_eq!(stats.chunks_read, 4);
@@ -237,7 +370,7 @@ fn saved_lighting_updates_match_full_build_after_reopening_at_every_lod() {
         );
         // Preserve the runtime file's previous inode while reopening the independent build next time.
         previous_path = incremental.path().to_owned();
-        assert!(runtime.refresh().unwrap().changed.is_empty());
+        assert!(runtime.refresh(0).unwrap().changed.is_empty());
     }
 }
 
@@ -247,7 +380,7 @@ fn obsolete_or_missing_terrain_cannot_be_skipped_by_a_current_source_table() {
         let f = Fixture::new();
         f.save(0);
         let runtime = f.runtime();
-        runtime.refresh().unwrap();
+        runtime.refresh(0).unwrap();
         let old = runtime.region(-1, -1).unwrap().unwrap();
         let path = old.path().to_owned();
         let expected_source = fs::read(path.with_extension("vxsource")).unwrap();
@@ -269,15 +402,15 @@ fn obsolete_or_missing_terrain_cannot_be_skipped_by_a_current_source_table() {
             fs::read(path.with_extension("vxsource")).unwrap(),
             expected_source
         );
-        let result = runtime.refresh().unwrap();
+        let result = runtime.refresh(0).unwrap();
         assert_eq!(result.changed, vec![(-1, -1, 1)]);
         assert_eq!(result.metadata_only, 0);
         assert_eq!(&fs::read(&path).unwrap()[..8], b"VXYRGN\0\x01");
         drop(runtime);
         let runtime = f.runtime();
-        assert!(runtime.refresh().unwrap().changed.is_empty());
+        assert!(runtime.refresh(0).unwrap().changed.is_empty());
         f.save(1);
-        assert_eq!(runtime.refresh().unwrap().changed, vec![(-1, -1, 2)]);
+        assert_eq!(runtime.refresh(0).unwrap().changed, vec![(-1, -1, 2)]);
     }
 }
 
@@ -291,7 +424,7 @@ fn stored_air_is_normalized_and_served_empty_in_an_ordinary_mixed_batch() {
         f.registry.clone(),
     )
     .unwrap();
-    service.refresh_all().unwrap();
+    service.refresh_all(0).unwrap();
     let region = service
         .runtime(&f.source.dimension)
         .unwrap()

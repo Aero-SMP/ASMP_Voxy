@@ -516,14 +516,19 @@ impl RegionFileBuilder {
                         let mut actual_crc = 0;
                         while remaining != 0 {
                             let count = remaining.min(reuse_buffer.len());
-                            source.read_exact_at(&mut reuse_buffer[..count], offset)?;
+                            source
+                                .read_exact_at(&mut reuse_buffer[..count], offset)
+                                .context(super::builder::UnusableBaseline)?;
                             actual_crc = crc32c::crc32c_append(actual_crc, &reuse_buffer[..count]);
                             file.write_all(&reuse_buffer[..count])?;
                             offset += count as u64;
                             remaining -= count;
                         }
                         if actual_crc != crc {
-                            bail!("reused regional section compressed checksum mismatch");
+                            return Err(anyhow::anyhow!(
+                                "reused regional section compressed checksum mismatch"
+                            )
+                            .context(super::builder::UnusableBaseline));
                         }
                     }
                     None => {}
@@ -533,7 +538,11 @@ impl RegionFileBuilder {
                 bail!("regional file writer produced an unexpected length");
             }
             file.sync_all()?;
+            #[cfg(test)]
+            super::faults::hit("terrain_before_rename", path)?;
             fs::rename(&temporary, path).with_context(|| format!("publish {}", path.display()))?;
+            #[cfg(test)]
+            super::faults::hit("terrain_after_rename", path)?;
             sync_parent(path)?;
             Ok(())
         })();
@@ -541,6 +550,8 @@ impl RegionFileBuilder {
             let _ = fs::remove_file(&temporary);
         }
         result?;
+        #[cfg(test)]
+        super::faults::hit("terrain_reopen", path)?;
         let mut region = RegionFile {
             path: path.to_owned(),
             file: Arc::new(File::open(path)?),

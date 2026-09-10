@@ -1,0 +1,6 @@
+// Keep the compatible live client on 211; do not publish an unnecessary client update.
+allprojects {
+    tasks.withType(Jar).configureEach {
+        destinationDirectory = rootProject.layout.projectDirectory.dir('build/release-validation-212')
+    }
+}

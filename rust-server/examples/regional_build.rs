@@ -36,16 +36,20 @@ fn main() -> Result<()> {
     identity_input.extend_from_slice(b"\0minecraft:overworld");
     let world_identity = *blake3::hash(&identity_input).as_bytes();
     let terrain_path = output.join(format!("r.{region_x}.{region_z}.vxregion"));
-    let (region, stats) = rebuild_region(
+    let built = rebuild_region(
         &source,
         &registry,
         &header,
         &terrain_path,
-        output.join(format!("r.{region_x}.{region_z}.vxsource")),
         world_identity,
         1,
         RegionLayout::new(-2, 12, 5)?,
     )?;
+    let region = built.terrain?;
+    built
+        .source
+        .write_atomic(output.join(format!("r.{region_x}.{region_z}.vxsource")))?;
+    let stats = built.stats;
     let reopened = RegionFile::open(&terrain_path)?;
     if reopened.generation() != region.generation() {
         bail!("reopened regional generation disagrees with the publication");

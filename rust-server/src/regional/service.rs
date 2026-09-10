@@ -11,7 +11,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex, RwLock, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{Notify, broadcast},
@@ -20,6 +20,59 @@ use tokio::{
 
 const ANNOUNCEMENT_CAPACITY: usize = 4_096;
 const TARGET_SECTION_BATCH_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+pub struct RefreshStatus {
+    pub more_pending: bool,
+    pub incomplete: bool,
+    pub failure: Option<String>,
+}
+
+struct RetryRound {
+    number: u64,
+    deadline: Instant,
+    interval: Duration,
+}
+impl RetryRound {
+    fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            number: 0,
+            deadline: now + interval,
+            interval,
+        }
+    }
+    fn advance(&mut self, now: Instant) {
+        if now >= self.deadline {
+            self.number = self
+                .number
+                .checked_add(1)
+                .expect("regional retry round exhausted");
+            self.deadline = now + self.interval;
+        }
+    }
+}
+
+#[cfg(test)]
+mod round_tests {
+    use super::*;
+    #[test]
+    fn wakeups_and_backlogs_share_round_until_deadline() {
+        let now = Instant::now();
+        let mut round = RetryRound::new(now, Duration::from_secs(2));
+        for _ in 0..1000 {
+            round.advance(now + Duration::from_secs(1));
+            assert_eq!(round.number, 0);
+        }
+        round.advance(now + Duration::from_secs(2));
+        assert_eq!(round.number, 1);
+        for _ in 0..1000 {
+            round.advance(now + Duration::from_secs(3));
+            assert_eq!(round.number, 1);
+        }
+        round.advance(now + Duration::from_secs(4));
+        assert_eq!(round.number, 2);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum RegionalAnnouncement {
@@ -96,11 +149,15 @@ impl RegionalService {
         self.announcements.subscribe()
     }
 
-    pub fn refresh_all(&self) -> Result<bool> {
-        let mut more = false;
+    pub fn refresh_all(&self, round: u64) -> Result<RefreshStatus> {
+        let mut result = RefreshStatus::default();
         for (dimension, runtime) in &self.runtimes {
-            let refresh = runtime.refresh()?;
-            more |= refresh.more_pending;
+            let refresh = runtime.refresh(round)?;
+            result.more_pending |= refresh.more_pending;
+            result.incomplete |= refresh.incomplete;
+            if result.failure.is_none() {
+                result.failure = refresh.failure;
+            }
             for (region_x, region_z, generation) in refresh.changed {
                 let _ = self.announcements.send(RegionalAnnouncement::Changed {
                     dimension: dimension.clone(),
@@ -118,7 +175,24 @@ impl RegionalService {
                 });
             }
         }
-        Ok(more)
+        Ok(result)
+    }
+
+    /// One logical round: finish independent eligible work, then truthfully report failures.
+    pub fn refresh_once(&self) -> Result<()> {
+        let mut failure = None;
+        loop {
+            let status = self.refresh_all(0)?;
+            if failure.is_none() && status.incomplete {
+                failure = status.failure;
+            }
+            if !status.more_pending {
+                if let Some(failure) = failure {
+                    bail!("regional import incomplete: {failure}");
+                }
+                return Ok(());
+            }
+        }
     }
 
     pub fn start(self: &Arc<Self>, poll_interval: Duration) -> Result<()> {
@@ -149,29 +223,32 @@ impl RegionalService {
 }
 
 async fn publication_loop(service: Weak<RegionalService>, poll_interval: Duration) {
+    let mut round = RetryRound::new(Instant::now(), poll_interval);
     loop {
         let Some(current) = service.upgrade() else {
             return;
         };
         let wake = current.wake.clone();
-        let refresh = tokio::task::spawn_blocking(move || current.refresh_all()).await;
+        round.advance(Instant::now());
+        let number = round.number;
+        let refresh = tokio::task::spawn_blocking(move || current.refresh_all(number)).await;
         let more = match refresh {
-            Ok(Ok(more)) => more,
+            Ok(Ok(status)) => status.more_pending,
             Ok(Err(error)) => {
-                eprintln!("regional publication refresh failed safely: {error:#}");
-                false
+                eprintln!("regional publication stopped on unsafe shared-state failure: {error:#}");
+                return;
             }
             Err(error) if error.is_cancelled() => return,
             Err(error) => {
-                eprintln!("regional publication worker failed safely: {error}");
-                false
+                eprintln!("regional publication worker stopped: {error}");
+                return;
             }
         };
         // Continue immediately while clean-import shards remain. Once caught up, polling is cheap:
         // only Anvil headers and the compact source tables are compared.
         if !more {
             tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => {},
+                _ = tokio::time::sleep_until(round.deadline.into()) => {},
                 _ = wake.notified() => {},
             }
         } else {

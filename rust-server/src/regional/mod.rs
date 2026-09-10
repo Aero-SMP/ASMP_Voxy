@@ -13,12 +13,16 @@ pub mod wire;
 
 #[cfg(test)]
 mod air_lighting_tests;
+#[cfg(test)]
+mod faults;
+#[cfg(test)]
+mod refresh_measurements;
 
-pub use builder::{RegionalBuildStats, rebuild_region, rebuild_region_incremental};
+pub use builder::{RegionalBuild, RegionalBuildStats, rebuild_region, rebuild_region_incremental};
 pub use index::RegionIndex;
 pub use runtime::{RegionalRefresh, RegionalRuntime};
 pub use section::SectionFrame;
-pub use service::{RegionalAnnouncement, RegionalResponder, RegionalService};
+pub use service::{RefreshStatus, RegionalAnnouncement, RegionalResponder, RegionalService};
 pub use source::{CHUNKS_PER_REGION, ChunkSourceRecord, RegionSourceTable};
 pub use store::{
     RegionFile, RegionFileBuilder, RegionLayout, RegionSectionEntry, SECTION_FLAG_EMPTY,
