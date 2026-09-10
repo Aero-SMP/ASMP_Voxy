@@ -1,0 +1,6 @@
+// Server-only correction: do not publish a client update to build/libs.
+allprojects {
+    tasks.withType(Jar).configureEach {
+        destinationDirectory = rootProject.layout.projectDirectory.dir('build/release-validation-213')
+    }
+}

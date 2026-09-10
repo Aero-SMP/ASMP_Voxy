@@ -8,8 +8,7 @@ use crate::{
         RegionalAnnouncement, RegionalResponder, RegionalService,
         wire::{
             ALPN, ControlMessage, STREAM_CONTROL, STREAM_SECTION_LANE, encode_control_record,
-            read_control, read_lane, read_request_batch, read_stream_role, write_control,
-            write_reply_batch,
+            read_control, read_lane, read_request_batch, read_stream_role, write_reply_batch,
         },
     },
     replace_synced, sync_parent,
@@ -40,7 +39,7 @@ const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 // Quinn fairly interleave metadata and coverage; refinement remains below both.
 // Making coverage strictly higher can instead starve a control write on reconnect.
 const CONTROL_STREAM_PRIORITY: i32 = 2;
-const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 const SECTION_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 // Fixed unauthenticated-protocol admission bounds. These limit task/handshake amplification;
 // they are not a configurable server-wide memory governor.
@@ -211,7 +210,12 @@ async fn serve_regional_connection(
     mut recv: quinn::RecvStream,
     dimension: String,
 ) -> Result<()> {
-    write_control_timeout(&mut send, &responder.hello()?).await?;
+    write_control(
+        &mut send,
+        &responder.hello()?,
+        CONTROL_WRITE_PROGRESS_TIMEOUT,
+    )
+    .await?;
     let mut announcements = service.subscribe();
     let mut subscribed_regions = HashSet::new();
     let result = async {
@@ -251,7 +255,7 @@ async fn serve_regional_connection(
                     _ => bail!("client sent a server-only or duplicate regional control record"),
                 };
                 if let Some(response) = response {
-                    write_control_timeout(&mut send, &response).await?;
+                    write_control(&mut send, &response, CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
                 }
             }
             announcement = announcements.recv() => {
@@ -270,13 +274,13 @@ async fn serve_regional_connection(
                         region_x, region_z, generation,
                     }),
                     RegionalAnnouncement::Shutdown(message) => {
-                        write_control_timeout(&mut send, &ControlMessage::Shutdown { message }).await?;
+                        write_control(&mut send, &ControlMessage::Shutdown { message }, CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
                         return Ok(());
                     }
                     _ => None,
                 };
                 if let Some(message) = message {
-                    write_control_timeout(&mut send, &message).await?;
+                    write_control(&mut send, &message, CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
                 }
             }
             }
@@ -331,15 +335,32 @@ async fn serve_section_lane(
     Ok(())
 }
 
-async fn write_control_timeout(
+async fn write_control(
     send: &mut quinn::SendStream,
     message: &ControlMessage,
+    progress_timeout: Duration,
 ) -> Result<()> {
-    tokio::time::timeout(CONTROL_WRITE_TIMEOUT, write_control(send, message))
-        .await
-        .context("regional control write timeout")??;
+    let record = encode_control_record(message)?;
+    let mut remaining = record.as_slice();
+    while !remaining.is_empty() {
+        // Quinn's inherent write is cancellation-safe and reports the accepted prefix.
+        // The next deadline starts only after bytes were accepted, not after a wakeup.
+        let written = tokio::time::timeout(progress_timeout, send.write(remaining))
+            .await
+            .context("regional control write made no progress")??;
+        if written == 0 {
+            bail!("regional control write accepted zero bytes");
+        }
+        remaining = &remaining[written..];
+        #[cfg(test)]
+        control_write_tests::record_progress(written);
+    }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "control_write_tests.rs"]
+mod control_write_tests;
 
 async fn write_terminal_control(send: &mut quinn::SendStream, message: &ControlMessage) {
     let Ok(record) = encode_control_record(message) else {

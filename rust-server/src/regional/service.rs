@@ -149,6 +149,18 @@ impl RegionalService {
         self.announcements.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_overflow_announcements(&self) {
+        for generation in 1..=(ANNOUNCEMENT_CAPACITY * 2) as u64 {
+            let _ = self.announcements.send(RegionalAnnouncement::Changed {
+                dimension: "minecraft:overworld".into(),
+                region_x: 0,
+                region_z: 0,
+                generation,
+            });
+        }
+    }
+
     pub fn refresh_all(&self, round: u64) -> Result<RefreshStatus> {
         let mut result = RefreshStatus::default();
         for (dimension, runtime) in &self.runtimes {

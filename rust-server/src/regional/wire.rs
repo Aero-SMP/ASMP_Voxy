@@ -113,14 +113,6 @@ pub fn encode_control_record(message: &ControlMessage) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-pub async fn write_control<W: AsyncWrite + Unpin>(
-    output: &mut W,
-    message: &ControlMessage,
-) -> Result<()> {
-    output.write_all(&encode_control_record(message)?).await?;
-    Ok(())
-}
-
 pub async fn read_control<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<ControlMessage>> {
     let kind = match input.read_u8().await {
         Ok(kind) => kind,

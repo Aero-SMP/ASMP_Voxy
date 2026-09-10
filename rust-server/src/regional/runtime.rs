@@ -412,6 +412,11 @@ impl RegionalRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_subscription_count(&self) -> usize {
+        self.priority.lock().unwrap().subscriptions.values().sum()
+    }
+
     pub fn unsubscribe_region(&self, region_x: i32, region_z: i32) -> Result<()> {
         let mut queue = self
             .priority
