@@ -247,7 +247,7 @@ final class CacheStartupBehaviorTest {
         return fixture(generation, children, light, catalogId, 0, 0);
     }
 
-    private static Fixture fixture(long generation, int children, int light, long catalogId, int x, int z) throws Exception {
+    static Fixture fixture(long generation, int children, int light, long catalogId, int x, int z) throws Exception {
         byte[] block = "minecraft:stone".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] biome = "minecraft:plains".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         ByteBuffer cat = buffer(46 + block.length + biome.length);
@@ -311,7 +311,7 @@ final class CacheStartupBehaviorTest {
         @Override protected void stateChanged() {}
     }
 
-    static final class Publisher implements SectionPublisher {
+    static class Publisher implements SectionPublisher {
         final List<Publication> publications = new ArrayList<>();
         @Override public SubmissionAttempt tryPublishBatch(List<SectionSubmission> submissions) {
             var result = submissions.stream().map(Publication::new).toList();
@@ -329,6 +329,15 @@ final class CacheStartupBehaviorTest {
         final ClientSession.Session session;
         boolean mapCatalog = true;
         Driver(Path root) throws Exception {
+            session = new ClientSession.Session(77, DIMENSION, null, publisher, mesher(), 2);
+            session.cacheRoot = root; session.serverKey = SERVER;
+            session.metadataWorker.start();
+            session.metadataWorker.assign(new ClientSession.Session.BootstrapTask(root, SERVER, DIMENSION));
+            for (var worker : session.sectionWorkers) worker.start();
+            session.demands.adopt(new ClientSession.Demand(KEY));
+            session.queueRegion(0);
+        }
+        static SectionMesher mesher() throws Exception {
             var models = new SectionMesher.Models() {
                 public int getModelId(int block) { return 1; }
                 public long getModelMetadataFromClientId(int model) { return 0; }
@@ -338,14 +347,7 @@ final class CacheStartupBehaviorTest {
             };
             var mesherConstructor = SectionMesher.class.getDeclaredConstructor(SectionMesher.Models.class, java.util.function.IntConsumer.class);
             mesherConstructor.setAccessible(true);
-            session = new ClientSession.Session(77, DIMENSION, null, publisher,
-                    mesherConstructor.newInstance(models, (java.util.function.IntConsumer) ignored -> {}), 2);
-            session.cacheRoot = root; session.serverKey = SERVER;
-            session.metadataWorker.start();
-            session.metadataWorker.assign(new ClientSession.Session.BootstrapTask(root, SERVER, DIMENSION));
-            for (var worker : session.sectionWorkers) worker.start();
-            session.demands.adopt(new ClientSession.Demand(KEY));
-            session.queueRegion(0);
+            return mesherConstructor.newInstance(models, (java.util.function.IntConsumer) ignored -> {});
         }
         void step() throws Exception {
             session.connect(); session.drainWorkers();

@@ -740,8 +740,9 @@ final class ClientSession {
                     try {
                         this.connect();
                         this.drainWorkers();
-                        this.drainNetworkReplies();
+                        // Arrived metadata gets released workers before terrain refills them.
                         if (this.quic != null) this.drainControls();
+                        this.drainNetworkReplies();
                         this.drainEvents();
                         this.drainDemand();
                         this.processMetadata();
