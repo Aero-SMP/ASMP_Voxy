@@ -20,12 +20,65 @@ public final class WorkerShaderDebugBehaviorTest {
         Field started = updater.getDeclaredField("STARTED"); started.setAccessible(true);
         ((AtomicBoolean) started.get(null)).set(true);
         autoConnectOnlyFromIdleMenus(updater);
+        cacheResetSafety();
         stageAccountingAndCpuUnavailable();
         DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
         HarnessTerminalBehaviorTest.run();
         System.out.println("actual debug worker boundaries, lock-owner evidence, CPU availability and shader diff tests passed");
+    }
+
+    private static void cacheResetSafety() throws Exception {
+        Class<?> restart = Class.forName("me.cortex.voxy.client.lod.ClientUpdateRestart");
+        var reset = restart.getDeclaredMethod("resetCache", java.nio.file.Path.class, String.class, long.class);
+        reset.setAccessible(true);
+        var child = new ProcessBuilder(java.nio.file.Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-version").redirectError(ProcessBuilder.Redirect.DISCARD).start();
+        child.waitFor();
+        long deadPid = child.pid();
+        var game = Files.createTempDirectory("voxy-reset-safety-");
+        var cache = Files.createDirectories(game.resolve(".voxy/nested"));
+        Files.writeString(cache.resolve("payload"), "cached");
+        Files.writeString(game.resolve("options.txt"), "preserve");
+        Files.createDirectories(game.resolve("mods"));
+        Files.writeString(game.resolve("mods/keep.jar"), "preserve");
+        String request = UUID.randomUUID().toString();
+        expectResetFailure(reset, game, request, ProcessHandle.current().pid());
+        check(Files.exists(cache.resolve("payload")), "active-client refusal deleted data");
+        expectResetFailure(reset, game, "../../outside", deadPid);
+        check(Files.exists(cache.resolve("payload")), "invalid reset ID deleted data");
+        check((Long) reset.invoke(null, game, request, deadPid) == 6, "reset byte accounting");
+        check(!Files.exists(game.resolve(".voxy")), "cache remains after reset");
+        check(Files.readString(game.resolve("options.txt")).equals("preserve")
+                && Files.exists(game.resolve("mods/keep.jar")), "reset escaped cache");
+        Files.createDirectories(cache);
+        Files.writeString(cache.resolve("new-cache"), "new");
+        check((Long) reset.invoke(null, game, request, deadPid) == 0
+                && Files.exists(cache.resolve("new-cache")), "request replay cleared new data");
+        reset.invoke(null, game, UUID.randomUUID().toString(), deadPid);
+        reset.invoke(null, game, UUID.randomUUID().toString(), deadPid); // Already absent.
+        var outside = Files.createTempDirectory("voxy-reset-outside-");
+        Files.writeString(outside.resolve("keep"), "preserve");
+        Files.createSymbolicLink(game.resolve(".voxy"), outside);
+        expectResetFailure(reset, game, UUID.randomUUID().toString(), deadPid);
+        check(Files.exists(outside.resolve("keep")), "linked root escaped cache");
+        Files.delete(game.resolve(".voxy"));
+        Files.createDirectory(game.resolve(".voxy"));
+        Files.createSymbolicLink(game.resolve(".voxy/outside"), outside);
+        reset.invoke(null, game, UUID.randomUUID().toString(), deadPid);
+        check(Files.exists(outside.resolve("keep")), "nested directory symlink was followed");
+        System.out.println("cache reset: stopped-process gate, exact scope, replay, missing cache and symlink tests passed");
+    }
+
+    private static void expectResetFailure(Method reset, java.nio.file.Path game, String request, long pid)
+            throws Exception {
+        try { reset.invoke(null, game, request, pid); }
+        catch (InvocationTargetException failure) {
+            check(failure.getCause() instanceof java.io.IOException, "unexpected reset failure");
+            return;
+        }
+        throw new AssertionError("unsafe cache reset accepted");
     }
 
     private static void autoConnectOnlyFromIdleMenus(Class<?> updater) throws Exception {

@@ -8,11 +8,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.FileVisitResult;
+import java.nio.file.LinkOption;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -20,14 +25,16 @@ import java.util.concurrent.TimeoutException;
 final class ClientUpdateRestart {
     private static final int MAX_ARGUMENTS = 16_384;
     private static final int MAX_ARGUMENT_BYTES = 16 * 1024 * 1024;
-    private static final String SSH_TARGET = "printer@ssh.aerosmp.com";
+    private static final String SSH_TARGET = "aerosmp@ssh.aerosmp.com";
     private static final String REMOTE_LOG =
-            "/home/printer/Desktop/Creative/logs/client-upload/restart.log";
+            "/home/aerosmp/Desktop/Main/logs/client-upload/restart.log";
 
     private ClientUpdateRestart() {}
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 3) throw new IllegalArgumentException("missing restart command");
+        if (arguments.length != 3 && arguments.length != 4) throw new IllegalArgumentException("invalid restart command");
+        String reset = arguments.length == 4 ? arguments[3] : null;
+        if (reset != null) validateResetId(reset);
         long oldPid = Long.parseLong(arguments[0]);
         Path gameDirectory = Path.of(arguments[1]);
         Path commandFile = Path.of(arguments[2]);
@@ -46,6 +53,10 @@ final class ClientUpdateRestart {
                     + " launcherDispatch=" + launcherDispatch);
             stopOldProcess(oldPid);
             append(restartLog, "old-process-stopped");
+            if (reset != null) {
+                long removed = resetCache(gameDirectory, reset, oldPid);
+                append(restartLog, "cache-reset-complete request=" + reset + " removedBytes=" + removed);
+            }
             Thread.sleep(500);
             Files.deleteIfExists(launchLog);
             Process launched = new ProcessBuilder(command)
@@ -74,6 +85,59 @@ final class ClientUpdateRestart {
         } finally {
             deleteLaunchCopies(commandFile.getParent(), restartLog);
         }
+    }
+
+    private static void validateResetId(String request) throws IOException {
+        try {
+            if (!UUID.fromString(request).toString().equals(request)) throw new IllegalArgumentException();
+        } catch (IllegalArgumentException invalid) {
+            throw new IOException("invalid cache-reset request ID", invalid);
+        }
+    }
+
+    static boolean cacheResetPending(Path gameDirectory, String request) throws IOException {
+        validateResetId(request);
+        Path completed = gameDirectory.resolve(".voxy-updater/cache-reset-completed");
+        return !Files.isRegularFile(completed) || Files.size(completed) != request.length()
+                || !Files.readString(completed).equals(request);
+    }
+
+    /** Only the standalone restart helper may clear the fixed cache after the old JVM exits. */
+    private static long resetCache(Path gameDirectory, String request, long oldPid) throws IOException {
+        if (ProcessHandle.of(oldPid).map(ProcessHandle::isAlive).orElse(false)) {
+            throw new IOException("refusing cache reset while the old client is alive");
+        }
+        Path game = gameDirectory.toRealPath();
+        if (!cacheResetPending(game, request)) return 0;
+        Path cache = game.resolve(".voxy");
+        Path updater = game.resolve(".voxy-updater");
+        Files.createDirectories(updater);
+        if (!updater.toRealPath().equals(updater)) throw new IOException("linked updater directory");
+        if (Files.isSymbolicLink(cache)) throw new IOException("refusing linked .voxy directory");
+        long[] removed = {0};
+        if (Files.exists(cache, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isDirectory(cache, LinkOption.NOFOLLOW_LINKS)
+                    || !cache.toRealPath().equals(cache)) throw new IOException("invalid .voxy directory");
+            Files.walkFileTree(cache, new SimpleFileVisitor<>() {
+                @Override public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs)
+                        throws IOException {
+                    if (!dir.toRealPath().startsWith(cache)) throw new IOException("cache directory escapes .voxy");
+                    return FileVisitResult.CONTINUE;
+                }
+                @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.delete(file); // No FOLLOW_LINKS: a file symlink itself is removed, never its target.
+                    if (attrs.isRegularFile()) removed[0] += attrs.size();
+                    return FileVisitResult.CONTINUE;
+                }
+                @Override public FileVisitResult postVisitDirectory(Path dir, IOException failure) throws IOException {
+                    if (failure != null) throw failure;
+                    Files.delete(dir);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }
+        Files.writeString(updater.resolve("cache-reset-completed"), request);
+        return removed[0];
     }
 
     private static List<String> stabilizeLaunchFiles(List<String> command, Path directory,

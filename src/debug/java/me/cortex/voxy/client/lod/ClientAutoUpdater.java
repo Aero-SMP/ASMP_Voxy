@@ -300,13 +300,28 @@ final class ClientAutoUpdater {
 
     private static boolean checkAndInstall() throws Exception {
         ClientLodDebug.updaterEvent("state=CHECKING target=" + SSH_TARGET);
+        String player = Minecraft.getInstance().getUser().getName();
+        if (!player.matches("[A-Za-z0-9_]{1,16}")) throw new IOException("invalid debug player name");
+        String resetFile = shellQuote(REMOTE_DIRECTORY + "/debug-client-reset/" + player + ".request");
         CommandResult listing = run(Duration.ofSeconds(45), sshExecutable(), "-n",
                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", SSH_TARGET,
-                "LC_ALL=C find " + REMOTE_DIRECTORY
-                        + " -maxdepth 1 -type f -printf '%f\\n' | sort");
+                "LC_ALL=C find " + shellQuote(REMOTE_DIRECTORY)
+                        + " -maxdepth 1 -type f -printf '%f\\n' | sort; if test -f " + resetFile
+                        + "; then printf 'VOXY_CACHE_RESET='; head -c 64 " + resetFile
+                        + "; printf '\\n'; fi");
         if (listing.exitCode != 0) {
             throw new IOException("ssh listing failed (exit " + listing.exitCode + "): "
                     + oneLine(listing.output));
+        }
+
+        Path gameDirectory = Minecraft.getInstance().gameDirectory.toPath().toAbsolutePath();
+        String reset = listing.output.lines().filter(line -> line.startsWith("VOXY_CACHE_RESET="))
+                .map(line -> line.substring("VOXY_CACHE_RESET=".length()).trim()).findFirst().orElse(null);
+        if (reset != null && ClientUpdateRestart.cacheResetPending(gameDirectory, reset)) {
+            launchRestartHelper(findCurrentJar(gameDirectory.resolve("mods")), gameDirectory, reset);
+            ClientLodDebug.updaterEvent("state=CACHE_RESET_RESTART request=" + reset + " player=" + player);
+            restartPending = true;
+            return true;
         }
 
         List<Artifact> artifacts = listing.output.lines()
@@ -327,12 +342,11 @@ final class ClientAutoUpdater {
             return false;
         }
 
-        Path gameDirectory = Minecraft.getInstance().gameDirectory.toPath().toAbsolutePath();
         Path modsDirectory = gameDirectory.resolve("mods");
         Path current = findCurrentJar(modsDirectory);
         Artifact disk = artifact(current.getFileName().toString());
         if (compareVersions(newest.version, disk.version) <= 0) {
-            launchRestartHelper(current, gameDirectory);
+            launchRestartHelper(current, gameDirectory, null);
             ClientLodDebug.updaterEvent("state=INSTALLED from=" + VoxyClient.MOD_VERSION
                     + " to=" + disk.version + " restart=NOW source=DISK_AHEAD");
             restartPending = true;
@@ -372,7 +386,7 @@ final class ClientAutoUpdater {
             throw failure;
         }
         try {
-            launchRestartHelper(installed, gameDirectory);
+            launchRestartHelper(installed, gameDirectory, null);
         } catch (Throwable failure) {
             Files.deleteIfExists(installed);
             move(backup, current);
@@ -497,7 +511,7 @@ final class ClientAutoUpdater {
         }
     }
 
-    private static void launchRestartHelper(Path installed, Path gameDirectory)
+    private static void launchRestartHelper(Path installed, Path gameDirectory, String cacheReset)
             throws IOException, InterruptedException {
         ProcessHandle current = ProcessHandle.current();
         ProcessHandle.Info info = current.info();
@@ -506,6 +520,7 @@ final class ClientAutoUpdater {
         List<String> restartCommand = currentCommand(current.pid(), info, executable);
 
         Path updaterDirectory = gameDirectory.resolve(".voxy-updater");
+        Files.createDirectories(updaterDirectory);
         Path commandFile = updaterDirectory.resolve("restart-command.bin");
         writeRestartCommand(commandFile, restartCommand);
 
@@ -517,6 +532,7 @@ final class ClientAutoUpdater {
         helper.add(Long.toString(current.pid()));
         helper.add(gameDirectory.toString());
         helper.add(commandFile.toString());
+        if (cacheReset != null) helper.add(cacheReset);
         Path restartLog = updaterDirectory.resolve("restart.log");
         Process process;
         try {
