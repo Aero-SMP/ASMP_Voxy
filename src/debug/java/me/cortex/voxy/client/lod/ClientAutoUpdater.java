@@ -4,6 +4,10 @@ import me.cortex.voxy.client.VoxyClient;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.DisconnectedScreen;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.TitleScreen;
+import net.minecraft.client.gui.screens.multiplayer.JoinMultiplayerScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 
@@ -35,13 +39,13 @@ import java.util.regex.Pattern;
 
 /** Development updater included only in debug client builds. */
 final class ClientAutoUpdater {
-    private static final String SSH_TARGET = "printer@ssh.aerosmp.com";
+    private static final String SSH_TARGET = "aerosmp@ssh.aerosmp.com";
     private static final String REMOTE_DIRECTORY =
-            "/home/printer/Desktop/ASMP_Voxy/build/libs";
-    private static final String MINECRAFT_SERVER = "ssh.aerosmp.com:25586";
+            "/home/aerosmp/Desktop/ASMP_Voxy/build/libs";
+    private static final String MINECRAFT_SERVER = "ssh.aerosmp.com:25565";
     private static final String REMOTE_DIAGNOSTICS =
-            "/home/printer/Desktop/Creative/logs/client-upload";
-    private static final String REMOTE_SCREENSHOTS = "/home/printer/screenshots";
+            "/home/aerosmp/Desktop/Main/logs/client-upload";
+    private static final String REMOTE_SCREENSHOTS = "/home/aerosmp/screenshots";
     private static final long POLL_SECONDS = 20;
     private static final int SCREENSHOT_QUEUE_CAPACITY = 256;
     private static final int SCREENSHOT_UPLOAD_ATTEMPTS = 3;
@@ -54,7 +58,6 @@ final class ClientAutoUpdater {
     private static final AtomicBoolean STARTED = new AtomicBoolean();
     private static final ArrayBlockingQueue<ScreenshotUpload> SCREENSHOT_QUEUE =
             new ArrayBlockingQueue<>(SCREENSHOT_QUEUE_CAPACITY);
-    private static volatile boolean readyToConnect;
     private static volatile boolean restartPending;
     private static boolean restartDisconnectRequested;
     private static long nextConnectNanos;
@@ -74,7 +77,6 @@ final class ClientAutoUpdater {
                     ClientLodDebug.updaterEvent("state=FAILED type="
                             + failure.getClass().getSimpleName() + " message="
                             + oneLine(failure.getMessage()));
-                    readyToConnect = true;
                 }
                 try {
                     uploadDiagnostics();
@@ -110,10 +112,10 @@ final class ClientAutoUpdater {
             minecraft.stop();
             return;
         }
-        if (!readyToConnect) return;
+        // Joining is independent of SSH availability. Only retry from idle menus, never
+        // from login/configuration/loading screens while a proxy connection is in progress.
         if (!minecraft.isGameLoadFinished() || minecraft.getConnection() != null
-                || minecraft.level != null || minecraft.screen == null
-                || minecraft.screen instanceof ConnectScreen) return;
+                || minecraft.level != null || !autoConnectScreen(minecraft.screen)) return;
         long now = System.nanoTime();
         if (now < nextConnectNanos) return;
         nextConnectNanos = now + TimeUnit.SECONDS.toNanos(5);
@@ -122,6 +124,11 @@ final class ClientAutoUpdater {
                 ServerData.Type.OTHER);
         ConnectScreen.startConnecting(minecraft.screen, minecraft,
                 ServerAddress.parseString(MINECRAFT_SERVER), server, false, null);
+    }
+
+    private static boolean autoConnectScreen(Screen screen) {
+        return screen instanceof TitleScreen || screen instanceof JoinMultiplayerScreen
+                || screen instanceof DisconnectedScreen;
     }
 
     static void queueScreenshot(Path screenshot) {
@@ -317,7 +324,6 @@ final class ClientAutoUpdater {
         if (compareVersions(newest.version, VoxyClient.MOD_VERSION) <= 0) {
             ClientLodDebug.updaterEvent("state=CURRENT local=" + VoxyClient.MOD_VERSION
                     + " remote=" + newest.version);
-            readyToConnect = true;
             return false;
         }
 

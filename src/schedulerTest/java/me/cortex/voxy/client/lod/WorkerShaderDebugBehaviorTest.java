@@ -19,12 +19,32 @@ public final class WorkerShaderDebugBehaviorTest {
         Class<?> updater = Class.forName("me.cortex.voxy.client.lod.ClientAutoUpdater");
         Field started = updater.getDeclaredField("STARTED"); started.setAccessible(true);
         ((AtomicBoolean) started.get(null)).set(true);
+        autoConnectOnlyFromIdleMenus(updater);
         stageAccountingAndCpuUnavailable();
         DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
         HarnessTerminalBehaviorTest.run();
         System.out.println("actual debug worker boundaries, lock-owner evidence, CPU availability and shader diff tests passed");
+    }
+
+    private static void autoConnectOnlyFromIdleMenus(Class<?> updater) throws Exception {
+        var predicate = updater.getDeclaredMethod("autoConnectScreen",
+                net.minecraft.client.gui.screens.Screen.class);
+        predicate.setAccessible(true);
+        check(!(Boolean) predicate.invoke(null, new Object[]{null}), "null screen must not connect");
+        Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        unsafeField.setAccessible(true);
+        var unsafe = (sun.misc.Unsafe) unsafeField.get(null);
+        for (String name : new String[]{"TitleScreen", "multiplayer.JoinMultiplayerScreen",
+                "DisconnectedScreen", "ConnectScreen", "ReceivingLevelScreen", "ProgressScreen"}) {
+            Class<?> screen = Class.forName("net.minecraft.client.gui.screens." + name);
+            Object instance = unsafe.allocateInstance(screen); // No window/game initialization.
+            boolean allowed = name.equals("TitleScreen") || name.equals("DisconnectedScreen")
+                    || name.equals("multiplayer.JoinMultiplayerScreen");
+            check((Boolean) predicate.invoke(null, instance) == allowed,
+                    "incorrect auto-connect screen: " + name);
+        }
     }
 
     private static void stageAccountingAndCpuUnavailable() throws Exception {
