@@ -288,7 +288,7 @@ final class RegionalControlFlowBehaviorTest {
     }
 
     private static void indexAuthorityAndCatalogWait() throws Exception {
-        for (int mode = 0; mode < 5; mode++) try (var owner = new Owner(1)) {
+        for (int mode = 0; mode < 7; mode++) try (var owner = new Owner(1)) {
             var s = owner.session;
             var metadata = CacheStartupBehaviorTest.fixture(1, 0, 15, 1, 20, 0);
             var region = index(owner, metadata);
@@ -304,6 +304,8 @@ final class RegionalControlFlowBehaviorTest {
             if (mode == 2) { s.connectionEpoch++; s.resetConnection(new IOException("decode disconnect")); s.quic = connection(); }
             if (mode == 3) region.metadataRevision++;
             if (mode == 4) s.viewRevision++;
+            if (mode >= 5) s.releaseRegion(region.key, region);
+            if (mode == 6) region.subscribed = true; // Reentry cannot revive the pre-release decoder lease.
             s.sectionWorkers[0].start();
             owner.workersComplete();
             owner.until(() -> region.resourceLease == null);
@@ -436,6 +438,7 @@ final class RegionalControlFlowBehaviorTest {
             session.quic = client;
             session.worldIdentity = RegionalProtocol.Hash32.ZERO;
             session.helloAccepted = true; // This test exercises post-handshake control backpressure.
+            session.offerWindow(new me.cortex.voxy.client.core.rendering.RenderDistanceTracker.Window(0, 0, 1));
             client.setActivityListener(session::signal);
             var demand = new ClientSession.Demand(SectionKey.pack(4, 0, 0, 0));
             session.demands.adopt(demand);

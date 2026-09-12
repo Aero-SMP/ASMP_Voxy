@@ -14,6 +14,8 @@ final class SessionDebugTelemetry {
         long firstLocal, hello, localViews, localActivations, validated, replacements, invalidations, metadataBytes;
         long admissionReleases, meshToLeaseReleaseNanos, maxMeshToLeaseReleaseNanos;
         long nextSample;
+        long subscriptions, subscriptionPeak, subscriptionRequests, subscriptionReleases, subscriptionStale;
+        long windowNanos;
         volatile Summary latest;
     }
 
@@ -31,6 +33,15 @@ final class SessionDebugTelemetry {
     static void event(ClientSession.Session session, String event, long bytes) {
         var stats = state(session);
         switch (event) {
+            case "subscriptionRequest" -> {
+                stats.subscriptionRequests++;
+                stats.subscriptions += bytes;
+                stats.subscriptionPeak = Math.max(stats.subscriptionPeak, stats.subscriptions);
+            }
+            case "subscriptionRelease" -> { stats.subscriptionReleases++; stats.subscriptions--; }
+            case "subscriptionReset" -> stats.subscriptions = 0;
+            case "subscriptionStale" -> stats.subscriptionStale++;
+            case "subscriptionWindow" -> stats.windowNanos += bytes;
             case "hello" -> { if (stats.hello == 0) stats.hello = System.nanoTime() - stats.start; }
             case "localView" -> stats.localViews++;
             case "localActivation" -> {
@@ -68,6 +79,11 @@ final class SessionDebugTelemetry {
                     && demand.publication != null && demand.publication.rendererAdmitted()) admittedPending++;
         }
         String startup = " transportHeld=" + transportHeld + " localViews=" + stats.localViews
+                + " subscriptionWindow=" + session.subscriptionWindow()
+                + " acceptedSubscriptions=" + stats.subscriptions + " acceptedSubscriptionPeak=" + stats.subscriptionPeak
+                + " subscriptionRequests=" + stats.subscriptionRequests + " subscriptionReleases=" + stats.subscriptionReleases
+                + " pendingReleases=" + session.regionReleases.size() + " staleRegionResponses=" + stats.subscriptionStale
+                + " windowReconciliations=" + session.windowReconciliations + " windowReconcileNanos=" + stats.windowNanos
                 + " localActivations=" + stats.localActivations + " firstLocalNanos=" + stats.firstLocal
                 + " firstHelloNanos=" + stats.hello + " validatedViews=" + stats.validated
                 + " replacements=" + stats.replacements + " invalidations=" + stats.invalidations

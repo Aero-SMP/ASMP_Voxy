@@ -41,6 +41,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         Object index;
         boolean requested;
         boolean subscribed;
+        int pendingResponses;
         boolean absent;
         boolean validated;
         boolean localTried;
@@ -309,12 +310,21 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
                     .mapToInt(member -> member.pixelBucket).max().orElse(0);
         }
         if (region.users == 0) {
-            this.regions.remove(region.key);
+            this.forgetUnusedRegion(region);
             this.readyRegions.remove(region.key);
         }
         demand.desired = false;
         demand.revision++;
         return demand;
+    }
+
+    void forgetUnusedRegion(RegionDemand region) {
+        // Keep response ordering on the existing record if a retired region reenters before
+        // its old response arrives. This is not an additional subscription or demand.
+        if (region.users == 0 && region.pendingResponses == 0) {
+            this.regions.remove(region.key, region);
+            this.readyRegions.remove(region.key);
+        }
     }
 
     void setPriority(Demand demand, int bucket) {

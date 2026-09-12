@@ -48,6 +48,11 @@ public final class ClientLodClient {
         ClientSession.sectionLeft(key);
     }
 
+    public static void subscriptionWindowChanged(me.cortex.voxy.client.core.VoxyRenderSystem renderer,
+            me.cortex.voxy.client.core.rendering.RenderDistanceTracker.Window window) {
+        ClientSession.subscriptionWindowChanged(renderer, window);
+    }
+
     /** Accepts the final-HZB pass's scored residency action without allocating per action. */
     public static void detailAction(long key, int action, int bucket, int epoch) {
         ClientSession.detailAction(key, action, bucket, epoch);

@@ -34,6 +34,7 @@ public final class SectionDemandTableBehaviorTest {
         Blake3BehaviorTest.run();
         RegionalSectionCodecBehaviorTest.run();
         RegionalControlFlowBehaviorTest.run();
+        SubscriptionWindowBehaviorTest.run();
         CacheStartupBehaviorTest.run();
         ZoomRangeBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationShutdownBehaviorTest.run();

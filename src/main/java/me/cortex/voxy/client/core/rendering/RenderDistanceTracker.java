@@ -3,6 +3,7 @@ package me.cortex.voxy.client.core.rendering;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 
 import java.util.function.LongConsumer;
+import java.util.function.Consumer;
 
 public class RenderDistanceTracker {
     private static final int CHECK_DISTANCE_BLOCKS = 128;
@@ -24,8 +25,26 @@ public class RenderDistanceTracker {
     private double posX;
     private double posZ;
     private boolean initialized;
+    private final Consumer<Window> windowChanged;
+
+    /** Exact horizontal membership of the target circle, independent of callback backlog. */
+    public record Window(int x, int z, int radius) {
+        public boolean contains(long region) {
+            long dx = (long) (int) region - x;
+            long dz = (long) (int) (region >>> 32) - z;
+            return Math.abs(dx) <= radius && Math.abs(dz) <= radius
+                    && dx * dx + dz * dz <= (long) radius * radius;
+        }
+    }
+
     public RenderDistanceTracker(int minSec, int maxSec, LongConsumer addTopLevelNode,
                                  LongConsumer removeTopLevelNode) {
+        this(minSec, maxSec, addTopLevelNode, removeTopLevelNode, ignored -> {});
+    }
+
+    public RenderDistanceTracker(int minSec, int maxSec, LongConsumer addTopLevelNode,
+                                 LongConsumer removeTopLevelNode, Consumer<Window> windowChanged) {
+        this.windowChanged = windowChanged;
         this.addTopLevelNode = addTopLevelNode;
         this.removeTopLevelNode = removeTopLevelNode;
         this.radius = this.renderDistance = 2;
@@ -47,7 +66,10 @@ public class RenderDistanceTracker {
         this.boundDist = generateBoundingHalfCircleDistance(this.radius);
         this.operations.putAll(previousOperations);
         previousOperations.clear();
-        if (this.initialized) this.fillRing(true);
+        if (this.initialized) {
+            this.fillRing(true);
+            this.publishWindow();
+        }
     }
 
     public boolean setCenterAndProcess(double x, double z) {
@@ -58,6 +80,7 @@ public class RenderDistanceTracker {
             this.centerZ = (int) Math.floor(z / 512.0);
             this.initialized = true;
             this.fillRing(true);
+            this.publishWindow();
             return this.process() != 0;
         }
         double dx = this.posX-x;
@@ -101,6 +124,7 @@ public class RenderDistanceTracker {
     }
 
     private void moveCenter(int x, int z) {
+        if (x == this.centerX && z == this.centerZ) return;
         if (this.radius+1<Math.abs(x-this.centerX) || this.radius+1<Math.abs(z-this.centerZ)) {
             this.fillRing(false);
             this.centerX = x;
@@ -114,6 +138,11 @@ public class RenderDistanceTracker {
                 moveZ(z - this.centerZ);
             }
         }
+        this.publishWindow();
+    }
+
+    private void publishWindow() {
+        this.windowChanged.accept(new Window(this.centerX, this.centerZ, this.radius));
     }
 
     private void moveZ(int delta) {

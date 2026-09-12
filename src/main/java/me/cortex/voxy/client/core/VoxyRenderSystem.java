@@ -580,6 +580,9 @@ public class VoxyRenderSystem {
 
 
     private RenderDistanceTracker renderDistanceTracker;
+    private volatile RenderDistanceTracker.Window subscriptionWindow;
+
+    public RenderDistanceTracker.Window subscriptionWindow() { return this.subscriptionWindow; }
     public ChunkBoundRenderer chunkBoundRenderer;
 
     private Viewport viewport;
@@ -654,6 +657,9 @@ public class VoxyRenderSystem {
                         position -> {
                             ClientLodClient.sectionLeft(position);
                             this.nodeManager.removeTopLevel(position);
+                        }, window -> {
+                            this.subscriptionWindow = window;
+                            ClientLodClient.subscriptionWindowChanged(this, window);
                         });
 
                 this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);

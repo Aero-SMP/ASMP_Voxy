@@ -7,6 +7,7 @@ import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
 import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.core.rendering.SectionKey;
+import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.building.SectionMesher;
@@ -61,6 +62,13 @@ final class ClientSession {
     private static volatile long retryAfter;
 
     private ClientSession() {}
+
+    static void subscriptionWindowChanged(VoxyRenderSystem renderer, RenderDistanceTracker.Window window) {
+        synchronized (LIFECYCLE) {
+            Session current = active;
+            if (current != null && current.renderer == renderer) current.offerWindow(window);
+        }
+    }
 
     static boolean sectionEntered(long key) {
         requireTop(key);
@@ -303,6 +311,34 @@ final class ClientSession {
         final Set<Long> coarseningRoots = new HashSet<>();
         final Set<Long> rendererBlocked = new LinkedHashSet<>();
         final Set<Long> regionReleases = new LinkedHashSet<>();
+        private volatile RenderDistanceTracker.Window targetWindow;
+        private RenderDistanceTracker.Window reconciledWindow;
+        long windowReconciliations;
+
+        synchronized void offerWindow(RenderDistanceTracker.Window window) {
+            this.targetWindow = window;
+            this.signal();
+        }
+
+        boolean inSubscriptionWindow(long region) {
+            var window = this.targetWindow;
+            return window != null && window.contains(region);
+        }
+
+        RenderDistanceTracker.Window subscriptionWindow() { return this.reconciledWindow; }
+
+        void reconcileWindow() {
+            var window = this.targetWindow;
+            if (Objects.equals(window, this.reconciledWindow)) return;
+            long started = System.nanoTime();
+            for (var state : this.demands.regions()) {
+                if (window == null || !window.contains(state.key)) this.releaseRegion(state.key, state);
+                else this.queueRegion(state.key);
+            }
+            this.reconciledWindow = window;
+            this.windowReconciliations++;
+            ClientLodDebug.startupEvent(this, "subscriptionWindow", System.nanoTime() - started);
+        }
         final Long2ObjectOpenHashMap<DormantRoot> dormantRoots =
                 new Long2ObjectOpenHashMap<>();
         final Long2LongOpenHashMap pendingDormantEvictions = new Long2LongOpenHashMap();
@@ -699,6 +735,7 @@ final class ClientSession {
                     HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT, id);
             this.dimension = dimension;
             this.renderer = renderer;
+            this.targetWindow = renderer == null ? null : renderer.subscriptionWindow();
             this.publisher = publisher;
             this.mesher = mesher;
             this.sectionWorkerCount = workers;
@@ -739,6 +776,7 @@ final class ClientSession {
                 while (this.open.get()) {
                     try {
                         this.connect();
+                        this.reconcileWindow();
                         this.drainWorkers();
                         // Arrived metadata gets released workers before terrain refills them.
                         if (this.quic != null) this.drainControls();
@@ -824,6 +862,7 @@ final class ClientSession {
             this.pendingControl = null;
             this.catalogRequested = false;
             this.regionReleases.clear();
+            ClientLodDebug.startupEvent(this, "subscriptionReset", 0);
             this.inFlightBatches = 0;
             this.inFlightSections = 0;
             this.inFlightBytes = 0;
@@ -836,11 +875,16 @@ final class ClientSession {
                 demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                 this.demands.ready(demand, SectionDemandTable.ReadyKind.NETWORK);
             }
-            for (SectionDemandTable.RegionDemand region : this.demands.regions()) {
+            for (SectionDemandTable.RegionDemand region : List.copyOf(this.demands.regions())) {
                 region.requested = false;
                 region.subscribed = false;
                 region.validated = false;
+                region.pendingResponses = 0;
+                region.metadataRevision++;
+                region.pendingIndex = null;
+                region.pendingCatalog = null;
                 region.retryAfter = 0;
+                this.demands.forgetUnusedRegion(region);
                 this.queueRegion(region.key);
             }
         }
@@ -921,18 +965,21 @@ final class ClientSession {
         boolean acceptRegion(RegionalProtocol.RegionMessage message) throws IOException {
             long region = regionKey(message.regionX(), message.regionZ());
             SectionDemandTable.RegionDemand state = this.demands.region(region);
-            if (state == null || !state.subscribed) return true;
+            if (state == null) return true;
+            if (this.discardRegionResponse(state)) return true;
             long expected = state.announcedGeneration;
             if (expected != 0
                     && Long.compareUnsigned(message.generation(), expected) < 0) {
                 state.requested = false;
                 state.validated = false;
+                if (state.pendingResponses > 0) state.pendingResponses--;
                 this.queueRegion(region);
                 return true;
             }
             this.ensureCatalog(message.catalogFingerprint());
             WorkerSlot worker = this.idleWorker(state.coverageUsers > 0);
             if (worker == null) return false;
+            if (state.pendingResponses > 0) state.pendingResponses--;
             // Receiving a record is not validation. Keep requests parked until its owned
             // decoder verifies the index; the installed index may still be provisional.
             state.requested = true;
@@ -953,7 +1000,8 @@ final class ClientSession {
         void acceptRegionUnavailable(RegionalProtocol.RegionUnavailable message) {
             long region = regionKey(message.regionX(), message.regionZ());
             SectionDemandTable.RegionDemand state = this.demands.region(region);
-            if (state == null || !state.subscribed) return;
+            if (state == null || this.discardRegionResponse(state)) return;
+            if (state.pendingResponses > 0) state.pendingResponses--;
             state.requested = false;
             state.validated = message.confirmedAbsent();
             if (!message.confirmedAbsent()) {
@@ -970,16 +1018,30 @@ final class ClientSession {
             this.retireRegion(region);
         }
 
+        boolean discardRegionResponse(SectionDemandTable.RegionDemand state) {
+            if (state.subscribed && (this.targetWindow == null || this.inSubscriptionWindow(state.key))
+                    && state.pendingResponses <= 1) return false;
+            if (state.pendingResponses > 0) state.pendingResponses--;
+            ClientLodDebug.startupEvent(this, "subscriptionStale", 0);
+            this.demands.forgetUnusedRegion(state);
+            return true;
+        }
+
         void regionChanged(RegionalProtocol.RegionChanged message) {
             long region = regionKey(message.regionX(), message.regionZ());
-            if (this.demands.region(region) == null) return;
+            var state = this.demands.region(region);
+            if (state == null || !state.subscribed || state.pendingResponses != 0
+                    || this.targetWindow != null && !this.inSubscriptionWindow(region)) return;
             this.demands.offerRegion(region, message.generation());
         }
 
         void applyRegionChanged(long region, long generation) {
             SectionDemandTable.RegionDemand state = this.demands.region(region);
-            if (state == null) return;
-            state.announcedGeneration = generation;
+            if (state == null || !state.subscribed || state.pendingResponses != 0
+                    || this.targetWindow != null && !this.inSubscriptionWindow(region)) return;
+            if (generation != 0 && state.announcedGeneration != 0
+                    && Long.compareUnsigned(generation, state.announcedGeneration) < 0) return;
+            if (generation != 0) state.announcedGeneration = generation;
             state.requested = false;
             state.validated = false;
             state.retryAfter = 0;
@@ -989,17 +1051,9 @@ final class ClientSession {
             state.absent = false;
             // The arriving index binds new work. Already-owned operations finish with their
             // exact revision and keep the old surface available until a replacement is ready.
-            if (generation == 0) {
-                state.index = null;
-                state.catalog = null;
-                state.installedGeneration = 0;
-                this.invalidateSavedRegion(state);
-                state.validated = true;
-                state.absent = true;
-                this.retireRegion(region);
-            } else {
-                this.queueRegion(region);
-            }
+            // A zero-generation notification has no ordering token: it can describe a removal
+            // preceding reentry. Only the fresh ordered response may confirm absence.
+            this.queueRegion(region);
         }
 
         void drainEvents() throws Exception {
@@ -1474,7 +1528,7 @@ final class ClientSession {
             demand.publication = null;
             demand.previousPublication = null;
             removeOwned(this.demandsByTop, topAncestor(key), key);
-            if (this.demands.region(region) == null) this.releaseRegion(region, regionState);
+            if (regionState != null && regionState.users == 0) this.releaseRegion(region, regionState);
         }
 
         boolean isCoarsening(long key) {
@@ -1627,7 +1681,7 @@ final class ClientSession {
                 SectionDemandTable.RegionDemand regionState = this.demands.region(region);
                 this.demands.remove(key);
                 removeOwned(this.demandsByTop, topAncestor(key), key);
-                if (this.demands.region(region) == null) {
+                if (regionState != null && regionState.users == 0) {
                     this.releaseRegion(region, regionState);
                 }
             }
@@ -1640,6 +1694,14 @@ final class ClientSession {
             }
             if (state == null || !state.subscribed) return;
             state.subscribed = false;
+            state.requested = false;
+            state.validated = false;
+            if (state.users > 0) {
+                state.metadataRevision++;
+                state.pendingIndex = null;
+                state.pendingCatalog = null;
+                state.retryAfter = 0;
+            }
             if (this.quic == null) return;
             this.regionReleases.add(region);
         }
@@ -1716,6 +1778,7 @@ final class ClientSession {
         }
 
         void processRegions() throws IOException {
+            this.reconcileWindow();
             if (this.worldIdentity == null || this.quic == null || !this.helloAccepted) return;
             if (this.requiredCatalogFingerprint != null) {
                 this.ensureCatalog(this.requiredCatalogFingerprint);
@@ -1727,18 +1790,27 @@ final class ClientSession {
                 long key = releases.next();
                 if (!this.quic.releaseRegion((int) key, (int) (key >>> 32))) return;
                 releases.remove();
+                ClientLodDebug.startupEvent(this, "subscriptionRelease", 0);
             }
             SectionDemandTable.RegionDemand region;
             long now = System.nanoTime();
             while ((region = this.demands.pollRegion(candidate -> !candidate.requested
-                    && !candidate.validated && now - candidate.retryAfter >= 0)) != null) {
+                    && !candidate.validated && this.inSubscriptionWindow(candidate.key)
+                    && now - candidate.retryAfter >= 0)) != null) {
                 if (region.users == 0) continue;
-                if (!this.quic.requestRegion((int) region.key, (int) (region.key >>> 32))) {
-                    this.demands.readyRegion(region);
-                    return;
+                synchronized (this) {
+                    // Publish and admission share this short lock, never a network write or scan.
+                    // A newer window must have its releases reconciled before any next addition.
+                    if (!Objects.equals(this.targetWindow, this.reconciledWindow)
+                            || !this.quic.requestRegion((int) region.key, (int) (region.key >>> 32))) {
+                        this.demands.readyRegion(region);
+                        return;
+                    }
+                    region.requested = true;
+                    ClientLodDebug.startupEvent(this, "subscriptionRequest", region.subscribed ? 0 : 1);
+                    region.subscribed = true;
+                    region.pendingResponses++;
                 }
-                region.requested = true;
-                region.subscribed = true;
                 this.demands.readyRegion(region);
             }
         }
@@ -1849,7 +1921,9 @@ final class ClientSession {
 
         void applyPendingIndexes(RegionalSectionCodec.BoundCatalog binding) {
             for (var state : List.copyOf(this.demands.regions())) {
-                if (state.pendingIndex == null || !binding.fingerprint().equals(state.pendingCatalog)) continue;
+                if (!state.subscribed || state.pendingIndex == null
+                        || this.targetWindow != null && !this.inSubscriptionWindow(state.key)
+                        || !binding.fingerprint().equals(state.pendingCatalog)) continue;
                 var index = state.pendingIndex;
                 state.pendingIndex = null;
                 state.pendingCatalog = null;
@@ -1995,7 +2069,9 @@ final class ClientSession {
                         if (task.session() == this.id && task.view() == this.viewRevision
                                 && task.connection() == this.connectionEpoch
                                 && task.slot() == worker.index
-                                && region != null && lease.equals(region.resourceLease)
+                                && region != null && region.subscribed
+                                && (this.targetWindow == null || this.inSubscriptionWindow(region.key))
+                                && lease.equals(region.resourceLease)
                                 && region.metadataRevision == task.revision()
                                 && region.announcedGeneration == task.generation()) {
                             region.resourceSlot = -1;
