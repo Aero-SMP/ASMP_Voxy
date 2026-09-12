@@ -23,11 +23,32 @@ public final class WorkerShaderDebugBehaviorTest {
         cacheResetSafety();
         stageAccountingAndCpuUnavailable();
         transportCounters();
+        transportHoldLease();
         DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
         HarnessTerminalBehaviorTest.run();
         System.out.println("actual debug worker boundaries, lock-owner evidence, CPU availability and shader diff tests passed");
+    }
+
+    private static void transportHoldLease() throws Exception {
+        var directory = Files.createTempDirectory("voxy-hold-lease-");
+        var marker = directory.resolve("hold");
+        var method = Class.forName("me.cortex.voxy.client.lod.ClientLodDebug")
+                .getDeclaredMethod("holdDeadline", java.nio.file.Path.class, long.class);
+        method.setAccessible(true);
+        long now = 2000000000000L, duration = TimeUnit.MINUTES.toMillis(5);
+        try {
+            check((long) method.invoke(null, marker, now) == 0, "missing marker enabled hold");
+            Files.writeString(marker, "legacy marker contents");
+            Files.setLastModifiedTime(marker, java.nio.file.attribute.FileTime.fromMillis(now - 10000));
+            long expected = now - 10000 + duration;
+            check((long) method.invoke(null, marker, now) == expected
+                    && (long) method.invoke(null, marker, now + 20000) == expected, "restart renewed transport hold");
+            check((long) method.invoke(null, marker, expected) == 0, "expired lease blocked connection");
+            Files.setLastModifiedTime(marker, java.nio.file.attribute.FileTime.fromMillis(now + duration));
+            check((long) method.invoke(null, marker, now) == now + duration, "future timestamp extended maximum hold");
+        } finally { CacheStartupBehaviorTest.cleanup(directory); }
     }
 
     private static void transportCounters() throws Exception {

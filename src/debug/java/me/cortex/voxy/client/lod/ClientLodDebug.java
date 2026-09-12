@@ -55,9 +55,24 @@ public final class ClientLodDebug {
     private static volatile int conservativeDraws;
     private static volatile int refinedDraws;
     private static final Path TRANSPORT_HOLD = Path.of(".voxy", "debug-hold-regional-transport");
-    private static volatile boolean transportHeld = Files.exists(TRANSPORT_HOLD);
+    private static final long TRANSPORT_HOLD_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    private static final java.util.concurrent.atomic.AtomicLong transportHoldUntil =
+            new java.util.concurrent.atomic.AtomicLong(holdDeadline(TRANSPORT_HOLD, System.currentTimeMillis()));
 
-    static boolean connectionAllowed() { return !transportHeld; }
+    static long holdDeadline(Path marker, long now) {
+        try {
+            long deadline = Math.min(now, Files.getLastModifiedTime(marker).toMillis()) + TRANSPORT_HOLD_MILLIS;
+            return deadline > now ? deadline : 0;
+        } catch (IOException absent) { return 0; }
+    }
+
+    static boolean connectionAllowed() {
+        long deadline = transportHoldUntil.get();
+        if (deadline == 0) return true;
+        if (System.currentTimeMillis() < deadline) return false;
+        if (transportHoldUntil.compareAndSet(deadline, 0)) persistTransportHold(0);
+        return transportHoldUntil.get() == 0;
+    }
     static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) {
         return builder.socketFactory(ignored -> new TransportDebugTelemetry.Socket());
     }
@@ -65,16 +80,30 @@ public final class ClientLodDebug {
         SessionDebugTelemetry.activated(session, section, cacheHit);
     }
 
-    /** Debug-only persistent hold survives a whole-game restart; Minecraft traffic is untouched. */
+    /** Explicit five-minute test lease may span a restart; it cannot strand later launches.
+     * The timestamp is not renewed by reading it. Minecraft traffic remains untouched. */
     static void holdTransport(boolean held) {
-        transportHeld = held;
+        long deadline = held ? System.currentTimeMillis() + TRANSPORT_HOLD_MILLIS : 0;
+        transportHoldUntil.set(deadline);
+        persistTransportHold(deadline);
+    }
+
+    private static void persistTransportHold(long deadline) {
         WRITER.execute(() -> {
+            if (transportHoldUntil.get() != deadline) return;
             try {
                 Files.createDirectories(TRANSPORT_HOLD.getParent());
-                if (held) Files.writeString(TRANSPORT_HOLD, "Debug cache-start test: resume with resume_quic.\n");
+                if (deadline != 0) {
+                    Files.writeString(TRANSPORT_HOLD, "Bounded debug cache-start lease: resume with resume_quic.\n");
+                    Files.setLastModifiedTime(TRANSPORT_HOLD,
+                            java.nio.file.attribute.FileTime.fromMillis(deadline - TRANSPORT_HOLD_MILLIS));
+                }
                 else Files.deleteIfExists(TRANSPORT_HOLD);
-                emit("VOXY_CACHE_START transportHeld=" + held + " persisted=true");
-            } catch (IOException failure) { LOGGER.error("Could not persist debug transport hold", failure); }
+                emit("VOXY_CACHE_START transportHeld=" + (deadline != 0) + " untilMillis=" + deadline + " persisted=true");
+            } catch (IOException failure) {
+                transportHoldUntil.compareAndSet(deadline, 0);
+                LOGGER.error("Could not persist debug transport hold; releasing it", failure);
+            }
         });
     }
 
@@ -87,7 +116,7 @@ public final class ClientLodDebug {
     }
 
     static void captureSession(ClientSession.Session session) {
-        SessionDebugTelemetry.capture(session, System.nanoTime(), transportHeld);
+        SessionDebugTelemetry.capture(session, System.nanoTime(), !connectionAllowed());
     }
 
     static String sessionSnapshot(ClientSession.Session session) {
@@ -220,6 +249,7 @@ public final class ClientLodDebug {
     }
 
     static void tick() {
+        connectionAllowed(); // Expire leases even while no Voxy session is connected.
         ClientAutoUpdater.tick();
         LiveClientTestHarness.tick();
         long now = System.nanoTime();
