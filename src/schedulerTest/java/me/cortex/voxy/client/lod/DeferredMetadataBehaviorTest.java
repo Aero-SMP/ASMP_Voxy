@@ -1,0 +1,103 @@
+package me.cortex.voxy.client.lod;
+
+import java.nio.file.*;
+import java.util.concurrent.*;
+import static me.cortex.voxy.client.lod.CacheStartupBehaviorTest.*;
+
+/** Real inventory and owner/worker scheduling; no server metadata redelivery. */
+final class DeferredMetadataBehaviorTest {
+    static void run() throws Exception {
+        readiness(false);
+        readiness(true);
+        acknowledgementIdentity();
+        System.out.println("deferred metadata: once-delivered metadata, terminal failure, coalescing, stale acknowledgement and reopen passed");
+    }
+
+    private static void readiness(boolean failInventory) throws Exception {
+        Path root = Files.createTempDirectory("voxy-deferred-metadata-");
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var f = fixture(1, 1, 240, 1);
+        try {
+            Files.write(root.resolve("gate.vxmeta"), new byte[1]);
+            var budget = RegionalDiskBudget.open(root, path -> {
+                entered.countDown();
+                try { if (!release.await(10, TimeUnit.SECONDS)) throw new java.io.IOException("inventory gate timeout"); }
+                catch (InterruptedException e) { throw new java.io.IOException(e); }
+                if (failInventory) throw new java.io.IOException("injected inventory failure");
+                return null;
+            });
+            try (var owner = new RegionalMetadataStore(budget); var driver = new Driver(root)) {
+                check(entered.await(5, TimeUnit.SECONDS), "inventory not held");
+                var s = driver.session;
+                driver.until(() -> s.metadata != null);
+                s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, f.catalog().fingerprint()));
+                driver.until(() -> s.cache != null);
+                driver.until(() -> s.metadataWorker.idle());
+                check(s.acceptCatalog(f.catalog()), "catalog not accepted");
+                driver.until(() -> s.currentCatalog != null);
+                var region = s.demands.region(0);
+                for (int i = 0; i < 1000; i++) s.saveMetadata(region, i % 2 == 0 ? null : f.index(), f.catalog().fingerprint());
+                check(s.metadataWrites.size() == 1 && s.catalogWrites.size() == 1
+                        && s.pendingCatalogBytes() == f.catalog().canonical().length, "metadata history did not coalesce");
+                for (int i = 0; i < 100; i++) { driver.step(); s.awaitWake(1); }
+                check(!budget.ready() && s.currentCatalog != null && s.metadataWorker.idle(),
+                        "optional persistence blocked catalog use or held worker during inventory");
+                release.countDown();
+                if (failInventory) {
+                    driver.until(() -> budget.persistenceUnavailable() == RegionalMetadataStore.Persistence.UNAVAILABLE);
+                    driver.until(() -> s.metadataWrites.isEmpty() && s.catalogWrites.isEmpty() && !s.associationPending);
+                    long failures = s.persistenceOutcomes[RegionalMetadataStore.Persistence.UNAVAILABLE.ordinal()];
+                    check(failures == 3 && s.pendingCatalogBytes() == 0, "terminal refusal was not acknowledged");
+                    for (int i = 0; i < 100; i++) driver.step();
+                    check(s.persistenceOutcomes[RegionalMetadataStore.Persistence.UNAVAILABLE.ordinal()] == failures
+                            && s.failure == null && s.connectionEpoch == 0, "terminal failure spun or broke streaming");
+                    return;
+                }
+                awaitInventory(budget);
+                driver.until(() -> {
+                    try { return s.metadata.readCatalog(WORLD, DIMENSION, f.catalog().fingerprint()) != null; }
+                    catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
+                });
+                check(WORLD.equals(s.metadata.world(SERVER, DIMENSION)), "association intent lost");
+                driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
+                check(s.cache.put(LocalSection.from(f.index(), 340, f.catalog().fingerprint()), f.payload(), () -> true),
+                        "subsequent section could not commit against deferred catalog");
+            }
+            try (var driver = new Driver(root)) {
+                driver.until(() -> driver.session.activeCount == 1);
+                check(driver.session.receivedBytes == 0 && !driver.session.helloAccepted,
+                        "candidate-written root needed network metadata after reopen");
+            }
+        } finally { release.countDown(); cleanup(root); }
+    }
+
+    private static void acknowledgementIdentity() throws Exception {
+        Path root = Files.createTempDirectory("voxy-metadata-ack-");
+        var f = fixture(1, 1, 240, 1);
+        try (var legacy = new RegionalMetadataStore(root)) {
+            persist(legacy, f, true);
+            try (var driver = new Driver(root)) {
+                var s = driver.session;
+                driver.until(() -> s.activeCount == 1 && s.metadataWorker.idle());
+                var region = s.demands.region(0);
+                s.saveMetadata(region, null, RegionalProtocol.Hash32.ZERO);
+                Object old = s.metadataWrites.get(0L);
+                var dispatch = ClientSession.Session.class.getDeclaredMethod("persistMetadata");
+                dispatch.setAccessible(true);
+                check((boolean) dispatch.invoke(s), "old intent not dispatched");
+                long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (s.metadataWorker.resource.state() != WorkerResource.State.COMPLETED && System.nanoTime() < end) Thread.sleep(1);
+                check(s.metadataWorker.resource.state() == WorkerResource.State.COMPLETED, "write did not complete");
+                region.metadataRevision++;
+                s.saveMetadata(region, f.index(), f.catalog().fingerprint());
+                Object next = s.metadataWrites.get(0L);
+                check(next != old, "replacement identity missing");
+                s.drainWorkers();
+                check(s.metadataWrites.get(0L) == next, "old acknowledgement erased newer region intent");
+                driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
+                check(s.regionPersisted == 2, "coalesced region outcomes inaccurate");
+            }
+        } finally { cleanup(root); }
+    }
+}

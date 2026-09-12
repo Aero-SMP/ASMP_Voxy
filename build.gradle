@@ -297,6 +297,7 @@ tasks.register('verifyDebugHarnessArtifacts') {
                 include '**/SessionDebugTelemetry*'
                 include '**/WorkerDebugTelemetry*', '**/ShaderDebugTelemetry*'
                 include '**/TransportDebugTelemetry*'
+                include '**/DebugCacheTestProfile*'
                 include '**/DebugZoomControl*', '**/debugmixin/**', 'debug.voxy.mixins.json'
             }.files
             if (!leaked.empty) throw new GradleException("debug-test protocol leaked into ${artifact}")

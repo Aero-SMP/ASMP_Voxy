@@ -13,6 +13,11 @@ public final class ClientLodDebug {
     static void init(IEventBus modBus) {}
     static void tick() {}
     static boolean connectionAllowed() { return true; }
+    static java.nio.file.Path cacheNamespace(java.nio.file.Path normal) { return normal; }
+    static boolean cacheDeletionAllowed(java.nio.file.Path path) { return true; }
+    static void inventoryDelay(java.nio.file.Path root) throws java.io.IOException {}
+    static void cacheCommitted(CompletedSectionCache cache, LocalSection section) {}
+    static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) {}
     static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) { return builder; }
     static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {}
     static void startupEvent(ClientSession.Session session, String event, long bytes) {}

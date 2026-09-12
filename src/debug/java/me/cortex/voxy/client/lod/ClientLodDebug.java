@@ -111,6 +111,12 @@ public final class ClientLodDebug {
         SessionDebugTelemetry.event(session, event, bytes);
     }
 
+    static Path cacheNamespace(Path normal) { return DebugCacheTestProfile.namespace(normal); }
+    static boolean cacheDeletionAllowed(Path path) { return DebugCacheTestProfile.canDelete(path); }
+    static void inventoryDelay(Path root) throws IOException { DebugCacheTestProfile.inventoryDelay(root); }
+    static void cacheCommitted(CompletedSectionCache cache, LocalSection section) { DebugCacheTestProfile.verifyChain(cache, section); }
+    static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) { SessionDebugTelemetry.discovered(session, sections); }
+
     static void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {
         SessionDebugTelemetry.admissionReleased(session, meshCompletedNanos);
     }

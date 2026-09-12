@@ -18,6 +18,8 @@ final class SessionDebugTelemetry {
         long windowNanos;
         final LocalSection[] lastActivated = new LocalSection[5];
         final long[] cachedActivations = new long[5], freshActivations = new long[5], firstCachedNanos = new long[5];
+        final long[] discoveredBindings = new long[5];
+        long discoveredRoots;
         volatile Summary latest;
     }
 
@@ -54,6 +56,16 @@ final class SessionDebugTelemetry {
             case "replacement" -> stats.replacements++;
             case "invalidation", "worldCorrection" -> stats.invalidations++;
             case "metadata" -> stats.metadataBytes += bytes;
+        }
+    }
+
+    static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) {
+        var stats = state(session);
+        for (var section : sections.values()) {
+            if (section.kind() == LocalSection.ABSENT) continue;
+            int level = me.cortex.voxy.client.core.rendering.SectionKey.level(section.key());
+            stats.discoveredBindings[level]++;
+            if (level == 4 && session.demands.get(section.key()) != null) stats.discoveredRoots++;
         }
     }
 
@@ -108,6 +120,19 @@ final class SessionDebugTelemetry {
                     && demand.publication != null && demand.publication.rendererAdmitted()) admittedPending++;
         }
         String startup = " transportHeld=" + transportHeld + " localViews=" + stats.localViews
+                + " usableBindingDiscoveriesLod=" + java.util.Arrays.toString(stats.discoveredBindings)
+                + " usableDemandedRootDiscoveries=" + stats.discoveredRoots
+                + " metadataPendingRegions=" + session.metadataWrites.size()
+                + " metadataPendingCatalogs=" + session.catalogWrites.size()
+                + " metadataPendingCatalogBytes=" + session.pendingCatalogBytes()
+                + " metadataPendingAssociation=" + session.associationPending
+                + " metadataOutcomes=" + java.util.Arrays.toString(session.persistenceOutcomes)
+                + " metadataOutcomeOrder=PERSISTED,DEFERRED_INVENTORY,OBSOLETE,UNAVAILABLE"
+                + " associationPersisted=" + session.associationPersisted
+                + " catalogPersisted=" + session.catalogPersisted
+                + " regionPersisted=" + session.regionPersisted
+                + " metadataFailure=" + (session.lastPersistenceFailure == null ? "none" : session.lastPersistenceFailure.replace(' ', '_'))
+                + " bindingCatalogRefusals=" + (session.cache == null ? 0 : session.cache.catalogRefusals)
                 + " subscriptionWindow=" + session.subscriptionWindow()
                 + " acceptedSubscriptions=" + stats.subscriptions + " acceptedSubscriptionPeak=" + stats.subscriptionPeak
                 + " subscriptionRequests=" + stats.subscriptionRequests + " subscriptionReleases=" + stats.subscriptionReleases

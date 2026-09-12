@@ -41,6 +41,7 @@ public final class SectionDemandTableBehaviorTest {
         CacheStartupBehaviorTest.run();
         CompletedSectionJournalBehaviorTest.run();
         CompletedLocalCacheBehaviorTest.run();
+        DeferredMetadataBehaviorTest.run();
         ZoomRangeBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationShutdownBehaviorTest.run();
         PublicationRepairBehaviorTest.run();

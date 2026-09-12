@@ -108,6 +108,15 @@ final class RegionalDiskBudget {
     }
 
     boolean ready() { return this.state == InventoryState.READY; }
+    /** Cheap owner hint; workers recheck under the budget lock. Null permits an attempt. */
+    RegionalMetadataStore.Persistence persistenceUnavailable() {
+        return switch (this.state) {
+            case READY -> null;
+            case NEW, SCANNING, CLEANING -> RegionalMetadataStore.Persistence.DEFERRED_INVENTORY;
+            case CLOSED -> RegionalMetadataStore.Persistence.OBSOLETE;
+            case FAILED -> RegionalMetadataStore.Persistence.UNAVAILABLE;
+        };
+    }
     synchronized boolean writable() {
         if (ready()) return true;
         this.skippedWrites++;
@@ -132,6 +141,7 @@ final class RegionalDiskBudget {
         long started = System.nanoTime();
         this.inventoryStarted = started;
         try {
+            ClientLodDebug.inventoryDelay(this.root);
             this.ownershipChannel = FileChannel.open(this.root.resolve(".voxy-cache.lock"),
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             this.ownershipLock = this.ownershipChannel.tryLock();
@@ -337,6 +347,7 @@ final class RegionalDiskBudget {
     }
 
     private boolean deleteKnown(Path path) throws IOException {
+        if (!ClientLodDebug.cacheDeletionAllowed(path)) return false;
         if (this.preserveLegacy) {
             Path relative = this.root.relativize(path);
             boolean experimental = false;

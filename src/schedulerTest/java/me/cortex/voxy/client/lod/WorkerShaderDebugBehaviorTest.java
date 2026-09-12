@@ -24,11 +24,35 @@ public final class WorkerShaderDebugBehaviorTest {
         stageAccountingAndCpuUnavailable();
         transportCounters();
         transportHoldLease();
+        cacheTestProfileSafety();
         DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
         HarnessTerminalBehaviorTest.run();
         System.out.println("actual debug worker boundaries, lock-owner evidence, CPU availability and shader diff tests passed");
+    }
+
+    private static void cacheTestProfileSafety() throws Exception {
+        var type = Class.forName("me.cortex.voxy.client.lod.DebugCacheTestProfile");
+        var parse = type.getDeclaredMethod("parse", String.class, long.class); parse.setAccessible(true);
+        var install = type.getDeclaredMethod("install", java.nio.file.Path.class, String.class); install.setAccessible(true);
+        long now = System.currentTimeMillis();
+        String request = UUID.randomUUID().toString(), namespace = UUID.randomUUID().toString();
+        String valid = request + " " + namespace + " " + (now + 60_000) + " 2000";
+        check(parse.invoke(null, valid, now) != null, "valid scoped profile rejected");
+        for (String invalid : List.of(request + " ../escape " + (now + 60_000) + " 0",
+                request + " " + namespace + " " + (now - 1) + " 0",
+                request + " " + namespace + " " + (now + 31 * 60_000) + " 0",
+                request + " " + namespace + " " + (now + 60_000) + " 60001")) {
+            try { parse.invoke(null, invalid, now); throw new AssertionError("unsafe profile accepted"); }
+            catch (InvocationTargetException expected) { check(expected.getCause() instanceof IllegalArgumentException, "unexpected parse failure"); }
+        }
+        var root = Files.createTempDirectory("voxy-cache-profile-");
+        try {
+            check((boolean) install.invoke(null, root, valid), "new profile not installed");
+            check(!(boolean) install.invoke(null, root, valid), "consumed profile would restart repeatedly");
+            check(!Files.exists(root.resolve(".voxy")), "profile touched the cache");
+        } finally { CacheStartupBehaviorTest.cleanup(root); }
     }
 
     private static void transportHoldLease() throws Exception {

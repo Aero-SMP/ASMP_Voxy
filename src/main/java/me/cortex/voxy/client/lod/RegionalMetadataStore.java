@@ -12,6 +12,7 @@ import java.util.function.BooleanSupplier;
 
 /** Saved wire inputs only. No transient renderer IDs, meshes, subscriptions or worker state. */
 final class RegionalMetadataStore implements AutoCloseable {
+    enum Persistence { PERSISTED, DEFERRED_INVENTORY, OBSOLETE, UNAVAILABLE }
     private static final long MAGIC = 0x3154524154535856L; // VXSTART1, little endian
     private static final int HEADER = 24, VERSION = 1, ASSOCIATION = 1, CATALOG = 2, REGION = 3;
     private static final int REGION_FIXED = 100;
@@ -38,7 +39,7 @@ final class RegionalMetadataStore implements AutoCloseable {
 
     Path namespace(RegionalProtocol.Hash32 world, String dimension) {
         Path legacy = legacyNamespace(world, dimension);
-        return this.experimental ? legacy.resolve("completed-v1") : legacy;
+        return this.experimental ? ClientLodDebug.cacheNamespace(legacy.resolve("completed-v1")) : legacy;
     }
     Path legacyNamespace(RegionalProtocol.Hash32 world, String dimension) {
         return this.budget.root.resolve(hex(world)).resolve(identifier(dimension));
@@ -47,7 +48,7 @@ final class RegionalMetadataStore implements AutoCloseable {
         return namespace(world, dimension).resolve("r." + x + '.' + z + ".vxmeta");
     }
     private Path association(String server, String dimension) {
-        return (this.experimental ? this.budget.root.resolve("completed-v1") : this.budget.root)
+        return (this.experimental ? ClientLodDebug.cacheNamespace(this.budget.root.resolve("completed-v1")) : this.budget.root)
                 .resolve("servers").resolve(identifier(server + '\0' + dimension) + ".vxlink");
     }
     Path catalogPath(RegionalProtocol.Hash32 world, String dimension, RegionalProtocol.Hash32 hash) {
@@ -63,9 +64,9 @@ final class RegionalMetadataStore implements AutoCloseable {
         return RegionalProtocol.Hash32.read(buffer(bytes));
     }
 
-    void associate(String server, String dimension, RegionalProtocol.Hash32 world,
+    Persistence associate(String server, String dimension, RegionalProtocol.Hash32 world,
                    long stamp, BooleanSupplier current) throws IOException {
-        if (server != null) write(association(server, dimension), ASSOCIATION, world.bytes(),
+        return server == null ? Persistence.OBSOLETE : write(association(server, dimension), ASSOCIATION, world.bytes(),
                 stamp, current, Set.of());
     }
 
@@ -74,22 +75,17 @@ final class RegionalMetadataStore implements AutoCloseable {
         byte[] bytes = read(catalogPath(world, dimension, hash), CATALOG, RegionalProtocol.MAX_CATALOG_BYTES);
         if (bytes == null && this.experimental) {
             bytes = read(legacyNamespace(world, dimension).resolve(hex(hash) + ".vxcat"), CATALOG, RegionalProtocol.MAX_CATALOG_BYTES);
-            if (bytes != null && hash(bytes).equals(hash)) {
-                try { saveCatalog(world, dimension, new RegionalProtocol.CatalogMessage(hash, bytes), this.budget.stamp(), () -> true); }
-                catch (IOException optional) { /* Legacy input remains read-only and usable. */ }
-            }
         }
         if (bytes == null || !hash(bytes).equals(hash)) return null;
         return bytes;
     }
 
-    void saveCatalog(RegionalProtocol.Hash32 world, String dimension,
+    Persistence saveCatalog(RegionalProtocol.Hash32 world, String dimension,
                      RegionalProtocol.CatalogMessage message, long stamp,
                      BooleanSupplier current) throws IOException {
-        if (!this.budget.writable()) return;
         if (!hash(message.canonical()).equals(message.fingerprint())) throw new IOException("catalog hash mismatch");
         Path path = catalogPath(world, dimension, message.fingerprint());
-        write(path, CATALOG, message.canonical(), stamp, current, Set.of(path));
+        return write(path, CATALOG, message.canonical(), stamp, current, Set.of(path));
     }
 
     record SavedRegion(RegionalProtocol.RegionMessage message, boolean absent) {}
@@ -136,22 +132,27 @@ final class RegionalMetadataStore implements AutoCloseable {
             // pressure advanced the stamp. It must not recreate an already evicted descriptor.
             long writeStamp = message == null && Files.isRegularFile(target) ? this.budget.stamp() : stamp;
             if (write(target, REGION, body.array(), writeStamp, current,
-                    catalog == null ? Set.of(target) : Set.of(target, catalog))) {
+                    catalog == null ? Set.of(target) : Set.of(target, catalog)) == Persistence.PERSISTED) {
                 this.budget.reference(target, catalog);
             }
         }
     }
 
-    private boolean write(Path target, int kind, byte[] body, long stamp,
+    private Persistence write(Path target, int kind, byte[] body, long stamp,
                           BooleanSupplier current, Set<Path> protectedPaths) throws IOException {
         synchronized (this.budget) {
-            if (this.closed || !this.budget.writable() || !current.getAsBoolean() || stamp != this.budget.eviction) return false;
-            if (!this.budget.ensure(HEADER + (long) body.length, protectedPaths)) return false;
+            if (this.closed || !current.getAsBoolean() || stamp != this.budget.eviction) return Persistence.OBSOLETE;
+            var unavailable = this.budget.persistenceUnavailable();
+            if (unavailable != null) return unavailable;
+            if (java.util.Arrays.equals(body, read(target, kind, body.length))) {
+                return current.getAsBoolean() && stamp == this.budget.eviction ? Persistence.PERSISTED : Persistence.OBSOLETE;
+            }
+            if (!this.budget.ensure(HEADER + (long) body.length, protectedPaths)) return Persistence.UNAVAILABLE;
             Files.createDirectories(target.getParent());
             Path temporary = target.resolveSibling(target.getFileName() + ".pending");
             if (Files.exists(temporary) && !Files.isRegularFile(temporary))
                 throw new IOException("cache temporary is not a regular file");
-            if (Files.exists(temporary) && !this.budget.delete(temporary)) return false;
+            if (Files.exists(temporary) && !this.budget.delete(temporary)) return Persistence.UNAVAILABLE;
             long old = RegionalDiskBudget.size(target);
             long reserved = HEADER + (long) body.length;
             this.budget.bytes += reserved;
@@ -167,11 +168,11 @@ final class RegionalMetadataStore implements AutoCloseable {
                     while (data.hasRemaining()) out.write(data);
                     out.force(true);
                 }
-                if (!current.getAsBoolean()) return false;
+                if (!current.getAsBoolean()) return Persistence.OBSOLETE;
                 Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
                 this.budget.bytes -= old;
                 installed = true;
-                return true;
+                return Persistence.PERSISTED;
             } finally {
                 if (!installed) {
                     long actual = RegionalDiskBudget.size(temporary);

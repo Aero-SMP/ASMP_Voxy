@@ -13,7 +13,7 @@ final class RuntimeCachePressureBehaviorTest {
         for (String mode : List.of("oldest", "ties", "protected", "no-eligible", "recorded")) eviction(mode);
         filesystemFailures();
         replacementAccounting();
-        for (String mode : List.of("valid", "stamp", "view", "revision", "closed")) schedulerPersistence(mode);
+        for (String mode : List.of("valid", "stamp", "dispatched-stamp", "view", "revision", "closed")) schedulerPersistence(mode);
         concurrentSnapshots();
         System.out.println("runtime pressure ordering, safeguards, worker persistence and nonblocking cache statistics tests passed");
     }
@@ -182,12 +182,18 @@ final class RuntimeCachePressureBehaviorTest {
                     case "view" -> session.viewRevision++;
                     case "revision" -> state.metadataRevision++;
                     case "closed" -> session.cache.close(); // A closed cache rejects even with other budget owners.
-                    case "valid" -> {}
+                    case "valid", "dispatched-stamp" -> {}
                     default -> throw new AssertionError(mode);
                 }
+                var dispatch = ClientSession.Session.class.getDeclaredMethod("persistMetadata");
+                dispatch.setAccessible(true);
+                check((boolean) dispatch.invoke(session), "persistence not dispatched");
+                if (mode.equals("dispatched-stamp")) synchronized (store.budget) {
+                    try (var files = Files.walk(root)) {
+                        check(store.budget.delete(files.filter(p -> p.toString().endsWith(".vxlink")).findFirst().orElseThrow()), "dispatch stamp not advanced");
+                    }
+                }
                 session.metadataWorker.start();
-                ClientSession.Session.WorkerTask task = session.metadataWrites.remove(0L);
-                session.metadataWorker.assign(task);
                 long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                 while (session.metadataWorker.resource.state() != WorkerResource.State.COMPLETED && System.nanoTime() < end) Thread.sleep(1);
                 var result = session.metadataWorker.resource.claim();

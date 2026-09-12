@@ -303,18 +303,34 @@ final class ClientAutoUpdater {
         String player = Minecraft.getInstance().getUser().getName();
         if (!player.matches("[A-Za-z0-9_]{1,16}")) throw new IOException("invalid debug player name");
         String resetFile = shellQuote(REMOTE_DIRECTORY + "/debug-client-reset/" + player + ".request");
+        String profileFile = shellQuote(REMOTE_DIRECTORY + "/debug-cache-test/" + player + ".request");
         CommandResult listing = run(Duration.ofSeconds(45), sshExecutable(), "-n",
                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", SSH_TARGET,
                 "LC_ALL=C find " + shellQuote(REMOTE_DIRECTORY)
                         + " -maxdepth 1 -type f -printf '%f\\n' | sort; if test -f " + resetFile
                         + "; then printf 'VOXY_CACHE_RESET='; head -c 64 " + resetFile
-                        + "; printf '\\n'; fi");
+                        + "; printf '\\n'; fi; if test -f " + profileFile
+                        + "; then printf 'VOXY_CACHE_TEST='; head -c 200 " + profileFile + "; printf '\\n'; fi");
         if (listing.exitCode != 0) {
             throw new IOException("ssh listing failed (exit " + listing.exitCode + "): "
                     + oneLine(listing.output));
         }
 
         Path gameDirectory = Minecraft.getInstance().gameDirectory.toPath().toAbsolutePath();
+        String profile = listing.output.lines().filter(line -> line.startsWith("VOXY_CACHE_TEST="))
+                .map(line -> line.substring("VOXY_CACHE_TEST=".length()).trim()).findFirst().orElse(null);
+        if (profile != null) {
+            try {
+                if (DebugCacheTestProfile.install(gameDirectory, profile)) {
+                    launchRestartHelper(findCurrentJar(gameDirectory.resolve("mods")), gameDirectory, null);
+                    ClientLodDebug.updaterEvent("state=CACHE_TEST_RESTART profile=" + profile);
+                    restartPending = true;
+                    return true;
+                }
+            } catch (IllegalArgumentException expired) {
+                ClientLodDebug.updaterEvent("state=CACHE_TEST_IGNORED reason=" + oneLine(expired.getMessage()));
+            }
+        }
         String reset = listing.output.lines().filter(line -> line.startsWith("VOXY_CACHE_RESET="))
                 .map(line -> line.substring("VOXY_CACHE_RESET=".length()).trim()).findFirst().orElse(null);
         if (reset != null && ClientUpdateRestart.cacheResetPending(gameDirectory, reset)) {

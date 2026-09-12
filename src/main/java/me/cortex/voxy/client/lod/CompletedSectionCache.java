@@ -10,14 +10,15 @@ import java.util.function.BooleanSupplier;
 
 /** Budget-owned experimental local directory; all methods are worker-only, never render-thread I/O. */
 final class CompletedSectionCache implements AutoCloseable {
-    private final RegionalMetadataStore metadata;
+    final RegionalMetadataStore metadata;
     private final RegionalDiskBudget budget;
-    private final RegionalProtocol.Hash32 world;
-    private final String dimension;
+    final RegionalProtocol.Hash32 world;
+    final String dimension;
     private final Path root;
     private final RegionalCache legacy;
     private final LinkedHashMap<Long, CompletedSectionJournal> journals = new LinkedHashMap<>(64, .75f, true);
     private boolean closed;
+    volatile long catalogRefusals;
 
     CompletedSectionCache(RegionalMetadataStore metadata, RegionalProtocol.Hash32 world, String dimension) throws IOException {
         this.metadata = metadata; this.budget = metadata.budget; this.world = world; this.dimension = dimension;
@@ -90,19 +91,23 @@ final class CompletedSectionCache implements AutoCloseable {
         }
     }
 
-    void absentRegion(long region, BooleanSupplier current) throws IOException {
+    RegionalMetadataStore.Persistence absentRegion(long region, BooleanSupplier current) throws IOException {
         synchronized (this.budget) {
-            if (this.closed || !this.budget.writable() || !current.getAsBoolean()) return;
+            if (this.closed || !current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
+            var unavailable = this.budget.persistenceUnavailable();
+            if (unavailable != null) return unavailable;
             Path path = path(region);
-            if (!this.budget.closeOtherOwners(path, this)) return;
+            if (!this.budget.closeOtherOwners(path, this)) return RegionalMetadataStore.Persistence.UNAVAILABLE;
             var journal = journal(region, true);
-            if (journal == null || !this.budget.ensure(32, Set.of(path)) || !current.getAsBoolean()) return;
+            if (journal == null || !this.budget.ensure(32, Set.of(path))) return RegionalMetadataStore.Persistence.UNAVAILABLE;
+            if (!current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
             long before = journal.bytes();
             try { journal.absentRegion(); }
             finally {
                 this.budget.bytes += RegionalDiskBudget.size(path) - before;
                 this.budget.references(path, catalogPaths(path, journal.catalogs()));
             }
+            return RegionalMetadataStore.Persistence.PERSISTED;
         }
     }
 
@@ -110,29 +115,40 @@ final class CompletedSectionCache implements AutoCloseable {
      * append exclusion: a revoked worker cannot overwrite a successor's committed binding.
      * Server generation numbers are deliberately not used as cross-session cache authority. */
     boolean put(LocalSection section, byte[] compressed, BooleanSupplier current) throws IOException {
+        return putMetadata(section, compressed, current) == RegionalMetadataStore.Persistence.PERSISTED;
+    }
+
+    RegionalMetadataStore.Persistence putMetadata(LocalSection section, byte[] compressed, BooleanSupplier current) throws IOException {
         synchronized (this.budget) {
-            if (this.closed || !this.budget.writable() || !current.getAsBoolean()) return false;
+            if (this.closed || !current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
+            var unavailable = this.budget.persistenceUnavailable();
+            if (unavailable != null) return unavailable;
             Path path = path(section.region());
             Path catalog = section.catalog().equals(RegionalProtocol.Hash32.ZERO) ? null
                     : this.metadata.catalogPath(this.world, this.dimension, section.catalog());
             // Catalog save validates and forces content before this worker can publish a binding.
-            if (catalog != null && !Files.isRegularFile(catalog)) return false;
+            if (catalog != null && !Files.isRegularFile(catalog)) {
+                this.catalogRefusals++;
+                return RegionalMetadataStore.Persistence.UNAVAILABLE;
+            }
             Set<Path> protect = catalog == null ? Set.of(path) : Set.of(path, catalog);
-            if (!this.budget.closeOtherOwners(path, this)) return false;
+            if (!this.budget.closeOtherOwners(path, this)) return RegionalMetadataStore.Persistence.UNAVAILABLE;
             // Catalog pins cover initial shard creation as well as the actual append reservation.
             try (var pin = this.budget.pin(catalog)) {
             var journal = journal(section.region(), true);
-            if (journal == null) return false;
+            if (journal == null) return RegionalMetadataStore.Persistence.UNAVAILABLE;
             long added = journal.appendBytes(section);
-            if (journal.bytes() + added > CompletedSectionJournal.MAX_BYTES) return false;
-            if (!this.budget.ensure(added, protect) || !current.getAsBoolean()) return false;
+            if (journal.bytes() + added > CompletedSectionJournal.MAX_BYTES) return RegionalMetadataStore.Persistence.UNAVAILABLE;
+            if (!this.budget.ensure(added, protect)) return RegionalMetadataStore.Persistence.UNAVAILABLE;
+            if (!current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
             long before = journal.bytes();
             try { journal.append(section, compressed); }
             finally {
                 this.budget.bytes += RegionalDiskBudget.size(path) - before;
                 this.budget.references(path, catalogPaths(path, journal.catalogs()));
             }
-            return true;
+            ClientLodDebug.cacheCommitted(this, section);
+            return RegionalMetadataStore.Persistence.PERSISTED;
             }
         }
     }
