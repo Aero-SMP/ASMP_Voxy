@@ -1,5 +1,0 @@
-allprojects {
-    tasks.withType(Jar).configureEach {
-        destinationDirectory = rootProject.layout.projectDirectory.dir('build/release-validation-211')
-    }
-}
