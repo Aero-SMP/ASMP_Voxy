@@ -1149,36 +1149,6 @@ public class ModelFactory implements SectionMesher.Models {
         return this.metadataCache[clientId];
     }
 
-    /** Stable baked texture/template contribution used by the compiled-geometry identity. */
-    public long getModelResourceFingerprint(int clientId) {
-        if (clientId < 0 || clientId >= this.modelEntriesById.length) {
-            throw new IllegalArgumentException("model id is outside the renderer format");
-        }
-        ModelEntry entry = this.modelEntriesById[clientId];
-        if (entry == null) return 0;
-        long hash = 0x9e3779b97f4a7c15L;
-        hash = mixFingerprint(hash, entry.down());
-        hash = mixFingerprint(hash, entry.up());
-        hash = mixFingerprint(hash, entry.north());
-        hash = mixFingerprint(hash, entry.south());
-        hash = mixFingerprint(hash, entry.west());
-        hash = mixFingerprint(hash, entry.east());
-        hash ^= Integer.toUnsignedLong(entry.fluidBlockStateId()) * 0xd6e8feb86659fd93L;
-        hash = Long.rotateLeft(hash, 23)
-                ^ Integer.toUnsignedLong(entry.tintingColour()) * 0xa0761d6478bd642fL;
-        hash ^= hash >>> 29;
-        hash *= 0x94d049bb133111ebL;
-        return hash ^ hash >>> 31;
-    }
-
-    private static long mixFingerprint(long hash, ColourDepthTextureData texture) {
-        long value = Integer.toUnsignedLong(texture.hash())
-                | (long) texture.width() << 32 | (long) texture.height() << 48;
-        hash ^= value * 0x9e3779b185ebca87L;
-        return Long.rotateLeft(hash, 27) * 0xc2b2ae3d27d4eb4fL;
-    }
-
-
     public void free() {
         var cleanup = new me.cortex.voxy.common.util.Cleanup();
         cleanup.run(this.bakery2::free);

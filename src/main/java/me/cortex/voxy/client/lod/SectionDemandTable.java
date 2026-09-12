@@ -22,8 +22,6 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         RENDERER_OWNED
     }
 
-    enum Retention { SELECTED, WARM, COLD, UNWANTED }
-
     enum ReadyKind { SOURCE, NETWORK, RENDERER }
 
     record Ticket(long key, long sessionEpoch, long demandRevision, long regionGeneration,
@@ -33,7 +31,6 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
 
     static final class RegionDemand {
         final long key;
-        int users;
         int coverageUsers;
         int highestBucket;
         long announcedGeneration;
@@ -61,14 +58,10 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         final long key;
         final long regionKey;
         final boolean coverage;
-        final long topOwner;
         volatile long revision = 1;
         volatile long regionGeneration;
         int pixelBucket;
-        int latestDetailEpoch = -1;
-        boolean desired = true;
         volatile CandidateState candidate = CandidateState.NONE;
-        Retention retention = Retention.SELECTED;
 
         ReadyKind readyKind;
         int readyBucket = -1;
@@ -76,10 +69,9 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         Demand readyPrevious;
         Demand readyNext;
 
-        Demand(long key, long regionKey, long topOwner, boolean coverage, int pixelBucket) {
+        Demand(long key, long regionKey, boolean coverage, int pixelBucket) {
             this.key = key;
             this.regionKey = regionKey;
-            this.topOwner = topOwner;
             this.coverage = coverage;
             this.pixelBucket = pixelBucket;
         }
@@ -244,7 +236,6 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
                 demand.pixelBucket));
         this.demands.put(demand.key, demand);
         RegionDemand region = this.regions.computeIfAbsent(demand.regionKey, RegionDemand::new);
-        region.users++;
         if (demand.coverage) region.coverageUsers++;
         region.members.put(demand.key, demand);
         region.highestBucket = Math.max(region.highestBucket, demand.pixelBucket);
@@ -294,13 +285,14 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     int readyRegionCount() { return this.readyRegions.size(); }
 
     D remove(long key) {
-        D demand = this.demands.remove(key);
+        D demand = this.demands.get(key);
         if (demand == null) return null;
-        unlinkReady(demand);
         RegionDemand region = this.regions.get(demand.regionKey);
-        if (region == null || --region.users < 0) {
-            throw new IllegalStateException("regional demand accounting underflow");
+        if (region == null || region.members.get(key) != demand) {
+            throw new IllegalStateException("regional demand membership mismatch");
         }
+        this.demands.remove(key);
+        unlinkReady(demand);
         region.members.remove(demand.key);
         if (demand.coverage && --region.coverageUsers < 0) {
             throw new IllegalStateException("regional coverage accounting underflow");
@@ -309,11 +301,10 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             region.highestBucket = region.members.values().stream()
                     .mapToInt(member -> member.pixelBucket).max().orElse(0);
         }
-        if (region.users == 0) {
+        if (region.members.isEmpty()) {
             this.forgetUnusedRegion(region);
             this.readyRegions.remove(region.key);
         }
-        demand.desired = false;
         demand.revision++;
         return demand;
     }
@@ -321,7 +312,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     void forgetUnusedRegion(RegionDemand region) {
         // Keep response ordering on the existing record if a retired region reenters before
         // its old response arrives. This is not an additional subscription or demand.
-        if (region.users == 0 && region.pendingResponses == 0) {
+        if (region.members.isEmpty() && region.pendingResponses == 0) {
             this.regions.remove(region.key, region);
             this.readyRegions.remove(region.key);
         }
@@ -447,6 +438,10 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         int memberships = 0;
         Map<Long, Integer> users = new HashMap<>();
         for (Demand demand : this.demands.values()) {
+            RegionDemand region = this.regions.get(demand.regionKey);
+            if (region == null || region.members.get(demand.key) != demand) {
+                throw new IllegalStateException("regional demand membership mismatch");
+            }
             users.merge(demand.regionKey, 1, Integer::sum);
             if (demand.readyKind != null) {
                 memberships++;
@@ -464,10 +459,25 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             }
         }
         if (memberships != indexed) throw new IllegalStateException("ready count mismatch");
-        if (users.size() != this.regions.size()) throw new IllegalStateException("region leak");
         for (RegionDemand region : this.regions.values()) {
-            if (region.users != users.getOrDefault(region.key, 0)) {
+            if (region.members.size() != users.getOrDefault(region.key, 0)) {
                 throw new IllegalStateException("region user mismatch");
+            }
+            if (region.pendingResponses < 0
+                    || region.members.isEmpty() && region.pendingResponses == 0) {
+                throw new IllegalStateException("region leak");
+            }
+            int coverage = 0;
+            for (var entry : region.members.entrySet()) {
+                Demand member = entry.getValue();
+                if (entry.getKey() != member.key || member.regionKey != region.key
+                        || this.demands.get(member.key) != member) {
+                    throw new IllegalStateException("stale regional member");
+                }
+                if (member.coverage) coverage++;
+            }
+            if (coverage != region.coverageUsers) {
+                throw new IllegalStateException("region coverage mismatch");
             }
         }
     }

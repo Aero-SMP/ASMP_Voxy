@@ -267,7 +267,7 @@ final class ClientSession {
         long blockedRequiredBytes;
 
         Demand(long key) {
-            super(key, regionFor(key), topAncestor(key),
+            super(key, regionFor(key),
                     SectionKey.level(key) == SectionKey.MAX_LOD_LAYER, 0);
         }
     }
@@ -378,9 +378,7 @@ final class ClientSession {
         RegionalSectionCodec.BoundCatalog currentCatalog;
         boolean catalogRequested;
         long catalogRequirementRevision;
-        long catalogRequestedRevision;
         int inFlightBatches;
-        int inFlightSections;
         long inFlightBytes;
         long connectionEpoch;
         long requestEpoch = 1;
@@ -864,7 +862,6 @@ final class ClientSession {
             this.regionReleases.clear();
             ClientLodDebug.startupEvent(this, "subscriptionReset", 0);
             this.inFlightBatches = 0;
-            this.inFlightSections = 0;
             this.inFlightBytes = 0;
             NetworkReply reply;
             while ((reply = this.networkReplies.poll()) != null) reply.transferred();
@@ -950,7 +947,6 @@ final class ClientSession {
                     && (this.metadata == null || !fingerprint.equals(this.catalogProbed))) return;
             if (this.quic != null && this.helloAccepted && !this.catalogRequested && this.quic.requestCatalog()) {
                 this.catalogRequested = true;
-                this.catalogRequestedRevision = this.catalogRequirementRevision;
             }
         }
 
@@ -1091,8 +1087,6 @@ final class ClientSession {
                         if (complete.connectionEpoch != this.connectionEpoch) continue;
                         this.completedBatches++;
                         this.inFlightBatches = Math.max(0, this.inFlightBatches - 1);
-                        this.inFlightSections = Math.max(0,
-                                this.inFlightSections - complete.sectionCount);
                         this.inFlightBytes = Math.max(0,
                                 this.inFlightBytes - complete.reservedBytes);
                     }
@@ -1281,7 +1275,6 @@ final class ClientSession {
             demand.lastSelectedSequence = ++this.selectionSequence;
             if (!demand.dormant) {
                 demand.dormant = true;
-                demand.retention = SectionDemandTable.Retention.WARM;
                 this.dormancyTransitions++;
             }
             DormantRoot ancestor = this.dormantAncestor(key);
@@ -1309,7 +1302,6 @@ final class ClientSession {
             demand.lastSelectedSequence = ++this.selectionSequence;
             boolean transitioned = demand.dormant;
             demand.dormant = false;
-            demand.retention = SectionDemandTable.Retention.SELECTED;
             DormantRoot root = this.removeDormantRoot(key);
             if (transitioned) this.wakes++;
             if (root != null) {
@@ -1528,7 +1520,7 @@ final class ClientSession {
             demand.publication = null;
             demand.previousPublication = null;
             removeOwned(this.demandsByTop, topAncestor(key), key);
-            if (regionState != null && regionState.users == 0) this.releaseRegion(region, regionState);
+            if (regionState != null && regionState.members.isEmpty()) this.releaseRegion(region, regionState);
         }
 
         boolean isCoarsening(long key) {
@@ -1681,7 +1673,7 @@ final class ClientSession {
                 SectionDemandTable.RegionDemand regionState = this.demands.region(region);
                 this.demands.remove(key);
                 removeOwned(this.demandsByTop, topAncestor(key), key);
-                if (regionState != null && regionState.users == 0) {
+                if (regionState != null && regionState.members.isEmpty()) {
                     this.releaseRegion(region, regionState);
                 }
             }
@@ -1689,14 +1681,14 @@ final class ClientSession {
 
         void releaseRegion(long region, SectionDemandTable.RegionDemand state) {
             var write = this.metadataWrites.get(region);
-            if (state != null && state.users == 0 && write != null && write.message() != null) {
+            if (state != null && state.members.isEmpty() && write != null && write.message() != null) {
                 this.metadataWrites.remove(region);
             }
             if (state == null || !state.subscribed) return;
             state.subscribed = false;
             state.requested = false;
             state.validated = false;
-            if (state.users > 0) {
+            if (!state.members.isEmpty()) {
                 state.metadataRevision++;
                 state.pendingIndex = null;
                 state.pendingCatalog = null;
@@ -1797,7 +1789,7 @@ final class ClientSession {
             while ((region = this.demands.pollRegion(candidate -> !candidate.requested
                     && !candidate.validated && this.inSubscriptionWindow(candidate.key)
                     && now - candidate.retryAfter >= 0)) != null) {
-                if (region.users == 0) continue;
+                if (region.members.isEmpty()) continue;
                 synchronized (this) {
                     // Publish and admission share this short lock, never a network write or scan.
                     // A newer window must have its releases reconciled before any next addition.
@@ -2362,8 +2354,7 @@ final class ClientSession {
                             if (!open.get()) throw new InterruptedException("session closed");
                         }
                         @Override public void complete() {
-                            putEvent(new BatchComplete(batchConnectionEpoch, reservedBytes,
-                                    selected.size()));
+                            putEvent(new BatchComplete(batchConnectionEpoch, reservedBytes));
                         }
                         @Override public void failed(Throwable failure) {
                             putEvent(new BatchFailed(batchConnectionEpoch, failure));
@@ -2379,7 +2370,6 @@ final class ClientSession {
                 demand.candidate = SectionDemandTable.CandidateState.NETWORK_OWNED;
             }
             this.inFlightBatches++;
-            this.inFlightSections += selected.size();
             this.inFlightBytes += reservedBytes;
             return true;
         }
@@ -2958,8 +2948,7 @@ final class ClientSession {
                                 Throwable failure) implements Event {}
     private record Coarsened(long parent, long view) implements Event {}
     private record CoarsenFailed(long parent, long view, Throwable failure) implements Event {}
-    private record BatchComplete(long connectionEpoch, long reservedBytes,
-                                 int sectionCount) implements Event {}
+    private record BatchComplete(long connectionEpoch, long reservedBytes) implements Event {}
     private record BatchFailed(long connectionEpoch, Throwable failure) implements Event {}
     private record SessionObservation(Consumer<Session> receiver) implements Event {}
 

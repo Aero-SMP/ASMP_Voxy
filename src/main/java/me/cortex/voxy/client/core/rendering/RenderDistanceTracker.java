@@ -21,7 +21,6 @@ public class RenderDistanceTracker {
     private int radius;
     private int centerX;
     private int centerZ;
-    private int renderDistance;
     private double posX;
     private double posZ;
     private boolean initialized;
@@ -47,20 +46,20 @@ public class RenderDistanceTracker {
         this.windowChanged = windowChanged;
         this.addTopLevelNode = addTopLevelNode;
         this.removeTopLevelNode = removeTopLevelNode;
-        this.radius = this.renderDistance = 2;
+        this.radius = 2;
         this.boundDist = generateBoundingHalfCircleDistance(this.radius);
         this.minSec = minSec;
         this.maxSec = maxSec;
     }
 
     public void setRenderDistance(int renderDistance) {
-        if (renderDistance == this.renderDistance) {
+        if (renderDistance == this.radius) {
             return;
         }
         if (this.initialized) this.fillRing(false);
         var previousOperations = this.operations;
         this.operations = new Long2ByteOpenHashMap(1<<13);
-        this.radius = this.renderDistance = renderDistance;
+        this.radius = renderDistance;
         this.centerX = (int) Math.floor(this.posX / 512.0);
         this.centerZ = (int) Math.floor(this.posZ / 512.0);
         this.boundDist = generateBoundingHalfCircleDistance(this.radius);

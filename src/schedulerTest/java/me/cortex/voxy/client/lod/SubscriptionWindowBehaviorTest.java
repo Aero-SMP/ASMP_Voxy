@@ -31,7 +31,7 @@ final class SubscriptionWindowBehaviorTest {
                 long region = wire.session.demands.get(key).regionKey;
                 var state = wire.session.demands.region(region);
                 wire.session.demands.remove(key);
-                if (state.users == 0) wire.session.releaseRegion(region, state);
+                if (state.members.isEmpty()) wire.session.releaseRegion(region, state);
             }, wire.session::offerWindow);
             tracker.setRenderDistance(65);
             settle(tracker, wire, 0, 0);
@@ -76,10 +76,10 @@ final class SubscriptionWindowBehaviorTest {
             var region = s.demands.region(old.regionKey);
             s.offerWindow(here); s.queueRegion(region.key); wire.drain();
             s.retireDemand(old.key);
-            check(region.users == 0 && s.demands.region(region.key) == region, "retirement lost ordered response ownership");
+            check(region.members.isEmpty() && s.demands.region(region.key) == region, "retirement lost ordered response ownership");
             var replacement = s.demands.adopt(new ClientSession.Demand(old.key));
             s.queueRegion(region.key); wire.drain();
-            check(region.users == 1 && region.pendingResponses == 2, "recreated demand did not reuse reply accounting");
+            check(region.members.size() == 1 && region.pendingResponses == 2, "recreated demand did not reuse reply accounting");
             s.acceptRegionUnavailable(new RegionalProtocol.RegionUnavailable(0, 0, true));
             check(s.demands.get(old.key) == replacement && !region.validated, "late retired-generation response removed successor");
             s.offerWindow(away);
@@ -146,6 +146,7 @@ final class SubscriptionWindowBehaviorTest {
             check(!windows.isEmpty(), "callback preceded target publication");
         }, key -> {}, windows::add);
         tracker.setRenderDistance(3);
+        tracker.setRenderDistance(3);
         check(windows.isEmpty(), "uninitialized tracker published origin");
         tracker.setCenterAndProcess(-1, -1);
         check(windows.getLast().equals(new RenderDistanceTracker.Window(-1, -1, 3)), "negative coordinates did not floor");
@@ -155,6 +156,9 @@ final class SubscriptionWindowBehaviorTest {
         check(windows.getLast().equals(new RenderDistanceTracker.Window(0, 0, 3)), "real center change not published");
         tracker.setRenderDistance(2);
         check(windows.getLast().equals(new RenderDistanceTracker.Window(0, 0, 2)), "distance change not published");
+        int notifications = windows.size();
+        tracker.setRenderDistance(2);
+        check(windows.size() == notifications, "same radius published an extra window");
     }
 
     static void exactWindow(Wire wire, int x, int z, int radius) {

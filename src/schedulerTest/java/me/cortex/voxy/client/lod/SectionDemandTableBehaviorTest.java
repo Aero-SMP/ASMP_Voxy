@@ -28,6 +28,8 @@ public final class SectionDemandTableBehaviorTest {
         readyRegionOrdering();
         mixedReadyRegionOrdering();
         finalSectionReleasesRegion();
+        emptyRegionRetainsPendingResponses();
+        rejectsInvalidRegionMembership();
         staleTicketCannotMutateReplacement();
         allocatorUsesExactOneKiBUnits();
         allocatorReportsFragmentation();
@@ -70,7 +72,7 @@ public final class SectionDemandTableBehaviorTest {
 
     private static void priorityMovesOneMembership() {
         SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(8);
-        SectionDemandTable.Demand demand = table.adopt(demand(1, 4, 9, false, 1));
+        SectionDemandTable.Demand demand = table.adopt(demand(1, 4, false, 1));
         table.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
         table.setPriority(demand, 7);
         check(table.readyCount(SectionDemandTable.ReadyKind.SOURCE) == 1,
@@ -84,10 +86,10 @@ public final class SectionDemandTableBehaviorTest {
 
     private static void coveragePrecedesFairRegionalRefinement() {
         SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(8);
-        SectionDemandTable.Demand lowA = table.adopt(demand(1, 10, 100, false, 7));
-        SectionDemandTable.Demand lowA2 = table.adopt(demand(2, 10, 100, false, 7));
-        SectionDemandTable.Demand lowB = table.adopt(demand(3, 20, 100, false, 7));
-        SectionDemandTable.Demand coverage = table.adopt(demand(4, 30, 100, true, 0));
+        SectionDemandTable.Demand lowA = table.adopt(demand(1, 10, false, 7));
+        SectionDemandTable.Demand lowA2 = table.adopt(demand(2, 10, false, 7));
+        SectionDemandTable.Demand lowB = table.adopt(demand(3, 20, false, 7));
+        SectionDemandTable.Demand coverage = table.adopt(demand(4, 30, true, 0));
         table.ready(lowA, SectionDemandTable.ReadyKind.NETWORK);
         table.ready(lowA2, SectionDemandTable.ReadyKind.NETWORK);
         table.ready(lowB, SectionDemandTable.ReadyKind.NETWORK);
@@ -105,25 +107,78 @@ public final class SectionDemandTableBehaviorTest {
 
     private static void finalSectionReleasesRegion() {
         SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(4);
-        table.adopt(demand(1, 77, 1, false, 0));
-        table.adopt(demand(2, 77, 1, false, 0));
+        table.adopt(demand(1, 77, false, 0));
+        table.adopt(demand(2, 77, false, 0));
         table.remove(1);
-        check(table.regionCount() == 1 && table.region(77).users == 1,
+        check(table.regionCount() == 1 && table.region(77).members.size() == 1,
                 "region was released too early");
         table.remove(2);
         check(table.regionCount() == 0, "final section did not release its region");
     }
 
+    private static void emptyRegionRetainsPendingResponses() {
+        var table = new SectionDemandTable<SectionDemandTable.Demand>(4);
+        table.adopt(demand(1, 77, false, 0));
+        var region = table.region(77);
+        region.pendingResponses = 2;
+        table.remove(1);
+        table.checkInvariants();
+        check(table.region(77) == region, "pending response record was discarded");
+        region.pendingResponses--;
+        table.forgetUnusedRegion(region);
+        table.checkInvariants();
+        var replacement = table.adopt(demand(2, 77, true, 1));
+        check(table.adopt(demand(2, 77, true, 1)) == replacement,
+                "duplicate adoption replaced member");
+        table.checkInvariants();
+        region.pendingResponses--;
+        table.forgetUnusedRegion(region);
+        check(table.region(77) == region, "live member was discarded with final response");
+        table.remove(2);
+        check(table.remove(2) == null && table.regionCount() == 0,
+                "final removal retained region or repeated removal changed state");
+        table.checkInvariants();
+    }
+
+    private static void rejectsInvalidRegionMembership() {
+        var table = new SectionDemandTable<SectionDemandTable.Demand>(4);
+        var owned = table.adopt(demand(1, 77, true, 0));
+        var region = table.region(77);
+        for (boolean missing : new boolean[]{true, false}) {
+            if (missing) region.members.remove(1L);
+            else region.members.put(1L, demand(1, 77, true, 0));
+            expectInvariantFailure(table::checkInvariants);
+            expectInvariantFailure(() -> table.remove(1));
+            check(table.get(1) == owned, "failed membership check mutated ownership");
+        }
+        region.members.put(1L, owned);
+        region.members.put(2L, demand(2, 77, false, 0));
+        expectInvariantFailure(table::checkInvariants);
+        region.members.remove(2L);
+        region.coverageUsers = 0;
+        expectInvariantFailure(table::checkInvariants);
+        region.coverageUsers = 1;
+        table.checkInvariants();
+        table.remove(1);
+        table.checkInvariants();
+    }
+
+    private static void expectInvariantFailure(Runnable action) {
+        try { action.run(); }
+        catch (IllegalStateException expected) { return; }
+        throw new AssertionError("corrupt membership passed validation");
+    }
+
     private static void readyRegionOrdering() {
         var table = new SectionDemandTable<SectionDemandTable.Demand>(8);
         var kind = SectionDemandTable.ReadyKind.NETWORK;
-        var a = table.adopt(demand(1, 10, 100, false, 7));
-        var a2 = table.adopt(demand(2, 10, 100, false, 7));
-        var a3 = table.adopt(demand(3, 10, 100, false, 7));
-        var b = table.adopt(demand(4, 20, 100, false, 7));
-        var b2 = table.adopt(demand(5, 20, 100, false, 7));
-        var c = table.adopt(demand(6, 30, 100, false, 7));
-        var c2 = table.adopt(demand(7, 30, 100, false, 7));
+        var a = table.adopt(demand(1, 10, false, 7));
+        var a2 = table.adopt(demand(2, 10, false, 7));
+        var a3 = table.adopt(demand(3, 10, false, 7));
+        var b = table.adopt(demand(4, 20, false, 7));
+        var b2 = table.adopt(demand(5, 20, false, 7));
+        var c = table.adopt(demand(6, 30, false, 7));
+        var c2 = table.adopt(demand(7, 30, false, 7));
         for (var d : List.of(a, b, c, a2, b2, c2, a3)) { table.ready(d, kind); table.checkInvariants(); }
         check(table.pollSameRegion(kind, 999, false, 7) == null, "missing region produced work");
         table.remove(a2.key); table.checkInvariants(); // Nonfinal removal must not rotate A.
@@ -163,7 +218,7 @@ public final class SectionDemandTableBehaviorTest {
             var d = table.get(id);
             int op = random.nextInt(5);
             if (op < 3) {
-                if (d == null) d = table.adopt(demand(id, id % 3, 100, false, 7));
+                if (d == null) d = table.adopt(demand(id, id % 3, false, 7));
                 for (var batch : turns) batch.remove(d);
                 turns.removeIf(List::isEmpty);
                 if (op == 0) {
@@ -197,12 +252,12 @@ public final class SectionDemandTableBehaviorTest {
 
     private static void staleTicketCannotMutateReplacement() {
         SectionDemandTable<SectionDemandTable.Demand> table = new SectionDemandTable<>(4, 9);
-        SectionDemandTable.Demand first = table.adopt(demand(1, 2, 3, false, 0));
+        SectionDemandTable.Demand first = table.adopt(demand(1, 2, false, 0));
         first.regionGeneration = 5;
         SectionDemandTable.Ticket ticket = first.ticket(9, 0);
         check(table.current(ticket), "fresh ticket was rejected");
         table.remove(1);
-        SectionDemandTable.Demand replacement = table.adopt(demand(1, 2, 3, false, 0));
+        SectionDemandTable.Demand replacement = table.adopt(demand(1, 2, false, 0));
         replacement.regionGeneration = 5;
         check(!table.current(ticket), "stale ticket matched replacement demand");
     }
@@ -232,9 +287,9 @@ public final class SectionDemandTableBehaviorTest {
         arena.free(first);
     }
 
-    private static SectionDemandTable.Demand demand(long key, long region, long top,
+    private static SectionDemandTable.Demand demand(long key, long region,
                                                      boolean coverage, int bucket) {
-        return new SectionDemandTable.Demand(key, region, top, coverage, bucket);
+        return new SectionDemandTable.Demand(key, region, coverage, bucket);
     }
 
     private static void check(boolean condition, String message) {
