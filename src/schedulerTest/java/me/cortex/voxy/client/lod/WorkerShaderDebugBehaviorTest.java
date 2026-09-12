@@ -25,6 +25,7 @@ public final class WorkerShaderDebugBehaviorTest {
         transportCounters();
         transportHoldLease();
         cacheTestProfileSafety();
+        overlappingRestartCopies();
         DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
@@ -52,6 +53,28 @@ public final class WorkerShaderDebugBehaviorTest {
             check((boolean) install.invoke(null, root, valid), "new profile not installed");
             check(!(boolean) install.invoke(null, root, valid), "consumed profile would restart repeatedly");
             check(!Files.exists(root.resolve(".voxy")), "profile touched the cache");
+        } finally { CacheStartupBehaviorTest.cleanup(root); }
+    }
+
+    private static void overlappingRestartCopies() throws Exception {
+        var type = Class.forName("me.cortex.voxy.client.lod.ClientUpdateRestart");
+        var stabilize = type.getDeclaredMethod("stabilizeLaunchFiles", List.class, java.nio.file.Path.class, java.nio.file.Path.class);
+        var cleanup = type.getDeclaredMethod("deleteLaunchCopies", java.nio.file.Path.class, java.nio.file.Path.class);
+        stabilize.setAccessible(true); cleanup.setAccessible(true);
+        var root = Files.createTempDirectory("voxy-overlap-restart-");
+        try {
+            var source = root.resolve("agent.jar"); Files.write(source, new byte[]{1, 2, 3});
+            var first = Files.createTempDirectory(root, "launch-");
+            var second = Files.createTempDirectory(root, "launch-");
+            @SuppressWarnings("unchecked") var firstCommand = (List<String>) stabilize.invoke(null,
+                    List.of("java", "-javaagent:" + source, "Main"), first, root);
+            @SuppressWarnings("unchecked") var secondCommand = (List<String>) stabilize.invoke(null, firstCommand, second, root);
+            var firstAgent = java.nio.file.Path.of(firstCommand.get(1).substring("-javaagent:".length()));
+            var secondAgent = java.nio.file.Path.of(secondCommand.get(1).substring("-javaagent:".length()));
+            check(!firstAgent.equals(secondAgent), "restart helpers shared a launch copy");
+            cleanup.invoke(null, first, root.resolve("restart.log"));
+            check(!Files.exists(firstAgent) && Arrays.equals(Files.readAllBytes(secondAgent), new byte[]{1, 2, 3}),
+                    "older helper cleanup removed successor's agent");
         } finally { CacheStartupBehaviorTest.cleanup(root); }
     }
 

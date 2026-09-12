@@ -10,6 +10,7 @@ final class DeferredMetadataBehaviorTest {
         readiness(false);
         readiness(true);
         acknowledgementIdentity();
+        unavailableWriteDoesNotRetry();
         System.out.println("deferred metadata: once-delivered metadata, terminal failure, coalescing, stale acknowledgement and reopen passed");
     }
 
@@ -97,6 +98,30 @@ final class DeferredMetadataBehaviorTest {
                 check(s.metadataWrites.get(0L) == next, "old acknowledgement erased newer region intent");
                 driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
                 check(s.regionPersisted == 2, "coalesced region outcomes inaccurate");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void unavailableWriteDoesNotRetry() throws Exception {
+        Path root = Files.createTempDirectory("voxy-metadata-unavailable-");
+        var a = fixture(1, 1, 240, 1);
+        var b = fixture(2, 1, 224, 2);
+        try (var legacy = new RegionalMetadataStore(root)) {
+            persist(legacy, a, true);
+            try (var driver = new Driver(root)) {
+                var s = driver.session;
+                driver.until(() -> s.activeCount == 1 && s.metadataWorker.idle());
+                Path target = s.metadata.catalogPath(WORLD, DIMENSION, b.catalog().fingerprint());
+                Files.createDirectories(target.resolveSibling(target.getFileName() + ".pending"));
+                s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, b.catalog().fingerprint()));
+                driver.until(() -> s.metadataWorker.idle());
+                check(s.acceptCatalog(b.catalog()), "new catalog not accepted");
+                driver.until(() -> s.currentCatalog != null && s.currentCatalog.fingerprint().equals(b.catalog().fingerprint()));
+                long failures = s.persistenceOutcomes[RegionalMetadataStore.Persistence.UNAVAILABLE.ordinal()];
+                check(failures == 1 && s.catalogWrites.isEmpty(), "failed catalog write became a retry or success");
+                for (int i = 0; i < 100; i++) driver.step();
+                check(s.persistenceOutcomes[RegionalMetadataStore.Persistence.UNAVAILABLE.ordinal()] == failures
+                        && s.activeCount == 1 && s.failure == null, "optional write failure damaged rendering or spun");
             }
         } finally { cleanup(root); }
     }

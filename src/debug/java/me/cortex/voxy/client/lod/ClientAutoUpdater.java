@@ -319,7 +319,9 @@ final class ClientAutoUpdater {
         Path gameDirectory = Minecraft.getInstance().gameDirectory.toPath().toAbsolutePath();
         String profile = listing.output.lines().filter(line -> line.startsWith("VOXY_CACHE_TEST="))
                 .map(line -> line.substring("VOXY_CACHE_TEST=".length()).trim()).findFirst().orElse(null);
-        if (profile != null) {
+        // Let the previous updater helper finish its startup observation before a test
+        // requests another restart, including when that previous helper is an older build.
+        if (profile != null && ManagementFactory.getRuntimeMXBean().getUptime() >= 60_000) {
             try {
                 if (DebugCacheTestProfile.install(gameDirectory, profile)) {
                     launchRestartHelper(findCurrentJar(gameDirectory.resolve("mods")), gameDirectory, null);

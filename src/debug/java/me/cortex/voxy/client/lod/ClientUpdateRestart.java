@@ -41,10 +41,12 @@ final class ClientUpdateRestart {
         Path restartLog = gameDirectory.resolve(".voxy-updater").resolve("restart.log");
         Path launchLog = gameDirectory.resolve(".voxy-updater")
                 .resolve("relaunched-java.log");
+        Path launchDirectory = null;
         try {
             append(restartLog, "helper-start oldPid=" + oldPid);
+            launchDirectory = Files.createTempDirectory(commandFile.getParent(), "launch-");
             List<String> command = stabilizeLaunchFiles(
-                    readCommand(commandFile), commandFile.getParent(), gameDirectory);
+                    readCommand(commandFile), launchDirectory, gameDirectory);
             PrismLaunch prism = prismLauncherCommand(oldPid, command, gameDirectory);
             boolean launcherDispatch = prism != null;
             if (launcherDispatch) command = prism.command;
@@ -83,7 +85,8 @@ final class ClientUpdateRestart {
             uploadFailure(restartLog, launchLog);
             throw failure;
         } finally {
-            deleteLaunchCopies(commandFile.getParent(), restartLog);
+            // A successor may already be launching. Never enumerate its launch files.
+            if (launchDirectory != null) deleteLaunchCopies(launchDirectory, restartLog);
         }
     }
 
@@ -307,6 +310,7 @@ final class ClientUpdateRestart {
             }).toList()) {
                 Files.deleteIfExists(path);
             }
+            Files.deleteIfExists(directory);
         } catch (IOException failure) {
             append(restartLog, "launch-copy-cleanup-failed message="
                     + String.valueOf(failure.getMessage()));
