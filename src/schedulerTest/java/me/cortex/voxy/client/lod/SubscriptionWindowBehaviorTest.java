@@ -24,7 +24,7 @@ final class SubscriptionWindowBehaviorTest {
         retiredReentryAndReconnect();
         try (var wire = new Wire()) {
             wire.autoRespond = true;
-            var tracker = new RenderDistanceTracker(0, 1, key -> {
+            var tracker = new Tracker(0, 1, key -> {
                 var demand = wire.session.demands.adopt(new ClientSession.Demand(key));
                 wire.session.queueRegion(demand.regionKey);
             }, key -> {
@@ -142,17 +142,15 @@ final class SubscriptionWindowBehaviorTest {
 
     static void trackerWindowPublication() {
         var windows = new java.util.ArrayList<RenderDistanceTracker.Window>();
-        var tracker = new RenderDistanceTracker(0, 0, key -> {
-            check(!windows.isEmpty(), "callback preceded target publication");
-        }, key -> {}, windows::add);
+        var tracker = new RenderDistanceTracker(windows::add);
         tracker.setRenderDistance(3);
         tracker.setRenderDistance(3);
         check(windows.isEmpty(), "uninitialized tracker published origin");
-        tracker.setCenterAndProcess(-1, -1);
+        tracker.setCenter(-1, -1);
         check(windows.getLast().equals(new RenderDistanceTracker.Window(-1, -1, 3)), "negative coordinates did not floor");
-        tracker.setCenterAndProcess(1, 1);
+        tracker.setCenter(1, 1);
         check(windows.size() == 1, "movement threshold changed");
-        tracker.setCenterAndProcess(129, 1);
+        tracker.setCenter(129, 1);
         check(windows.getLast().equals(new RenderDistanceTracker.Window(0, 0, 3)), "real center change not published");
         tracker.setRenderDistance(2);
         check(windows.getLast().equals(new RenderDistanceTracker.Window(0, 0, 2)), "distance change not published");
@@ -226,12 +224,30 @@ final class SubscriptionWindowBehaviorTest {
         }
     }
 
-    static void settle(RenderDistanceTracker tracker, Wire wire, double x, double z) throws Exception {
+    static void settle(Tracker tracker, Wire wire, double x, double z) throws Exception {
         boolean changed;
         do {
             changed = tracker.setCenterAndProcess(x, z);
             wire.drain();
         } while (changed);
+    }
+
+    // Explicitly drive the actual owner planner separately from render target publication.
+    static final class Tracker {
+        final RenderDistanceTracker publisher;
+        final RenderDistanceTracker.Planner planner;
+        RenderDistanceTracker.Window latest;
+        Tracker(int min, int max, java.util.function.LongConsumer enter,
+                java.util.function.LongConsumer leave, java.util.function.Consumer<RenderDistanceTracker.Window> window) {
+            publisher = new RenderDistanceTracker(target -> { window.accept(target); latest = target; });
+            planner = new RenderDistanceTracker.Planner(min, max, enter, leave, () -> latest, () -> true);
+        }
+        void setRenderDistance(int radius) { publisher.setRenderDistance(radius); }
+        boolean setCenterAndProcess(double x, double z) {
+            publisher.setCenter(x, z);
+            planner.process();
+            return planner.hasWork();
+        }
     }
 
     static final class Wire extends OutputStream implements AutoCloseable {

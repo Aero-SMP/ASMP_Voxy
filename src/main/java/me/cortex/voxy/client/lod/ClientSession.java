@@ -53,6 +53,9 @@ final class ClientSession {
 
     private static final Object LIFECYCLE = new Object();
     private static final LinkedHashSet<Long> TOP_LEVEL = new LinkedHashSet<>();
+    // LIFECYCLE owns callback authority and ordered roots, including pre-connect population.
+    // Cleared on owner replacement/reset/stop; a stopped owner cannot mutate its successor.
+    private static VoxyRenderSystem topRenderer;
     private static final java.util.concurrent.atomic.AtomicReference<CatalogTask> CATALOG_TASK =
             new java.util.concurrent.atomic.AtomicReference<>();
     private static final AtomicLong SESSION_IDS = new AtomicLong();
@@ -70,26 +73,38 @@ final class ClientSession {
         }
     }
 
-    static boolean sectionEntered(long key) {
-        requireTop(key);
-        synchronized (TOP_LEVEL) {
-            if (!TOP_LEVEL.add(key)) return false;
+    static void attachRenderer(VoxyRenderSystem renderer) {
+        synchronized (LIFECYCLE) {
+            if (topRenderer == renderer) return;
+            TOP_LEVEL.clear();
+            topRenderer = java.util.Objects.requireNonNull(renderer);
         }
-        Session current = active;
-        if (current != null) {
-            current.demands.offerTop(key, true);
-            current.signal();
-        }
-        return true;
     }
 
-    static void sectionLeft(long key) {
+    static boolean sectionEntered(VoxyRenderSystem renderer, long key) {
         requireTop(key);
-        synchronized (TOP_LEVEL) { TOP_LEVEL.remove(key); }
-        Session current = active;
-        if (current != null) {
-            current.demands.offerTop(key, false);
-            current.signal();
+        synchronized (LIFECYCLE) {
+            if (topRenderer != renderer || renderer == null) return false;
+            if (!TOP_LEVEL.add(key)) return false;
+            Session current = active;
+            if (current != null && current.renderer == renderer) {
+                current.demands.offerTop(key, true);
+                current.signal();
+            }
+            return true;
+        }
+    }
+
+    static void sectionLeft(VoxyRenderSystem renderer, long key) {
+        requireTop(key);
+        synchronized (LIFECYCLE) {
+            if (topRenderer != renderer || renderer == null) return;
+            TOP_LEVEL.remove(key);
+            Session current = active;
+            if (current != null && current.renderer == renderer) {
+                current.demands.offerTop(key, false);
+                current.signal();
+            }
         }
     }
 
@@ -99,9 +114,12 @@ final class ClientSession {
     }
 
     static void resetDemand() {
-        synchronized (TOP_LEVEL) { TOP_LEVEL.clear(); }
-        Session current = active;
-        if (current != null) current.resetRequested.set(true);
+        synchronized (LIFECYCLE) {
+            TOP_LEVEL.clear();
+            topRenderer = null;
+            Session current = active;
+            if (current != null) current.resetRequested.set(true);
+        }
     }
 
     static void rendererLifecycleChanged() { disconnect(); }
@@ -212,6 +230,10 @@ final class ClientSession {
     /** Detach under LIFECYCLE, but never join while holding it. The renderer keeps the waiter. */
     static void stopRenderer(VoxyRenderSystem renderer) {
         synchronized (LIFECYCLE) {
+            if (topRenderer == renderer) {
+                topRenderer = null;
+                TOP_LEVEL.clear();
+            }
             Session current = active;
             if (current == null || current.renderer != renderer) return;
             stopLocked(current);
@@ -233,10 +255,12 @@ final class ClientSession {
         }
     }
 
-    private static List<Long> topSnapshot() {
+    private static List<Long> topSnapshot(VoxyRenderSystem renderer) {
         // TOP_LEVEL is populated nearest-first by RenderDistanceTracker. Preserve that order so
         // a cold session requests the player's coverage before distant regions.
-        synchronized (TOP_LEVEL) { return List.copyOf(TOP_LEVEL); }
+        synchronized (LIFECYCLE) {
+            return renderer != null && topRenderer == renderer ? List.copyOf(TOP_LEVEL) : List.of();
+        }
     }
 
     static final class Demand extends SectionDemandTable.Demand {
@@ -287,6 +311,9 @@ final class ClientSession {
     }
 
     static final class Session implements AutoCloseable {
+        private boolean hasTop(long top) {
+            synchronized (LIFECYCLE) { return topRenderer == this.renderer && TOP_LEVEL.contains(top); }
+        }
         final long id;
         final String dimension;
         final VoxyRenderSystem renderer;
@@ -743,7 +770,7 @@ final class ClientSession {
             }
             this.thread = new Thread(this::run, "Voxy regional owner");
             this.thread.setDaemon(true);
-            for (long key : topSnapshot()) this.demands.offerTop(key, true);
+            for (long key : topSnapshot(renderer)) this.demands.offerTop(key, true);
         }
 
         void start() {
@@ -2993,10 +3020,6 @@ final class ClientSession {
         if (values == null) return;
         values.remove(key);
         if (values.isEmpty()) ownership.remove(owner);
-    }
-
-    private static boolean hasTop(long top) {
-        synchronized (TOP_LEVEL) { return TOP_LEVEL.contains(top); }
     }
 
     private static long topAncestor(long key) {

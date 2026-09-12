@@ -350,7 +350,8 @@ public class VoxyRenderSystem {
                 + " publishCoverage=" + publicationLatencyLane(0)
                 + " publishRefinement=" + publicationLatencyLane(1)
                 + (nodes == null ? " rendererBatches=STOPPED"
-                        : ' ' + nodes.regionalPublicationBatchSnapshot());
+                        : ' ' + nodes.regionalPublicationBatchSnapshot())
+                + (this.renderDistanceTracker == null ? "" : this.renderDistanceTracker.submissionSnapshot());
     }
 
     private String publicationLatencyLane(int lane) {
@@ -637,7 +638,6 @@ public class VoxyRenderSystem {
                 Arrays.stream(this.mapper.getBiomeEntries()).forEach(this.modelService::addBiome);
                 this.mapper.setBiomeCallback(this.modelService::addBiome);
 
-                this.nodeManager.start();
             }
 
             this.viewport = new Viewport(this.geometryData.getMaxSectionCount());
@@ -648,21 +648,18 @@ public class VoxyRenderSystem {
                 int minSec = Minecraft.getInstance().level.getMinSection() >> 5;
                 int maxSec = (Minecraft.getInstance().level.getMaxSection() - 1) >> 5;
 
-                this.renderDistanceTracker = new RenderDistanceTracker(minSec,
-                        maxSec,
-                        position -> {
-                            this.nodeManager.addTopLevel(position);
-                            ClientLodClient.sectionEntered(position);
-                        },
-                        position -> {
-                            ClientLodClient.sectionLeft(position);
-                            this.nodeManager.removeTopLevel(position);
-                        }, window -> {
+                this.nodeManager.configureTerrainPlanner(minSec, maxSec,
+                        position -> ClientLodClient.sectionEntered(this, position),
+                        position -> ClientLodClient.sectionLeft(this, position));
+                this.renderDistanceTracker = new RenderDistanceTracker(window -> {
                             this.subscriptionWindow = window;
                             ClientLodClient.subscriptionWindowChanged(this, window);
+                            this.nodeManager.terrainWindowChanged(window);
                         });
 
                 this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
+                ClientLodClient.attachRenderer(this);
+                this.nodeManager.start();
             }
 
 
@@ -771,7 +768,7 @@ public class VoxyRenderSystem {
             //Tick upload stream (this is ok to do here as upload ticking is just memory management)
             UploadStream.INSTANCE.tick();
 
-            this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);
+            this.renderDistanceTracker.setCenter(viewport.cameraX, viewport.cameraZ);
             //Done here as is allows less gl state resetup
             this.modelService.tick();
         }

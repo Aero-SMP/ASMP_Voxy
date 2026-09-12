@@ -3,7 +3,6 @@ package me.cortex.voxy.client.core.rendering.hierarchical;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntConsumer;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlFence;
 import me.cortex.voxy.client.core.gl.shader.Shader;
@@ -32,7 +31,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.BooleanSupplier;
 import java.util.concurrent.locks.LockSupport;
-import java.util.concurrent.locks.StampedLock;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -272,40 +270,13 @@ public class AsyncNodeManager {
         int workDone = 0;
         boolean hierarchyAdvanced = false;
 
-        {
-            LongOpenHashSet add = null;
-            LongOpenHashSet rem = null;
-            long stamp = this.tlnLock.writeLock();
-
-            if (!this.tlnAdd.isEmpty()) {
-                add = new LongOpenHashSet(this.tlnAdd);
-                this.tlnAdd.clear();
-            }
-            if (!this.tlnRem.isEmpty()) {
-                rem = new LongOpenHashSet(this.tlnRem);
-                this.tlnRem.clear();
-            }
-
-            this.tlnLock.unlockWrite(stamp);
-            int work = 0;
-            if (rem != null) {
-                var iter = rem.longIterator();
-                while (this.running && iter.hasNext()) {
-                    this.manager.removeTopLevelNode(iter.nextLong());
-                    work++;
-                }
-            }
-
-            if (add != null) {
-                var iter = add.longIterator();
-                while (this.running && iter.hasNext()) {
-                    this.manager.insertTopLevelNode(iter.nextLong());
-                    work++;
-                }
-            }
-
+        if (this.terrainPlanner != null) {
+            int work = this.terrainPlanner.process();
             workDone += work;
             hierarchyAdvanced = work != 0;
+            // Preparation-only progress is runnable, but does not create GPU results or
+            // advance topology generation. Existing sync backpressure still parks run().
+            if (this.terrainPlanner.hasWork()) this.workPending.set(true);
         }
 
         int rendererTransactions = this.rendererTransactionQueue.size();
@@ -1015,9 +986,6 @@ public class AsyncNodeManager {
         transaction.failure.accept(new IllegalStateException("Voxy renderer is not running"));
     }
 
-    private final StampedLock tlnLock = new StampedLock();
-    private final LongOpenHashSet tlnAdd = new LongOpenHashSet();
-    private final LongOpenHashSet tlnRem = new LongOpenHashSet();
 
     private void signalWork() {
         if (this.workPending.compareAndSet(false, true)) {
@@ -1066,7 +1034,21 @@ public class AsyncNodeManager {
                 + '/' + this.maximumRegionalRenderSyncBytes.get()
                 + " rendererBatchSyncSplits=" + this.regionalBatchSyncSplits.get()
                 + " rendererWorkerCpuMs=" + this.workerCpuNanos.get() / 1_000_000L
-                + " rendererWorkerIdleMs=" + this.workerIdleNanos.get() / 1_000_000L;
+                + " rendererWorkerIdleMs=" + this.workerIdleNanos.get() / 1_000_000L
+                + this.terrainPlanningSnapshot();
+    }
+
+    private String terrainPlanningSnapshot() {
+        var planner = this.terrainPlanner;
+        return planner == null ? " terrainPlanner=STOPPED" : " terrainPlanner=OWNER"
+                + " terrainObservedTargets=" + planner.observedTargets
+                + " terrainOrderingBuilds=" + planner.orderingBuilds
+                + " terrainDifferenceVisits=" + planner.differenceVisits
+                + " terrainOrderingVisits=" + planner.orderingVisits
+                + " terrainApplied=" + planner.appliedOperations
+                + " terrainPreparationNs=" + planner.preparationNanos
+                + " terrainApplicationNs=" + planner.applicationNanos
+                + " terrainSlices=" + planner.slices;
     }
 
     private void recordSubmittedRegionalBatch(int sections) {
@@ -1151,34 +1133,35 @@ public class AsyncNodeManager {
         return (T) batch.receipt();
     }
 
-    public void addTopLevel(long section) {//Only called from render thread
-        if (!this.running) throw new IllegalStateException("Not running");
-        long stamp = this.tlnLock.writeLock();
-        int state = 0;
-        if (!this.tlnRem.remove(section)) {
-            state += this.tlnAdd.add(section)?1:0;
-        } else {
-            state -= 1;
+    // Render publishes one immutable target; the hierarchy worker owns planner mutation.
+    // All three fields live until this renderer stops; no target history/output queue.
+    private volatile me.cortex.voxy.client.core.rendering.RenderDistanceTracker.Window terrainTarget;
+    private me.cortex.voxy.client.core.rendering.RenderDistanceTracker.Planner terrainPlanner;
+
+    public void configureTerrainPlanner(int minY, int maxY,
+                                       java.util.function.LongConsumer entered,
+                                       java.util.function.LongConsumer left) {
+        synchronized (this.submissionLock) {
+            if (this.thread.getState() != Thread.State.NEW || this.terrainPlanner != null || this.stopping) {
+                throw new IllegalStateException("terrain planner must be initialized before start");
+            }
+            this.terrainPlanner = new me.cortex.voxy.client.core.rendering.RenderDistanceTracker.Planner(
+                    minY, maxY, key -> {
+                        this.manager.insertTopLevelNode(key);
+                        entered.accept(key);
+                    }, key -> {
+                        left.accept(key);
+                        this.manager.removeTopLevelNode(key);
+                    }, () -> this.terrainTarget, () -> this.running);
         }
-        if (state != 0) {
-            this.signalWork();
-        }
-        this.tlnLock.unlockWrite(stamp);
     }
 
-    public void removeTopLevel(long section) {//Only called from render thread
-        if (!this.running) throw new IllegalStateException("Not running");
-        long stamp = this.tlnLock.writeLock();
-        int state = 0;
-        if (!this.tlnAdd.remove(section)) {
-            state += this.tlnRem.add(section)?1:0;
-        } else {
-            state -= 1;
+    public void terrainWindowChanged(me.cortex.voxy.client.core.rendering.RenderDistanceTracker.Window window) {
+        synchronized (this.submissionLock) {
+            if (this.stopping || this.terrainTarget == window) return;
+            this.terrainTarget = window;
         }
-        if (state != 0) {
-            this.signalWork();
-        }
-        this.tlnLock.unlockWrite(stamp);
+        this.signalWork();
     }
 
     //==================================================================================================================
@@ -1214,6 +1197,8 @@ public class AsyncNodeManager {
         this.awaitStopped();
         if (this.disposed) return;
         this.disposed = true;
+        this.terrainPlanner = null;
+        this.terrainTarget = null;
         var cleanup = new me.cortex.voxy.common.util.Cleanup();
         Throwable stopped = new IllegalStateException("Voxy renderer stopped");
         me.cortex.voxy.client.lod.ClientLodDebug.shutdownWork(System.identityHashCode(this),

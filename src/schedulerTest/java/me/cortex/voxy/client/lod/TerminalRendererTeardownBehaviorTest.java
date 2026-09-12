@@ -1,6 +1,5 @@
 package me.cortex.voxy.client.lod;
 
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
@@ -14,7 +13,6 @@ import me.cortex.voxy.common.util.Cleanup;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
-import java.util.concurrent.locks.StampedLock;
 
 import static me.cortex.voxy.client.lod.DebugSnapshotShutdownBehaviorTest.*;
 
@@ -122,8 +120,6 @@ final class TerminalRendererTeardownBehaviorTest {
     private static void activeTransactionStopsBacklog() throws Exception {
         var nodes = manager(); var hierarchy = new ControlledNodes();
         set(nodes, "manager", hierarchy);
-        set(nodes, "tlnLock", new StampedLock());
-        set(nodes, "tlnAdd", new LongOpenHashSet()); set(nodes, "tlnRem", new LongOpenHashSet());
         var run = AsyncNodeManager.class.getDeclaredMethod("run"); run.setAccessible(true);
         AtomicReference<Throwable> workerFailure = new AtomicReference<>();
         Thread worker = new Thread(() -> {

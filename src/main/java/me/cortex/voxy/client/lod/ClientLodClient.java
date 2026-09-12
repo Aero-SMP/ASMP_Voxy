@@ -40,12 +40,16 @@ public final class ClientLodClient {
     }
 
     /** Supplies the bounded LOD4 coverage window; finer demand still comes from the GPU. */
-    public static void sectionEntered(long key) {
-        ClientSession.sectionEntered(key);
+    public static void attachRenderer(me.cortex.voxy.client.core.VoxyRenderSystem renderer) {
+        ClientSession.attachRenderer(renderer);
     }
 
-    public static void sectionLeft(long key) {
-        ClientSession.sectionLeft(key);
+    public static void sectionEntered(me.cortex.voxy.client.core.VoxyRenderSystem renderer, long key) {
+        ClientSession.sectionEntered(renderer, key);
+    }
+
+    public static void sectionLeft(me.cortex.voxy.client.core.VoxyRenderSystem renderer, long key) {
+        ClientSession.sectionLeft(renderer, key);
     }
 
     public static void subscriptionWindowChanged(me.cortex.voxy.client.core.VoxyRenderSystem renderer,

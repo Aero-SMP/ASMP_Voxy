@@ -1,32 +1,26 @@
 package me.cortex.voxy.client.core.rendering;
 
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ByteMap;
+import it.unimi.dsi.fastutil.longs.LongHeapPriorityQueue;
+import it.unimi.dsi.fastutil.objects.ObjectIterator;
 
-import java.util.function.LongConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
+import java.util.function.Supplier;
 
-public class RenderDistanceTracker {
+/** Render-thread target publication only. Mutable planning lives on the hierarchy owner. */
+public final class RenderDistanceTracker {
     private static final int CHECK_DISTANCE_BLOCKS = 128;
-    private static final int MAX_OPERATIONS_PER_UPDATE = 512;
-    private static final long PROCESS_BUDGET_NANOS = 1_000_000L;
-    private final LongConsumer addTopLevelNode;
-    private final LongConsumer removeTopLevelNode;
-    private final int minSec;
-    private final int maxSec;
-    private final long[] candidateKeys = new long[MAX_OPERATIONS_PER_UPDATE];
-    private final long[] candidateDistances = new long[MAX_OPERATIONS_PER_UPDATE];
-    private final byte[] candidateOperations = new byte[MAX_OPERATIONS_PER_UPDATE];
-    private Long2ByteOpenHashMap operations = new Long2ByteOpenHashMap(1<<13);
-    private int[] boundDist;
-    private int radius;
-    private int centerX;
-    private int centerZ;
-    private double posX;
-    private double posZ;
-    private boolean initialized;
-    private final Consumer<Window> windowChanged;
+    private final Consumer<Window> targetChanged;
+    // Render-owned sampling state; lives until renderer teardown. No per-stationary-frame allocation.
+    private int radius = 2;
+    private double posX, posZ;
+    private Window window;
+    // Render-written aggregate timings, retained only for this renderer's diagnostics.
+    private volatile long submissions, submissionNanos, maximumSubmissionNanos;
 
-    /** Exact horizontal membership of the target circle, independent of callback backlog. */
     public record Window(int x, int z, int radius) {
         public boolean contains(long region) {
             long dx = (long) (int) region - x;
@@ -36,262 +30,243 @@ public class RenderDistanceTracker {
         }
     }
 
-    public RenderDistanceTracker(int minSec, int maxSec, LongConsumer addTopLevelNode,
-                                 LongConsumer removeTopLevelNode) {
-        this(minSec, maxSec, addTopLevelNode, removeTopLevelNode, ignored -> {});
+    public RenderDistanceTracker(Consumer<Window> targetChanged) {
+        this.targetChanged = targetChanged;
     }
 
-    public RenderDistanceTracker(int minSec, int maxSec, LongConsumer addTopLevelNode,
-                                 LongConsumer removeTopLevelNode, Consumer<Window> windowChanged) {
-        this.windowChanged = windowChanged;
-        this.addTopLevelNode = addTopLevelNode;
-        this.removeTopLevelNode = removeTopLevelNode;
-        this.radius = 2;
-        this.boundDist = generateBoundingHalfCircleDistance(this.radius);
-        this.minSec = minSec;
-        this.maxSec = maxSec;
+    public void setRenderDistance(int radius) {
+        if (this.radius == radius) return;
+        this.radius = radius;
+        if (this.window != null) this.publish();
     }
 
-    public void setRenderDistance(int renderDistance) {
-        if (renderDistance == this.radius) {
-            return;
+    public void setCenter(double x, double z) {
+        double dx = this.posX - x, dz = this.posZ - z;
+        if (this.window != null && dx * dx + dz * dz <= CHECK_DISTANCE_BLOCKS * CHECK_DISTANCE_BLOCKS) return;
+        this.posX = x;
+        this.posZ = z;
+        this.publish();
+    }
+
+    private void publish() {
+        int x = (int) Math.floor(this.posX / 512.0), z = (int) Math.floor(this.posZ / 512.0);
+        if (this.window != null && this.window.x == x && this.window.z == z && this.window.radius == this.radius) return;
+        long started = System.nanoTime();
+        this.window = new Window(x, z, this.radius);
+        this.targetChanged.accept(this.window);
+        long elapsed = System.nanoTime() - started;
+        this.submissions++;
+        this.submissionNanos += elapsed;
+        this.maximumSubmissionNanos = Math.max(this.maximumSubmissionNanos, elapsed);
+    }
+
+    public String submissionSnapshot() {
+        return " terrainTargets=" + this.submissions + " terrainSubmitNs=" + this.submissionNanos
+                + " terrainSubmitMaxNs=" + this.maximumSubmissionNanos;
+    }
+
+    /** Single hierarchy-owner state, released with that owner; no executor or output mailbox. */
+    public static final class Planner {
+        // Pending is desired-minus-applied CPU topology, never a duplicate resident set.
+        private final Long2ByteOpenHashMap pending = new Long2ByteOpenHashMap();
+        // Sign bit marks removal; packed LOD4 keys never use it. Comparator has no map lookups.
+        private final LongHeapPriorityQueue ordered = new LongHeapPriorityQueue(this::compare);
+        private final LongConsumer enter, leave;
+        private final Supplier<Window> latest;
+        private final BooleanSupplier running;
+        private final Difference difference;
+        // source: fully constructed desired window, NOT fully applied geometry.
+        // target: current construction/ordering identity. Latest targets overwrite one external slot.
+        private Window source, target;
+        private ObjectIterator<Long2ByteMap.Entry> ordering;
+        private int phase; // 0 idle, 1 difference, 2 undo partial difference, 3 ordering, 4 applying
+        private long constructed, undoRemaining;
+        // Owner-written bounded aggregate diagnostics, readable after slices; no sample queue.
+        public volatile long orderingBuilds, differenceVisits, orderingVisits, appliedOperations, observedTargets;
+        public volatile long preparationNanos, applicationNanos, slices;
+
+        public Planner(int minY, int maxY, LongConsumer enter, LongConsumer leave,
+                       Supplier<Window> latest, BooleanSupplier running) {
+            this.difference = new Difference(minY, maxY);
+            this.enter = enter;
+            this.leave = leave;
+            this.latest = latest;
+            this.running = running;
         }
-        if (this.initialized) this.fillRing(false);
-        var previousOperations = this.operations;
-        this.operations = new Long2ByteOpenHashMap(1<<13);
-        this.radius = renderDistance;
-        this.centerX = (int) Math.floor(this.posX / 512.0);
-        this.centerZ = (int) Math.floor(this.posZ / 512.0);
-        this.boundDist = generateBoundingHalfCircleDistance(this.radius);
-        this.operations.putAll(previousOperations);
-        previousOperations.clear();
-        if (this.initialized) {
-            this.fillRing(true);
-            this.publishWindow();
-        }
-    }
 
-    public boolean setCenterAndProcess(double x, double z) {
-        if (!this.initialized) {
-            this.posX = x;
-            this.posZ = z;
-            this.centerX = (int) Math.floor(x / 512.0);
-            this.centerZ = (int) Math.floor(z / 512.0);
-            this.initialized = true;
-            this.fillRing(true);
-            this.publishWindow();
-            return this.process() != 0;
-        }
-        double dx = this.posX-x;
-        double dz = this.posZ-z;
-        if (CHECK_DISTANCE_BLOCKS*CHECK_DISTANCE_BLOCKS<dx*dx+dz*dz) {
-            this.posX = x;
-            this.posZ = z;
-            this.moveCenter((int) Math.floor(x / 512.0), (int) Math.floor(z / 512.0));
-        }
+        public boolean hasWork() { return this.phase != 0 || this.latest.get() != this.target; }
 
-        return this.process()!=0;
-    }
+        /** Budget includes preparation. An individual callback/allocation is not preemptible. */
+        public int process() { return this.process(512, 1_000_000L); }
 
-    private void add(int x, int z) {
-        for (int y = this.minSec; y <= this.maxSec; y++) {
-            this.addTopLevelNode.accept(SectionKey.pack(4, x, y, z));
-        }
-    }
-
-    private void rem(int x, int z) {
-        for (int y = this.minSec; y <= this.maxSec; y++) {
-            this.removeTopLevelNode.accept(SectionKey.pack(4, x, y, z));
-        }
-    }
-
-    private static long pack(int x, int z) {
-        return Integer.toUnsignedLong(x)|(Integer.toUnsignedLong(z)<<32);
-    }
-
-    private void fillRing(boolean load) {
-        for (int i = 0; i <= this.radius*2; i++) {
-            int x = this.centerX + i - this.radius;
-            int d = this.boundDist[i];
-            for (int z = this.centerZ-d; z <= this.centerZ+d; z++) {
-                int res = this.operations.addTo(pack(x, z), (byte) (load?1:-1));
-                if ((load&&0<res)||(((!load)&&res<0))) {
-                    throw new IllegalStateException();
+        /** Deterministic operation budget is also used by production-path regression fixtures. */
+        public int process(int budget, long nanos) {
+            if (!this.running.getAsBoolean() || !this.hasWork()) return 0;
+            long start = System.nanoTime(), application = 0;
+            int applied = 0;
+            this.slices++;
+            for (int step = 0; step < budget && this.running.getAsBoolean(); step++) {
+                if (step != 0 && System.nanoTime() - start >= nanos) break;
+                Window newest = this.latest.get();
+                if (newest != this.target && this.phase != 2) {
+                    this.observedTargets++;
+                    this.ordering = null; // Never mutate pending underneath a retained iterator.
+                    this.ordered.clear();
+                    if (this.phase == 1 && this.constructed != 0) {
+                        // Undo just the constructed prefix, not applied topology. Replaying the
+                        // same resumable cursor avoids a history queue or a second world snapshot.
+                        this.undoRemaining = this.constructed;
+                        this.difference.reset(this.source, this.target);
+                        this.phase = 2;
+                    } else {
+                        this.begin(newest);
+                    }
+                }
+                if (this.phase == 0) break;
+                if (this.phase == 1 || this.phase == 2) {
+                    boolean changed = this.difference.advance();
+                    this.differenceVisits++;
+                    if (changed) {
+                        byte operation = (byte) (this.phase == 2 ? -this.difference.operation : this.difference.operation);
+                        long key = this.difference.key;
+                        byte previous = this.pending.get(key);
+                        int next = previous + operation;
+                        if (next < -1 || next > 1) throw new IllegalStateException("invalid terrain difference");
+                        // Keep zero tombstones until the ordering iterator removes them (without
+                        // fastutil's per-remove shrink/rehash). Reuse peak workspace across targets.
+                        this.pending.put(key, (byte) next);
+                        if (this.phase == 2) this.undoRemaining--;
+                        else this.constructed++;
+                    }
+                    if (this.phase == 2 && this.undoRemaining == 0) {
+                        this.begin(this.latest.get());
+                    } else if (this.phase == 1 && this.difference.done()) {
+                        this.source = this.target;
+                        this.ordering = this.pending.long2ByteEntrySet().fastIterator();
+                        this.orderingBuilds++;
+                        this.phase = 3;
+                    }
+                } else if (this.phase == 3) {
+                    if (this.ordering.hasNext()) {
+                        var entry = this.ordering.next();
+                        if (entry.getByteValue() == 0) this.ordering.remove();
+                        else this.ordered.enqueue(entry.getLongKey() | (entry.getByteValue() < 0 ? Long.MIN_VALUE : 0));
+                        this.orderingVisits++;
+                    } else {
+                        this.ordering = null;
+                        this.phase = 4;
+                    }
+                } else {
+                    if (this.ordered.isEmpty()) { this.pending.clear(); this.phase = 0; break; }
+                    long encoded = this.ordered.firstLong(), key = encoded & Long.MAX_VALUE;
+                    long before = System.nanoTime();
+                    // If this throws, the owner fails terminally and pending still describes the
+                    // unacknowledged operation. Never silently retry half-applied topology.
+                    if (encoded < 0) this.leave.accept(key); else this.enter.accept(key);
+                    application += System.nanoTime() - before;
+                    this.ordered.dequeueLong();
+                    this.pending.put(key, (byte) 0);
+                    this.appliedOperations++;
+                    applied++;
                 }
             }
+            this.applicationNanos += application;
+            this.preparationNanos += System.nanoTime() - start - application;
+            return applied;
         }
-    }
 
-    private void moveCenter(int x, int z) {
-        if (x == this.centerX && z == this.centerZ) return;
-        if (this.radius+1<Math.abs(x-this.centerX) || this.radius+1<Math.abs(z-this.centerZ)) {
-            this.fillRing(false);
-            this.centerX = x;
-            this.centerZ = z;
-            this.fillRing(true);
-        } else {
-            if (x != this.centerX) {
-                moveX(x - this.centerX);
-            }
-            if (z != this.centerZ) {
-                moveZ(z - this.centerZ);
-            }
+        private void begin(Window newest) {
+            this.target = newest;
+            this.constructed = 0;
+            this.difference.reset(this.source, newest);
+            this.phase = newest == null ? 0 : 1;
         }
-        this.publishWindow();
-    }
 
-    private void publishWindow() {
-        this.windowChanged.accept(new Window(this.centerX, this.centerZ, this.radius));
-    }
+        private int compare(long a, long b) {
+            boolean remove = a < 0;
+            if (remove != (b < 0)) return remove ? 1 : -1;
+            long ax = (long) SectionKey.x(a) - this.target.x, az = (long) SectionKey.z(a) - this.target.z;
+            long bx = (long) SectionKey.x(b) - this.target.x, bz = (long) SectionKey.z(b) - this.target.z;
+            int order = Long.compare(ax * ax + az * az, bx * bx + bz * bz);
+            if (order != 0) return remove ? -order : order;
+            long ak = Integer.toUnsignedLong(SectionKey.x(a)) | (Integer.toUnsignedLong(SectionKey.z(a)) << 32);
+            long bk = Integer.toUnsignedLong(SectionKey.x(b)) | (Integer.toUnsignedLong(SectionKey.z(b)) << 32);
+            order = Long.compareUnsigned(ak, bk);
+            return order != 0 ? order : Integer.compare(SectionKey.y(a), SectionKey.y(b));
+        }
 
-    private void moveZ(int delta) {
-        if (delta == 0) return;
-        if (delta == -1 || delta == 1) {
-            for (int i = 0; i <= this.radius * 2; i++) {
-                int x = this.centerX + i - this.radius;
-                int d = this.boundDist[i]*delta;
-                int pz = this.centerZ+d+delta;
-                int nz = this.centerZ-d;
-                if (0<this.operations.addTo(pack(x, pz), (byte) 1))
-                    throw new IllegalStateException("x: "+x+", z: "+pz+" state: "+this.operations.get(pack(x, pz)));
-                if (this.operations.addTo(pack(x, nz), (byte) -1)<0)
-                    throw new IllegalStateException("x: "+x+", z: "+nz+" state: "+this.operations.get(pack(x, nz)));
+        /** Row-interval subtraction: O(radius + changed cells), including small moves.
+         * Each advance performs at most one row setup or one vertical section operation.
+         * Cursor reset/replay handles interruption during a partially constructed column.
+         */
+        private static final class Difference {
+            private final int minY, maxY;
+            private Window oldWindow, newWindow;
+            private int pass, x, z, endZ, secondZ, secondEnd, y;
+            private boolean rowReady;
+            long key;
+            byte operation;
+
+            Difference(int minY, int maxY) { this.minY = minY; this.maxY = maxY; }
+
+            void reset(Window oldWindow, Window newWindow) {
+                this.oldWindow = oldWindow;
+                this.newWindow = newWindow;
+                this.pass = 0;
+                this.rowReady = false;
+                this.x = oldWindow == null ? 0 : oldWindow.x - oldWindow.radius;
             }
-            this.centerZ += delta;
-        } else {
-            int sDelta = Integer.signum(delta);
-            for (int i = 0; i <= this.radius * 2; i++) {
-                int x = this.centerX + i - this.radius;
-                int d = this.boundDist[i]*sDelta;
-                int pz = this.centerZ+d;
-                for (int z = pz + (sDelta<0?delta:1); z <= pz + (sDelta<0?-1:delta); z++) {
-                    if (0<this.operations.addTo(pack(x, z), (byte) 1))
-                        throw new IllegalStateException();
+
+            boolean done() { return this.pass == 2; }
+
+            boolean advance() {
+                if (this.done()) return false;
+                Window circle = this.pass == 0 ? this.oldWindow : this.newWindow;
+                Window other = this.pass == 0 ? this.newWindow : this.oldWindow;
+                if (circle == null || this.x > circle.x + circle.radius) {
+                    this.pass++;
+                    this.rowReady = false;
+                    this.x = this.newWindow == null ? 0 : this.newWindow.x - this.newWindow.radius;
+                    return false;
                 }
-                int nz = this.centerZ-d;
-                for (int z = nz + (sDelta<0?(delta+1):0); z < nz + (sDelta<0?1:delta); z++) {
-                    if (this.operations.addTo(pack(x, z), (byte) -1)<0)
-                        throw new IllegalStateException();
+                if (!this.rowReady) {
+                    long dx = (long) this.x - circle.x;
+                    int d = (int) Math.sqrt((long) circle.radius * circle.radius - dx * dx);
+                    this.z = circle.z - d;
+                    this.endZ = circle.z + d;
+                    this.secondZ = 1;
+                    this.secondEnd = 0;
+                    if (other != null && Math.abs((long) this.x - other.x) <= other.radius) {
+                        long ox = (long) this.x - other.x;
+                        int od = (int) Math.sqrt((long) other.radius * other.radius - ox * ox);
+                        int low = other.z - od, high = other.z + od;
+                        if (low <= this.endZ && high >= this.z) {
+                            this.secondZ = Math.max(this.z, high + 1);
+                            this.secondEnd = this.endZ;
+                            this.endZ = Math.min(this.endZ, low - 1);
+                        }
+                    }
+                    this.y = this.minY;
+                    this.rowReady = true;
+                    return false;
                 }
-            }
-            this.centerZ += delta;
-        }
-    }
-
-    private void moveX(int delta) {
-        if (delta == 0) return;
-        if (delta == -1 || delta == 1) {
-            for (int i = 0; i <= this.radius * 2; i++) {
-                int z = this.centerZ + i - this.radius;
-                int d = this.boundDist[i]*delta;
-                int px = this.centerX+d+delta;
-                int nx = this.centerX-d;
-                if (0<this.operations.addTo(pack(px, z), (byte) 1))
-                    throw new IllegalStateException();
-                if (this.operations.addTo(pack(nx, z), (byte) -1)<0)
-                    throw new IllegalStateException();
-            }
-            this.centerX += delta;
-        } else {
-            int sDelta = Integer.signum(delta);
-            for (int i = 0; i <= this.radius * 2; i++) {
-                int z = this.centerZ + i - this.radius;
-                int d = this.boundDist[i]*sDelta;
-                int px = this.centerX+d;
-                for (int x = px + (sDelta<0?delta:1); x <= px + (sDelta<0?-1:delta); x++) {
-                    if (0<this.operations.addTo(pack(x, z), (byte) 1))
-                        throw new IllegalStateException();
+                if (this.z > this.endZ) {
+                    if (this.secondZ <= this.secondEnd) {
+                        this.z = this.secondZ;
+                        this.endZ = this.secondEnd;
+                        this.secondZ = 1;
+                        this.secondEnd = 0;
+                    } else {
+                        this.x++;
+                        this.rowReady = false;
+                    }
+                    return false;
                 }
-                int nx = this.centerX-d;
-                for (int x = nx + (sDelta<0?(delta+1):0); x < nx + (sDelta<0?1:delta); x++) {
-                    if (this.operations.addTo(pack(x, z), (byte) -1)<0)
-                        throw new IllegalStateException();
-                }
+                this.key = SectionKey.pack(4, this.x, this.y, this.z);
+                this.operation = (byte) (this.pass == 0 ? -1 : 1);
+                if (++this.y > this.maxY) { this.y = this.minY; this.z++; }
+                return true;
             }
-            this.centerX += delta;
         }
-    }
-
-    private int process() {
-        if (this.operations.isEmpty()) {
-            return 0;
-        }
-        int candidates = 0;
-        var iter = this.operations.long2ByteEntrySet().fastIterator();
-        while (iter.hasNext()) {
-            var entry = iter.next();
-            if (entry.getByteValue()==0) {
-                iter.remove();
-                continue;
-            }
-            byte op = entry.getByteValue();
-            if (op != 1 && op != -1) {
-                throw new IllegalStateException();
-            }
-            long key = entry.getLongKey();
-            int x = (int) key;
-            int z = (int) (key >>> 32);
-            long dx = (long) x - this.centerX;
-            long dz = (long) z - this.centerZ;
-            long distance = dx * dx + dz * dz;
-            int insertion = candidates;
-            if (insertion == MAX_OPERATIONS_PER_UPDATE
-                    && compare(op, distance, key,
-                    this.candidateOperations[insertion - 1],
-                    this.candidateDistances[insertion - 1],
-                    this.candidateKeys[insertion - 1]) >= 0) continue;
-            if (insertion == MAX_OPERATIONS_PER_UPDATE) insertion--;
-            while (insertion > 0 && compare(op, distance, key,
-                    this.candidateOperations[insertion - 1],
-                    this.candidateDistances[insertion - 1],
-                    this.candidateKeys[insertion - 1]) < 0) {
-                if (insertion < MAX_OPERATIONS_PER_UPDATE) {
-                    this.candidateOperations[insertion] = this.candidateOperations[insertion - 1];
-                    this.candidateDistances[insertion] = this.candidateDistances[insertion - 1];
-                    this.candidateKeys[insertion] = this.candidateKeys[insertion - 1];
-                }
-                insertion--;
-            }
-            this.candidateOperations[insertion] = op;
-            this.candidateDistances[insertion] = distance;
-            this.candidateKeys[insertion] = key;
-            if (candidates < MAX_OPERATIONS_PER_UPDATE) candidates++;
-        }
-
-        long deadline = System.nanoTime() + PROCESS_BUDGET_NANOS;
-        int processed = 0;
-        for (int index = 0; index < candidates; index++) {
-            if (processed != 0 && System.nanoTime() - deadline >= 0) break;
-            long pos = this.candidateKeys[index];
-            byte op = this.operations.remove(pos);
-            if (op == 0) continue;
-            int x = (int) (pos&0xFFFFFFFFL);
-            int z = (int) ((pos>>>32)&0xFFFFFFFFL);
-            if (op == 1) {
-                this.add(x, z);
-            } else {
-                this.rem(x, z);
-            }
-            processed++;
-        }
-        return processed;
-    }
-
-    /** Additions nearest the camera precede removals; obsolete removals run farthest-first. */
-    private static int compare(byte leftOperation, long leftDistance, long leftKey,
-                               byte rightOperation, long rightDistance, long rightKey) {
-        if (leftOperation != rightOperation) return leftOperation == 1 ? -1 : 1;
-        int distance = leftOperation == 1
-                ? Long.compare(leftDistance, rightDistance)
-                : Long.compare(rightDistance, leftDistance);
-        return distance != 0 ? distance : Long.compareUnsigned(leftKey, rightKey);
-    }
-
-    private static int[] generateBoundingHalfCircleDistance(int radius) {
-        var ret = new int[radius*2+1];
-        for (int i = -radius; i <= radius; i++) {
-            ret[i+radius] = (int)Math.sqrt(radius*radius - i*i);
-        }
-        return ret;
     }
 }
