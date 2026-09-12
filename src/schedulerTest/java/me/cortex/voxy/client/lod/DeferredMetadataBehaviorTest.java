@@ -10,6 +10,8 @@ final class DeferredMetadataBehaviorTest {
         readiness(false);
         readiness(true);
         acknowledgementIdentity();
+        catalogAndWorldSuccessors();
+        localReadFairness();
         unavailableWriteDoesNotRetry();
         System.out.println("deferred metadata: once-delivered metadata, terminal failure, coalescing, stale acknowledgement and reopen passed");
     }
@@ -122,6 +124,97 @@ final class DeferredMetadataBehaviorTest {
                 for (int i = 0; i < 100; i++) driver.step();
                 check(s.persistenceOutcomes[RegionalMetadataStore.Persistence.UNAVAILABLE.ordinal()] == failures
                         && s.activeCount == 1 && s.failure == null, "optional write failure damaged rendering or spun");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void catalogAndWorldSuccessors() throws Exception {
+        Path root = Files.createTempDirectory("voxy-metadata-successors-");
+        var a = fixture(1, 1, 240, 1);
+        var b = fixture(2, 1, 224, 2);
+        var retain = ClientSession.Session.class.getDeclaredMethod("retainCatalog", long.class,
+                RegionalProtocol.Hash32.class, RegionalProtocol.CatalogMessage.class);
+        var prune = ClientSession.Session.class.getDeclaredMethod("pruneCatalogWrites");
+        var dispatch = ClientSession.Session.class.getDeclaredMethod("persistMetadata");
+        retain.setAccessible(true); prune.setAccessible(true); dispatch.setAccessible(true);
+        try (var legacy = new RegionalMetadataStore(root)) {
+            persist(legacy, a, true);
+            try (var driver = new Driver(root)) {
+                var s = driver.session;
+                driver.until(() -> s.activeCount == 1 && s.metadataWorker.idle() && s.catalogWrites.isEmpty());
+                s.requiredCatalogFingerprint = b.catalog().fingerprint();
+                retain.invoke(s, s.viewRevision, WORLD, a.catalog());
+                retain.invoke(s, s.viewRevision, WORLD, b.catalog());
+                prune.invoke(s);
+                check(s.catalogWrites.size() == 2, "new requirement discarded catalog needed by active terrain");
+                var region = s.demands.region(0);
+                region.localCatalogs.clear(); region.catalog = null;
+                prune.invoke(s);
+                check(s.catalogWrites.size() == 2, "active content was not counted as an old-catalog consumer");
+                s.retireDemand(KEY);
+                prune.invoke(s);
+                check(s.catalogWrites.size() == 1 && s.catalogWrites.containsKey(b.catalog().fingerprint()),
+                        "unused catalog history retained after its last consumer retired");
+                check((boolean) dispatch.invoke(s), "catalog intent not dispatched");
+                awaitCompletedMetadata(s);
+                Object old = s.catalogWrites.get(b.catalog().fingerprint());
+                retain.invoke(s, s.viewRevision, WORLD, b.catalog());
+                Object successor = s.catalogWrites.get(b.catalog().fingerprint());
+                s.drainWorkers();
+                check(successor != old && s.catalogWrites.get(b.catalog().fingerprint()) == successor,
+                        "old catalog acknowledgement erased same-fingerprint successor");
+                driver.until(() -> s.catalogWrites.isEmpty() && s.metadataWorker.idle());
+
+                s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, b.catalog().fingerprint()));
+                check((boolean) dispatch.invoke(s), "association intent not dispatched");
+                awaitCompletedMetadata(s);
+                var newWorld = new RegionalProtocol.Hash32(9, 8, 7, 6);
+                s.changeWorld(newWorld);
+                s.acceptHello(new RegionalProtocol.ServerHello(1, newWorld, 1, b.catalog().fingerprint()));
+                Object association = s.associationIntent;
+                s.drainWorkers();
+                check(s.associationPending && s.associationIntent == association,
+                        "old-world acknowledgement cleared new-world association");
+                driver.until(() -> !s.associationPending && s.metadataWorker.idle());
+                check(newWorld.equals(s.metadata.world(SERVER, DIMENSION)), "new-world association never persisted");
+                check(s.pendingCatalogBytes() == 0, "successor test retained canonical bytes");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void awaitCompletedMetadata(ClientSession.Session session) throws Exception {
+        long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (session.metadataWorker.resource.state() != WorkerResource.State.COMPLETED
+                && System.nanoTime() < end) Thread.sleep(1);
+        check(session.metadataWorker.resource.state() == WorkerResource.State.COMPLETED, "metadata write did not complete");
+    }
+
+    private static void localReadFairness() throws Exception {
+        Path root = Files.createTempDirectory("voxy-metadata-fairness-");
+        var f = fixture(1, 1, 240, 1);
+        try (var legacy = new RegionalMetadataStore(root)) {
+            persist(legacy, f, true);
+            try (var driver = new Driver(root)) {
+                var s = driver.session;
+                driver.until(() -> s.activeCount == 1 && s.metadataWorker.idle() && s.catalogWrites.isEmpty());
+                long other = me.cortex.voxy.client.core.rendering.SectionKey.pack(4, 1, 0, 0);
+                s.addDemand(other);
+                var local = s.demands.region(s.demands.get(other).regionKey);
+                var updated = s.demands.region(0);
+                long start = System.nanoTime();
+                int updates = 0;
+                while ((!local.localLoaded || s.regionPersisted == 0)
+                        && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+                    s.saveMetadata(updated, f.index(), f.catalog().fingerprint());
+                    check(s.metadataWrites.size() == 1, "repeated updates accumulated history");
+                    updates++;
+                    driver.step(); s.awaitWake(1);
+                }
+                check(local.localLoaded && s.regionPersisted > 0,
+                        "continuous metadata updates starved local reads or persistence");
+                driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
+                System.out.println("metadata fairness: updates=" + updates + " elapsedNs="
+                        + (System.nanoTime() - start) + " persisted=" + s.regionPersisted);
             }
         } finally { cleanup(root); }
     }
