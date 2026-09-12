@@ -144,8 +144,8 @@ final class CacheInventoryBehaviorTest {
                 var worker = driver.session.sectionWorkers[0];
                 var demand = driver.session.demands.get(KEY);
                 worker.assign(new ClientSession.Session.SectionWorkerTask(demand.ticket(driver.session.id, 0),
-                        fixture.index(), 340, ClientSession.Session.WorkerSource.NETWORK,
-                        fixture.payload(), MAPPINGS, driver.session.cache));
+                        LocalSection.from(fixture.index(), 340, fixture.catalog().fingerprint()), ClientSession.Session.WorkerSource.NETWORK,
+                        fixture.payload(), MAPPINGS, driver.session.cache, () -> true));
                 until(() -> worker.resource.state() == WorkerResource.State.COMPLETED);
                 var completion = worker.resource.claim();
                 check(completion.value() instanceof ClientSession.Session.WorkerGeometry, "network terrain waited for inventory");
@@ -154,7 +154,7 @@ final class CacheInventoryBehaviorTest {
                 store.associate("new server", DIMENSION, WORLD, budget.stamp(), () -> true);
                 store.saveCatalog(new RegionalProtocol.Hash32(9, 0, 0, 0), DIMENSION, fixture.catalog(), budget.stamp(), () -> true);
                 store.saveRegion(WORLD, DIMENSION, 0, 0, null, budget.stamp(), () -> true);
-                driver.session.cache.quarantine(fixture.index(), 340);
+                driver.session.cache.absentRegion(0, () -> true);
                 driver.session.saveRegion(driver.session.demands.region(0), fixture.message());
                 check(driver.session.metadataWrites.isEmpty(), "unknown accounting queued persistence");
                 check(!budget.delete(shard), "unknown accounting deleted cache data");
@@ -168,9 +168,10 @@ final class CacheInventoryBehaviorTest {
                         "foreground metadata gated by inventory");
                 resume.countDown(); awaitInventory(budget);
                 check(budget.bytes == diskBytes(root), "published inventory differs from disk");
-                // Upgrade a previously read-only shard, safely repair its tail and persist normally.
-                driver.session.cache.put(fixture.index(), 340, fixture.payload());
-                check(Files.size(shard) == before.get(shard).length - 3, "ready shard did not repair its suffix");
+                // The prototype must never repair its read-only rollback cache, even after inventory.
+                driver.session.metadata.readCatalog(WORLD, DIMENSION, fixture.catalog().fingerprint());
+                driver.session.cache.put(LocalSection.from(fixture.index(), 340, fixture.catalog().fingerprint()), fixture.payload(), () -> true);
+                check(Files.size(shard) == before.get(shard).length, "prototype changed legacy shard suffix");
                 check(budget.bytes == diskBytes(root), "tail repair did not update accounting");
             }
         } finally { resume.countDown(); cleanup(root); }

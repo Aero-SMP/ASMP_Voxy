@@ -16,6 +16,8 @@ final class SessionDebugTelemetry {
         long nextSample;
         long subscriptions, subscriptionPeak, subscriptionRequests, subscriptionReleases, subscriptionStale;
         long windowNanos;
+        final LocalSection[] lastActivated = new LocalSection[5];
+        final long[] cachedActivations = new long[5], freshActivations = new long[5], firstCachedNanos = new long[5];
         volatile Summary latest;
     }
 
@@ -63,6 +65,32 @@ final class SessionDebugTelemetry {
         stats.maxMeshToLeaseReleaseNanos = Math.max(stats.maxMeshToLeaseReleaseNanos, elapsed);
     }
 
+    static void activated(ClientSession.Session session, LocalSection section, boolean cacheHit) {
+        if (section == null || section.kind() != LocalSection.DATA) return;
+        var stats = state(session);
+        int lod = me.cortex.voxy.client.core.rendering.SectionKey.level(section.key());
+        stats.lastActivated[lod] = section;
+        if (cacheHit) {
+            stats.cachedActivations[lod]++;
+            if (stats.firstCachedNanos[lod] == 0) stats.firstCachedNanos[lod] = System.nanoTime() - stats.start;
+        } else stats.freshActivations[lod]++;
+    }
+
+    private static String localSummary(Stats stats) {
+        var text = new StringBuilder();
+        for (int lod = 0; lod < 5; lod++) {
+            text.append(" cachedActivatedLod").append(lod).append('=').append(stats.cachedActivations[lod])
+                    .append(" freshActivatedLod").append(lod).append('=').append(stats.freshActivations[lod])
+                    .append(" firstCachedNanosLod").append(lod).append('=').append(stats.firstCachedNanos[lod]);
+            var section = stats.lastActivated[lod];
+            if (section != null) text.append(" lastActivatedLod").append(lod).append('=')
+                    .append(Long.toUnsignedString(section.key(), 16)).append(':')
+                    .append(java.util.HexFormat.of().formatHex(section.fingerprint().bytes())).append(':')
+                    .append(java.util.HexFormat.of().formatHex(section.catalog().bytes()));
+        }
+        return text.toString();
+    }
+
     static void capture(ClientSession.Session session, long now, boolean transportHeld) {
         if (Thread.currentThread() != session.thread) {
             throw new IllegalStateException("debug capture must run on the session owner");
@@ -72,8 +100,9 @@ final class SessionDebugTelemetry {
         stats.nextSample = now + INTERVAL_NANOS;
         long started = System.nanoTime(), allocated = WorkerDebugTelemetry.allocatedBytes();
         long cpuStarted = WorkerDebugTelemetry.samplerCpuTime();
-        long admittedPending = 0;
+        long admittedPending = 0, pendingRefresh = 0;
         for (var demand : session.demands.values()) {
+            if (demand.pendingIndex != null) pendingRefresh++;
             if (demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
                     && demand.geometryBytes > 0 && demand.workLease == null
                     && demand.publication != null && demand.publication.rendererAdmitted()) admittedPending++;
@@ -94,7 +123,8 @@ final class SessionDebugTelemetry {
                 + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos;
         // No shared debug monitor is held while scanning, reading renderer counters or formatting.
         String workers = WorkerDebugTelemetry.sample(session, now);
-        String summary = session.snapshot(startup) + workers
+        String summary = session.snapshot(startup) + workers + " pendingRefresh=" + pendingRefresh
+                + localSummary(stats) + TransportDebugTelemetry.snapshot()
                 + (session.metadata == null ? " cacheInventory=NOT_OPEN" : session.metadata.budget.snapshot());
         long afterAllocated = WorkerDebugTelemetry.allocatedBytes();
         long cpuEnded = WorkerDebugTelemetry.samplerCpuTime();

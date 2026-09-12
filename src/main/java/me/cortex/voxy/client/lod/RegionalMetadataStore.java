@@ -16,10 +16,15 @@ final class RegionalMetadataStore implements AutoCloseable {
     private static final int HEADER = 24, VERSION = 1, ASSOCIATION = 1, CATALOG = 2, REGION = 3;
     private static final int REGION_FIXED = 100;
     final RegionalDiskBudget budget;
+    private final boolean experimental;
     private boolean closed;
 
-    RegionalMetadataStore(Path root) throws IOException { this.budget = RegionalDiskBudget.acquire(root); }
-    RegionalMetadataStore(RegionalDiskBudget budget) { this.budget = budget; budget.retain(); }
+    RegionalMetadataStore(Path root) throws IOException { this(root, false); }
+    RegionalMetadataStore(Path root, boolean experimental) throws IOException {
+        this.experimental = experimental;
+        this.budget = experimental ? RegionalDiskBudget.acquireExperimental(root) : RegionalDiskBudget.acquire(root);
+    }
+    RegionalMetadataStore(RegionalDiskBudget budget) { this.budget = budget; this.experimental = false; budget.retain(); }
 
     @Override public void close() { synchronized (this.budget) {
         if (this.closed) return;
@@ -32,21 +37,28 @@ final class RegionalMetadataStore implements AutoCloseable {
     }
 
     Path namespace(RegionalProtocol.Hash32 world, String dimension) {
+        Path legacy = legacyNamespace(world, dimension);
+        return this.experimental ? legacy.resolve("completed-v1") : legacy;
+    }
+    Path legacyNamespace(RegionalProtocol.Hash32 world, String dimension) {
         return this.budget.root.resolve(hex(world)).resolve(identifier(dimension));
     }
     Path descriptor(RegionalProtocol.Hash32 world, String dimension, int x, int z) {
         return namespace(world, dimension).resolve("r." + x + '.' + z + ".vxmeta");
     }
     private Path association(String server, String dimension) {
-        return this.budget.root.resolve("servers").resolve(identifier(server + '\0' + dimension) + ".vxlink");
+        return (this.experimental ? this.budget.root.resolve("completed-v1") : this.budget.root)
+                .resolve("servers").resolve(identifier(server + '\0' + dimension) + ".vxlink");
     }
-    private Path catalogPath(RegionalProtocol.Hash32 world, String dimension, RegionalProtocol.Hash32 hash) {
+    Path catalogPath(RegionalProtocol.Hash32 world, String dimension, RegionalProtocol.Hash32 hash) {
         return namespace(world, dimension).resolve(hex(hash) + ".vxcat");
     }
 
     RegionalProtocol.Hash32 world(String server, String dimension) throws IOException {
         if (server == null) return null;
         byte[] bytes = read(association(server, dimension), ASSOCIATION, 32);
+        if (bytes == null && this.experimental) bytes = read(this.budget.root.resolve("servers")
+                .resolve(identifier(server + '\0' + dimension) + ".vxlink"), ASSOCIATION, 32);
         if (bytes == null || bytes.length != 32) return null;
         return RegionalProtocol.Hash32.read(buffer(bytes));
     }
@@ -60,6 +72,13 @@ final class RegionalMetadataStore implements AutoCloseable {
     byte[] readCatalog(RegionalProtocol.Hash32 world, String dimension,
                        RegionalProtocol.Hash32 hash) throws IOException {
         byte[] bytes = read(catalogPath(world, dimension, hash), CATALOG, RegionalProtocol.MAX_CATALOG_BYTES);
+        if (bytes == null && this.experimental) {
+            bytes = read(legacyNamespace(world, dimension).resolve(hex(hash) + ".vxcat"), CATALOG, RegionalProtocol.MAX_CATALOG_BYTES);
+            if (bytes != null && hash(bytes).equals(hash)) {
+                try { saveCatalog(world, dimension, new RegionalProtocol.CatalogMessage(hash, bytes), this.budget.stamp(), () -> true); }
+                catch (IOException optional) { /* Legacy input remains read-only and usable. */ }
+            }
+        }
         if (bytes == null || !hash(bytes).equals(hash)) return null;
         return bytes;
     }

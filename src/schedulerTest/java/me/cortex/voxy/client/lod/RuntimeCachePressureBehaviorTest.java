@@ -158,6 +158,7 @@ final class RuntimeCachePressureBehaviorTest {
             persist(store, old, false);
             var session = new ClientSession.Session(781, DIMENSION, null, new Publisher(), null, 0);
             session.metadata = store; session.worldIdentity = WORLD;
+            session.cache = new CompletedSectionCache(store, WORLD, DIMENSION);
             session.demands.adopt(new ClientSession.Demand(KEY)); session.queueRegion(0);
             var state = session.demands.region(0);
             try {
@@ -165,8 +166,10 @@ final class RuntimeCachePressureBehaviorTest {
                     setOwner(session);
                     String before = store.budget.snapshot();
                     session.saveRegion(state, old.message());
+                    check(session.metadataWrites.isEmpty(), "advertised index became persisted local authority");
+                    session.saveRegion(state, null);
                     Object first = session.metadataWrites.get(0L);
-                    session.saveRegion(state, next.message());
+                    session.saveRegion(state, null);
                     check(session.metadataWrites.size() == 1 && session.metadataWrites.get(0L) != first, "same-region writes not coalesced");
                     check(store.budget.snapshot().equals(before), "enqueue changed writable-check accounting");
                 });
@@ -178,7 +181,7 @@ final class RuntimeCachePressureBehaviorTest {
                     } }
                     case "view" -> session.viewRevision++;
                     case "revision" -> state.metadataRevision++;
-                    case "closed" -> store.close(); // Other owner keeps accounting READY; store itself must reject.
+                    case "closed" -> session.cache.close(); // A closed cache rejects even with other budget owners.
                     case "valid" -> {}
                     default -> throw new AssertionError(mode);
                 }
@@ -190,11 +193,14 @@ final class RuntimeCachePressureBehaviorTest {
                 var result = session.metadataWorker.resource.claim();
                 check(result != null && result.value().getClass().getSimpleName().equals("WorkerSaved"), "persistence worker did not complete");
                 session.metadataWorker.releaseCompletion(result.lease());
-                check(otherOwner.region(WORLD, DIMENSION, 0, 0).message().generation() == (mode.equals("valid") ? 2 : 1),
-                        "worker accepted stale/closed persistence: " + mode);
+                check(otherOwner.region(WORLD, DIMENSION, 0, 0).message().generation() == 1,
+                        "prototype worker overwrote the legacy descriptor: " + mode);
+                if (!mode.equals("closed")) check(session.cache.legacySealed(0) == (mode.equals("valid") || mode.equals("stamp")),
+                        "absence worker accepted stale authority or lost valid deletion: " + mode);
                 synchronized (store.budget) { check(store.budget.bytes == diskBytes(root), "worker accounting mismatch"); }
             } finally {
                 session.open.set(false); session.metadataWorker.close(); session.metadataWorker.workerThread.join(5000);
+                session.cache.close();
             }
         } finally { cleanup(root); }
     }

@@ -58,6 +58,12 @@ public final class ClientLodDebug {
     private static volatile boolean transportHeld = Files.exists(TRANSPORT_HOLD);
 
     static boolean connectionAllowed() { return !transportHeld; }
+    static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) {
+        return builder.socketFactory(ignored -> new TransportDebugTelemetry.Socket());
+    }
+    static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {
+        SessionDebugTelemetry.activated(session, section, cacheHit);
+    }
 
     /** Debug-only persistent hold survives a whole-game restart; Minecraft traffic is untouched. */
     static void holdTransport(boolean held) {

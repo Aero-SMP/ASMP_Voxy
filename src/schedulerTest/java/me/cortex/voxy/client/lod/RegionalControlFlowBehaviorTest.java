@@ -155,6 +155,7 @@ final class RegionalControlFlowBehaviorTest {
             idx = RegionalProtocol.decodeIndex(bytes.array(), CacheStartupBehaviorTest.fingerprint(bytes.array()));
         }
         demand.index = idx; demand.ordinal = idx.ordinal(key); demand.regionGeneration = 1;
+        demand.content = LocalSection.from(idx, demand.ordinal, fixture.catalog().fingerprint());
         demand.catalog = new RegionalSectionCodec.BoundCatalog(fixture.catalog().fingerprint(), CacheStartupBehaviorTest.MAPPINGS);
         s.demands.setPriority(demand, x % 16);
         s.demands.owned(demand, SectionDemandTable.CandidateState.NETWORK_OWNED);

@@ -26,6 +26,7 @@ final class RegionalCache implements AutoCloseable {
     private final RegionalProtocol.Hash32 worldIdentity;
     private final LinkedHashMap<Long, Shard> shards = new LinkedHashMap<>(64, 0.75f, true);
     private final RegionalDiskBudget budget;
+    private boolean readOnly;
     private boolean closed;
     private boolean budgetReleased;
 
@@ -47,6 +48,30 @@ final class RegionalCache implements AutoCloseable {
         }
         this.budget = budget;
         if (!acquired) budget.retain();
+    }
+
+    static RegionalCache legacyReader(Path root, RegionalProtocol.Hash32 world, RegionalDiskBudget budget) throws IOException {
+        var cache = new RegionalCache(root, world, budget);
+        cache.readOnly = true;
+        return cache;
+    }
+
+    byte[] get(LocalSection section) throws IOException {
+        Shard shard;
+        synchronized (this.budget) {
+            shard = shard((int) section.region(), (int) (section.region() >>> 32), false);
+            if (shard != null) shard.users++;
+        }
+        if (shard == null) return null;
+        try { return shard.get(new CacheKey(section.fingerprint().low(), section.fingerprint().high(), section.compressedBytes())); }
+        finally { release(shard); }
+    }
+
+    boolean contains(LocalSection section) throws IOException {
+        synchronized (this.budget) {
+            var shard = shard((int) section.region(), (int) (section.region() >>> 32), false);
+            return shard != null && shard.contains(new CacheKey(section.fingerprint().low(), section.fingerprint().high(), section.compressedBytes()));
+        }
     }
 
     byte[] get(RegionalProtocol.RegionIndex index, int ordinal) throws IOException {
@@ -119,24 +144,29 @@ final class RegionalCache implements AutoCloseable {
     }
 
     private Shard shard(RegionalProtocol.RegionIndex index, boolean create) throws IOException {
+        return shard(index.regionX(), index.regionZ(), create);
+    }
+
+    private Shard shard(int x, int z, boolean create) throws IOException {
         if (this.closed) return null;
-        long id = regionKey(index.regionX(), index.regionZ());
+        if (create && this.readOnly) return null;
+        long id = regionKey(x, z);
         Shard current = this.shards.get(id);
         if (create && current != null && !current.writable) {
             if (!closePath(current.path)) return null;
             current = null;
         }
         if (current != null) return current;
-        Path path = path(index.regionX(), index.regionZ());
+        Path path = path(x, z);
         long oldLength = this.budget.ready() ? RegionalDiskBudget.size(path) : 0;
         Shard opened = Files.exists(path)
-                ? Shard.open(path, this.worldIdentity, index.regionX(), index.regionZ(), this.budget.ready()) : null;
+                ? Shard.open(path, this.worldIdentity, x, z, !this.readOnly && this.budget.ready()) : null;
         if (opened != null && opened.writable) this.budget.bytes -= oldLength - opened.length();
         if (opened == null && Files.exists(path)) {
-            if (!this.budget.delete(path)) return null;
+            if (this.readOnly || !this.budget.delete(path)) return null;
         }
         if (opened == null && create && ensureBudget(HEADER_BYTES, path)) {
-            opened = Shard.create(path, this.worldIdentity, index.regionX(), index.regionZ());
+            opened = Shard.create(path, this.worldIdentity, x, z);
             this.budget.bytes += HEADER_BYTES;
         }
         if (opened != null) {

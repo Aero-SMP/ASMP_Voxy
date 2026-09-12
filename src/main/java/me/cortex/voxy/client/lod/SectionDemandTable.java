@@ -42,6 +42,9 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         boolean absent;
         boolean validated;
         boolean localTried;
+        boolean localLoaded;
+        Map<Long, LocalSection> localSections = Map.of();
+        final Map<RegionalProtocol.Hash32, RegionalSectionCodec.BoundCatalog> localCatalogs = new HashMap<>();
         volatile long metadataRevision;
         long retryAfter;
         RegionalSectionCodec.BoundCatalog catalog;

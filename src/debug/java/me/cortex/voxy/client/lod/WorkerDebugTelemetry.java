@@ -67,7 +67,7 @@ final class WorkerDebugTelemetry {
         long key = 0, revision = 0, version = 0; String source = "METADATA";
         if (task instanceof ClientSession.Session.SectionWorkerTask section) {
             key = section.ticket().key(); revision = section.ticket().demandRevision();
-            version = section.index().generation(); source = section.source().name();
+            version = section.ticket().regionGeneration(); source = section.source().name();
         } else if (task instanceof ClientSession.Session.EmptyWorkerTask empty) {
             key = empty.ticket().key(); revision = empty.ticket().demandRevision(); source = "EMPTY";
         } else if (task instanceof ClientSession.Session.IndexWorkerTask index) {

@@ -200,7 +200,9 @@ final class DebugSnapshotShutdownBehaviorTest {
         surface.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
         var demand = session.demands.adopt(new ClientSession.Demand(16)); demand.publication = surface;
         var cacheRoot = Files.createTempDirectory("voxy-shutdown-race-");
-        session.cache = new RegionalCache(cacheRoot, RegionalProtocol.Hash32.ZERO);
+        try (var metadata = new RegionalMetadataStore(cacheRoot, true)) {
+            session.cache = new CompletedSectionCache(metadata, RegionalProtocol.Hash32.ZERO, "test");
+        }
         session.release();
         check(session.demands.isEmpty() && surface.retirementFencePassed(), "release skipped demands/publications");
         check(session.sectionWorkers[0].resource.state() == WorkerResource.State.CLOSED

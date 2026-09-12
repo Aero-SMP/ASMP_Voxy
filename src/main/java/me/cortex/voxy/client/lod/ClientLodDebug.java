@@ -13,6 +13,8 @@ public final class ClientLodDebug {
     static void init(IEventBus modBus) {}
     static void tick() {}
     static boolean connectionAllowed() { return true; }
+    static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) { return builder; }
+    static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {}
     static void startupEvent(ClientSession.Session session, String event, long bytes) {}
     static void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {}
     static void captureSession(ClientSession.Session session) {}

@@ -46,6 +46,16 @@ final class CacheStartupBehaviorTest {
     record Fixture(RegionalProtocol.CatalogMessage catalog, RegionalProtocol.RegionMessage message,
                    RegionalProtocol.RegionIndex index, byte[] payload) {}
 
+    static CompletedSectionCache completedCache(Path root, Fixture fixture) throws Exception {
+        try (var metadata = new RegionalMetadataStore(root, true)) {
+            awaitInventory(metadata.budget);
+            metadata.saveCatalog(WORLD, DIMENSION, fixture.catalog(), metadata.budget.stamp(), () -> true);
+            var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION);
+            cache.put(LocalSection.from(fixture.index(), 340, fixture.catalog().fingerprint()), fixture.payload(), () -> true);
+            return cache;
+        }
+    }
+
     private static void shardReconstruction() throws Exception {
         Path root = Files.createTempDirectory("voxy-shard-open-");
         Path path = root.resolve("r.0.0.vxcache");
@@ -325,11 +335,15 @@ final class CacheStartupBehaviorTest {
     }
 
     static final class Driver implements AutoCloseable {
-        final Publisher publisher = new Publisher();
+        final Publisher publisher;
         final ClientSession.Session session;
         boolean mapCatalog = true;
         Driver(Path root) throws Exception {
-            session = new ClientSession.Session(77, DIMENSION, null, publisher, mesher(), 2);
+            this(root, new Publisher(), mesher());
+        }
+        Driver(Path root, Publisher publisher, SectionMesher mesher) throws Exception {
+            this.publisher = publisher;
+            session = new ClientSession.Session(77, DIMENSION, null, publisher, mesher, 2);
             session.cacheRoot = root; session.serverKey = SERVER;
             session.metadataWorker.start();
             session.metadataWorker.assign(new ClientSession.Session.BootstrapTask(root, SERVER, DIMENSION));
@@ -350,7 +364,7 @@ final class CacheStartupBehaviorTest {
             return mesherConstructor.newInstance(models, (java.util.function.IntConsumer) ignored -> {});
         }
         void step() throws Exception {
-            session.connect(); session.drainWorkers();
+            session.connect(); session.drainWorkers(); session.drainNetworkReplies();
             if (mapCatalog && session.pendingCatalogTask != null && !session.pendingCatalogSubmitted) {
                 session.pendingCatalogSubmitted = true;
                 // Current Minecraft registry mapping is the sole substituted catalog boundary.
@@ -406,7 +420,7 @@ final class CacheStartupBehaviorTest {
                 s.demands.region(0).subscribed = true;
                 check(s.acceptRegion(same.message()), "live validation not admitted");
                 check(!s.validated(demand), "unverified incoming index authorized a saved-generation request");
-                driver.until(() -> demand.index.generation() == 1);
+                driver.until(() -> demand.index != null && demand.index.generation() == 1);
                 check(demand.revision == revision && demand.installed && s.meshedSections == 1,
                         "generation-only validation rebuilt geometry");
                 var changed = fixture(2, 1, 0xe0, 1);
@@ -425,7 +439,8 @@ final class CacheStartupBehaviorTest {
                 check(demand.installed && !region.validated, "pending regeneration erased provisional terrain");
                 s.acceptRegionUnavailable(new RegionalProtocol.RegionUnavailable(0, 0, true));
                 driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
-                check(s.activeCount == 0 && store.region(WORLD, DIMENSION, 0, 0).absent(), "deletion not persisted");
+                check(s.activeCount == 0 && s.cache.legacySealed(0), "deletion not persisted");
+                check(!store.region(WORLD, DIMENSION, 0, 0).absent(), "prototype altered the rollback descriptor");
             } finally { release.countDown(); }
             try (var restarted = new Driver(root)) {
                 restarted.until(() -> restarted.session.metadataWorker.idle() && restarted.session.cacheOpened
@@ -470,7 +485,7 @@ final class CacheStartupBehaviorTest {
                 var s = driver.session;
                 s.connector = () -> { throw new IOException("no terrain server for empty fixture"); };
                 driver.until(() -> s.activated == 1);
-                check(s.demands.get(KEY).installed && s.demands.get(KEY).index.childMask(340) == 0xa5,
+                check(s.demands.get(KEY).installed && s.demands.get(KEY).content.children() == 0xa5,
                         "empty hierarchy was not completed");
                 check(s.cacheReads == 0 && s.cacheHits == 0 && s.cacheMisses == 0 && s.cacheBytes == 0
                         && s.receivedBytes == 0 && s.decodedSections == 0 && s.meshedSections == 0,
@@ -548,9 +563,9 @@ final class CacheStartupBehaviorTest {
             persist(store, fixture, false);
             try (var driver = new Driver(root)) {
                 var s = driver.session;
-                driver.until(() -> s.cacheMisses == 1);
+                driver.until(() -> s.demands.region(0).localLoaded);
                 for (int i = 0; i < 50; i++) driver.step();
-                check(s.cacheMisses == 1 && s.demands.get(KEY).candidate == SectionDemandTable.CandidateState.WAIT_REGION,
+                check(s.cacheMisses == 0 && s.demands.get(KEY).candidate == SectionDemandTable.CandidateState.WAIT_REGION,
                         "provisional payload miss spun or sent obsolete generation");
                 s.changeWorld(new RegionalProtocol.Hash32(5, 6, 7, 8));
                 driver.until(() -> s.cacheOpened && s.metadataWorker.idle());
@@ -678,11 +693,24 @@ final class CacheStartupBehaviorTest {
         constructor.setAccessible(true);
         var client = constructor.newInstance(connection, stream, "late test result");
         var entered = new CountDownLatch(1); var finish = new CountDownLatch(1);
-        var attempt = new RegionalConnectionAttempt(() -> {
+        RegionalConnectionAttempt.Connector connector = () -> {
             entered.countDown();
             for (;;) try { finish.await(); break; } catch (InterruptedException ignored) { }
             return client;
-        });
+        };
+        var attempt = new RegionalConnectionAttempt(connector);
+        // The preceding cancellation fixture signals from inside its connector, before the
+        // single executor has finished its resource callback. Respect its real busy response.
+        long available = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (entered.getCount() != 0 && System.nanoTime() < available) {
+            var outcome = attempt.poll();
+            if (outcome != null) {
+                check(outcome.failure() instanceof IOException, "unexpected late-success setup failure");
+                attempt.close();
+                attempt = new RegionalConnectionAttempt(connector);
+            }
+            Thread.sleep(1);
+        }
         try {
             check(entered.await(2, TimeUnit.SECONDS), "late-success attempt did not start");
             attempt.close(); finish.countDown();

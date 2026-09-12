@@ -183,10 +183,9 @@ final class TerminalRendererTeardownBehaviorTest {
     private static void actualSessionWaitsForMesher() throws Exception {
         var fixture = CacheStartupBehaviorTest.fixture(1, 1, 255, 1);
         var root = java.nio.file.Files.createTempDirectory("voxy-terminal-worker-");
-        var cache = new RegionalCache(root, CacheStartupBehaviorTest.WORLD);
+        var cache = CacheStartupBehaviorTest.completedCache(root, fixture);
         CacheStartupBehaviorTest.awaitInventory((RegionalDiskBudget) get(cache, "budget"));
         int ordinal = fixture.index().ordinal(CacheStartupBehaviorTest.KEY);
-        cache.put(fixture.index(), ordinal, fixture.payload());
         CountDownLatch entered = new CountDownLatch(1), stopRequested = new CountDownLatch(1), resume = new CountDownLatch(1);
         AtomicBoolean dependenciesFreed = new AtomicBoolean(), blocked = new AtomicBoolean();
         var models = new me.cortex.voxy.client.core.rendering.building.SectionMesher.Models() {
@@ -217,8 +216,9 @@ final class TerminalRendererTeardownBehaviorTest {
         var worker = session.sectionWorkers[0];
         var demand = session.demands.adopt(new ClientSession.Demand(CacheStartupBehaviorTest.KEY));
         worker.start();
-        worker.assign(new ClientSession.Session.SectionWorkerTask(demand.ticket(session.id, 0), fixture.index(), ordinal,
-                ClientSession.Session.WorkerSource.CACHE, null, CacheStartupBehaviorTest.MAPPINGS, cache));
+        worker.assign(new ClientSession.Session.SectionWorkerTask(demand.ticket(session.id, 0),
+                LocalSection.from(fixture.index(), ordinal, fixture.catalog().fingerprint()),
+                ClientSession.Session.WorkerSource.CACHE, null, CacheStartupBehaviorTest.MAPPINGS, cache, () -> true));
         AtomicReference<Throwable> failure = new AtomicReference<>();
         Thread release = new Thread(() -> {
             try { session.release(); dependenciesFreed.set(true); }

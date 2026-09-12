@@ -22,11 +22,34 @@ public final class WorkerShaderDebugBehaviorTest {
         autoConnectOnlyFromIdleMenus(updater);
         cacheResetSafety();
         stageAccountingAndCpuUnavailable();
+        transportCounters();
         DebugSnapshotShutdownBehaviorTest.cacheMonitorDoesNotBlockOwner();
         actualWorkerStalls();
         shaderDiffAndAliases();
         HarnessTerminalBehaviorTest.run();
         System.out.println("actual debug worker boundaries, lock-owner evidence, CPU availability and shader diff tests passed");
+    }
+
+    private static void transportCounters() throws Exception {
+        long sent = TransportDebugTelemetry.sent.get(), received = TransportDebugTelemetry.received.get();
+        long opened = TransportDebugTelemetry.opened.get(), closed = TransportDebugTelemetry.closed.get();
+        try (var tracked = new TransportDebugTelemetry.Socket(); var peer = new java.net.DatagramSocket()) {
+            tracked.setSoTimeout(2000); peer.setSoTimeout(2000);
+            var address = java.net.InetAddress.getLoopbackAddress();
+            tracked.send(new java.net.DatagramPacket(new byte[31], 31, address, peer.getLocalPort()));
+            peer.receive(new java.net.DatagramPacket(new byte[100], 100));
+            peer.send(new java.net.DatagramPacket(new byte[17], 17, address, tracked.getLocalPort()));
+            tracked.receive(new java.net.DatagramPacket(new byte[100], 100));
+            check(TransportDebugTelemetry.sent.get() - sent == 31
+                    && TransportDebugTelemetry.received.get() - received == 17, "wire counter counted buffer capacity or peer traffic");
+            tracked.close(); tracked.close();
+            try { tracked.send(new java.net.DatagramPacket(new byte[3], 3, address, peer.getLocalPort()));
+                throw new AssertionError("closed UDP socket accepted send");
+            } catch (java.io.IOException expected) { }
+            check(TransportDebugTelemetry.sent.get() - sent == 31, "failed send counted as transmitted bytes");
+        }
+        check(TransportDebugTelemetry.opened.get() - opened == 1 && TransportDebugTelemetry.closed.get() - closed == 1,
+                "socket ownership counters leaked or double-closed");
     }
 
     private static void cacheResetSafety() throws Exception {
@@ -125,10 +148,9 @@ public final class WorkerShaderDebugBehaviorTest {
 
     private static void actualWorkerStalls() throws Exception {
         var fixture = CacheStartupBehaviorTest.fixture(1, 1, 255, 1);
-        var cache = new RegionalCache(Files.createTempDirectory("voxy-instrumentation-cache-"), CacheStartupBehaviorTest.WORLD);
+        var cache = CacheStartupBehaviorTest.completedCache(Files.createTempDirectory("voxy-instrumentation-cache-"), fixture);
         CacheStartupBehaviorTest.awaitInventory((RegionalDiskBudget) field(cache, "budget"));
         int ordinal = fixture.index().ordinal(CacheStartupBehaviorTest.KEY);
-        cache.put(fixture.index(), ordinal, fixture.payload());
         Object budget = field(cache, "budget");
         AtomicReference<String> blockAt = new AtomicReference<>("REQUEST_MODELS");
         CountDownLatch modelEntered = new CountDownLatch(1), modelResume = new CountDownLatch(1);
@@ -153,8 +175,9 @@ public final class WorkerShaderDebugBehaviorTest {
         var work = (WorkerDebugTelemetry.Work) worker.debugWork;
         var demand = session.demands.adopt(new ClientSession.Demand(CacheStartupBehaviorTest.KEY));
         var ticket = demand.ticket(session.id, 0);
-        var task = new ClientSession.Session.SectionWorkerTask(ticket, fixture.index(), ordinal,
-                ClientSession.Session.WorkerSource.CACHE, null, CacheStartupBehaviorTest.MAPPINGS, cache);
+        var content = LocalSection.from(fixture.index(), ordinal, fixture.catalog().fingerprint());
+        var task = new ClientSession.Session.SectionWorkerTask(ticket, content,
+                ClientSession.Session.WorkerSource.CACHE, null, CacheStartupBehaviorTest.MAPPINGS, cache, () -> true);
         List<String> evidence = new ArrayList<>();
         var bean = ManagementFactory.getThreadMXBean();
         try {
@@ -187,15 +210,15 @@ public final class WorkerShaderDebugBehaviorTest {
             check(work.copy().outcomes()[WorkerDebugTelemetry.Outcome.MODEL_WAIT.ordinal()] == 1
                     && work.copy().repeats() == 1, "model retry identity missing");
             // An invalid compressed body still leaves a terminal diagnostic state and unchanged failure handling.
-            worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, fixture.index(), ordinal,
-                    ClientSession.Session.WorkerSource.NETWORK, new byte[]{1}, CacheStartupBehaviorTest.MAPPINGS, cache));
+            worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, content,
+                    ClientSession.Session.WorkerSource.NETWORK, new byte[]{1}, CacheStartupBehaviorTest.MAPPINGS, cache, () -> true));
             until(() -> work.copy().jobs() == 3);
             check(work.copy().stage() == WorkerDebugTelemetry.Stage.IDLE
                     && work.copy().outcomes()[WorkerDebugTelemetry.Outcome.FAILURE.ordinal()] == 1, "exception left running stage");
             completed = worker.resource.claim(); worker.releaseCompletion(completed.lease());
             synchronized (budget) {
-                worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, fixture.index(), ordinal,
-                        ClientSession.Session.WorkerSource.NETWORK, fixture.payload(), CacheStartupBehaviorTest.MAPPINGS, cache));
+                worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, content,
+                        ClientSession.Session.WorkerSource.NETWORK, fixture.payload(), CacheStartupBehaviorTest.MAPPINGS, cache, () -> true));
                 until(() -> work.copy().stage() == WorkerDebugTelemetry.Stage.CACHE_WRITE);
                 until(() -> worker.workerThread.getState() == Thread.State.BLOCKED);
                 var before = work.copy(); Thread.sleep(3);
@@ -204,13 +227,22 @@ public final class WorkerShaderDebugBehaviorTest {
             }
             until(() -> work.copy().jobs() == 4);
             completed = worker.resource.claim(); worker.releaseCompletion(completed.lease());
-            cache.quarantine(fixture.index(), ordinal);
+            synchronized (budget) {
+                var disk = (RegionalDiskBudget) budget;
+                var catalogPath = cache.path(content.region()).resolveSibling(java.util.HexFormat.of().formatHex(content.catalog().bytes()) + ".vxcat");
+                try (var pin = disk.pin(catalogPath)) { disk.delete(cache.path(content.region())); }
+            }
             worker.assign(task); until(() -> work.copy().jobs() == 5);
             completed = worker.resource.claim();
             check(completed.value().getClass().getSimpleName().equals("WorkerMiss")
                     && work.copy().outcomes()[WorkerDebugTelemetry.Outcome.CACHE_MISS.ordinal()] == 1, "real cache miss missing");
             worker.releaseCompletion(completed.lease());
-            cache.put(fixture.index(), ordinal, new byte[fixture.payload().length]);
+            cache.put(content, fixture.payload(), () -> true);
+            try (var file = new java.io.RandomAccessFile(cache.path(content.region()).toFile(), "rw")) {
+                file.seek(CompletedSectionJournal.HEADER_BYTES + CompletedSectionJournal.FRAME_BYTES
+                        + CompletedSectionJournal.PAYLOAD_METADATA_BYTES);
+                file.write(0); // Actual file corruption, not a bypass of the cache write validator.
+            }
             worker.assign(task); until(() -> work.copy().jobs() == 6);
             completed = worker.resource.claim();
             check(completed.value().getClass().getSimpleName().equals("WorkerMiss")

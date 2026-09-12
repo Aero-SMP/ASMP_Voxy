@@ -68,7 +68,7 @@ final class RegionalQuicClient implements AutoCloseable {
             QuicClientConnection connection = null;
             try {
                 ConnectionOwner owner = new ConnectionOwner();
-                connection = QuicClientConnection.newBuilder()
+                connection = ClientLodDebug.quicBuilder(QuicClientConnection.newBuilder())
                         .host(TLS_SERVER_NAME).proxy(address.getHostAddress()).port(port)
                         .applicationProtocol(alpn).connectTimeout(Duration.ofSeconds(5))
                         .maxIdleTimeout(Duration.ofSeconds(60))

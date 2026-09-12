@@ -373,6 +373,7 @@ public final class PublicationRepairBehaviorTest {
         Publisher p = new Publisher(); ClientSession.Session s = session(p, 1);
         var d = ready(s, key(0), new CountedBuffer());
         var original = emptyIndex(); d.index = original; d.ordinal = original.ordinal(d.key);
+        d.content = LocalSection.from(original, d.ordinal, RegionalProtocol.Hash32.ZERO);
         s.scheduleReadyPublications(); Publication publication = p.handoff.take().getFirst();
         publication.markRendererAdmitted(); s.pollPublications();
         var newer = emptyIndex();
@@ -484,6 +485,7 @@ public final class PublicationRepairBehaviorTest {
     private static ClientSession.Session.NetworkReply reply(ClientSession.Session s, long key, int bucket) throws Exception {
         ClientSession.Demand demand = s.demands.adopt(new ClientSession.Demand(key));
         demand.index = emptyIndex(); demand.ordinal = demand.index.ordinal(key); demand.regionGeneration = 1;
+        demand.content = LocalSection.from(demand.index, demand.ordinal, RegionalProtocol.Hash32.ZERO);
         s.demands.setPriority(demand, bucket);
         s.demands.owned(demand, SectionDemandTable.CandidateState.NETWORK_OWNED);
         var body = new ClientSession.Session.NetworkReply(s.connectionEpoch,
@@ -525,6 +527,7 @@ public final class PublicationRepairBehaviorTest {
         for (int x = 0; x < 100; x++) {
             ClientSession.Demand d = s.demands.adopt(new ClientSession.Demand(key(x)));
             d.index = index; d.ordinal = 0; s.queueBound(d);
+            d.content = LocalSection.from(index, d.ordinal, RegionalProtocol.Hash32.ZERO);
         }
         s.scheduleSourceWork();
         check(s.idleWorker() == null && s.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) == 98,

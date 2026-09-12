@@ -35,9 +35,22 @@ final class RegionalDiskBudget {
     private final Map<Path, Integer> pins = new HashMap<>();
     @FunctionalInterface interface ReferenceReader { Path read(Path path) throws IOException; }
     private final ReferenceReader referenceReader;
-    private final Map<Path, Map<RegionalCache, BooleanSupplier>> openFiles = new HashMap<>();
-    private final Map<Path, Path> references = new HashMap<>();
+    private final Map<Path, Map<Object, BooleanSupplier>> openFiles = new HashMap<>();
+    private final Map<Path, Set<Path>> references = new HashMap<>();
     private final Map<Path, Integer> catalogReferences = new HashMap<>();
+    private boolean preserveLegacy;
+
+    static RegionalDiskBudget acquireExperimental(Path root) throws IOException {
+        for (;;) {
+            var budget = open(root);
+            synchronized (budget) {
+                if (budget.state == InventoryState.CLOSED && budget.maintenance == null) continue;
+                budget.preserveLegacy = true;
+                budget.retain();
+                return budget;
+            }
+        }
+    }
 
     static synchronized RegionalDiskBudget open(Path root) throws IOException {
         return open(root, RegionalMetadataStore::referencedCatalog);
@@ -124,7 +137,7 @@ final class RegionalDiskBudget {
             this.ownershipLock = this.ownershipChannel.tryLock();
             if (this.ownershipLock == null) throw new IOException("cache is owned by another process");
             Map<Path, BasicFileAttributes> observed = new HashMap<>();
-            Map<Path, Path> discovered = new HashMap<>();
+            Map<Path, Set<Path>> discovered = new HashMap<>();
             Map<Path, Integer> counts = new HashMap<>();
             long total = 0;
             try (var files = Files.walk(this.root)) {
@@ -139,9 +152,13 @@ final class RegionalDiskBudget {
                     if (path.toString().endsWith(".vxmeta")) {
                         Path catalog = this.referenceReader.read(path);
                         if (catalog != null) {
-                            discovered.put(path, catalog);
+                            discovered.put(path, Set.of(catalog));
                             counts.merge(catalog, 1, Integer::sum);
                         }
+                    } else if (path.toString().endsWith(".vxlocal")) {
+                        var catalogs = CompletedSectionCache.referencedCatalogs(path);
+                        discovered.put(path, catalogs);
+                        for (var catalog : catalogs) counts.merge(catalog, 1, Integer::sum);
                     }
                 }
             }
@@ -243,12 +260,20 @@ final class RegionalDiskBudget {
     }
 
     long stamp() { return this.eviction; }
-    void register(Path path, RegionalCache owner, BooleanSupplier close) {
+    void register(Path path, Object owner, BooleanSupplier close) {
         this.openFiles.computeIfAbsent(path, ignored -> new HashMap<>()).put(owner, close);
     }
-    void unregister(Path path, RegionalCache owner) {
+    void unregister(Path path, Object owner) {
         var readers = this.openFiles.get(path);
         if (readers != null && readers.remove(owner) != null && readers.isEmpty()) this.openFiles.remove(path);
+    }
+
+    boolean closeOtherOwners(Path path, Object owner) {
+        var readers = this.openFiles.get(path);
+        if (readers != null) for (var entry : List.copyOf(readers.entrySet())) {
+            if (entry.getKey() != owner && !entry.getValue().getAsBoolean()) return false;
+        }
+        return true;
     }
 
     boolean ensure(long added, Set<Path> protectedPaths) throws IOException {
@@ -281,14 +306,19 @@ final class RegionalDiskBudget {
     private record EvictionCandidate(Path path, long modified) {}
 
     void reference(Path descriptor, Path catalog) throws IOException {
-        if (catalog == null) {
-            this.unreference(this.references.remove(descriptor));
-            return;
-        }
-        Path previous = this.references.put(descriptor, catalog);
-        if (Objects.equals(previous, catalog)) return;
-        this.catalogReferences.merge(catalog, 1, Integer::sum);
-        this.unreference(previous);
+        references(descriptor, catalog == null ? Set.of() : Set.of(catalog));
+    }
+
+    void references(Path descriptor, Set<Path> catalogs) throws IOException {
+        Set<Path> previous = this.references.put(descriptor, Set.copyOf(catalogs));
+        if (Objects.equals(previous, catalogs)) return;
+        for (var catalog : catalogs) if (previous == null || !previous.contains(catalog))
+            this.catalogReferences.merge(catalog, 1, Integer::sum);
+        if (previous != null) for (var catalog : previous) if (!catalogs.contains(catalog)) this.unreference(catalog);
+    }
+
+    private void unreference(Set<Path> catalogs) throws IOException {
+        if (catalogs != null) for (var catalog : catalogs) this.unreference(catalog);
     }
 
     private void unreference(Path catalog) throws IOException {
@@ -307,6 +337,12 @@ final class RegionalDiskBudget {
     }
 
     private boolean deleteKnown(Path path) throws IOException {
+        if (this.preserveLegacy) {
+            Path relative = this.root.relativize(path);
+            boolean experimental = false;
+            for (Path component : relative) experimental |= component.toString().equals("completed-v1");
+            if (!experimental) return false;
+        }
         if (this.pins.containsKey(path)) return false;
         var readers = this.openFiles.get(path);
         if (readers != null) for (var close : List.copyOf(readers.values())) {
@@ -328,7 +364,7 @@ final class RegionalDiskBudget {
     }
     private static boolean managedName(Path path) {
         String name = path.getFileName().toString();
-        return name.endsWith(".vxcache") || name.endsWith(".vxmeta")
+        return name.endsWith(".vxcache") || name.endsWith(".vxlocal") || name.endsWith(".vxmeta")
                 || name.endsWith(".vxcat") || name.endsWith(".vxlink")
                 || name.endsWith(".vxmeta.pending") || name.endsWith(".vxcat.pending")
                 || name.endsWith(".vxlink.pending");

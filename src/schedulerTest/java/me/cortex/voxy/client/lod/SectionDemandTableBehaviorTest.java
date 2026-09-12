@@ -39,6 +39,8 @@ public final class SectionDemandTableBehaviorTest {
         SubscriptionWindowBehaviorTest.run();
         TerrainWindowPlannerBehaviorTest.run();
         CacheStartupBehaviorTest.run();
+        CompletedSectionJournalBehaviorTest.run();
+        CompletedLocalCacheBehaviorTest.run();
         ZoomRangeBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationShutdownBehaviorTest.run();
         PublicationRepairBehaviorTest.run();

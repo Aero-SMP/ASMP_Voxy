@@ -267,6 +267,7 @@ tasks.register('schedulerBehaviorTest', JavaExec) {
 tasks.named('compileSchedulerTestJava', JavaCompile) {
     source 'src/debug/java/me/cortex/voxy/client/lod/SessionDebugTelemetry.java'
     source 'src/debug/java/me/cortex/voxy/client/lod/WorkerDebugTelemetry.java'
+    source 'src/debug/java/me/cortex/voxy/client/lod/TransportDebugTelemetry.java'
     source 'src/debug/java/me/cortex/voxy/client/lod/ShaderDebugTelemetry.java'
 }
 
@@ -295,6 +296,7 @@ tasks.register('verifyDebugHarnessArtifacts') {
                 include '**/LiveClientTestHarness*', '**/LiveServerTestHarness*'
                 include '**/SessionDebugTelemetry*'
                 include '**/WorkerDebugTelemetry*', '**/ShaderDebugTelemetry*'
+                include '**/TransportDebugTelemetry*'
                 include '**/DebugZoomControl*', '**/debugmixin/**', 'debug.voxy.mixins.json'
             }.files
             if (!leaked.empty) throw new GradleException("debug-test protocol leaked into ${artifact}")
