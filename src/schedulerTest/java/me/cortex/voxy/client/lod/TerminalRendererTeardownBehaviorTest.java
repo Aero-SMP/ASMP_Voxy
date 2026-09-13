@@ -212,6 +212,8 @@ final class TerminalRendererTeardownBehaviorTest {
         constructor.setAccessible(true);
         var mesher = constructor.newInstance(models, (java.util.function.IntConsumer) ignored -> {});
         var session = new ClientSession.Session(211, "test", null, new CacheStartupBehaviorTest.Publisher(), mesher, 1);
+        session.blockNames.put("minecraft:stone", 15);
+        session.biomeNames.put("minecraft:plains", 0);
         session.cache = cache;
         var worker = session.sectionWorkers[0];
         var demand = session.demands.adopt(new ClientSession.Demand(CacheStartupBehaviorTest.KEY));

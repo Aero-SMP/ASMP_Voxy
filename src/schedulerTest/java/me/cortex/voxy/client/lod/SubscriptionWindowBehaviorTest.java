@@ -167,7 +167,8 @@ final class SubscriptionWindowBehaviorTest {
                 expected.add(Integer.toUnsignedLong(x + dx) | (Integer.toUnsignedLong(z + dz) << 32));
             }
         }
-        check(wire.server.equals(expected), "settled wire membership differs from tracker circle");
+        check(wire.server.equals(expected), "settled wire membership differs from tracker circle at "
+                + x + "," + z + " radius=" + radius + " expected=" + expected.size() + " actual=" + wire.server.size());
         check(expected.size() <= 16384, "supported radius exceeds bound at rest");
     }
 

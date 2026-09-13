@@ -41,6 +41,8 @@ public final class NodeStore {
         return id;
     }
 
+    boolean canAllocate(int count) { return this.allocationSet.canAllocateConsecutive(count); }
+
     public int allocate(int count) {
         if (count <= 0) {
             throw new IllegalArgumentException("Count cannot be <= 0 was " + count);

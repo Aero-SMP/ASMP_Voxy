@@ -14,6 +14,7 @@ final class WorkerResource<T> {
     private long generation;
     private State state = State.IDLE;
     private T result;
+    private boolean savePending, releaseRequested;
 
     WorkerResource(int slot, Consumer<T> dispose) {
         this.slot = slot;
@@ -23,6 +24,7 @@ final class WorkerResource<T> {
     synchronized Lease acquire() {
         if (this.state != State.IDLE) return null;
         this.state = State.RUNNING;
+        this.savePending = this.releaseRequested = false;
         return new Lease(this.slot, ++this.generation);
     }
 
@@ -54,6 +56,28 @@ final class WorkerResource<T> {
     synchronized boolean release(Lease lease) {
         if (!matches(lease) || this.state != State.COMPLETED) return false;
         if (this.result != null) throw new IllegalStateException("worker result must be claimed");
+        this.releaseRequested = true;
+        if (this.savePending) return false;
+        this.state = State.IDLE;
+        return true;
+    }
+
+    /** Retain the same slot for one optional save before handing off its sole mesh result. */
+    synchronized void retainSave(Lease lease) {
+        if (!matches(lease) || this.state != State.RUNNING || this.savePending)
+            throw new IllegalStateException("save must belong to the running worker lease");
+        this.savePending = true;
+    }
+
+    /** Save completion is an obligation acknowledgement, never another worker result.
+     * True means the slot became idle; stale acknowledgements cannot affect a reused slot.
+     */
+    synchronized boolean finishSave(Lease lease) {
+        if (!matches(lease) || !this.savePending) return false;
+        this.savePending = false;
+        if (!this.releaseRequested) return false;
+        if (this.state != State.COMPLETED || this.result != null)
+            throw new IllegalStateException("save released untransferred geometry");
         this.state = State.IDLE;
         return true;
     }

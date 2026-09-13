@@ -230,9 +230,48 @@ public class NodeManager {
         for (int level = MAX_LOD_LAYER; level > SectionKey.level(position); level--) {
             long ancestor = ancestorAtLevel(position, level);
             if (this.activeSectionMap.get(ancestor) == -1) return false;
+            if (!this.navigationOwner(ancestor, getChildIdx(ancestorAtLevel(position, level - 1)))) return false;
             this.processRequest(ancestor);
         }
         return this.activeSectionMap.get(position) != -1;
+    }
+
+    /** Missing geometry is a navigation node, never authoritative EMPTY terrain. A real
+     * parent retains its existing all-required-children transaction/fallback semantics. */
+    private boolean navigationOwner(long position, int child) {
+        int state = this.activeSectionMap.get(position);
+        if ((state & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
+            if (this.committedPositions.containsKey(position)) return false;
+            int requestId = state & NODE_ID_MSK;
+            boolean top = (state & REQUEST_TYPE_MSK) == REQUEST_TYPE_SINGLE;
+            NodeRequest request = top ? this.topLevelRequests.get(requestId) : this.childRequests.get(requestId);
+            int needed = 1;
+            if (!top) {
+                int parentState = this.activeSectionMap.get(request.position());
+                if ((parentState & NODE_TYPE_MSK) == NODE_TYPE_REQUEST
+                        || this.nodeData.getNodeGeometry(parentState & NODE_ID_MSK) != NULL_GEOMETRY_ID) return false;
+                int existing = (parentState & NODE_TYPE_MSK) == NODE_TYPE_INNER
+                        ? this.existingChildMask(parentState & NODE_ID_MSK) : 0;
+                needed = Integer.bitCount(existing | request.requiredMask());
+            }
+            if (!this.nodeData.canAllocate(needed)) return false;
+            // Do not turn another child's prepared real mesh into a placeholder.
+            for (int i = 0; i < 8; i++) if ((request.requiredMask() & 1 << i) != 0
+                    && request.mesh(i) != NULL_GEOMETRY_ID) return false;
+            for (int i = 0; i < 8; i++) if ((request.requiredMask() & 1 << i) != 0) {
+                request.replaceMesh(i, NULL_GEOMETRY_ID);
+                request.setChildExistence(i, (byte) 0);
+            }
+            this.finishRequestIfSatisfied(requestId, request, state & REQUEST_TYPE_MSK);
+            state = this.activeSectionMap.get(position);
+        }
+        int nodeId = state & NODE_ID_MSK;
+        if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) {
+            int mask = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(nodeId));
+            this.nodeData.setNodeChildExistence(nodeId, (byte) (mask | 1 << child));
+            this.invalidateNode(nodeId);
+        }
+        return true;
     }
 
     boolean hasTopLevelAncestor(long position) {
@@ -451,6 +490,7 @@ public class NodeManager {
         int type = state & NODE_TYPE_MSK;
         if (state != -1 && type == NODE_TYPE_INNER) {
             int nodeId = state & NODE_ID_MSK;
+            if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) return false;
             this._recurseRemoveNode(parent, true, retired);
             this.transition(parent, state, NODE_TYPE_LEAF | nodeId);
             this.refreshParentLeafState(parent);
@@ -1060,8 +1100,7 @@ public class NodeManager {
         if (SectionKey.level(pos) == 0) return;
 
         int nodeId = state & NODE_ID_MSK;
-        if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID
-                || this.nodeData.isNodeRequestInFlight(nodeId)) return;
+        if (this.nodeData.isNodeRequestInFlight(nodeId)) return;
         int desired = Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(nodeId));
         int existing = nodeType == NODE_TYPE_INNER ? this.existingChildMask(nodeId) : 0;
         int missing = desired & ~existing;

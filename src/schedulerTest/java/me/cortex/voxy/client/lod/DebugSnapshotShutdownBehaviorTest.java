@@ -58,7 +58,8 @@ final class DebugSnapshotShutdownBehaviorTest {
             RuntimeCachePressureBehaviorTest.whileBudgetHeld(store.budget, () -> {
                 RuntimeCachePressureBehaviorTest.setOwner(session);
                 SessionDebugTelemetry.capture(session, System.nanoTime(), false);
-                check(SessionDebugTelemetry.latest(session).text().contains("cacheInventory=READY cacheDiskBytes=0"),
+                check(SessionDebugTelemetry.latest(session).text().contains("cacheInventory=READY cacheDiskBytes="
+                                + Files.size(root.resolve("cache-format"))),
                         "owner capture did not observe cache without its monitor");
             });
         } finally { CacheStartupBehaviorTest.cleanup(root); }
@@ -200,7 +201,7 @@ final class DebugSnapshotShutdownBehaviorTest {
         surface.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
         var demand = session.demands.adopt(new ClientSession.Demand(16)); demand.publication = surface;
         var cacheRoot = Files.createTempDirectory("voxy-shutdown-race-");
-        try (var metadata = new RegionalMetadataStore(cacheRoot, true)) {
+        try (var metadata = new RegionalMetadataStore(cacheRoot)) {
             session.cache = new CompletedSectionCache(metadata, RegionalProtocol.Hash32.ZERO, "test");
         }
         session.release();

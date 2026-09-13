@@ -22,7 +22,34 @@ final class SectionPublicationLookupBehaviorTest {
             for (boolean batch : new boolean[]{false, true}) siblings(reverse, batch);
         }
         blockedTopologyRetries();
+        sparseCachedBranch();
         System.out.println("section publication isolation, sibling orders, retry and stale-fence tests passed");
+    }
+
+    private static void sparseCachedBranch() {
+        var allocator = new BasicAsyncGeometryManager(16, 16384);
+        var nodes = new NodeManager(1024, allocator);
+        long top = root(0), fine = SectionKey.pack(0, 0, 0, 0), sibling = SectionKey.pack(0, 1, 0, 0);
+        nodes.insertTopLevelNode(top);
+        check(nodes.ensureHierarchyOwner(fine), "fine-only cache waited for absent parents");
+        var geometry = new Buffer(); stage(nodes, mesh(fine, 1, geometry, 0));
+        check(nodes.finalizeSection(1, fine), "fine-only cache failed to publish");
+        NodeStore data = (NodeStore) get(nodes, "nodeData");
+        for (int level = 1; level <= 4; level++) {
+            long pos = SectionKey.pack(level, 0, 0, 0);
+            int id = active(nodes).get(pos) & NodeManager.NODE_ID_MSK;
+            check(data.getNodeGeometry(id) == NodeManager.NULL_GEOMETRY_ID, "unknown ancestor became EMPTY content");
+            check(data.getChildPtrCount(id) == 1, "missing siblings were fabricated");
+            check(!nodes.coarsenSubtree(10 + level, pos) && !geometry.isFreed(), "coarsened detail into meshless parent");
+        }
+        check(nodes.ensureHierarchyOwner(sibling), "second sparse sibling cannot enter");
+        var other = new Buffer(); stage(nodes, mesh(sibling, 2, other, 0));
+        check(nodes.finalizeSection(2, sibling) && !geometry.isFreed(), "sparse sibling displaced existing geometry");
+        var coarse = new Buffer(); stage(nodes, mesh(top, 3, coarse, 1));
+        check(nodes.finalizeSection(3, top) && !geometry.isFreed(), "late real parent erased cached fine geometry");
+        nodes.removeTopLevelNode(top);
+        check(geometry.frees == 1 && other.frees == 1 && coarse.frees == 1 && allocator.getSectionCount() == 0,
+                "sparse branch teardown leaked/double-freed geometry");
     }
 
     private static final class Buffer extends MemoryBuffer {

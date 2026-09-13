@@ -39,13 +39,19 @@ public final class CatalogCodec {
                     || biomes.isEmpty() || biomes.size() > MAX_BIOMES) {
                 throw new IllegalArgumentException("catalog entry counts are outside bounds");
             }
-            for (Block block : blocks) Objects.requireNonNull(block, "block");
+            var blockNames = new java.util.HashSet<String>();
+            for (Block block : blocks) {
+                Objects.requireNonNull(block, "block");
+                if (!blockNames.add(block.canonical())) throw new IllegalArgumentException("duplicate canonical block name");
+            }
+            var biomeNames = new java.util.HashSet<String>();
             for (String biome : biomes) {
                 Objects.requireNonNull(biome, "biome");
                 int bytes = biome.getBytes(StandardCharsets.UTF_8).length;
                 if (biome.isEmpty() || bytes > MAX_NAME_BYTES) {
                     throw new IllegalArgumentException("invalid canonical biome name");
                 }
+                if (!biomeNames.add(biome)) throw new IllegalArgumentException("duplicate canonical biome name");
             }
         }
     }

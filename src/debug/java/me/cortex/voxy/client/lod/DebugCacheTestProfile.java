@@ -94,7 +94,7 @@ final class DebugCacheTestProfile {
                 .append(" world=").append(java.util.HexFormat.of().formatHex(cache.world.bytes()))
                 .append(" fineKey=").append(fine.key());
         boolean ready = true;
-        try (var codec = new RegionalSectionCodec()) {
+        try (var codec = new LocalSectionCodec()) {
             var sections = cache.directory(fine.region());
             for (int level = 4; level >= 0; level--) {
                 long key = me.cortex.voxy.client.core.rendering.SectionKey.pack(level,
@@ -104,8 +104,6 @@ final class DebugCacheTestProfile {
                 var section = sections.get(key);
                 boolean valid = section != null && section.kind() != LocalSection.ABSENT;
                 if (valid) {
-                    valid = Files.isRegularFile(cache.metadata.catalogPath(cache.world, cache.dimension, section.catalog()))
-                            && cache.metadata.readCatalog(cache.world, cache.dimension, section.catalog()) != null;
                     if (level > 0) {
                         int shift = level - 1;
                         int child = (me.cortex.voxy.client.core.rendering.SectionKey.x(fine.key()) >> shift & 1)
@@ -114,14 +112,7 @@ final class DebugCacheTestProfile {
                         valid &= (section.children() & 1 << child) != 0;
                     }
                     if (valid && section.kind() == LocalSection.DATA) {
-                        byte[] payload = cache.get(section);
-                        valid = payload != null && RegionalProtocol.crc32c(payload) == section.crc();
-                        if (valid) {
-                            byte[] canonical = codec.decompress(payload, section.canonicalBytes());
-                            var bytes = java.nio.ByteBuffer.wrap(new Blake3.Hasher().update(canonical).digest())
-                                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                            valid = new RegionalProtocol.Fingerprint(bytes.getLong(), bytes.getLong()).equals(section.fingerprint());
-                        }
+                        valid = cache.get(section, codec, (name, biome) -> 0) != null;
                     }
                     evidence.append(" lod").append(level).append('=').append(key).append(':').append(valid)
                             .append(':').append(java.util.HexFormat.of().formatHex(section.catalog().bytes()));

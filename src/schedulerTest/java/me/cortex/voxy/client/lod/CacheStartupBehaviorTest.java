@@ -23,234 +23,37 @@ final class CacheStartupBehaviorTest {
     static final RegionalSectionCodec.Mappings MAPPINGS = new RegionalSectionCodec.Mappings(new int[]{15}, new int[]{0});
 
     static void run() throws Exception {
-        shardReconstruction();
-        grownShardOffsets();
-        overlappingShardOwners();
-        trimmedShardsReopen();
-        CacheInventoryBehaviorTest.run();
-        RuntimeCachePressureBehaviorTest.run();
-        localActivationAndValidation();
         storedAirProjectionSkipsPayloadWork();
-        lowerAuthoritativeGenerationReplacesChangedCachedLighting();
         cachedRefinementWhileHeld();
         missesDoNotSpin();
-        corruptPayloadAndLateMapping();
-        metadataIntegrityAndBudget();
-        CacheKeyMetadataBehaviorTest.run();
         connectorCancellation();
         lateConnectionSuccessIsClosed();
         wireAbsence();
-        System.out.println("cache-startup production worker/mesher, validation, disk and connector tests passed");
+        System.out.println("self-contained startup, empty topology, cache-only refinement and connector lifetime passed");
     }
 
     record Fixture(RegionalProtocol.CatalogMessage catalog, RegionalProtocol.RegionMessage message,
                    RegionalProtocol.RegionIndex index, byte[] payload) {}
 
     static CompletedSectionCache completedCache(Path root, Fixture fixture) throws Exception {
-        try (var metadata = new RegionalMetadataStore(root, true)) {
+        try (var metadata = new RegionalMetadataStore(root)) {
             awaitInventory(metadata.budget);
-            metadata.saveCatalog(WORLD, DIMENSION, fixture.catalog(), metadata.budget.stamp(), () -> true);
             var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION);
-            cache.put(LocalSection.from(fixture.index(), 340, fixture.catalog().fingerprint()), fixture.payload(), () -> true);
+            storeSection(cache, fixture, 340);
             return cache;
         }
     }
 
-    private static void shardReconstruction() throws Exception {
-        Path root = Files.createTempDirectory("voxy-shard-open-");
-        Path path = root.resolve("r.0.0.vxcache");
-        byte[] header = buffer(64).put(new byte[]{'V','X','Y','S','E','C',0,0})
-                .putLong(1).putLong(2).putLong(3).putLong(4).putInt(0).putInt(0).putLong(0).array();
-        try {
-            Files.write(path, new byte[0]);
-            check(openShard(path, false) == null, "empty file accepted");
-            Files.write(path, header);
-            try (var shard = openShard(path, false)) {
-                check(shard != null && shardValue(shard, 1, 2) == null, "header-only shard rejected");
+    static void storeSection(CompletedSectionCache cache, Fixture fixture, int ordinal) throws Exception {
+        var section = LocalSection.from(fixture.index(), ordinal, fixture.catalog().fingerprint());
+        if (section.kind() != LocalSection.DATA) { cache.putMetadata(section, null, () -> true); return; }
+        try (var wire = new RegionalSectionCodec(); var local = new LocalSectionCodec()) {
+            byte[] canonical = wire.decompress(fixture.payload(), section.canonicalBytes());
+            wire.decode(section.key(), section.children(), canonical, section.fingerprint(), MAPPINGS);
+            try (var save = cache.begin(section, local, canonical, CatalogCodec.decode(fixture.catalog().canonical()), () -> true)) {
+                while (!save.step()) {}
             }
-            // Same fingerprint with different lengths, last-record wins, and a reinsert after a tombstone.
-            byte[] records = buffer(64 + 7 * 20 + 2 + 3 + 2 + 2 + 4)
-                    .put(header).put(record(1, 2, new byte[]{1, 1}))
-                    .put(record(1, 3, new byte[]{3, 3, 3}))
-                    .put(record(1, 2, new byte[]{2, 2})).put(record(1, -2, new byte[0]))
-                    .put(record(1, 2, new byte[]{4, 4})).put(record(2, 4, new byte[]{5, 5, 5, 5}))
-                    .put(record(2, -4, new byte[0])).array();
-            Files.write(path, Arrays.copyOf(records, records.length - 20));
-            try (var shard = openShard(path, false)) {
-                check(Arrays.equals(shardValue(shard, 2, 4), new byte[]{5, 5, 5, 5}), "exact-end payload lost");
-            }
-            List<byte[]> suffixes = new ArrayList<>();
-            suffixes.add(new byte[0]); suffixes.add(new byte[]{7, 8, 9});
-            suffixes.add(record(3, 4, new byte[]{7})); // incomplete payload
-            for (int invalid : new int[]{0, Integer.MIN_VALUE, RegionalProtocol.MAX_SECTION_BYTES + 1,
-                    -RegionalProtocol.MAX_SECTION_BYTES - 1}) suffixes.add(record(3, invalid, new byte[0]));
-            for (byte[] suffix : suffixes) {
-                Files.write(path, buffer(records.length + suffix.length).put(records).put(suffix).array());
-                var modified = java.nio.file.attribute.FileTime.fromMillis(123456000);
-                Files.setLastModifiedTime(path, modified);
-                byte[] before = Files.readAllBytes(path);
-                for (int reopen = 0; reopen < 3; reopen++) try (var shard = openShard(path, false)) {
-                    check(Arrays.equals(shardValue(shard, 1, 2), new byte[]{4, 4}), "reinsert/duplicate lost");
-                    check(Arrays.equals(shardValue(shard, 1, 3), new byte[]{3, 3, 3}), "length keys conflated");
-                    check(shardValue(shard, 2, 4) == null, "exact-end tombstone lost");
-                }
-                check(Arrays.equals(before, Files.readAllBytes(path)) && Files.getLastModifiedTime(path).equals(modified),
-                        "read-only scan repaired or touched file");
-                try (var shard = openShard(path, true)) {
-                    check(Files.size(path) == records.length && shardValue(shard, 1, 2) != null, "suffix repair changed prefix");
-                    var field = shard.getClass().getDeclaredField("file"); field.setAccessible(true);
-                    var file = (java.io.RandomAccessFile) field.get(shard);
-                    shard.close(); check(!file.getFD().valid(), "closed shard leaked file handle");
-                }
-                try (var shard = openShard(path, true)) {
-                    check(Files.size(path) == records.length, "repeated repair changed exact end");
-                }
-            }
-            for (int offset : new int[]{0, 8, 40, 44, 48}) {
-                byte[] invalid = header.clone(); invalid[offset] ^= 1; Files.write(path, invalid);
-                check(openShard(path, false) == null, "malformed magic/world/coordinates/reserved field accepted");
-            }
-            Files.write(path, Arrays.copyOf(header, 63));
-            check(openShard(path, false) == null, "short header accepted");
-            try (var file = new java.io.RandomAccessFile(path.toFile(), "rw")) { file.setLength(256L * 1024 * 1024 + 1); }
-            check(openShard(path, false) == null, "oversized shard accepted");
-            // Real positional reads still fail if the underlying payload disappears after opening.
-            Files.write(path, records);
-            try (var shard = openShard(path, false)) {
-                Files.write(path, header);
-                try { shardValue(shard, 1, 2); throw new AssertionError("truncated read accepted"); }
-                catch (IOException expected) { check(expected.getMessage().contains("truncated"), "wrong read failure"); }
-            }
-        } finally { cleanup(root); }
-    }
-
-    private static void trimmedShardsReopen() throws Exception {
-        Path root = Files.createTempDirectory("voxy-shard-trim-");
-        var budget = new RegionalDiskBudget(root, 1024 * 1024);
-        try (var store = new RegionalMetadataStore(budget); var cache = new RegionalCache(root, WORLD, budget)) {
-            awaitInventory(budget);
-            List<Fixture> fixtures = new ArrayList<>();
-            for (int x = 0; x < 66; x++) {
-                var f = fixture(1, 0, 1, 1, x, 0); fixtures.add(f);
-                cache.put(f.index(), 340, f.payload());
-            }
-            var field = RegionalCache.class.getDeclaredField("shards"); field.setAccessible(true);
-            Map<?, ?> handles = (Map<?, ?>) field.get(cache);
-            check(handles.size() == 64 && !handles.containsKey(0L), "open shard limit not exercised");
-            for (int pass = 0; pass < 3; pass++) for (var f : fixtures) {
-                check(!handles.containsKey(Integer.toUnsignedLong(f.index().regionX())), "fixture unexpectedly hit open handle");
-                check(Arrays.equals(cache.get(f.index(), 340), f.payload()), "trimmed shard reconstruction lost payload");
-            }
-            long total;
-            try (var paths = Files.walk(root)) { total = paths.filter(Files::isRegularFile).mapToLong(RegionalDiskBudget::size).sum(); }
-            check(budget.bytes == total, "repeated real shard reopen drifted accounting");
-        } finally { cleanup(root); }
-    }
-
-    private static void grownShardOffsets() throws Exception {
-        Path root = Files.createTempDirectory("voxy-shard-growth-");
-        Path path = root.resolve("r.0.0.vxcache");
-        int count = 8192;
-        try {
-            ByteBuffer bytes = buffer(64 + count * 24);
-            bytes.put(new byte[]{'V','X','Y','S','E','C',0,0}).putLong(1).putLong(2).putLong(3).putLong(4);
-            bytes.putInt(0).putInt(0).putLong(0).position(64);
-            for (int i = 0; i < count; i++) bytes.put(record(i, 4, buffer(4).putInt(i).array()));
-            Files.write(path, bytes.array());
-            try (var shard = openShard(path, true)) {
-                check(Arrays.equals(shardValue(shard, 0, 4), new byte[4]), "first payload offset confused with zero absence sentinel");
-                var key = shardKey(count + 1, 4);
-                var remove = shard.getClass().getDeclaredMethod("remove", key.getClass()); remove.setAccessible(true);
-                long before = Files.size(path);
-                invoke(remove, shard, key); check(Files.size(path) == before, "absent removal appended a tombstone");
-                for (int i = 0; i < count; i += 3) invoke(remove, shard, shardKey(i, 4));
-                long after = Files.size(path);
-                for (int i = 0; i < count; i += 3) invoke(remove, shard, shardKey(i, 4));
-                check(Files.size(path) == after, "repeated removals appended tombstones");
-            }
-            // Replay duplicates, resurrection and same fingerprint/different lengths through the real parser.
-            Files.write(path, record(0, 4, buffer(4).putInt(99).array()), StandardOpenOption.APPEND);
-            Files.write(path, record(1, 4, buffer(4).putInt(101).array()), StandardOpenOption.APPEND);
-            Files.write(path, record(1, 2, new byte[]{8, 9}), StandardOpenOption.APPEND);
-            byte[] expectedDisk = Files.readAllBytes(path);
-            for (int pass = 0; pass < 3; pass++) try (var shard = openShard(path, false)) {
-                for (int i = 0; i < count; i++) {
-                    byte[] expected = i == 0 ? buffer(4).putInt(99).array() : i == 1 ? buffer(4).putInt(101).array()
-                            : i % 3 == 0 ? null : buffer(4).putInt(i).array();
-                    check(Arrays.equals(shardValue(shard, i, 4), expected), "grown/replayed offset lost for " + i);
-                }
-                check(Arrays.equals(shardValue(shard, 1, 2), new byte[]{8, 9}), "different-length key conflated");
-                check(shardValue(shard, count + 1, 4) == null, "missing offset became readable");
-                check(Arrays.equals(Files.readAllBytes(path), expectedDisk), "read-only replay changed file");
-            }
-        } finally { cleanup(root); }
-    }
-
-    private static byte[] record(long fingerprint, int length, byte[] payload) {
-        return buffer(20 + payload.length).putLong(fingerprint).putLong(0).putInt(length).put(payload).array();
-    }
-
-    // Exercise the actual private parser, without substituting its file operations or reconstruction.
-    static AutoCloseable openShard(Path path, boolean writable) throws Exception {
-        var type = Class.forName(RegionalCache.class.getName() + "$Shard");
-        var method = type.getDeclaredMethod("open", Path.class, RegionalProtocol.Hash32.class, int.class, int.class, boolean.class);
-        method.setAccessible(true);
-        return (AutoCloseable) invoke(method, null, path, WORLD, 0, 0, writable);
-    }
-    private static byte[] shardValue(AutoCloseable shard, long fingerprint, int length) throws Exception {
-        Object key = shardKey(fingerprint, length);
-        var method = shard.getClass().getDeclaredMethod("get", key.getClass()); method.setAccessible(true);
-        return (byte[]) invoke(method, shard, key);
-    }
-    static Object shardKey(long fingerprint, int length) throws Exception {
-        return shardKey(fingerprint, 0, length);
-    }
-    static Object shardKey(long low, long high, int length) throws Exception {
-        var keyType = Class.forName(RegionalCache.class.getName() + "$CacheKey");
-        var constructor = keyType.getDeclaredConstructor(long.class, long.class, int.class);
-        constructor.setAccessible(true);
-        return constructor.newInstance(low, high, length);
-    }
-    static Object invoke(java.lang.reflect.Method method, Object target, Object... args) throws Exception {
-        try { return method.invoke(target, args); }
-        catch (java.lang.reflect.InvocationTargetException failure) {
-            if (failure.getCause() instanceof Exception cause) throw cause;
-            throw failure;
         }
-    }
-
-    private static void overlappingShardOwners() throws Exception {
-        Path root = Files.createTempDirectory("voxy-shard-owners-");
-        var first = fixture(1, 0, 1, 1); var second = fixture(1, 0, 2, 1);
-        var budget = new RegionalDiskBudget(root, 1024 * 1024);
-        try (var store = new RegionalMetadataStore(budget)) {
-            awaitInventory(budget);
-            for (int repeat = 0; repeat < 3; repeat++) {
-                try (var a = new RegionalCache(root, WORLD, budget); var b = new RegionalCache(root, WORLD, budget)) {
-                    // Force both handles to open before either append starts.
-                    a.put(first.index(), 340, first.payload()); b.get(first.index(), 340);
-                    var start = new CountDownLatch(1);
-                    var executor = Executors.newFixedThreadPool(2);
-                    try {
-                        var x = executor.submit(() -> { start.await(); a.quarantine(first.index(), 340); return null; });
-                        var y = executor.submit(() -> { start.await(); b.put(second.index(), 340, second.payload()); return null; });
-                        start.countDown(); x.get(5, TimeUnit.SECONDS); y.get(5, TimeUnit.SECONDS);
-                    } finally { start.countDown(); executor.shutdownNow(); }
-                }
-                try (var reopened = new RegionalCache(root, WORLD, budget)) {
-                    check(reopened.get(first.index(), 340) == null, "overlapping tombstone lost");
-                    check(Arrays.equals(reopened.get(second.index(), 340), second.payload()), "overlapping append lost");
-                }
-                check(budget.bytes == Files.size(root.resolve("r.0.0.vxcache")), "overlapping accounting drift");
-            }
-            Path broken = root.resolve("r.0.0.vxcache"); Files.delete(broken); Files.createDirectory(broken);
-            try (var cache = new RegionalCache(root, WORLD, budget)) {
-                try { cache.get(first.index(), 340); throw new AssertionError("directory opened as usable shard"); }
-                catch (IOException expected) { /* Open failure must never register a shard. */ }
-                var field = RegionalCache.class.getDeclaredField("shards"); field.setAccessible(true);
-                check(((Map<?, ?>) field.get(cache)).isEmpty(), "failed open registered a shard");
-            }
-        } finally { cleanup(root); }
     }
 
     static Fixture fixture(long generation, int children, int light, long catalogId) throws Exception {
@@ -297,10 +100,9 @@ final class CacheStartupBehaviorTest {
     static void persist(RegionalMetadataStore store, Fixture fixture, boolean payload) throws Exception {
         awaitInventory(store.budget);
         store.associate(SERVER, DIMENSION, WORLD, store.budget.stamp(), () -> true);
-        store.saveCatalog(WORLD, DIMENSION, fixture.catalog(), store.budget.stamp(), () -> true);
-        store.saveRegion(WORLD, DIMENSION, 0, 0, fixture.message(), store.budget.stamp(), () -> true);
-        if (payload) try (var cache = new RegionalCache(store.namespace(WORLD, DIMENSION), WORLD, store.budget)) {
-            cache.put(fixture.index(), 340, fixture.payload());
+        try (var cache = new CompletedSectionCache(store, WORLD, DIMENSION)) {
+            for (int ordinal = 0; ordinal < fixture.index().entryCount(); ordinal++) if (fixture.index().isPresent(ordinal)
+                    && (payload || fixture.index().isEmpty(ordinal))) storeSection(cache, fixture, ordinal);
         }
     }
 
@@ -337,7 +139,6 @@ final class CacheStartupBehaviorTest {
     static final class Driver implements AutoCloseable {
         final Publisher publisher;
         final ClientSession.Session session;
-        boolean mapCatalog = true;
         Driver(Path root) throws Exception {
             this(root, new Publisher(), mesher());
         }
@@ -365,11 +166,7 @@ final class CacheStartupBehaviorTest {
         }
         void step() throws Exception {
             session.connect(); session.drainWorkers(); session.drainNetworkReplies();
-            if (mapCatalog && session.pendingCatalogTask != null && !session.pendingCatalogSubmitted) {
-                session.pendingCatalogSubmitted = true;
-                // Current Minecraft registry mapping is the sole substituted catalog boundary.
-                session.pendingCatalogTask.mapped(MAPPINGS);
-            }
+            session.resolveNames((name, biome) -> biome ? 0 : 15);
             session.drainEvents(); session.processMetadata();
             session.pollPublications(); session.processStages();
             check(session.failure == null, "session failed");
@@ -377,7 +174,20 @@ final class CacheStartupBehaviorTest {
         void until(BooleanSupplier complete) throws Exception {
             long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (!complete.getAsBoolean() && System.nanoTime() < end) { step(); session.awaitWake(1); }
+            if (!complete.getAsBoolean()) {
+                for (var demand : session.demands.values()) System.out.println("WAIT key=" + demand.key
+                        + " candidate=" + demand.candidate + " ready=" + demand.readyKind
+                        + " index=" + (demand.index == null ? "none" : demand.index.generation())
+                        + " pending=" + (demand.pendingIndex == null ? "none" : demand.pendingIndex.generation())
+                        + " lease=" + demand.workLease + " installed=" + demand.installed);
+                System.out.println("WAIT catalog=" + session.catalogFingerprint + " saved=" + session.retainedSaveBytes()
+                        + " persistence=" + session.lastPersistenceFailure);
+            }
             check(complete.getAsBoolean(), "production pipeline did not reach expected state");
+        }
+        void catalog(RegionalProtocol.CatalogMessage catalog) throws Exception {
+            var accepted = new java.util.concurrent.atomic.AtomicBoolean();
+            until(() -> accepted.get() || (session.acceptCatalog(catalog) && accepted.compareAndSet(false, true)));
         }
         @Override public void close() throws Exception {
             session.open.set(false); session.release();
@@ -387,67 +197,6 @@ final class CacheStartupBehaviorTest {
                 check(!worker.workerThread.isAlive(), "worker leaked on close");
             }
         }
-    }
-
-    static void localActivationAndValidation() throws Exception {
-        Path root = Files.createTempDirectory("voxy-cache-start-");
-        try {
-            var store = new RegionalMetadataStore(root);
-            var old = fixture(900, 0, 0xf0, 1);
-            persist(store, old, true);
-            CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
-            try (var driver = new Driver(root)) {
-                var s = driver.session;
-                s.connector = () -> {
-                    entered.countDown();
-                    try { release.await(); } catch (InterruptedException stop) { Thread.currentThread().interrupt(); }
-                    throw new IOException("held endpoint unavailable");
-                };
-                driver.until(() -> s.activeCount == 1);
-                check(entered.await(1, TimeUnit.SECONDS), "connector never started");
-                check(s.quic == null && !s.helloAccepted && s.connectionEpoch == 0 && s.cacheHits == 1
-                        && s.meshedSections == 1 && driver.publisher.publications.size() == 1,
-                        "cached geometry required a Voxy network response");
-                check(s.sectionWorkers[0].idle() && s.sectionWorkers[1].idle(), "activation retained worker");
-                release.countDown(); driver.until(() -> s.lastConnectionFailure != null);
-                check(s.activeCount == 1, "failed setup destroyed local geometry");
-                var demand = s.demands.get(KEY);
-                long revision = demand.revision;
-                var binding = demand.catalog;
-                // A provisional generation 900 does not overrule authoritative generation 1.
-                var same = fixture(1, 0, 0xf0, 1);
-                s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, same.catalog().fingerprint()));
-                s.demands.region(0).subscribed = true;
-                check(s.acceptRegion(same.message()), "live validation not admitted");
-                check(!s.validated(demand), "unverified incoming index authorized a saved-generation request");
-                driver.until(() -> demand.index != null && demand.index.generation() == 1);
-                check(demand.revision == revision && demand.installed && s.meshedSections == 1,
-                        "generation-only validation rebuilt geometry");
-                var changed = fixture(2, 1, 0xe0, 1);
-                s.bind(demand, changed.index(), 340, binding);
-                check(demand.installed && demand.publication != null && demand.revision != revision,
-                        "changed payload/mask removed fallback");
-                // Return to cached bytes, but a different exact catalog must still replace.
-                var catalogChange = fixture(3, 0, 0xf0, 2);
-                var newBinding = new RegionalSectionCodec.BoundCatalog(catalogChange.catalog().fingerprint(), MAPPINGS);
-                s.bind(demand, catalogChange.index(), 340, newBinding);
-                check(demand.installed && demand.catalog == newBinding, "catalog change reused incompatible geometry");
-                driver.until(() -> s.activated == 2);
-                check(s.meshedSections == 2 && s.receivedBytes == 0, "catalog replacement redownloaded matching cells");
-                var region = s.demands.region(0); region.subscribed = true;
-                s.acceptRegionUnavailable(new RegionalProtocol.RegionUnavailable(0, 0, false));
-                check(demand.installed && !region.validated, "pending regeneration erased provisional terrain");
-                s.acceptRegionUnavailable(new RegionalProtocol.RegionUnavailable(0, 0, true));
-                driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
-                check(s.activeCount == 0 && s.cache.legacySealed(0), "deletion not persisted");
-                check(!store.region(WORLD, DIMENSION, 0, 0).absent(), "prototype altered the rollback descriptor");
-            } finally { release.countDown(); }
-            try (var restarted = new Driver(root)) {
-                restarted.until(() -> restarted.session.metadataWorker.idle() && restarted.session.cacheOpened
-                        && restarted.session.demands.region(0).localTried);
-                check(restarted.session.activeCount == 0, "deleted terrain resurrected on restart");
-            }
-        } finally { cleanup(root); }
     }
 
     static void storedAirProjectionSkipsPayloadWork() throws Exception {
@@ -497,47 +246,6 @@ final class CacheStartupBehaviorTest {
         } finally { cleanup(root); }
     }
 
-    static void lowerAuthoritativeGenerationReplacesChangedCachedLighting() throws Exception {
-        Path root = Files.createTempDirectory("voxy-air-upgrade-");
-        try {
-            var old = fixture(900, 0, 0, 1);
-            var corrected = fixture(1, 0, 15, 1);
-            var store = new RegionalMetadataStore(root);
-            persist(store, old, true);
-            // Corrected content may already exist by exact fingerprint, independent of index generation.
-            try (var cache = new RegionalCache(store.namespace(WORLD, DIMENSION), WORLD, store.budget)) {
-                cache.put(corrected.index(), 340, corrected.payload());
-                check(Arrays.equals(cache.get(fixture(1, 0, 0, 1).index(), 340), old.payload()),
-                        "unchanged content stopped hitting cache after generation reset");
-            }
-            try (var driver = new Driver(root)) {
-                var s = driver.session;
-                s.connector = () -> { throw new IOException("endpoint deliberately held offline"); };
-                driver.until(() -> s.activated == 1);
-                check(!s.helloAccepted && s.receivedBytes == 0 && s.cacheHits == 1,
-                        "old cached terrain could not display provisionally");
-                var oldPublication = driver.publisher.publications.getFirst();
-                var demand = s.demands.get(KEY);
-                long revision = demand.revision;
-                s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, corrected.catalog().fingerprint()));
-                s.demands.region(0).subscribed = true;
-                check(s.acceptRegion(corrected.message()), "lower authoritative index was not admitted");
-                driver.until(() -> s.activated == 2);
-                check(demand.index.generation() == 1 && demand.revision != revision && demand.installed
-                        && demand.index.sectionFingerprint(340).equals(corrected.index().sectionFingerprint(340)),
-                        "higher provisional generation prevented corrected lighting replacement");
-                check(s.cacheHits == 2 && s.meshedSections == 2 && s.receivedBytes == 0,
-                        "corrected cached payload was not reused");
-                check(oldPublication != demand.publication && oldPublication.retirementFencePassed(),
-                        "old publication was not replaced");
-                long activated = s.activated;
-                for (int i = 0; i < 50; i++) driver.step();
-                check(s.activated == activated && s.helloAccepted && s.failure == null,
-                        "authoritative validation entered a replacement/reconnect loop");
-            }
-        } finally { cleanup(root); }
-    }
-
     static void cachedRefinementWhileHeld() throws Exception {
         Path root = Files.createTempDirectory("voxy-cache-refine-");
         try {
@@ -571,74 +279,6 @@ final class CacheStartupBehaviorTest {
                 driver.until(() -> s.cacheOpened && s.metadataWorker.idle());
                 check(s.activeCount == 0 && !s.worldIdentity.equals(WORLD) && s.mapping(fixture.catalog().fingerprint()) == null,
                         "world correction retained old mappings/geometry");
-            }
-        } finally { cleanup(root); }
-    }
-
-    static void metadataIntegrityAndBudget() throws Exception {
-        Path root = Files.createTempDirectory("voxy-cache-integrity-");
-        try {
-            var budget = new RegionalDiskBudget(root, 8192); var store = new RegionalMetadataStore(budget);
-            var fixture = fixture(1, 0, 0xf0, 1); persist(store, fixture, true);
-            check(store.world(SERVER, DIMENSION).equals(WORLD), "association lost");
-            check(store.world(SERVER, "minecraft:the_nether") == null, "dimension association leaked");
-            check(store.region(new RegionalProtocol.Hash32(9, 0, 0, 0), DIMENSION, 0, 0) == null, "world namespace leaked");
-            Path descriptor = store.descriptor(WORLD, DIMENSION, 0, 0);
-            long stamp = budget.stamp(); budget.delete(descriptor);
-            store.saveRegion(WORLD, DIMENSION, 0, 0, fixture.message(), stamp, () -> true);
-            check(!Files.exists(descriptor), "late write resurrected evicted descriptor");
-            persist(store, fixture, false);
-            byte[] valid = Files.readAllBytes(descriptor), corrupt = valid.clone(); corrupt[corrupt.length - 1] ^= 1;
-            Files.write(descriptor, corrupt);
-            check(store.region(WORLD, DIMENSION, 0, 0) == null, "CRC corruption accepted");
-            Files.write(descriptor, Arrays.copyOf(valid, 12));
-            check(store.region(WORLD, DIMENSION, 0, 0) == null, "torn envelope accepted");
-            Files.write(descriptor, valid);
-            Path pending = descriptor.resolveSibling(descriptor.getFileName() + ".pending");
-            Files.createDirectory(pending); // Inject a failed disk replacement without damaging the old target.
-            try {
-                store.saveRegion(WORLD, DIMENSION, 0, 0, null, budget.stamp(), () -> true);
-                throw new AssertionError("injected write failure was accepted");
-            } catch (IOException expected) {
-                check(Arrays.equals(Files.readAllBytes(descriptor), valid), "failed disk replacement destroyed old descriptor");
-            }
-            store.saveRegion(WORLD, DIMENSION, 0, 0, null, budget.stamp(), () -> false);
-            check(!store.region(WORLD, DIMENSION, 0, 0).absent(), "cancelled atomic replacement overwrote old view");
-            // All world namespaces consume the same allowance, with no per-world multiplier.
-            for (int i = 0; i < 70; i++) {
-                var world = new RegionalProtocol.Hash32(100 + i, 0, 0, 0);
-                store.saveCatalog(world, DIMENSION, fixture.catalog(), budget.stamp(), () -> true);
-                store.saveRegion(world, DIMENSION, 0, 0, fixture.message(), budget.stamp(), () -> true);
-                check(budget.bytes <= budget.limit, "metadata exceeded shared allowance");
-            }
-            long actual;
-            try (var files = Files.walk(root)) { actual = files.filter(Files::isRegularFile).mapToLong(RegionalDiskBudget::size).sum(); }
-            check(actual == budget.bytes, "budget accounting differs from disk extents");
-        } finally { cleanup(root); }
-    }
-
-    static void corruptPayloadAndLateMapping() throws Exception {
-        Path root = Files.createTempDirectory("voxy-cache-lifetime-");
-        try {
-            var store = new RegionalMetadataStore(root); var fixture = fixture(1, 0, 0xf0, 1);
-            persist(store, fixture, true);
-            Path payload = store.namespace(WORLD, DIMENSION).resolve("r.0.0.vxcache");
-            byte[] bytes = Files.readAllBytes(payload); bytes[bytes.length - 1] ^= 1; Files.write(payload, bytes);
-            try (var driver = new Driver(root)) {
-                driver.until(() -> driver.session.cacheMisses == 1);
-                check(driver.session.activeCount == 0 && driver.session.failure == null,
-                        "corrupt compressed terrain escaped integrity checking");
-            }
-            try (var driver = new Driver(root)) {
-                driver.mapCatalog = false;
-                driver.until(() -> driver.session.pendingCatalogTask != null);
-                var s = driver.session; var oldMapping = s.pendingCatalogTask;
-                var newWorld = new RegionalProtocol.Hash32(50, 0, 0, 0);
-                s.changeWorld(newWorld);
-                oldMapping.mapped(MAPPINGS); s.drainEvents();
-                check(s.metadataWorker.idle() && s.mapping(fixture.catalog().fingerprint()) == null
-                        && s.activeCount == 0 && s.worldIdentity.equals(newWorld),
-                        "late mapping crossed corrected world or leaked metadata worker");
             }
         } finally { cleanup(root); }
     }

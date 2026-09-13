@@ -123,16 +123,16 @@ final class SessionDebugTelemetry {
                 + " usableBindingDiscoveriesLod=" + java.util.Arrays.toString(stats.discoveredBindings)
                 + " usableDemandedRootDiscoveries=" + stats.discoveredRoots
                 + " metadataPendingRegions=" + session.metadataWrites.size()
-                + " metadataPendingCatalogs=" + session.catalogWrites.size()
-                + " metadataPendingCatalogBytes=" + session.pendingCatalogBytes()
+                + " retainedSaveInputBytes=" + session.retainedSaveBytes()
+                + " resolverBlockNames=" + session.blockNames.size()
+                + " resolverBiomeNames=" + session.biomeNames.size()
+                + " resolverNameChars=" + session.resolvedNameCharacters
                 + " metadataPendingAssociation=" + session.associationPending
                 + " metadataOutcomes=" + java.util.Arrays.toString(session.persistenceOutcomes)
                 + " metadataOutcomeOrder=PERSISTED,DEFERRED_INVENTORY,OBSOLETE,UNAVAILABLE"
                 + " associationPersisted=" + session.associationPersisted
-                + " catalogPersisted=" + session.catalogPersisted
                 + " regionPersisted=" + session.regionPersisted
                 + " metadataFailure=" + (session.lastPersistenceFailure == null ? "none" : session.lastPersistenceFailure.replace(' ', '_'))
-                + " bindingCatalogRefusals=" + (session.cache == null ? 0 : session.cache.catalogRefusals)
                 + " subscriptionWindow=" + session.subscriptionWindow()
                 + " acceptedSubscriptions=" + stats.subscriptions + " acceptedSubscriptionPeak=" + stats.subscriptionPeak
                 + " subscriptionRequests=" + stats.subscriptionRequests + " subscriptionReleases=" + stats.subscriptionReleases
@@ -149,6 +149,7 @@ final class SessionDebugTelemetry {
         // No shared debug monitor is held while scanning, reading renderer counters or formatting.
         String workers = WorkerDebugTelemetry.sample(session, now);
         String summary = session.snapshot(startup) + workers + " pendingRefresh=" + pendingRefresh
+                + " retainedModelArrayBytes=" + session.retainedModelBytes()
                 + localSummary(stats) + TransportDebugTelemetry.snapshot()
                 + (session.metadata == null ? " cacheInventory=NOT_OPEN" : session.metadata.budget.snapshot());
         long afterAllocated = WorkerDebugTelemetry.allocatedBytes();

@@ -12,12 +12,145 @@ import static me.cortex.voxy.client.lod.CacheStartupBehaviorTest.*;
 public final class CompletedLocalCacheBehaviorTest {
     public static void main(String[] args) throws Exception { run(); }
     static void run() throws Exception {
+        fineOnlyWithoutParents();
+        saveClaimsRotate();
+        SectionDemandTableBehaviorTest.saveAndGeometryOwnOneWorkerLease();
+        parkedModelsReleaseForCoverage();
         for (boolean serverFirst : new boolean[]{false, true}) staleFineAndRejoin(serverFirst);
         unchangedQueuedWork();
         for (int phase = 0; phase < 3; phase++) metadataDuringOwnedWork(phase);
-        for (boolean mappingFailure : new boolean[]{false, true}) missingCatalogFallsBack(mappingFailure);
         deletionSurvivesRejoin();
         System.out.println("completed local cache: metadata-first races, all-LOD stale detail/rejoin and unchanged queued work passed");
+    }
+
+    private static void saveClaimsRotate() throws Exception {
+        var root = Files.createTempDirectory(java.nio.file.Path.of("project_audit"), "fair-cache-saves-");
+        var fixture = fixture(1, 0, 240, 1);
+        try (var metadata = new RegionalMetadataStore(root);
+             var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION)) {
+            awaitInventory(metadata.budget);
+            var s = new ClientSession.Session(91, DIMENSION, null, new Publisher(), Driver.mesher(), 3);
+            s.metadata = metadata; s.worldIdentity = WORLD; s.cacheOpened = true;
+            s.blockNames.put("minecraft:stone", 15); s.biomeNames.put("minecraft:plains", 0);
+            var mappings = new RegionalSectionCodec.Mappings(CatalogCodec.decode(fixture.catalog().canonical()));
+            var tasks = new ClientSession.Session.SectionWorkerTask[3];
+            var content = LocalSection.from(fixture.index(), 0, fixture.catalog().fingerprint());
+            try {
+                s.metadataWorker.start();
+                for (int i = 0; i < 3; i++) {
+                    var worker = s.sectionWorkers[i]; worker.start();
+                    var demand = s.demands.adopt(new ClientSession.Demand(SectionKey.pack(0, i, 0, 0)));
+                    demand.content = new LocalSection(demand.key, content.kind(), content.children(), content.compressedBytes(),
+                            content.canonicalBytes(), content.crc(), content.fingerprint(), content.catalog());
+                    tasks[i] = new ClientSession.Session.SectionWorkerTask(demand.ticket(s.id, i), demand.content,
+                            ClientSession.Session.WorkerSource.NETWORK, fixture.payload(), mappings, cache, () -> s.open.get());
+                    admitOwnedMesh(worker, tasks[i]);
+                }
+                for (int expected = 0; expected < 3; expected++) {
+                    s.processMetadata();
+                    check(s.savingWorker == s.sectionWorkers[expected], "lower-numbered replacement starved an older save");
+                    long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                    while (!s.sectionWorkers[expected].idle() && System.nanoTime() < end) {
+                        s.drainWorkers(); s.awaitWake(1);
+                    }
+                    check(s.sectionWorkers[expected].idle() && s.lastPersistenceFailure == null, "save did not finish");
+                    // Refill a just-released early slot while later slots still need service.
+                    if (expected == 0) admitOwnedMesh(s.sectionWorkers[0], tasks[0]);
+                }
+            } finally {
+                s.open.set(false); s.release();
+                s.metadataWorker.workerThread.join(5000);
+                check(s.retainedSaveBytes() == 0, "shutdown retained pending save input");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void admitOwnedMesh(ClientSession.Session.WorkerSlot worker,
+                                       ClientSession.Session.SectionWorkerTask task) throws Exception {
+        check(worker.assign(task) != null, "test worker not idle");
+        long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (worker.resource.pendingResult() == null && System.nanoTime() < end) Thread.sleep(1);
+        var result = worker.resource.claim();
+        check(result != null && result.value() instanceof ClientSession.Session.WorkerGeometry,
+                "real worker did not prepare a mesh with a save obligation");
+        ((ClientSession.Session.WorkerGeometry) result.value()).geometry().free();
+        worker.releaseCompletion(result.lease());
+        check(!worker.idle(), "admission discarded the save obligation");
+    }
+
+    private static void fineOnlyWithoutParents() throws Exception {
+        var root = Files.createTempDirectory(java.nio.file.Path.of("project_audit"), "fine-only-cache-");
+        var fixture = fixture(1, 1, 240, 1);
+        long fine = SectionKey.pack(0, 0, 0, 0);
+        try (var metadata = new RegionalMetadataStore(root)) {
+            awaitInventory(metadata.budget);
+            metadata.associate(SERVER, DIMENSION, WORLD, metadata.budget.stamp(), () -> true);
+            try (var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION)) {
+                storeSection(cache, fixture, 0);
+                check(cache.directory(0).keySet().equals(java.util.Set.of(fine)), "fixture includes a parent or sibling");
+            }
+            for (int rejoin = 0; rejoin < 2; rejoin++) try (var driver = new Driver(root)) {
+                var s = driver.session;
+                driver.until(() -> s.demands.get(fine) != null && s.demands.get(fine).installed);
+                check(s.activeCount == 1 && !s.demands.get(KEY).installed && s.receivedBytes == 0
+                                && !s.helloAccepted && s.quic == null && s.retainedSaveBytes() == 0,
+                        "fine-only publication depended on absent ancestors, network or a hit-side save");
+                check(s.blockNames.size() == 1 && s.biomeNames.size() == 1,
+                        "shared canonical resolver retained duplicate names");
+                s.retireDemand(fine);
+                s.retireDemand(KEY);
+                check(s.demands.regionCount() == 0, "retired sparse demand retained its region");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static void parkedModelsReleaseForCoverage() throws Exception {
+        var f = fixture(1, 0, 240, 1);
+        var models = new SectionMesher.Models() {
+            public int getModelId(int block) { throw new AssertionError("unready model meshed"); }
+            public long getModelMetadataFromClientId(int model) { throw new AssertionError(); }
+            public int getFluidClientStateId(int model) { throw new AssertionError(); }
+            public boolean isModelReadyForBlockId(int block) { return false; }
+            public boolean isWaterState(int block) { return false; }
+        };
+        var constructor = SectionMesher.class.getDeclaredConstructor(SectionMesher.Models.class, java.util.function.IntConsumer.class);
+        constructor.setAccessible(true);
+        var requests = new java.util.concurrent.atomic.AtomicInteger();
+        var mesher = constructor.newInstance(models, (java.util.function.IntConsumer) b -> requests.incrementAndGet());
+        var s = new ClientSession.Session(91, DIMENSION, null, new Publisher(), mesher, 2);
+        try {
+            s.metadataWorker.start();
+            for (int i = 0; i < 2; i++) {
+                var demand = s.demands.adopt(new ClientSession.Demand(SectionKey.pack(0, i, 0, 0)));
+                var content = LocalSection.from(f.index(), 0, f.catalog().fingerprint());
+                demand.content = new LocalSection(demand.key, LocalSection.DATA, 0, content.compressedBytes(),
+                        content.canonicalBytes(), content.crc(), content.fingerprint(), content.catalog());
+                var worker = s.sectionWorkers[i]; worker.start();
+                var ticket = demand.ticket(s.id, i);
+                demand.workLease = worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, demand.content,
+                        ClientSession.Session.WorkerSource.NETWORK, f.payload(), MAPPINGS, null,
+                        () -> s.open.get() && demand.revision == ticket.demandRevision()));
+                s.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
+            }
+            long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            while (s.retainedModelBytes() != 2 * (32768L * 8 + 4) && System.nanoTime() < until) s.awaitWake(1);
+            check(s.retainedModelBytes() == 2 * (32768L * 8 + 4), "model slots did not retain exactly two results");
+            s.processWaitingModels();
+            check(requests.get() == 2, "ordinary model wait repeated decode requests");
+            check(s.acceptCatalog(f.catalog()), "parked sections blocked metadata admission");
+            while (s.currentCatalog == null && System.nanoTime() < until) { s.drainWorkers(); s.awaitWake(1); }
+            check(s.currentCatalog != null && s.metadataWorker.idle(), "metadata did not progress with parked section workers");
+            check(s.idleWorker(true) == null, "coverage stole a running worker before ownership returned");
+            while (s.idleWorker() == null && System.nanoTime() < until) { s.drainWorkers(); s.awaitWake(1); }
+            check(s.idleWorker() != null && s.retainedModelBytes() == 32768L * 8 + 4,
+                    "coverage did not reclaim one parked result");
+            check(requests.get() == 2, "reclamation silently ran another decode");
+        } finally {
+            s.open.set(false); s.release();
+            s.metadataWorker.workerThread.join(5000);
+            for (var worker : s.sectionWorkers) check(!worker.workerThread.isAlive(), "parked worker leaked on shutdown");
+            check(s.retainedModelBytes() == 0, "shutdown retained model cells");
+        }
     }
 
     private static final class DeferredPublisher extends Publisher {
@@ -49,6 +182,7 @@ public final class CompletedLocalCacheBehaviorTest {
         var root = Files.createTempDirectory("voxy-completed-owned-");
         var a = fixture(1, 0, 240, 1); var b = fixture(2, 0, 224, 1);
         var ready = new java.util.concurrent.atomic.AtomicBoolean(phase != 0);
+        var bakeRequests = new java.util.concurrent.atomic.AtomicInteger();
         var models = new SectionMesher.Models() {
             public int getModelId(int block) { return 1; }
             public long getModelMetadataFromClientId(int model) { return 0; }
@@ -58,7 +192,7 @@ public final class CompletedLocalCacheBehaviorTest {
         };
         var constructor = SectionMesher.class.getDeclaredConstructor(SectionMesher.Models.class, java.util.function.IntConsumer.class);
         constructor.setAccessible(true);
-        var mesher = constructor.newInstance(models, (java.util.function.IntConsumer) ignored -> {});
+        var mesher = constructor.newInstance(models, (java.util.function.IntConsumer) ignored -> bakeRequests.incrementAndGet());
         var publisher = new DeferredPublisher(); publisher.busy = phase == 1; publisher.hold = phase == 2;
         try (var legacy = new RegionalMetadataStore(root)) {
             persist(legacy, a, true);
@@ -69,8 +203,14 @@ public final class CompletedLocalCacheBehaviorTest {
                         : phase == 1 ? demand.completedGeometry != null : publisher.waiting != null);
                 long revision = demand.revision;
                 var lease = demand.workLease;
+                if (phase == 0) {
+                    check(lease != null, "model wait discarded the owned worker");
+                    for (int i = 0; i < 20; i++) driver.step();
+                    check(bakeRequests.get() == 1 && lease.equals(demand.workLease),
+                            "unready models caused ordinary read/decode retry");
+                }
                 s.demands.region(0).announcedGeneration = b.index().generation();
-                s.installIndex(b.index(), demand.catalog, false);
+                s.installIndex(b.index(), new RegionalSectionCodec.BoundCatalog(b.catalog().fingerprint(), MAPPINGS), false);
                 check(demand.revision == revision && demand.content.fingerprint().equals(a.index().sectionFingerprint(340))
                         && java.util.Objects.equals(lease, demand.workLease) && demand.pendingIndex == b.index(),
                         "metadata revoked useful owned A operation at phase " + phase);
@@ -82,52 +222,7 @@ public final class CompletedLocalCacheBehaviorTest {
                         "owned A did not activate once before B bodies at phase " + phase);
                 check(s.completedGeometryBytes == 0 && s.publishingGeometryBytes == 0,
                         "old A allocation remained owned after activation at phase " + phase);
-            }
-        } finally { cleanup(root); }
-    }
-
-    private static void missingCatalogFallsBack(boolean mappingFailure) throws Exception {
-        var root = Files.createTempDirectory("voxy-completed-catalog-");
-        var a = fixture(1, 0, 240, 1);
-        var b = fixture(2, 0, 224, 2);
-        try (var metadata = new RegionalMetadataStore(root, true)) {
-            awaitInventory(metadata.budget);
-            metadata.associate(SERVER, DIMENSION, WORLD, metadata.budget.stamp(), () -> true);
-            metadata.saveCatalog(WORLD, DIMENSION, a.catalog(), metadata.budget.stamp(), () -> true);
-            metadata.saveCatalog(WORLD, DIMENSION, b.catalog(), metadata.budget.stamp(), () -> true);
-            try (var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION)) {
-                check(cache.put(LocalSection.from(a.index(), 340, a.catalog().fingerprint()), a.payload(), () -> true), "A not committed");
-                check(cache.put(LocalSection.from(b.index(), 340, b.catalog().fingerprint()), b.payload(), () -> true), "B not committed");
-            }
-            // Exact-path fault injection, accounting retained: B's catalog disappears after commit.
-            if (!mappingFailure) synchronized (metadata.budget) {
-                check(metadata.budget.delete(metadata.catalogPath(WORLD, DIMENSION, b.catalog().fingerprint())), "catalog fault not injected");
-            }
-            try (var driver = new Driver(root)) {
-                if (mappingFailure) {
-                    driver.mapCatalog = false;
-                    driver.until(() -> driver.session.pendingCatalogTask != null);
-                    var task = driver.session.pendingCatalogTask;
-                    check(task.fingerprint().equals(b.catalog().fingerprint()), "fixture did not try B mapping first");
-                    // Inject precisely the event emitted by the Minecraft mapping boundary.
-                    Class<?> event = Class.forName(ClientSession.class.getName() + "$Event");
-                    Class<?> ready = Class.forName(ClientSession.class.getName() + "$CatalogReady");
-                    var constructor = ready.getDeclaredConstructors()[0]; constructor.setAccessible(true);
-                    var put = ClientSession.Session.class.getDeclaredMethod("putEvent", event); put.setAccessible(true);
-                    var handoff = ClientSession.class.getDeclaredField("CATALOG_TASK"); handoff.setAccessible(true);
-                    ((java.util.concurrent.atomic.AtomicReference<?>) handoff.get(null)).getAndSet(null);
-                    put.invoke(driver.session, constructor.newInstance(task, null,
-                            new IllegalArgumentException("injected unavailable client block mapping")));
-                    driver.session.pendingCatalogSubmitted = true;
-                    driver.session.drainEvents();
-                    driver.mapCatalog = true;
-                }
-                driver.until(() -> driver.session.activeCount == 1);
-                check(driver.session.demands.get(KEY).activeContent.catalog().equals(a.catalog().fingerprint())
-                        && driver.session.receivedBytes == 0, "missing B catalog lost usable A or reinterpreted its IDs");
-                for (int i = 0; i < 50; i++) driver.step();
-                check(driver.session.meshedSections == 1 && driver.session.pendingCatalogTask == null,
-                        "rejected catalog triggered repeated mapping or duplicate geometry");
+                check(bakeRequests.get() == 1, "model readiness repeated decode/model requests");
             }
         } finally { cleanup(root); }
     }
@@ -143,7 +238,7 @@ public final class CompletedLocalCacheBehaviorTest {
                 s.demands.region(0).subscribed = true;
                 s.acceptRegionUnavailable(new RegionalProtocol.RegionUnavailable(0, 0, true));
                 driver.until(() -> s.metadataWrites.isEmpty() && s.metadataWorker.idle());
-                check(s.cache.legacySealed(0) && s.cache.directory(0).isEmpty(), "absence did not seal legacy fallback");
+                check(s.cache.directory(0).isEmpty(), "absence did not seal legacy fallback");
             }
             try (var driver = new Driver(root)) {
                 driver.until(() -> driver.session.demands.region(0).localLoaded);
@@ -160,13 +255,13 @@ public final class CompletedLocalCacheBehaviorTest {
         var b = fixture(2, 1, 224, 1);
         try (var legacy = new RegionalMetadataStore(root)) {
             persist(legacy, a, true);
-            byte[] oldDescriptor = Files.readAllBytes(legacy.descriptor(WORLD, DIMENSION, 0, 0));
             try (var driver = new Driver(root)) {
                 var s = driver.session;
                 if (!serverFirst) driver.until(() -> s.activeCount == 1);
                 s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, b.catalog().fingerprint()));
                 s.demands.region(0).subscribed = true;
                 check(s.acceptRegion(b.message()), "B metadata not admitted");
+                driver.catalog(b.catalog());
                 driver.until(() -> s.activeCount == 1);
                 for (int level = 4; level > 0; level--) {
                     check(s.addChildren(SectionKey.pack(level, 0, 0, 0), 15), "cached fine descendants undiscoverable");
@@ -174,16 +269,12 @@ public final class CompletedLocalCacheBehaviorTest {
                     driver.until(() -> s.activeCount == expected);
                 }
                 check(s.receivedBytes == 0 && s.meshedSections == 5 && s.uploadedSections == 5,
-                        "stale fine geometry required B bodies or duplicate work");
+                        "stale fine geometry required B bodies or duplicate work: serverFirst=" + serverFirst
+                                + " received=" + s.receivedBytes + " meshed=" + s.meshedSections + " uploaded=" + s.uploadedSections);
                 for (var demand : s.demands.values()) check(demand.activeContent.fingerprint().equals(
                         a.index().sectionFingerprint(340)), "unreceived B became visible");
                 check(s.cache.directory(0).size() == 5, "completed fine bindings were not committed");
-                check(java.util.Arrays.equals(oldDescriptor, Files.readAllBytes(legacy.descriptor(WORLD, DIMENSION, 0, 0))),
-                        "candidate overwrote legacy server descriptor");
             }
-            // Simulate the old implementation having lost its positional mapping after the
-            // prototype completed A. The new journal must stand on its own, at every LOD.
-            legacy.saveRegion(WORLD, DIMENSION, 0, 0, b.message(), legacy.budget.stamp(), () -> true);
             try (var driver = new Driver(root)) {
                 var s = driver.session;
                 driver.until(() -> s.activeCount == 1);
@@ -197,6 +288,7 @@ public final class CompletedLocalCacheBehaviorTest {
                 s.acceptHello(new RegionalProtocol.ServerHello(1, WORLD, 1, b.catalog().fingerprint()));
                 s.demands.region(0).subscribed = true;
                 check(s.acceptRegion(b.message()), "refresh index not admitted on rejoin");
+                driver.catalog(b.catalog());
                 for (var demand : java.util.List.copyOf(s.demands.values())) {
                     driver.until(() -> demand.activeContent.fingerprint().equals(b.index().sectionFingerprint(340))
                             || demand.index != null && demand.index.generation() == 2
@@ -213,6 +305,7 @@ public final class CompletedLocalCacheBehaviorTest {
                 }
                 check(s.activeCount == 5 && s.meshedSections == 10 && s.uploadedSections == 10,
                         "wanted stale content did not converge once B bodies were released");
+                driver.until(() -> s.retainedSaveBytes() == 0);
                 for (var section : s.cache.directory(0).values()) check(section.fingerprint().equals(b.index().sectionFingerprint(340)),
                         "completed refresh did not replace persisted A binding");
             }
@@ -232,7 +325,7 @@ public final class CompletedLocalCacheBehaviorTest {
                 var fine = s.demands.get(SectionKey.pack(3, 0, 0, 0));
                 long revision = fine.revision;
                 s.demands.region(0).announcedGeneration = 99;
-                s.installIndex(b.index(), s.demands.get(KEY).catalog, false);
+                s.installIndex(b.index(), new RegionalSectionCodec.BoundCatalog(b.catalog().fingerprint(), MAPPINGS), false);
                 check(fine.revision == revision, "identical queued content was superseded by generation alone");
                 driver.until(() -> fine.installed && fine.pendingIndex == null);
                 check(fine.revision == revision && s.meshedSections == 2 && s.uploadedSections == 2,

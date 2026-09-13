@@ -27,6 +27,11 @@ public final class ClientLodClient {
         ClientLodDebug.tick();
     }
 
+    @SubscribeEvent
+    public static void onFrame(net.neoforged.neoforge.client.event.RenderFrameEvent.Pre event) {
+        ClientSession.frame();
+    }
+
     public static void disconnect() {
         // LoggingOut may precede LevelRenderer.setLevel(null). Publish the terminal boundary
         // before that earlier hook closes any active section publications.

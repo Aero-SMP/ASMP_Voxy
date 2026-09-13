@@ -333,9 +333,6 @@ final class RegionalControlFlowBehaviorTest {
                 check(System.nanoTime() < deadline, "catalog decoder did not complete");
                 s.awaitWake(100);
             }
-            owner.until(() -> s.pendingCatalogTask != null);
-            // Substitute only registry mapping, as in the existing cache-startup fixture.
-            s.pendingCatalogTask.mapped(CacheStartupBehaviorTest.MAPPINGS);
             owner.until(() -> s.currentCatalog != null);
             check(s.currentCatalog.fingerprint().equals(catalog.fingerprint()) && s.metadataWorker.idle(),
                     "catalog completion/event was lost or retained metadata worker");

@@ -40,11 +40,9 @@ import java.util.regex.Pattern;
 /** Development updater included only in debug client builds. */
 final class ClientAutoUpdater {
     private static final String SSH_TARGET = "aerosmp@ssh.aerosmp.com";
-    private static final String REMOTE_DIRECTORY =
-            "/home/aerosmp/Desktop/ASMP_Voxy/build/libs";
-    private static final String MINECRAFT_SERVER = "ssh.aerosmp.com:25565";
-    private static final String REMOTE_DIAGNOSTICS =
-            "/home/aerosmp/Desktop/Main/logs/client-upload";
+    private static String REMOTE_DIRECTORY = "/home/aerosmp/Desktop/ASMP_Voxy/build/libs";
+    private static String MINECRAFT_SERVER = "ssh.aerosmp.com:25565";
+    private static String REMOTE_DIAGNOSTICS = "/home/aerosmp/Desktop/Main/logs/client-upload";
     private static final String REMOTE_SCREENSHOTS = "/home/aerosmp/screenshots";
     private static final long POLL_SECONDS = 20;
     private static final int SCREENSHOT_QUEUE_CAPACITY = 256;
@@ -65,8 +63,28 @@ final class ClientAutoUpdater {
 
     private ClientAutoUpdater() {}
 
+    static String updateDirectory(String player) {
+        return "/home/aerosmp/Desktop/ASMP_Voxy/build/libs"
+                + (player.equals("MGengine") ? "/debug-clients/MGengine" : "");
+    }
+
+    static String serverAddress(String player) {
+        return "ssh.aerosmp.com:" + (player.equals("MGengine") ? "25586" : "25565");
+    }
+
+    static String diagnosticsDirectory(String player) {
+        return "/home/aerosmp/Desktop/" + (player.equals("MGengine") ? "Mod_Testing" : "Main")
+                + "/logs/client-upload";
+    }
+
     static void start() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft == null || minecraft.getUser() == null) return;
         if (!STARTED.compareAndSet(false, true)) return;
+        String player = minecraft.getUser().getName();
+        REMOTE_DIRECTORY = updateDirectory(player);
+        MINECRAFT_SERVER = serverAddress(player);
+        REMOTE_DIAGNOSTICS = diagnosticsDirectory(player);
         Thread.ofPlatform().daemon().name("Voxy screenshot uploader")
                 .start(ClientAutoUpdater::runScreenshotUploader);
         Thread.ofPlatform().daemon().name("Voxy debug auto-updater").start(() -> {
@@ -97,6 +115,7 @@ final class ClientAutoUpdater {
 
     /** Runs on Minecraft's client thread through the existing debug tick. */
     static void tick() {
+        start(); // Early debug-class initialization may precede the Minecraft singleton.
         Minecraft minecraft = Minecraft.getInstance();
         if (restartPending) {
             if (minecraft.getConnection() != null || minecraft.level != null) {

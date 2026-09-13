@@ -8,8 +8,8 @@ import java.util.function.Consumer;
 /** One bounded record per actual worker. No task, session, Thread or buffer references retained. */
 final class WorkerDebugTelemetry {
     enum Stage { IDLE, TASK, METADATA, INDEX_DECODE, CACHE_READ, DECOMPRESS, DECODE_VALIDATE,
-        REQUEST_MODELS, CACHE_WRITE, CHECK_MODELS, MESH, CACHE_QUARANTINE, RESULT_READY }
-    enum Outcome { CACHE_HIT, CACHE_MISS, CACHE_CORRUPT, MODEL_WAIT, FAILURE, COMPRESSED_BYTES, CANONICAL_BYTES, MESH_BYTES }
+        REQUEST_MODELS, CACHE_WRITE, CHECK_MODELS, MESH, CACHE_QUARANTINE, RESULT_READY, WAIT_MODELS }
+    enum Outcome { CACHE_HIT, CACHE_MISS, CACHE_CORRUPT, MODEL_WAIT, FAILURE, COMPRESSED_BYTES, CANONICAL_BYTES, MESH_BYTES, MODEL_RECLAIM }
     private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
 
     static final class Work {

@@ -176,6 +176,13 @@ public final class WorkerShaderDebugBehaviorTest {
         var predicate = updater.getDeclaredMethod("autoConnectScreen",
                 net.minecraft.client.gui.screens.Screen.class);
         predicate.setAccessible(true);
+        var destination = updater.getDeclaredMethod("serverAddress", String.class); destination.setAccessible(true);
+        check(destination.invoke(null, "MGengine").equals("ssh.aerosmp.com:25586"), "debug restart target is not Mod_Testing");
+        check(destination.invoke(null, "AnotherPlayer").equals("ssh.aerosmp.com:25565"), "bootstrap moved another player");
+        var channel = updater.getDeclaredMethod("updateDirectory", String.class); channel.setAccessible(true);
+        check(channel.invoke(null, "MGengine").equals("/home/aerosmp/Desktop/ASMP_Voxy/build/libs/debug-clients/MGengine")
+                && channel.invoke(null, "AnotherPlayer").equals("/home/aerosmp/Desktop/ASMP_Voxy/build/libs"),
+                "bootstrap channel is not scoped");
         check(!(Boolean) predicate.invoke(null, new Object[]{null}), "null screen must not connect");
         Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
         unsafeField.setAccessible(true);
@@ -237,6 +244,12 @@ public final class WorkerShaderDebugBehaviorTest {
             if (blockAt.compareAndSet("REQUEST_MODELS", "NONE")) await(modelEntered, modelResume);
         });
         var session = new ClientSession.Session(88, "test", null, new CacheStartupBehaviorTest.Publisher(), mesher, 1);
+        session.blockNames.put("minecraft:stone", 15);
+        session.biomeNames.put("minecraft:plains", 0);
+        session.metadata = cache.metadata;
+        session.worldIdentity = CacheStartupBehaviorTest.WORLD;
+        session.cacheOpened = true;
+        session.metadataWorker.start();
         check(((WorkerDebugTelemetry.Work) session.metadataWorker.debugWork).session == 88,
                 "metadata worker captured the uninitialized session identity");
         var worker = session.sectionWorkers[0]; worker.start();
@@ -270,11 +283,25 @@ public final class WorkerShaderDebugBehaviorTest {
             var completed = worker.resource.claim(); check(completed != null, "completion lost");
             if (completed.value() instanceof ClientSession.Session.WorkerGeometry geometry) geometry.geometry().free();
             worker.releaseCompletion(completed.lease());
-            check(work.copy().counts()[WorkerDebugTelemetry.Stage.DECOMPRESS.ordinal()] == 1
-                    && work.copy().counts()[WorkerDebugTelemetry.Stage.DECODE_VALIDATE.ordinal()] == 1, "real decode stages missing");
+            check(work.copy().counts()[WorkerDebugTelemetry.Stage.CACHE_READ.ordinal()] == 1
+                    && work.copy().outcomes()[WorkerDebugTelemetry.Outcome.CACHE_HIT.ordinal()] == 1,
+                    "streaming local decode was not counted");
             modelsReady.set(false);
-            worker.assign(task); until(() -> work.copy().jobs() == 2);
-            completed = worker.resource.claim(); worker.releaseCompletion(completed.lease());
+            demand.workLease = worker.assign(task);
+            until(() -> work.copy().stage() == WorkerDebugTelemetry.Stage.WAIT_MODELS
+                    && session.retainedModelBytes() == 32768L * 8 + 4);
+            check(work.copy().jobs() == 1 && worker.resource.claim() == null && worker.resource.acquire() == null,
+                    "unready models released or completed their owning worker");
+            check(work.copy().counts()[WorkerDebugTelemetry.Stage.CACHE_READ.ordinal()] == 2,
+                    "model wait did not retain one ordinary decode");
+            modelsReady.set(true); session.processWaitingModels();
+            until(() -> work.copy().jobs() == 2);
+            completed = worker.resource.claim();
+            check(completed.value() instanceof ClientSession.Session.WorkerGeometry, "model readiness did not resume meshing");
+            ((ClientSession.Session.WorkerGeometry) completed.value()).geometry().free();
+            worker.releaseCompletion(completed.lease());
+            check(work.copy().counts()[WorkerDebugTelemetry.Stage.CACHE_READ.ordinal()] == 2
+                    && session.retainedModelBytes() == 0, "model readiness repeated decode or retained cells");
             check(work.copy().outcomes()[WorkerDebugTelemetry.Outcome.MODEL_WAIT.ordinal()] == 1
                     && work.copy().repeats() == 1, "model retry identity missing");
             // An invalid compressed body still leaves a terminal diagnostic state and unchanged failure handling.
@@ -286,26 +313,34 @@ public final class WorkerShaderDebugBehaviorTest {
             completed = worker.resource.claim(); worker.releaseCompletion(completed.lease());
             synchronized (budget) {
                 worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, content,
-                        ClientSession.Session.WorkerSource.NETWORK, fixture.payload(), CacheStartupBehaviorTest.MAPPINGS, cache, () -> true));
-                until(() -> work.copy().stage() == WorkerDebugTelemetry.Stage.CACHE_WRITE);
-                until(() -> worker.workerThread.getState() == Thread.State.BLOCKED);
-                var before = work.copy(); Thread.sleep(3);
-                check(work.copy().stageStart() == before.stageStart()
-                        && work.copy().jobs() == 3, "cache write invented completion");
+                        ClientSession.Session.WorkerSource.NETWORK, fixture.payload(),
+                        new RegionalSectionCodec.Mappings(CatalogCodec.decode(fixture.catalog().canonical())), cache, () -> true));
+                until(() -> work.copy().jobs() == 4);
+                completed = worker.resource.claim();
+                check(completed.value() instanceof ClientSession.Session.WorkerGeometry,
+                        "disk lock prevented mesh handoff");
+                ((ClientSession.Session.WorkerGeometry) completed.value()).geometry().free();
+                worker.releaseCompletion(completed.lease());
+                check(session.retainedSaveBytes() > 0 && worker.resource.acquire() == null,
+                        "mesh admission dropped its pending save obligation");
+                session.processMetadata();
+                until(() -> session.metadataWorker.workerThread.getState() == Thread.State.BLOCKED);
+                check(work.copy().jobs() == 4 && worker.resource.acquire() == null,
+                        "blocked save completed twice or released section ownership");
             }
-            until(() -> work.copy().jobs() == 4);
-            completed = worker.resource.claim(); worker.releaseCompletion(completed.lease());
-            synchronized (budget) {
-                var disk = (RegionalDiskBudget) budget;
-                var catalogPath = cache.path(content.region()).resolveSibling(java.util.HexFormat.of().formatHex(content.catalog().bytes()) + ".vxcat");
-                try (var pin = disk.pin(catalogPath)) { disk.delete(cache.path(content.region())); }
-            }
+            until(() -> {
+                try { session.drainWorkers(); } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+                session.processMetadata(); return worker.idle();
+            });
+            check(session.retainedSaveBytes() == 0 && session.lastPersistenceFailure == null,
+                    "save acknowledgement leaked its slot or failed");
+            check(((RegionalDiskBudget) budget).delete(cache.path(content.region())), "unleased shard not evicted");
             worker.assign(task); until(() -> work.copy().jobs() == 5);
             completed = worker.resource.claim();
             check(completed.value().getClass().getSimpleName().equals("WorkerMiss")
                     && work.copy().outcomes()[WorkerDebugTelemetry.Outcome.CACHE_MISS.ordinal()] == 1, "real cache miss missing");
             worker.releaseCompletion(completed.lease());
-            cache.put(content, fixture.payload(), () -> true);
+            CacheStartupBehaviorTest.storeSection(cache, fixture, ordinal);
             try (var file = new java.io.RandomAccessFile(cache.path(content.region()).toFile(), "rw")) {
                 file.seek(CompletedSectionJournal.HEADER_BYTES + CompletedSectionJournal.FRAME_BYTES
                         + CompletedSectionJournal.PAYLOAD_METADATA_BYTES);
@@ -329,7 +364,8 @@ public final class WorkerShaderDebugBehaviorTest {
             check(!worker.workerThread.isAlive() && work.copy().stage() == WorkerDebugTelemetry.Stage.IDLE,
                     "retirement retained a running diagnostic record");
         } finally {
-            modelResume.countDown(); meshResume.countDown(); worker.close(); worker.workerThread.join(5000); cache.close();
+            modelResume.countDown(); meshResume.countDown(); worker.close(); worker.workerThread.join(5000);
+            session.metadataWorker.close(); session.metadataWorker.workerThread.join(5000); cache.close();
         }
     }
 

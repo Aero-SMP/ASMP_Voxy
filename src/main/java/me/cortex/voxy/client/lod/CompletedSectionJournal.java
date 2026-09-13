@@ -1,298 +1,330 @@
 package me.cortex.voxy.client.lod;
 
-import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
-import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
-import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.nio.file.*;
+import java.util.*;
+import java.util.function.BooleanSupplier;
+import java.util.zip.CRC32C;
 
-/** Experimental per-region append journal. Its caller owns disk-budget pins and append exclusion.
- * Recovery reads framing/metadata only, never payloads. Payload integrity is checked on use.
- * A footer commits a record; a binding references an earlier complete payload. No per-section
- * fsync: close/flush is the durability boundary. A crash may lose recent writes. Catalogs must
- * be durably saved before append. A torn suffix cannot replace an earlier binding.
+/** Recovered directory for one retained region, independent of its open writer handle.
+ * Footer-committed payloads and predecessor bindings; no per-append fsync guarantee.
+ * Every reader owns its channel so interruption cannot close another reader's channel.
  */
 final class CompletedSectionJournal implements AutoCloseable {
     static final long MAX_BYTES = 256L * 1024 * 1024;
     static final int HEADER_BYTES = 64, FRAME_BYTES = 16, FOOTER_BYTES = 8;
-    static final int BINDING_BYTES = 96, PAYLOAD_METADATA_BYTES = 24;
-    private static final long MAGIC = 0x31434f4c595856L; // VXYLOC1
-    private static final int FRAME_MAGIC = 0x434f4c56, PAYLOAD = 1, BINDING = 2, RESET = 3, DROP_PAYLOAD = 4;
-    private final RandomAccessFile file;
-    private final FileChannel channel;
+    static final int BINDING_BYTES = 96, PAYLOAD_METADATA_BYTES = 76;
+    private static final long MAGIC = 0x314d414e595856L; // VXYNAM1
+    private static final int FRAME_MAGIC = 0x434f4c56, PAYLOAD = 1, BINDING = 2, RESET = 3;
+    private final Path path;
     private final long region;
-    private final boolean writable;
-    private final Long2LongOpenHashMap bindings = new Long2LongOpenHashMap();
-    private final Map<Blob, Long> payloads = new HashMap<>();
-    // Includes recovery predecessors until this bounded shard is evicted, not all global catalogs.
-    private final Set<RegionalProtocol.Hash32> catalogs = new HashSet<>();
+    private final Map<Long, Binding> bindings = new HashMap<>();
+    private final Map<Token, Payload> payloads = new HashMap<>();
+    private FileChannel writer;
     private long end;
-    private boolean closed;
-    private boolean legacySealed;
+    private boolean closed, appending;
+    private int readers;
+    record Token(RegionalProtocol.Hash32 catalog, RegionalProtocol.Fingerprint source) {}
+    record Payload(long offset, int compressed, int canonical, int crc, RegionalProtocol.Fingerprint local) {}
+    record Binding(LocalSection section, long offset, long previous, long payload) {}
+    /** Charge BEFORE writing, reconcile aborted tails including failed truncation. */
+    interface Space { void reserve(long bytes) throws IOException; void resized(long delta); }
+    static final class RotationRequired extends IOException {
+        RotationRequired() { super("local journal rotation required"); }
+    }
 
-    record Blob(RegionalProtocol.Fingerprint fingerprint, int length, int crc) {}
-    record Binding(LocalSection section, long previous, long payload) {}
-
-    static CompletedSectionJournal open(Path path, RegionalProtocol.Hash32 world, long region,
-                                        boolean writable) throws IOException {
-        var file = new RandomAccessFile(path.toFile(), writable ? "rw" : "r");
+    static CompletedSectionJournal open(Path path, RegionalProtocol.Hash32 world, long region, boolean writable) throws IOException {
+        LocalCacheOwnership.rejectLinks(path);
+        var channel = FileChannel.open(path, writable
+                ? Set.of(StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)
+                : Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
         try {
-            if (file.length() == 0 && writable) {
-                var header = buffer(HEADER_BYTES);
-                header.putLong(MAGIC).put(world.bytes()).putLong(region).putLong(0);
-                header.putInt(RegionalProtocol.crc32c(java.util.Arrays.copyOf(header.array(), 56))).putInt(0).flip();
-                write(file.getChannel(), 0, header);
+            if (channel.size() == 0 && writable) {
+                var header = buffer(HEADER_BYTES).putLong(MAGIC).put(world.bytes()).putLong(region).putLong(0);
+                header.putInt(RegionalProtocol.crc32c(Arrays.copyOf(header.array(), 56))).putInt(0).flip();
+                write(channel, 0, header);
             }
-            if (file.length() < HEADER_BYTES || file.length() > MAX_BYTES)
-                throw new IOException("invalid completed journal extent");
-            var header = read(file.getChannel(), 0, HEADER_BYTES);
+            if (channel.size() < HEADER_BYTES || channel.size() > MAX_BYTES) throw new IOException("invalid local journal extent");
+            var header = read(channel, 0, HEADER_BYTES);
             if (header.getLong() != MAGIC || !RegionalProtocol.Hash32.read(header).equals(world)
                     || header.getLong() != region || header.getLong() != 0
-                    || header.getInt() != RegionalProtocol.crc32c(java.util.Arrays.copyOf(header.array(), 56))
-                    || header.getInt() != 0) throw new IOException("invalid completed journal identity");
-            var journal = new CompletedSectionJournal(file, region, writable);
-            journal.recover();
+                    || header.getInt() != RegionalProtocol.crc32c(Arrays.copyOf(header.array(), 56))
+                    || header.getInt() != 0) throw new IOException("invalid local journal identity");
+            var journal = new CompletedSectionJournal(path, region);
+            journal.recover(channel);
+            if (writable) { channel.truncate(journal.end); journal.writer = channel; }
+            else channel.close();
             return journal;
         } catch (Throwable failure) {
-            try { file.close(); } catch (IOException close) { failure.addSuppressed(close); }
-            if (failure instanceof IOException io) throw io;
+            try { channel.close(); } catch (IOException close) { failure.addSuppressed(close); }
             throw failure;
         }
     }
+    private CompletedSectionJournal(Path path, long region) { this.path = path; this.region = region; }
 
-    private CompletedSectionJournal(RandomAccessFile file, long region, boolean writable) {
-        this.file = file;
-        this.channel = file.getChannel();
-        this.region = region;
-        this.writable = writable;
-    }
-
-    private void recover() throws IOException {
-        long extent = this.file.length();
+    private void recover(FileChannel file) throws IOException {
         this.end = HEADER_BYTES;
+        long extent = file.size();
         while (this.end + FRAME_BYTES + FOOTER_BYTES <= extent) {
             long at = this.end;
-            var frame = read(this.channel, at, FRAME_BYTES);
+            var frame = read(file, at, FRAME_BYTES);
             if (frame.getInt() != FRAME_MAGIC) break;
             int kind = frame.getInt(), length = frame.getInt(), crc = frame.getInt();
-            int metadataBytes = kind == PAYLOAD || kind == DROP_PAYLOAD ? PAYLOAD_METADATA_BYTES
-                    : kind == BINDING ? BINDING_BYTES : kind == RESET ? 8 : -1;
-            if (metadataBytes < 0 || length < metadataBytes || length > RegionalProtocol.MAX_SECTION_BYTES + BINDING_BYTES
-                    || kind == BINDING && length != BINDING_BYTES
-                    || kind == RESET && length != 8
-                    || kind == DROP_PAYLOAD && length != PAYLOAD_METADATA_BYTES
+            int size = kind == PAYLOAD ? PAYLOAD_METADATA_BYTES : kind == BINDING ? BINDING_BYTES
+                    : kind == RESET ? 8 : -1;
+            if (size < 0 || length < size || length > LocalSectionCodec.MAX_COMPRESSED_BYTES + PAYLOAD_METADATA_BYTES
+                    || kind != PAYLOAD && length != size
                     || at + FRAME_BYTES + (long) length + FOOTER_BYTES > extent) break;
-            var metadata = read(this.channel, at + FRAME_BYTES, metadataBytes);
+            var metadata = read(file, at + FRAME_BYTES, size);
             if (RegionalProtocol.crc32c(metadata.array()) != crc
-                    || read(this.channel, at + FRAME_BYTES + length, FOOTER_BYTES).getLong()
-                    != commit(kind, length, crc)) break;
+                    || read(file, at + FRAME_BYTES + length, FOOTER_BYTES).getLong() != commit(kind, length, crc)) break;
             try {
-                if (kind == PAYLOAD || kind == DROP_PAYLOAD) {
-                    var blob = new Blob(RegionalProtocol.Fingerprint.read(metadata), metadata.getInt(), metadata.getInt());
-                    if (blob.length() < 1 || blob.length() > RegionalProtocol.MAX_SECTION_BYTES
-                            || blob.fingerprint().isZero()
-                            || kind == PAYLOAD && length != PAYLOAD_METADATA_BYTES + blob.length()) break;
-                    if (kind == DROP_PAYLOAD) this.payloads.remove(blob);
-                    else this.payloads.put(blob, at + FRAME_BYTES + PAYLOAD_METADATA_BYTES);
+                if (kind == PAYLOAD) {
+                    var token = new Token(RegionalProtocol.Hash32.read(metadata), RegionalProtocol.Fingerprint.read(metadata));
+                    if (token.catalog().equals(RegionalProtocol.Hash32.ZERO) || token.source().isZero()) break;
+                        int compressed = metadata.getInt(), canonical = metadata.getInt(), bodyCrc = metadata.getInt();
+                        var hash = RegionalProtocol.Fingerprint.read(metadata);
+                        if (canonical < LocalSectionCodec.HEADER_BYTES || canonical > LocalSectionCodec.MAX_CANONICAL_BYTES
+                                || compressed < 1 || compressed > LocalSectionCodec.compressedBound(canonical)
+                                || length != PAYLOAD_METADATA_BYTES + compressed || hash.isZero()) break;
+                        this.payloads.put(token, new Payload(at + FRAME_BYTES + PAYLOAD_METADATA_BYTES,
+                                compressed, canonical, bodyCrc, hash));
                 } else if (kind == RESET) {
                     if (metadata.getLong() != 0) break;
-                    this.bindings.clear(); this.catalogs.clear(); this.legacySealed = true;
+                    this.bindings.clear();
                 } else {
-                    Binding binding = binding(metadata);
-                    if (binding.section().region() != this.region
-                            || binding.previous() != this.bindings.get(binding.section().key())) break;
+                    var binding = binding(metadata, at);
+                    var previous = this.bindings.get(binding.section().key());
+                    if (binding.section().region() != this.region || binding.previous() != (previous == null ? 0 : previous.offset())) break;
+                    var payload = this.payloads.get(token(binding.section()));
                     if (binding.section().kind() == LocalSection.DATA
-                            && !java.util.Objects.equals(this.payloads.get(blob(binding.section())), binding.payload())) break;
-                    if (binding.section().kind() != LocalSection.DATA && binding.payload() != 0) break;
-                    this.bindings.put(binding.section().key(), at);
-                    if (!binding.section().catalog().equals(RegionalProtocol.Hash32.ZERO))
-                        this.catalogs.add(binding.section().catalog());
+                            ? payload == null || payload.offset() != binding.payload() : binding.payload() != 0) break;
+                    this.bindings.put(binding.section().key(), binding);
                 }
             } catch (IllegalArgumentException | IOException corrupt) { break; }
             this.end += FRAME_BYTES + (long) length + FOOTER_BYTES;
         }
-        if (this.writable && this.end != extent) this.file.setLength(this.end);
     }
-
-    Map<Long, LocalSection> directory() throws IOException {
+    synchronized Map<Long, LocalSection> directory() throws IOException {
         checkOpen();
-        var directory = new HashMap<Long, LocalSection>(this.bindings.size());
-        for (var entry : this.bindings.long2LongEntrySet())
-            directory.put(entry.getLongKey(), readBinding(entry.getLongValue()).section());
-        return directory;
+        var result = new HashMap<Long, LocalSection>(this.bindings.size());
+        this.bindings.forEach((key, value) -> result.put(key, value.section()));
+        return result;
     }
-
-    Set<RegionalProtocol.Hash32> catalogs() { return Set.copyOf(this.catalogs); }
-    long bytes() { return this.end; }
-    boolean writable() { return this.writable; }
-    boolean legacySealed() { return this.legacySealed; }
-    int payloadCount() { return this.payloads.size(); }
-
-    void absentRegion() throws IOException {
-        checkOpen();
-        if (this.legacySealed && this.bindings.isEmpty()) return;
-        if (!this.writable) throw new IOException("read-only completed journal");
-        if (this.end + FRAME_BYTES + 8 + FOOTER_BYTES > MAX_BYTES) throw new IOException("completed journal full");
-        appendFrame(RESET, new byte[8], null);
-        this.bindings.clear(); this.catalogs.clear(); this.legacySealed = true;
+    synchronized long bytes() { return this.end; }
+    synchronized int payloadCount() { return this.payloads.size(); }
+    synchronized boolean busy() { return this.appending || this.readers != 0; }
+    synchronized boolean closeHandle() throws IOException {
+        if (this.appending) return false;
+        if (this.writer != null) { this.writer.close(); this.writer = null; }
+        return true;
     }
-
-    /** Lazy recovery candidate. Never crosses an authoritative absence barrier. */
     LocalSection previous(LocalSection invalid) throws IOException {
-        var found = resolve(invalid.key(), candidate -> !candidate.equals(invalid)
-                && (candidate.kind() != LocalSection.DATA || !blob(candidate).equals(blob(invalid))));
-        return found == null || found.kind() == LocalSection.ABSENT ? null : found;
+        Binding value;
+        synchronized (this) { checkOpen(); value = this.bindings.get(invalid.key()); this.readers++; }
+        try (var file = FileChannel.open(this.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            while (value != null) {
+                var section = value.section();
+                if (section.kind() == LocalSection.ABSENT) return null;
+                synchronized (this) {
+                    if (!section.equals(invalid) && !token(section).equals(token(invalid))
+                            && (section.kind() != LocalSection.DATA || this.payloads.containsKey(token(section)))) return section;
+                }
+                if (value.previous() == 0) break;
+                if (value.previous() >= value.offset()) throw new IOException("cyclic local predecessor");
+                value = readBinding(file, value.previous());
+            }
+            return null;
+        } finally { synchronized (this) { this.readers--; } }
     }
-
-    LocalSection resolve(long key, java.util.function.Predicate<LocalSection> usable) throws IOException {
-        checkOpen();
-        long at = this.bindings.get(key);
-        while (at != 0) {
-            var binding = readBinding(at);
-            if (binding.section().kind() == LocalSection.ABSENT) return binding.section();
-            if ((binding.section().kind() != LocalSection.DATA || this.payloads.containsKey(blob(binding.section())))
-                    && usable.test(binding.section())) return binding.section();
-            if (binding.previous() >= at) throw new IOException("cyclic completed binding chain");
-            at = binding.previous();
+    RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names) throws IOException {
+        Payload payload;
+        synchronized (this) {
+            checkOpen(); payload = this.payloads.get(token(section));
+            if (payload == null) return null;
+            this.readers++;
         }
-        return null;
+        try (var file = FileChannel.open(this.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            var crc = new CRC32C(); var hash = new Blake3.Hasher();
+            var input = new InputStream() {
+                long consumed;
+                @Override public int read() throws IOException { throw new IOException("buffered local read required"); }
+                @Override public int read(byte[] bytes, int offset, int length) throws IOException {
+                    if (length == 0) return 0;
+                    if (this.consumed == payload.compressed()) return -1;
+                    int count = file.read(ByteBuffer.wrap(bytes, offset, (int) Math.min(length, payload.compressed() - this.consumed)),
+                            payload.offset() + this.consumed);
+                    if (count <= 0) throw new IOException("truncated local payload");
+                    this.consumed += count; crc.update(bytes, offset, count); hash.update(bytes, offset, count);
+                    return count;
+                }
+            };
+            var decoded = codec.decode(section.key(), section.children(), input, payload.compressed(), payload.canonical(), names);
+            if ((int) crc.getValue() != payload.crc() || !fingerprint(hash).equals(payload.local()))
+                throw new IOException("local payload integrity mismatch");
+            return decoded; // Journal integrity AND format validation before publication.
+        } catch (IOException invalid) {
+            synchronized (this) { this.payloads.remove(token(section), payload); }
+            throw invalid; // A late reader cannot quarantine a concurrently repaired payload.
+        } finally { synchronized (this) { this.readers--; } }
     }
-
-    /** Charge this exact worst-case append size before calling append, including dedup races. */
-    long appendBytes(LocalSection section) throws IOException {
+    synchronized Append begin(LocalSection section, LocalSectionCodec.Encoder encoder, Space space,
+                              BooleanSupplier current) throws IOException {
         checkOpen();
-        long previous = this.bindings.get(section.key());
-        if (previous != 0 && readBinding(previous).section().equals(section)
-                && (section.kind() != LocalSection.DATA || this.payloads.containsKey(blob(section)))) return 0;
-        return FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES
-                + (section.kind() == LocalSection.DATA && !this.payloads.containsKey(blob(section))
-                ? FRAME_BYTES + PAYLOAD_METADATA_BYTES + (long) section.compressedBytes() + FOOTER_BYTES : 0);
-    }
-
-    /** Caller validates canonical bytes/catalog and checks immutable task authority before commit. */
-    void append(LocalSection section, byte[] compressed) throws IOException {
-        checkOpen();
-        if (!this.writable) throw new IOException("read-only completed journal");
-        if (section.region() != this.region) throw new IOException("section outside journal region");
-        long added = appendBytes(section);
-        if (added == 0) return;
-        if (this.end + added > MAX_BYTES) throw new IOException("completed journal rotation required");
-        if (section.kind() == LocalSection.DATA && (compressed == null
-                || compressed.length != section.compressedBytes() || RegionalProtocol.crc32c(compressed) != section.crc()))
-            throw new IOException("completed payload CRC or extent mismatch");
-        long payload = 0;
-        if (section.kind() == LocalSection.DATA) {
-            Blob blob = blob(section);
-            Long existing = this.payloads.get(blob);
-            if (existing == null) {
-                var metadata = buffer(PAYLOAD_METADATA_BYTES).put(blob.fingerprint().bytes())
-                        .putInt(blob.length()).putInt(blob.crc());
-                payload = this.end + FRAME_BYTES + PAYLOAD_METADATA_BYTES;
-                appendFrame(PAYLOAD, metadata.array(), compressed);
-                this.payloads.put(blob, payload);
-            } else payload = existing;
+        if (this.appending) throw new IOException("local append already owned");
+        if (section != null && section.region() != this.region) throw new IOException("section outside local region");
+        if (this.writer == null) {
+            this.writer = FileChannel.open(this.path, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+            long before = this.writer.size();
+            this.writer.truncate(this.end);
+            space.resized(this.writer.size() - before);
         }
-        long offset = this.end;
-        var metadata = buffer(BINDING_BYTES).putLong(section.key()).putInt(section.kind()).putInt(section.children())
-                .putInt(section.compressedBytes()).putInt(section.canonicalBytes()).putInt(section.crc()).putInt(0)
-                .put(section.fingerprint().bytes()).put(section.catalog().bytes())
-                .putLong(this.bindings.get(section.key())).putLong(payload);
-        appendFrame(BINDING, metadata.array(), null);
-        this.bindings.put(section.key(), offset);
-        if (!section.catalog().equals(RegionalProtocol.Hash32.ZERO)) this.catalogs.add(section.catalog());
+        this.appending = true;
+        return new Append(section, encoder, space, current);
     }
-
-    /** Exact content read; old immutable workers can still consume their own committed payload. */
-    byte[] get(LocalSection section) throws IOException {
-        checkOpen();
-        Long offset = this.payloads.get(blob(section));
-        if (offset == null) return null;
-        byte[] bytes = read(this.channel, offset, section.compressedBytes()).array();
-        if (RegionalProtocol.crc32c(bytes) != section.crc()) throw new IOException("completed payload CRC mismatch");
-        return bytes;
-    }
-
-    void quarantine(LocalSection section, boolean persist) throws IOException {
-        checkOpen();
-        if (!this.payloads.containsKey(blob(section))) return;
-        if (!persist || !this.writable || this.end + FRAME_BYTES + PAYLOAD_METADATA_BYTES + FOOTER_BYTES > MAX_BYTES) {
-            this.payloads.remove(blob(section));
-            return;
+    /** One append can remain suspended between steps; no monitor is held during encoding or I/O. */
+    final class Append extends OutputStream {
+        private final LocalSection section;
+        private final LocalSectionCodec.Encoder encoder;
+        private final Space space;
+        private final BooleanSupplier current;
+        private final long start = end;
+        private final CRC32C crc = new CRC32C();
+        private final Blake3.Hasher hash = new Blake3.Hasher();
+        private long charged, output;
+        private boolean initialized, committed, released;
+        private Payload payload;
+        private Append(LocalSection section, LocalSectionCodec.Encoder encoder, Space space, BooleanSupplier current) {
+            this.section = section; this.encoder = encoder; this.space = space; this.current = current;
+            this.payload = section == null ? null : payloads.get(token(section));
         }
-        var metadata = buffer(PAYLOAD_METADATA_BYTES).put(section.fingerprint().bytes())
-                .putInt(section.compressedBytes()).putInt(section.crc());
-        try { appendFrame(DROP_PAYLOAD, metadata.array(), null); }
-        finally { this.payloads.remove(blob(section)); }
-    }
-
-    private void appendFrame(int kind, byte[] metadata, byte[] payload) throws IOException {
-        int length = metadata.length + (payload == null ? 0 : payload.length);
-        int crc = RegionalProtocol.crc32c(metadata);
-        long start = this.end;
-        try {
-            write(this.channel, start, buffer(FRAME_BYTES).putInt(FRAME_MAGIC).putInt(kind).putInt(length).putInt(crc).flip());
-            write(this.channel, start + FRAME_BYTES, ByteBuffer.wrap(metadata));
-            if (payload != null) write(this.channel, start + FRAME_BYTES + metadata.length, ByteBuffer.wrap(payload));
-            write(this.channel, start + FRAME_BYTES + length, buffer(FOOTER_BYTES).putLong(commit(kind, length, crc)).flip());
-            this.end += FRAME_BYTES + (long) length + FOOTER_BYTES;
-        } catch (IOException failure) {
-            try { this.file.setLength(start); } catch (IOException rollback) { failure.addSuppressed(rollback); this.closed = true; }
-            throw failure;
+        boolean step() throws IOException {
+            if (this.released) throw new IOException("released local append");
+            if (this.committed) return true;
+            if (!this.current.getAsBoolean()) throw new IOException("obsolete local append");
+            if (!this.initialized) {
+                this.initialized = true;
+                if (this.section != null) synchronized (CompletedSectionJournal.this) {
+                    var old = bindings.get(this.section.key());
+                    if (old != null && old.section().equals(this.section)
+                            && (this.section.kind() != LocalSection.DATA || this.payload != null)) { this.committed = true; return true; }
+                }
+                if (this.section != null && this.section.kind() == LocalSection.DATA && this.payload == null) {
+                    if (this.encoder == null) throw new IOException("missing conversion input");
+                    reserve(FRAME_BYTES + PAYLOAD_METADATA_BYTES);
+                    CompletedSectionJournal.write(writer, this.start, buffer(FRAME_BYTES + PAYLOAD_METADATA_BYTES));
+                }
+            }
+            if (this.section != null && this.section.kind() == LocalSection.DATA && this.payload == null) {
+                if (!this.encoder.step(this)) return false;
+                var local = fingerprint(this.hash);
+                this.payload = new Payload(this.start + FRAME_BYTES + PAYLOAD_METADATA_BYTES,
+                        Math.toIntExact(this.output), Math.toIntExact(this.encoder.canonicalBytes()), (int) this.crc.getValue(), local);
+                var token = token(this.section);
+                byte[] metadata = buffer(PAYLOAD_METADATA_BYTES).put(token.catalog().bytes()).put(token.source().bytes())
+                        .putInt(this.payload.compressed()).putInt(this.payload.canonical()).putInt(this.payload.crc()).put(local.bytes()).array();
+                reserve(FOOTER_BYTES);
+                finishFrame(this.start, PAYLOAD, metadata, this.payload.compressed());
+            }
+            if (!this.current.getAsBoolean()) throw new IOException("obsolete local commit");
+            long at = this.start + this.charged;
+            if (this.section == null) {
+                reserve(FRAME_BYTES + 8 + FOOTER_BYTES);
+                finishFrame(at, RESET, new byte[8], 0);
+            } else {
+                long previous;
+                synchronized (CompletedSectionJournal.this) { var old = bindings.get(this.section.key()); previous = old == null ? 0 : old.offset(); }
+                var s = this.section;
+                byte[] metadata = buffer(BINDING_BYTES).putLong(s.key()).putInt(s.kind()).putInt(s.children())
+                        .putInt(s.compressedBytes()).putInt(s.canonicalBytes()).putInt(s.crc()).putInt(0)
+                        .put(s.fingerprint().bytes()).put(s.catalog().bytes()).putLong(previous)
+                        .putLong(s.kind() == LocalSection.DATA ? this.payload.offset() : 0).array();
+                reserve(FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES);
+                finishFrame(at, BINDING, metadata, 0);
+                synchronized (CompletedSectionJournal.this) {
+                    if (s.kind() == LocalSection.DATA) payloads.put(token(s), this.payload);
+                    bindings.put(s.key(), binding(buffer(metadata), at));
+                }
+            }
+            synchronized (CompletedSectionJournal.this) {
+                if (this.section == null) bindings.clear();
+                end = this.start + this.charged;
+            }
+            this.committed = true;
+            return true;
+        }
+        private void reserve(long bytes) throws IOException {
+            if (this.start + this.charged + bytes > MAX_BYTES) throw new RotationRequired();
+            this.space.reserve(bytes); this.charged += bytes;
+        }
+        @Override public void write(int value) throws IOException { throw new IOException("buffered local write required"); }
+        @Override public void write(byte[] bytes, int offset, int count) throws IOException {
+            if (!this.current.getAsBoolean()) throw new IOException("obsolete local output");
+            if (this.output + count > LocalSectionCodec.MAX_COMPRESSED_BYTES) throw new IOException("local output exceeds bound");
+            reserve(count);
+            CompletedSectionJournal.write(writer, this.start + FRAME_BYTES + PAYLOAD_METADATA_BYTES + this.output, ByteBuffer.wrap(bytes, offset, count));
+            this.output += count; this.crc.update(bytes, offset, count); this.hash.update(bytes, offset, count);
+        }
+        @Override public void close() throws IOException {
+            if (this.released) return;
+            this.released = true;
+            try {
+                if (!this.committed) {
+                    try { writer.truncate(this.start); }
+                    catch (IOException failure) {
+                        synchronized (CompletedSectionJournal.this) { closed = true; }
+                        throw failure;
+                    }
+                    finally { this.space.resized(writer.size() - this.start - this.charged); }
+                }
+            } finally {
+                synchronized (CompletedSectionJournal.this) { appending = false; closeHandle(); }
+            }
         }
     }
-
-    private Binding readBinding(long at) throws IOException {
-        if (at < HEADER_BYTES || at + FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES > this.end)
-            throw new IOException("invalid completed binding offset");
-        var frame = read(this.channel, at, FRAME_BYTES);
-        if (frame.getInt() != FRAME_MAGIC || frame.getInt() != BINDING || frame.getInt() != BINDING_BYTES)
-            throw new IOException("invalid completed binding frame");
-        int crc = frame.getInt();
-        var metadata = read(this.channel, at + FRAME_BYTES, BINDING_BYTES);
+    private void finishFrame(long at, int kind, byte[] metadata, int payloadBytes) throws IOException {
+        int length = metadata.length + payloadBytes, crc = RegionalProtocol.crc32c(metadata);
+        write(this.writer, at + FRAME_BYTES, ByteBuffer.wrap(metadata));
+        write(this.writer, at, buffer(FRAME_BYTES).putInt(FRAME_MAGIC).putInt(kind).putInt(length).putInt(crc).flip());
+        write(this.writer, at + FRAME_BYTES + length, buffer(FOOTER_BYTES).putLong(commit(kind, length, crc)).flip());
+    }
+    private static Binding readBinding(FileChannel file, long at) throws IOException {
+        if (at < HEADER_BYTES || at + FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES > file.size()) throw new IOException("invalid binding offset");
+        var frame = read(file, at, FRAME_BYTES);
+        if (frame.getInt() != FRAME_MAGIC || frame.getInt() != BINDING || frame.getInt() != BINDING_BYTES) throw new IOException("invalid binding frame");
+        int crc = frame.getInt(); var metadata = read(file, at + FRAME_BYTES, BINDING_BYTES);
         if (RegionalProtocol.crc32c(metadata.array()) != crc
-                || read(this.channel, at + FRAME_BYTES + BINDING_BYTES, FOOTER_BYTES).getLong()
-                    != commit(BINDING, BINDING_BYTES, crc)) throw new IOException("corrupt completed binding");
-        return binding(metadata);
+                || read(file, at + FRAME_BYTES + BINDING_BYTES, FOOTER_BYTES).getLong() != commit(BINDING, BINDING_BYTES, crc))
+            throw new IOException("corrupt binding");
+        return binding(metadata, at);
     }
-    private static Binding binding(ByteBuffer bytes) throws IOException {
+    private static Binding binding(ByteBuffer bytes, long at) throws IOException {
         long key = bytes.getLong(); int kind = bytes.getInt(), children = bytes.getInt();
         int compressed = bytes.getInt(), canonical = bytes.getInt(), crc = bytes.getInt();
-        if (bytes.getInt() != 0) throw new IOException("nonzero local binding reserved field");
+        if (bytes.getInt() != 0) throw new IOException("nonzero binding reserved field");
         var section = new LocalSection(key, kind, children, compressed, canonical, crc,
                 RegionalProtocol.Fingerprint.read(bytes), RegionalProtocol.Hash32.read(bytes));
-        return new Binding(section, bytes.getLong(), bytes.getLong());
+        return new Binding(section, at, bytes.getLong(), bytes.getLong());
     }
-    private static Blob blob(LocalSection section) { return new Blob(section.fingerprint(), section.compressedBytes(), section.crc()); }
-    private static long commit(int kind, int length, int crc) {
-        return MAGIC ^ Integer.toUnsignedLong(crc) ^ (long) length << 32 ^ kind;
-    }
+    private static Token token(LocalSection section) { return new Token(section.catalog(), section.fingerprint()); }
+    private static RegionalProtocol.Fingerprint fingerprint(Blake3.Hasher hash) { return RegionalProtocol.Fingerprint.read(buffer(hash.digest())); }
+    private static long commit(int kind, int length, int crc) { return MAGIC ^ Integer.toUnsignedLong(crc) ^ (long) length << 32 ^ kind; }
     private static ByteBuffer buffer(int bytes) { return ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN); }
-    private static ByteBuffer read(FileChannel file, long offset, int bytes) throws IOException {
-        ByteBuffer result = buffer(bytes);
-        while (result.hasRemaining()) {
-            int count = file.read(result, offset);
-            if (count <= 0) throw new IOException("truncated completed journal");
-            offset += count;
-        }
+    private static ByteBuffer buffer(byte[] bytes) { return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN); }
+    private static ByteBuffer read(FileChannel file, long at, int bytes) throws IOException {
+        var result = buffer(bytes);
+        while (result.hasRemaining()) { int n = file.read(result, at); if (n <= 0) throw new IOException("truncated journal"); at += n; }
         return result.flip();
     }
-    private static void write(FileChannel file, long offset, ByteBuffer bytes) throws IOException {
-        while (bytes.hasRemaining()) {
-            int count = file.write(bytes, offset);
-            if (count <= 0) throw new IOException("short completed journal write");
-            offset += count;
-        }
+    private static void write(FileChannel file, long at, ByteBuffer bytes) throws IOException {
+        while (bytes.hasRemaining()) { int n = file.write(bytes, at); if (n <= 0) throw new IOException("short journal write"); at += n; }
     }
-    void flush() throws IOException { checkOpen(); if (this.writable) this.channel.force(true); }
-    private void checkOpen() throws IOException { if (this.closed) throw new IOException("completed journal closed"); }
-    @Override public void close() throws IOException {
-        try { if (!this.closed) flush(); }
-        finally { this.closed = true; this.file.close(); }
+    private void checkOpen() throws IOException { if (this.closed) throw new IOException("closed local journal"); }
+    @Override public synchronized void close() throws IOException {
+        if (busy()) throw new IOException("local journal still leased");
+        closeHandle(); this.closed = true;
     }
 }

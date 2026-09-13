@@ -112,9 +112,7 @@ final class LiveClientTestHarness {
             return;
         }
         if (active.pose != null && now - active.pose.deadlineNanos >= 0) {
-            active.pose = null;
-            requestResult(DebugTestProtocol.ResultKind.POSE_FAILED, active.runId,
-                    active.stepId, DebugTestProtocol.Failure.POSE_TIMEOUT, false);
+            failRun(DebugTestProtocol.Failure.POSE_TIMEOUT);
             return;
         }
         Trace trace = active.trace;

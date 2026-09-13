@@ -34,6 +34,16 @@ public final class HierarchicalBitSet {
     }
 
     public int allocateNextConsecutiveCounted(int requested) {
+        int start = this.findConsecutive(requested);
+        if (start < 0) return start;
+        this.allocated.set(start, start + requested);
+        this.count += requested;
+        return start;
+    }
+
+    public boolean canAllocateConsecutive(int requested) { return this.findConsecutive(requested) >= 0; }
+
+    private int findConsecutive(int requested) {
         if (requested <= 0) throw new IllegalArgumentException("Count must be positive");
         if (requested > this.limit || this.count + requested > this.limit) return -2;
 
@@ -41,8 +51,6 @@ public final class HierarchicalBitSet {
         while (start <= this.limit - requested) {
             int occupied = this.allocated.nextSetBit(start);
             if (occupied < 0 || occupied >= start + requested) {
-                this.allocated.set(start, start + requested);
-                this.count += requested;
                 return start;
             }
             start = this.allocated.nextClearBit(occupied + 1);

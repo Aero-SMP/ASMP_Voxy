@@ -23,10 +23,14 @@ public final class RegionalSectionCodec implements AutoCloseable {
     static final int SECTION_CELLS = 32 * 32 * 32;
     private static final int HEADER_BYTES = 2;
 
-    record Mappings(int[] blocks, int[] biomes) {
+    record Mappings(int[] blocks, int[] biomes, CatalogCodec.Catalog source) {
+        Mappings(int[] blocks, int[] biomes) { this(blocks, biomes, null); }
+        Mappings(CatalogCodec.Catalog source) { this(null, null, Objects.requireNonNull(source)); }
         Mappings {
-            blocks = Objects.requireNonNull(blocks, "blocks").clone();
-            biomes = Objects.requireNonNull(biomes, "biomes").clone();
+            if (source == null) {
+                blocks = Objects.requireNonNull(blocks, "blocks").clone();
+                biomes = Objects.requireNonNull(biomes, "biomes").clone();
+            }
         }
     }
 
@@ -96,6 +100,12 @@ public final class RegionalSectionCodec implements AutoCloseable {
     SectionData decode(long key, int childMask, byte[] canonical,
                        RegionalProtocol.Fingerprint expected,
                        Mappings mappings) throws IOException {
+        return decode(key, childMask, canonical, expected, mappings, null);
+    }
+
+    SectionData decode(long key, int childMask, byte[] canonical,
+                       RegionalProtocol.Fingerprint expected, Mappings mappings,
+                       LocalSectionCodec.Names names) throws IOException {
         Objects.requireNonNull(canonical, "canonical");
         Objects.requireNonNull(expected, "fingerprint");
         Objects.requireNonNull(mappings, "mappings");
@@ -106,7 +116,7 @@ public final class RegionalSectionCodec implements AutoCloseable {
         if (canonical.length < HEADER_BYTES) throw new IOException("truncated regional section");
         ByteBuffer input = ByteBuffer.wrap(canonical).order(ByteOrder.LITTLE_ENDIAN);
         int paletteCount = Short.toUnsignedInt(input.getShort());
-        if ((childMask & ~0xff) != 0 || paletteCount < 1) {
+        if ((childMask & ~0xff) != 0 || paletteCount < 1 || paletteCount > SECTION_CELLS) {
             throw new IOException("invalid regional section header");
         }
         int bits = minimumBits(paletteCount);
@@ -126,14 +136,18 @@ public final class RegionalSectionCodec implements AutoCloseable {
             byte light = input.get();
             RemotePaletteEntry identity = new RemotePaletteEntry(
                     (int) remoteBlock, (int) remoteBiome, light);
-            if (!remotePalette.add(identity) || remoteBlock >= mappings.blocks.length
-                    || remoteBiome >= mappings.biomes.length) {
+            var source = mappings.source();
+            if (!remotePalette.add(identity) || remoteBlock >= (source == null ? mappings.blocks.length : source.blocks().size())
+                    || remoteBiome >= (source == null ? mappings.biomes.length : source.biomes().size())) {
                 throw new IOException("invalid regional section palette entry");
             }
-            int localBlock = mappings.blocks[(int) remoteBlock];
+            int localBlock = source == null ? mappings.blocks[(int) remoteBlock]
+                    : names.resolve(source.blocks().get((int) remoteBlock).canonical(), false);
+            int localBiome = source == null ? mappings.biomes[(int) remoteBiome]
+                    : names.resolve(source.biomes().get((int) remoteBiome), true);
             if (localBlock != 0) usedBlocks.add(localBlock);
             palette[index] = CatalogMapper.composeMappingId(light,
-                    localBlock, mappings.biomes[(int) remoteBiome]);
+                    localBlock, localBiome);
         }
         int wordsOffset = input.position();
         if (bits != 0 && (SECTION_CELLS * bits & 63) != 0) {

@@ -1,214 +1,141 @@
 package me.cortex.voxy.client.lod;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.Map;
 import java.util.function.BooleanSupplier;
 
-/** Budget-owned experimental local directory; all methods are worker-only, never render-thread I/O. */
+/** Worker-only cache facade. A save/read holds a disk pin, not the budget monitor. */
 final class CompletedSectionCache implements AutoCloseable {
     final RegionalMetadataStore metadata;
-    private final RegionalDiskBudget budget;
     final RegionalProtocol.Hash32 world;
     final String dimension;
+    private final RegionalDiskBudget budget;
     private final Path root;
-    private final RegionalCache legacy;
-    private final LinkedHashMap<Long, CompletedSectionJournal> journals = new LinkedHashMap<>(64, .75f, true);
     private boolean closed;
-    volatile long catalogRefusals;
-
-    CompletedSectionCache(RegionalMetadataStore metadata, RegionalProtocol.Hash32 world, String dimension) throws IOException {
+    private int operations;
+    private final java.util.Set<Long> retained = new java.util.HashSet<>();
+    CompletedSectionCache(RegionalMetadataStore metadata, RegionalProtocol.Hash32 world, String dimension) {
         this.metadata = metadata; this.budget = metadata.budget; this.world = world; this.dimension = dimension;
-        this.root = metadata.namespace(world, dimension);
-        this.legacy = RegionalCache.legacyReader(metadata.legacyNamespace(world, dimension), world, this.budget);
-        this.budget.retain();
+        this.root = metadata.namespace(world, dimension); this.budget.retain();
     }
-
     Path path(long region) { return this.root.resolve("r." + (int) region + "." + (int) (region >>> 32) + ".vxlocal"); }
-
+    private synchronized RegionalDiskBudget.Pin acquire(long region) throws IOException {
+        if (this.closed) throw new IOException("closed section cache");
+        var pin = this.budget.pin(path(region)); this.operations++; return pin;
+    }
+    private synchronized void released() {
+        if (--this.operations < 0) throw new IllegalStateException("cache operation underflow");
+        if (this.closed && this.operations == 0) this.budget.release();
+    }
     Map<Long, LocalSection> directory(long region) throws IOException {
-        synchronized (this.budget) {
-            var journal = journal(region, false);
+        synchronized (this) {
+            if (this.closed) throw new IOException("closed section cache");
+            if (this.retained.add(region)) this.budget.retainDirectory(path(region));
+        }
+        return directorySnapshot(region);
+    }
+    synchronized void forget(long region) {
+        if (this.retained.remove(region)) this.budget.releaseDirectory(path(region));
+    }
+    Map<Long, LocalSection> directorySnapshot(long region) throws IOException {
+        var acquired = acquire(region);
+        try (var pin = acquired) {
+            var journal = this.budget.journal(path(region), this.world, region, false);
             return journal == null ? Map.of() : journal.directory();
+        } finally { released(); }
+    }
+    LocalSection previous(LocalSection section) throws IOException {
+        var acquired = acquire(section.region());
+        try (var pin = acquired) {
+            var journal = this.budget.journal(path(section.region()), this.world, section.region(), false);
+            return journal == null ? null : journal.previous(section);
+        } finally { released(); }
+    }
+    RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names) throws IOException {
+        var acquired = acquire(section.region());
+        try (var pin = acquired) {
+            var journal = this.budget.journal(path(section.region()), this.world, section.region(), false);
+            if (journal == null) return null;
+            return journal.get(section, codec, names);
+        } finally { released(); }
+    }
+    Save begin(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Catalog source,
+               BooleanSupplier current) throws IOException {
+        long region = section.region();
+        var pin = acquire(region);
+        LocalSectionCodec.Encoder encoder = null;
+        try {
+            if (section.kind() == LocalSection.DATA) encoder = codec.encode(canonical, source);
+            var journal = this.budget.journal(path(region), this.world, region, true);
+            // A full shard is rotated only when its actual next record cannot fit, never using
+            // the maximum possible extent for every small record. Save retries own conversion.
+            return new Save(section, region, encoder, journal.begin(section, encoder, space(region), current), pin);
+        } catch (Throwable failure) {
+            if (encoder != null) encoder.close();
+            pin.close(); released(); throw failure;
         }
     }
-
-    LocalSection previous(LocalSection invalid) throws IOException {
-        synchronized (this.budget) {
-            var journal = journal(invalid.region(), false);
-            return journal == null ? null : journal.previous(invalid);
-        }
-    }
-
-    LocalSection resolve(long key, long region, java.util.function.Predicate<LocalSection> usable) throws IOException {
-        synchronized (this.budget) {
-            try (var pin = this.budget.pin(path(region))) {
-                var journal = journal(region, false);
-                return journal == null ? null : journal.resolve(key, usable);
-            }
-        }
-    }
-
-    void quarantine(LocalSection invalid, byte[] failedBytes) throws IOException {
-        synchronized (this.budget) {
-            if (this.closed) return;
-            Path path = path(invalid.region());
-            if (!this.budget.closeOtherOwners(path, this)) return;
-            var journal = journal(invalid.region(), false);
-            if (journal == null) return;
-            // A concurrent worker may already have repaired this shared blob. A failed
-            // read without bytes only authorizes dropping data that still fails CRC.
-            try {
-                byte[] now = journal.get(invalid);
-                if (now == null || failedBytes == null || !Arrays.equals(now, failedBytes)) return;
-            } catch (IOException stillCorrupt) { /* The currently installed blob is damaged. */ }
-            boolean persist = this.budget.writable() && this.budget.ensure(48, Set.of(path));
-            long before = journal.bytes();
-            try { journal.quarantine(invalid, persist); }
-            finally { if (this.budget.ready()) this.budget.bytes += RegionalDiskBudget.size(path) - before; }
-        }
-    }
-
-    byte[] get(LocalSection section) throws IOException {
-        synchronized (this.budget) {
-            var journal = journal(section.region(), false);
-            byte[] bytes = journal == null ? null : journal.get(section);
-            return bytes == null ? this.legacy.get(section) : bytes;
-        }
-    }
-
-    boolean legacyContains(LocalSection section) throws IOException {
-        return section.kind() != LocalSection.DATA || this.legacy.contains(section);
-    }
-
-    boolean legacySealed(long region) throws IOException {
-        synchronized (this.budget) {
-            var journal = journal(region, false);
-            return journal != null && journal.legacySealed();
-        }
-    }
-
-    RegionalMetadataStore.Persistence absentRegion(long region, BooleanSupplier current) throws IOException {
-        synchronized (this.budget) {
-            if (this.closed || !current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
-            var unavailable = this.budget.persistenceUnavailable();
-            if (unavailable != null) return unavailable;
-            Path path = path(region);
-            if (!this.budget.closeOtherOwners(path, this)) return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            var journal = journal(region, true);
-            if (journal == null || !this.budget.ensure(32, Set.of(path))) return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            if (!current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
-            long before = journal.bytes();
-            try { journal.absentRegion(); }
-            finally {
-                this.budget.bytes += RegionalDiskBudget.size(path) - before;
-                this.budget.references(path, catalogPaths(path, journal.catalogs()));
-            }
-            return RegionalMetadataStore.Persistence.PERSISTED;
-        }
-    }
-
-    /** The pipeline has one immutable worker ticket per position. Check that ticket under
-     * append exclusion: a revoked worker cannot overwrite a successor's committed binding.
-     * Server generation numbers are deliberately not used as cross-session cache authority. */
-    boolean put(LocalSection section, byte[] compressed, BooleanSupplier current) throws IOException {
-        return putMetadata(section, compressed, current) == RegionalMetadataStore.Persistence.PERSISTED;
-    }
-
-    RegionalMetadataStore.Persistence putMetadata(LocalSection section, byte[] compressed, BooleanSupplier current) throws IOException {
-        synchronized (this.budget) {
-            if (this.closed || !current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
-            var unavailable = this.budget.persistenceUnavailable();
-            if (unavailable != null) return unavailable;
-            Path path = path(section.region());
-            Path catalog = section.catalog().equals(RegionalProtocol.Hash32.ZERO) ? null
-                    : this.metadata.catalogPath(this.world, this.dimension, section.catalog());
-            // Catalog save validates and forces content before this worker can publish a binding.
-            if (catalog != null && !Files.isRegularFile(catalog)) {
-                this.catalogRefusals++;
-                return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            }
-            Set<Path> protect = catalog == null ? Set.of(path) : Set.of(path, catalog);
-            if (!this.budget.closeOtherOwners(path, this)) return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            // Catalog pins cover initial shard creation as well as the actual append reservation.
-            try (var pin = this.budget.pin(catalog)) {
-            var journal = journal(section.region(), true);
-            if (journal == null) return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            long added = journal.appendBytes(section);
-            if (journal.bytes() + added > CompletedSectionJournal.MAX_BYTES) return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            if (!this.budget.ensure(added, protect)) return RegionalMetadataStore.Persistence.UNAVAILABLE;
-            if (!current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
-            long before = journal.bytes();
-            try { journal.append(section, compressed); }
-            finally {
-                this.budget.bytes += RegionalDiskBudget.size(path) - before;
-                this.budget.references(path, catalogPaths(path, journal.catalogs()));
-            }
-            ClientLodDebug.cacheCommitted(this, section);
-            return RegionalMetadataStore.Persistence.PERSISTED;
-            }
-        }
-    }
-
-    private CompletedSectionJournal journal(long region, boolean create) throws IOException {
-        if (this.closed) return null;
-        var existing = this.journals.get(region);
-        if (existing != null && create && !existing.writable()) {
-            if (!closeRegion(region)) return null;
-            existing = null;
-        }
-        if (existing != null) return existing;
+    private CompletedSectionJournal.Space space(long region) {
         Path path = path(region);
-        boolean present = Files.isRegularFile(path);
-        long before = RegionalDiskBudget.size(path);
-        if ((!present || before == 0) && !create) return null;
-        if ((!present || before == 0) && !this.budget.ensure(CompletedSectionJournal.HEADER_BYTES, Set.of(path))) return null;
-        if (!present) Files.createDirectories(this.root);
-        CompletedSectionJournal opened;
-        try { opened = CompletedSectionJournal.open(path, this.world, region, this.budget.ready()); }
-        finally { if (this.budget.ready()) this.budget.bytes += RegionalDiskBudget.size(path) - before; }
-        this.journals.put(region, opened);
-        this.budget.register(path, this, () -> closeRegion(region));
-        while (this.journals.size() > 64) closeRegion(this.journals.firstEntry().getKey());
-        return opened;
+        return new CompletedSectionJournal.Space() {
+            public void reserve(long bytes) throws IOException { budget.reserve(path, bytes); }
+            public void resized(long delta) { budget.resized(path, delta); }
+        };
     }
 
-    private boolean closeRegion(long region) {
-        var journal = this.journals.remove(region);
-        if (journal == null) return true;
-        this.budget.unregister(path(region), this);
-        try { journal.close(); return true; } catch (IOException failure) { return false; }
-    }
-
-    static Set<Path> referencedCatalogs(Path path) throws IOException {
-        // Fixed header identifies the namespace; recovery skips compressed payload bodies.
-        try (var input = Files.newInputStream(path)) {
-            byte[] header = input.readNBytes(CompletedSectionJournal.HEADER_BYTES);
-            if (header.length != CompletedSectionJournal.HEADER_BYTES) return Set.of();
-            var bytes = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN); bytes.position(8);
-            var world = RegionalProtocol.Hash32.read(bytes); long region = bytes.getLong();
-            try (var journal = CompletedSectionJournal.open(path, world, region, false)) {
-                return catalogPaths(path, journal.catalogs());
-            } catch (IOException invalid) { return Set.of(); }
+    boolean rotate(long region) throws IOException { return this.budget.delete(path(region)); }
+    long pinRevision() { return this.budget.pinRevision; }
+    final class Save implements AutoCloseable {
+        private final LocalSection section;
+        private final long region;
+        private final LocalSectionCodec.Encoder encoder;
+        private final CompletedSectionJournal.Append append;
+        private final RegionalDiskBudget.Pin pin;
+        private boolean closed;
+        private Save(LocalSection section, long region, LocalSectionCodec.Encoder encoder,
+                     CompletedSectionJournal.Append append, RegionalDiskBudget.Pin pin) {
+            this.section = section; this.region = region; this.encoder = encoder; this.append = append; this.pin = pin;
         }
-    }
-
-    private static Set<Path> catalogPaths(Path path, Set<RegionalProtocol.Hash32> catalogs) {
-        var result = new HashSet<Path>();
-        for (var catalog : catalogs) result.add(path.resolveSibling(HexFormat.of().formatHex(catalog.bytes()) + ".vxcat"));
-        return result;
-    }
-
-    @Override public void close() {
-        synchronized (this.budget) {
+        boolean step() throws IOException {
+            boolean done = this.append.step();
+            if (done && this.section != null) ClientLodDebug.cacheCommitted(CompletedSectionCache.this, this.section);
+            return done;
+        }
+        @Override public void close() throws IOException {
             if (this.closed) return;
             this.closed = true;
-            for (long region : List.copyOf(this.journals.keySet())) closeRegion(region);
-            this.legacy.close();
-            this.budget.release();
+            try { this.append.close(); }
+            finally {
+                if (this.encoder != null) this.encoder.close();
+                this.pin.close(); released();
+            }
         }
+    }
+    RegionalMetadataStore.Persistence putMetadata(LocalSection section, byte[] ignored, BooleanSupplier current) throws IOException {
+        if (!current.getAsBoolean()) return RegionalMetadataStore.Persistence.OBSOLETE;
+        var unavailable = this.budget.persistenceUnavailable(); if (unavailable != null) return unavailable;
+        if (section.kind() == LocalSection.DATA) throw new IOException("data requires self-contained conversion");
+        try (var save = begin(section, null, null, null, current)) { while (!save.step()) {} }
+        return RegionalMetadataStore.Persistence.PERSISTED;
+    }
+    boolean put(LocalSection section, byte[] ignored, BooleanSupplier current) throws IOException {
+        return putMetadata(section, ignored, current) == RegionalMetadataStore.Persistence.PERSISTED;
+    }
+    RegionalMetadataStore.Persistence absentRegion(long region, BooleanSupplier current) throws IOException {
+        var unavailable = this.budget.persistenceUnavailable(); if (unavailable != null) return unavailable;
+        var acquired = acquire(region);
+        try (var pin = acquired) {
+            var journal = this.budget.journal(path(region), this.world, region, true);
+            try (var append = journal.begin(null, null, space(region), current)) { while (!append.step()) {} }
+        } finally { released(); }
+        return RegionalMetadataStore.Persistence.PERSISTED;
+    }
+    @Override public synchronized void close() {
+        if (this.closed) return;
+        this.closed = true;
+        for (long region : this.retained) this.budget.releaseDirectory(path(region));
+        this.retained.clear();
+        if (this.operations == 0) this.budget.release();
     }
 }

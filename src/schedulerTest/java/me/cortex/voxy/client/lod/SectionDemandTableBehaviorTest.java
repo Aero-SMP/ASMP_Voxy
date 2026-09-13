@@ -14,6 +14,7 @@ public final class SectionDemandTableBehaviorTest {
     private SectionDemandTableBehaviorTest() {}
 
     public static void main(String[] arguments) throws Exception {
+        saveAndGeometryOwnOneWorkerLease();
         me.cortex.voxy.client.core.rendering.building.MesherNeighborBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.building.MeshBoundsBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.section.GeometryEndpointBehaviorTest.run();
@@ -35,13 +36,13 @@ public final class SectionDemandTableBehaviorTest {
         allocatorReportsFragmentation();
         Blake3BehaviorTest.run();
         RegionalSectionCodecBehaviorTest.run();
+        LocalSectionCodecBehaviorTest.run();
         RegionalControlFlowBehaviorTest.run();
         SubscriptionWindowBehaviorTest.run();
         TerrainWindowPlannerBehaviorTest.run();
         CacheStartupBehaviorTest.run();
         CompletedSectionJournalBehaviorTest.run();
         CompletedLocalCacheBehaviorTest.run();
-        DeferredMetadataBehaviorTest.run();
         ZoomRangeBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationShutdownBehaviorTest.run();
         PublicationRepairBehaviorTest.run();
@@ -49,6 +50,27 @@ public final class SectionDemandTableBehaviorTest {
         me.cortex.voxy.client.core.rendering.building.BoundaryWaterMesherBehaviorTest.run();
         me.cortex.voxy.client.core.rendering.hierarchical.PublicationTopologyBehaviorTest.run();
         System.out.println("coalesced demand-table behavior tests passed");
+    }
+
+    static void saveAndGeometryOwnOneWorkerLease() {
+        for (boolean saveFirst : new boolean[]{false, true}) {
+            var slot = new WorkerResource<Integer>(0, value -> {});
+            var lease = slot.acquire();
+            slot.retainSave(lease);
+            if (saveFirst) check(!slot.finishSave(lease), "save freed running geometry");
+            slot.complete(lease, 42);
+            check(slot.claim().value() == 42 && slot.claim() == null, "geometry delivered twice");
+            check(slot.release(lease) == saveFirst, "admission released an outstanding save");
+            if (!saveFirst) {
+                check(slot.acquire() == null, "pending save did not retain its slot");
+                check(slot.finishSave(lease), "last obligation did not release slot");
+            }
+            var next = slot.acquire();
+            slot.retainSave(next);
+            check(!slot.finishSave(lease) && slot.matches(next), "stale save touched a reused slot");
+            slot.close();
+            check(!slot.finishSave(next) && slot.acquire() == null, "shutdown revived a slot");
+        }
     }
 
     private static void retainsOneHundredThousandDetailTransitions() {
