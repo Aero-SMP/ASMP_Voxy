@@ -17,6 +17,14 @@ public final class CompletedLocalCacheBehaviorTest {
         for (int mode = 0; mode < 4; mode++) publicationBeforeOwnedSave(mode);
         SectionDemandTableBehaviorTest.saveAndGeometryOwnOneWorkerLease();
         parkedModelsReleaseForCoverage();
+        for (int update = 0; update < 3; update++) reclaimedCacheCompletes(update);
+        for (int terminal = 0; terminal < 5; terminal++)
+            for (int ownership = 0; ownership < 6; ownership++) cancelledCompletion(terminal, ownership);
+        cancelledCompletion(2, 6); // Save and admission remain separate obligations.
+        cancelledCompletion(1, 7); // Lost binding returns to discovery, not a retry spin.
+        cancelledCompletion(1, 8); // Authoritative absence does not resurrect work.
+        cancelledCompletion(1, 9); // An unusable local binding cannot suppress discovery.
+        cancelledRetryMiss();
         for (boolean serverFirst : new boolean[]{false, true}) staleFineAndRejoin(serverFirst);
         unchangedQueuedWork();
         for (int phase = 0; phase < 3; phase++) metadataDuringOwnedWork(phase);
@@ -206,6 +214,177 @@ public final class CompletedLocalCacheBehaviorTest {
             for (var worker : s.sectionWorkers) check(!worker.workerThread.isAlive(), "parked worker leaked on shutdown");
             check(s.retainedModelBytes() == 0, "shutdown retained model cells");
         }
+    }
+
+    private static void reclaimedCacheCompletes(int update) throws Exception {
+        var root = Files.createTempDirectory(java.nio.file.Path.of("project_audit"), "cancelled-cache-");
+        var a = fixture(1, 1, 240, 1);
+        var b = fixture(2, 1, update == 2 ? 128 : 240, 1);
+        var ready = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var models = new SectionMesher.Models() {
+            public int getModelId(int block) { check(ready.get(), "unready model meshed"); return 1; }
+            public long getModelMetadataFromClientId(int model) { return 0; }
+            public int getFluidClientStateId(int model) { throw new AssertionError(); }
+            public boolean isModelReadyForBlockId(int block) { return ready.get(); }
+            public boolean isWaterState(int block) { return false; }
+        };
+        var constructor = SectionMesher.class.getDeclaredConstructor(SectionMesher.Models.class, java.util.function.IntConsumer.class);
+        constructor.setAccessible(true);
+        try (var metadata = new RegionalMetadataStore(root)) {
+            persist(metadata, a, true);
+            try (var driver = new Driver(root, new Publisher(), constructor.newInstance(models,
+                    (java.util.function.IntConsumer) ignored -> {}))) {
+                var s = driver.session;
+                driver.until(() -> s.activeCount == 1);
+                ready.set(false);
+                check(s.addChildren(KEY, 15), "cached child unavailable");
+                var fine = s.demands.get(SectionKey.pack(3, 0, 0, 0));
+                driver.until(() -> s.retainedModelBytes() != 0);
+                var worker = s.sectionWorkers[fine.workLease.slot()];
+                var other = s.sectionWorkers[1 - worker.index];
+                var held = other.resource.acquire();
+                check(held != null, "control slot unavailable");
+                if (update != 0) {
+                    s.demands.region(0).announcedGeneration = 2;
+                    s.installIndex(b.index(), new RegionalSectionCodec.BoundCatalog(b.catalog().fingerprint(),
+                            new RegionalSectionCodec.Mappings(CatalogCodec.decode(b.catalog().canonical()))), false);
+                    check(fine.pendingIndex == b.index(), "running cache refresh not deferred");
+                }
+                check(s.idleWorker(true) == null, "reclaim revoked running ownership");
+                int readyBeforeReturn = s.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE);
+                long returnedBy = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                while (worker.resource.pendingResult() == null && System.nanoTime() < returnedBy) s.awaitWake(1);
+                check(worker.resource.pendingResult() != null, "reclaimed worker did not return cancellation");
+                s.drainWorker(worker);
+                check(fine.workLease == null && fine.readyKind == SectionDemandTable.ReadyKind.SOURCE
+                        && s.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) == readyBeforeReturn + 1,
+                        "cancelled cache demand stranded with pending update=" + update);
+                check(update == 0 || fine.pendingIndex == b.index(), "recovery consumed deferred refresh before local activation");
+                other.resource.complete(held, new ClientSession.Session.WorkerGeometry(fine.ticket(s.id, other.index),
+                        me.cortex.voxy.client.core.rendering.building.BuiltSection.emptyWithChildren(fine.key, 0, (byte) 0), 0, true, 0));
+                ClientSession.Session.freeWorkerResult(other.resource.claim().value());
+                other.releaseCompletion(held);
+                ready.set(true);
+                driver.until(() -> fine.installed);
+                check(fine.activeContent.fingerprint().equals(a.index().sectionFingerprint(336))
+                        && s.receivedBytes == 0 && s.uploadedSections == 2,
+                        "reclaimed cached content failed to activate before refresh");
+                if (update == 2) {
+                    driver.until(() -> fine.index == b.index());
+                    s.demands.owned(fine, SectionDemandTable.CandidateState.NETWORK_OWNED);
+                    var reply = new ClientSession.Session.NetworkReply(s.connectionEpoch,
+                            new RegionalProtocol.SectionReply(2, fine.ordinal, fine.key,
+                                    RegionalProtocol.Status.DATA, b.payload()), fine.ticket(s.id, -1));
+                    s.networkReplies.add(reply); s.drainNetworkReplies();
+                    driver.until(() -> fine.activeContent.fingerprint().equals(b.index().sectionFingerprint(336)));
+                    check(reply.released.get() && s.uploadedSections == 3, "fresh replacement lost ownership");
+                }
+                driver.until(() -> fine.pendingIndex == null && fine.workLease == null && s.retainedSaveBytes() == 0);
+                check(fine.readyKind == null && fine.candidate == SectionDemandTable.CandidateState.NONE,
+                        "settled retry retained ready/deferred state");
+                check(s.uploadedSections == (update == 2 ? 3 : 2), "identical refresh republished geometry");
+            }
+        } finally { cleanup(root); }
+    }
+
+    private static ClientSession.Session.WorkerResult controlledResult(String type, Object... arguments) throws Exception {
+        var constructor = Class.forName(ClientSession.Session.class.getName() + "$" + type).getDeclaredConstructors()[0];
+        constructor.setAccessible(true);
+        return (ClientSession.Session.WorkerResult) constructor.newInstance(arguments);
+    }
+
+    private static void cancelledCompletion(int terminal, int ownership) throws Exception {
+        var s = new ClientSession.Session(93, DIMENSION, null, new Publisher(), Driver.mesher(), 2);
+        var f = fixture(1, 0, 240, 1);
+        var d = s.demands.adopt(new ClientSession.Demand(0));
+        d.content = LocalSection.from(f.index(), 0, f.catalog().fingerprint());
+        var w = s.sectionWorkers[0];
+        var lease = w.resource.acquire(); d.workLease = lease;
+        var ticket = d.ticket(ownership == 4 ? s.id - 1 : s.id, 0);
+        var buffer = terminal == 2 ? new PublicationRepairBehaviorTest.CountedBuffer() : null;
+        var mesh = terminal == 2
+                ? new me.cortex.voxy.client.core.rendering.building.BuiltSection(d.key, d.revision, (byte) 0, 0, buffer, new int[8])
+                : me.cortex.voxy.client.core.rendering.building.BuiltSection.emptyWithChildren(d.key, d.revision, (byte) 0);
+        var task = terminal == 3
+                ? new ClientSession.Session.EmptyWorkerTask(ticket, (byte) 0)
+                : new ClientSession.Session.SectionWorkerTask(ticket, d.content, ClientSession.Session.WorkerSource.CACHE,
+                        null, null, null, () -> false);
+        ClientSession.Session.WorkerResult result = switch (terminal) {
+            case 0, 3 -> controlledResult("WorkerFailure", task, 0, new java.util.concurrent.CancellationException());
+            case 1 -> controlledResult("WorkerMiss", ticket, false, null);
+            default -> new ClientSession.Session.WorkerGeometry(ticket, mesh, 0, true, 0);
+        };
+        try {
+            s.demands.revise(d); d.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
+            if (ownership >= 7) d.content = null;
+            if (ownership == 8) s.demands.region(d.regionKey).absent = true;
+            if (ownership == 9) d.content = new LocalSection(d.key, LocalSection.ABSENT, 0, 0, 0, 0,
+                    new RegionalProtocol.Fingerprint(0, 0), RegionalProtocol.Hash32.ZERO);
+            if (ownership == 1 || ownership == 2) s.retireDemand(d.key);
+            ClientSession.Demand replacement = null;
+            WorkerResource.Lease newer = null;
+            if (ownership == 2) {
+                replacement = s.demands.adopt(new ClientSession.Demand(d.key));
+                newer = s.sectionWorkers[1].resource.acquire(); replacement.workLease = newer;
+                s.demands.owned(replacement, SectionDemandTable.CandidateState.WORKER_OWNED);
+            }
+            if (ownership == 3) s.open.set(false);
+            if (ownership == 5) {
+                w.resource.complete(lease, new ClientSession.Session.WorkerGeometry(ticket,
+                        me.cortex.voxy.client.core.rendering.building.BuiltSection.empty(d.key), 0, true, 0));
+                ClientSession.Session.freeWorkerResult(w.resource.claim().value()); w.releaseCompletion(lease);
+                newer = w.resource.acquire(); d.workLease = newer;
+                s.demands.owned(d, SectionDemandTable.CandidateState.WORKER_OWNED);
+            }
+            if (ownership == 6) w.resource.retainSave(lease);
+            w.resource.complete(lease, result);
+            s.drainWorker(w); s.drainWorker(w); // A consumed completion cannot enqueue/dispose twice.
+            if (buffer != null) check(buffer.frees == 1, "stale mesh not disposed exactly once");
+            if (ownership == 0 || ownership == 6) {
+                check(d.workLease == null && d.readyKind == SectionDemandTable.ReadyKind.SOURCE
+                        && s.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) == 1,
+                        "terminal path stranded retry: " + terminal);
+            } else {
+                check(s.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) == 0, "obsolete completion resurrected work");
+                if (replacement != null) check(newer.equals(replacement.workLease), "old result detached replacement lease");
+                if (ownership == 4) check(lease.equals(d.workLease), "foreign session mutated demand");
+                if (ownership == 7 || ownership == 9) check(d.candidate == SectionDemandTable.CandidateState.WAIT_REGION
+                        && d.workLease == null && s.demands.readyRegionCount() == 1,
+                        "missing binding did not return to discovery");
+                if (ownership == 8) check(s.demands.get(d.key) == null, "absent binding was requeued");
+            }
+            if (ownership == 5) check(w.resource.matches(newer), "stale result released reused slot");
+            else if (ownership == 6) {
+                check(!w.idle() && w.resource.savePending() && w.resource.releaseRequested(), "cancelled mesh bypassed pending save");
+                check(w.resource.finishSave(lease) && w.idle(), "save acknowledgement did not finish old ownership");
+            } else check(w.idle(), "cancelled completion leaked worker lease");
+        } finally { s.open.set(false); s.release(); }
+    }
+
+    private static void cancelledRetryMiss() throws Exception {
+        var s = new ClientSession.Session(94, DIMENSION, null, new Publisher(), Driver.mesher(), 1);
+        try {
+            var f = fixture(1, 0, 240, 1);
+            var d = s.demands.adopt(new ClientSession.Demand(0));
+            d.content = LocalSection.from(f.index(), 0, f.catalog().fingerprint());
+            var region = s.demands.region(0);
+            region.localLoaded = true; region.localSections = new java.util.LinkedHashMap<>();
+            region.localSections.put(d.key, d.content);
+            region.index = f.index(); region.catalog = new RegionalSectionCodec.BoundCatalog(f.catalog().fingerprint(), MAPPINGS);
+            region.validated = region.subscribed = s.helloAccepted = true;
+            var w = s.sectionWorkers[0]; var lease = w.resource.acquire(); d.workLease = lease;
+            var old = d.ticket(s.id, 0); s.demands.revise(d); d.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
+            w.resource.complete(lease, controlledResult("WorkerMiss", old, false, null)); s.drainWorker(w);
+            check(d.readyKind == SectionDemandTable.ReadyKind.SOURCE, "stale miss did not retry existing source");
+            lease = w.resource.acquire(); d.workLease = lease;
+            s.demands.owned(d, SectionDemandTable.CandidateState.WORKER_OWNED);
+            w.resource.complete(lease, controlledResult("WorkerMiss", d.ticket(s.id, 0), false, null)); s.drainWorker(w);
+            check(d.index == f.index() && d.readyKind == SectionDemandTable.ReadyKind.NETWORK
+                    && s.cacheMisses == 1 && w.idle(), "missing retry failed to reach validated network work");
+            for (int i = 0; i < 3; i++) s.processStages();
+            check(s.cacheMisses == 1 && s.demands.readyCount(SectionDemandTable.ReadyKind.NETWORK) == 1,
+                    "missing cached retry spun without a network response");
+        } finally { s.open.set(false); s.release(); }
     }
 
     private static final class DeferredPublisher extends Publisher {

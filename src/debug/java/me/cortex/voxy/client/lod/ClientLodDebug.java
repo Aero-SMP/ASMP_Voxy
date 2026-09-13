@@ -79,6 +79,13 @@ public final class ClientLodDebug {
     static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {
         SessionDebugTelemetry.activated(session, section, cacheHit);
     }
+    static void sectionRecovery(ClientSession.Session session, SectionDemandTable.Ticket old,
+                                ClientSession.Demand demand, WorkerResource.Lease lease) {
+        emit("SECTION_RECOVERY session=" + session.id + " key=" + demand.key + " oldRevision=" + old.demandRevision()
+                + " revision=" + demand.revision + " lease=" + lease + " disposition="
+                + (session.demands.get(demand.key) != demand ? "REMOVED" : demand.readyKind != null ? demand.readyKind : demand.candidate)
+                + " deferred=" + (demand.pendingIndex != null));
+    }
 
     /** Explicit five-minute test lease may span a restart; it cannot strand later launches.
      * The timestamp is not renewed by reading it. Minecraft traffic remains untouched. */

@@ -20,6 +20,8 @@ public final class ClientLodDebug {
     static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) {}
     static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) { return builder; }
     static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {}
+    static void sectionRecovery(ClientSession.Session session, SectionDemandTable.Ticket old,
+                                ClientSession.Demand demand, WorkerResource.Lease lease) {}
     static void startupEvent(ClientSession.Session session, String event, long bytes) {}
     static void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {}
     static void captureSession(ClientSession.Session session) {}

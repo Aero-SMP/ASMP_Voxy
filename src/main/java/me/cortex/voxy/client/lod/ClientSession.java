@@ -2372,7 +2372,7 @@ final class ClientSession {
                             this.waitForNetwork(demand);
                             }
                         } else {
-                            this.finishStaleWorker(miss.ticket(), lease);
+                            this.finishStaleWorker(miss.ticket(), worker, lease);
                         }
                         worker.releaseCompletion(lease);
                     }
@@ -2380,7 +2380,7 @@ final class ClientSession {
                         Demand demand = this.currentWorkerDemand(geometry.ticket(), worker, lease);
                         if (demand == null) {
                             geometry.geometry().free();
-                            this.finishStaleWorker(geometry.ticket(), lease);
+                            this.finishStaleWorker(geometry.ticket(), worker, lease);
                             worker.releaseCompletion(lease);
                             return;
                         }
@@ -2406,14 +2406,17 @@ final class ClientSession {
                             this.catalogRequested = false;
                         }
                         Demand currentDemand = null;
+                        SectionDemandTable.Ticket sectionTicket = null;
                         SectionDemandTable.RegionDemand currentRegion = null;
                         boolean stale = switch (failed.task()) {
                             case SectionWorkerTask section -> {
-                                currentDemand = this.currentWorkerDemand(section.ticket(), worker, lease);
+                                sectionTicket = section.ticket();
+                                currentDemand = this.currentWorkerDemand(sectionTicket, worker, lease);
                                 yield currentDemand == null;
                             }
                             case EmptyWorkerTask empty -> {
-                                currentDemand = this.currentWorkerDemand(empty.ticket(), worker, lease);
+                                sectionTicket = empty.ticket();
+                                currentDemand = this.currentWorkerDemand(sectionTicket, worker, lease);
                                 yield currentDemand == null;
                             }
                             case IndexWorkerTask index -> {
@@ -2427,13 +2430,12 @@ final class ClientSession {
                             }
                             default -> true;
                         };
-                        if (failed.task() instanceof SectionWorkerTask section && stale) {
-                            this.finishStaleWorker(section.ticket(), lease);
+                        if (sectionTicket != null && stale) {
+                            this.finishStaleWorker(sectionTicket, worker, lease);
                         }
                         if (!stale && failed.task() instanceof EmptyWorkerTask) {
                             currentDemand.workLease = null;
-                            currentDemand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
-                            this.demands.ready(currentDemand, SectionDemandTable.ReadyKind.SOURCE);
+                            this.queueBound(currentDemand);
                         } else if (!stale && failed.task() instanceof SectionWorkerTask section) {
                             currentDemand.workLease = null;
                             this.demands.revise(currentDemand);
@@ -2473,28 +2475,29 @@ final class ClientSession {
 
         Demand currentWorkerDemand(SectionDemandTable.Ticket ticket, WorkerSlot worker,
                                    WorkerResource.Lease lease) {
-            if (!this.demands.current(ticket) || ticket.resourceSlot() != worker.index) return null;
+            if (!this.open.get() || !this.demands.current(ticket) || ticket.resourceSlot() != worker.index) return null;
             Demand demand = this.demands.get(ticket.key());
             return demand != null && lease.equals(demand.workLease)
                     && worker.resource.matches(lease) ? demand : null;
         }
 
-        void finishStaleWorker(SectionDemandTable.Ticket ticket, WorkerResource.Lease lease) {
+        void finishStaleWorker(SectionDemandTable.Ticket ticket, WorkerSlot worker, WorkerResource.Lease lease) {
+            if (!this.open.get() || ticket.sessionEpoch() != this.id || ticket.resourceSlot() != worker.index
+                    || !worker.resource.matches(lease)) return;
             Demand demand = this.demands.get(ticket.key());
             if (demand == null || !lease.equals(demand.workLease)) return;
             demand.workLease = null;
-            if (demand.pendingIndex == null || demand.pendingOrdinal < 0) {
-                if (demand.candidate == SectionDemandTable.CandidateState.READY_SOURCE)
-                    this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
-                return;
+            if (demand.candidate != SectionDemandTable.CandidateState.READY_SOURCE) return;
+            // Cancellation returns ownership, not authority to replace unfinished cached work.
+            // Its deferred server binding is consumed after the retried operation activates.
+            if (demand.content != null && demand.content.kind() != LocalSection.ABSENT) {
+                this.queueBound(demand);
+            } else {
+                demand.content = null;
+                demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
+                if (!this.bindAvailable(demand)) this.ensureRegion(demand.key);
             }
-            RegionalProtocol.RegionIndex index = demand.pendingIndex;
-            var catalog = demand.pendingCatalog;
-            int ordinal = demand.pendingOrdinal;
-            demand.pendingIndex = null;
-            demand.pendingCatalog = null;
-            demand.pendingOrdinal = -1;
-            this.bind(demand, index, ordinal, catalog);
+            ClientLodDebug.sectionRecovery(this, ticket, demand, lease);
         }
 
         void recordWorkerSource(boolean cacheHit, int compressedBytes, boolean meshed) {
