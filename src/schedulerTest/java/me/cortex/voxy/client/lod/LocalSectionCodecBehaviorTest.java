@@ -121,29 +121,73 @@ public final class LocalSectionCodecBehaviorTest {
              var codec = new LocalSectionCodec()) {
             CacheStartupBehaviorTest.awaitInventory(metadata.budget);
             LocalSection latest = null;
-            for (int generation = 1; generation <= 7; generation++) {
+            for (int generation = 1; generation <= 6; generation++) {
                 // Distinct source-catalog identities with unchanged names and numeric content.
                 latest = new LocalSection(0, LocalSection.DATA, 0, network.length, wire.length,
                         RegionalProtocol.crc32c(network), source, new RegionalProtocol.Hash32(generation, 2, 3, 4));
-                long before = RegionalDiskBudget.size(cache.path(0));
-                for (;;) {
-                    try (var save = cache.begin(latest, codec, wire, catalog, () -> true)) {
-                        while (!save.step()) check(metadata.budget.bytes <= RegionalDiskBudget.LIMIT,
-                                "streamed uncommitted record exceeded total disk allowance");
-                        break;
-                    } catch (CompletedSectionJournal.RotationRequired full) {
-                        check(RegionalDiskBudget.size(cache.path(0)) == before, "full shard lost its committed predecessor");
-                        check(cache.rotate(0), "unleased full shard could not rotate"); rotations++;
-                    }
-                }
+                cache.save(latest, codec, wire, catalog, () -> true, null);
                 check(Files.size(cache.path(0)) <= CompletedSectionJournal.MAX_BYTES,
                         "oversized valid section crossed regional safety ceiling");
             }
-            check(rotations == 1, "fixture did not exercise the real full-region boundary");
-            var decoded = cache.get(latest, codec, (name, biome) -> biome ? 7
+            var previous = latest;
+            latest = new LocalSection(0, LocalSection.DATA, 0, network.length, wire.length,
+                    RegionalProtocol.crc32c(network), source, new RegionalProtocol.Hash32(7, 2, 3, 4));
+            long committedBytes = Files.size(cache.path(0));
+            try (var partial = cache.begin(latest, codec, wire, catalog, () -> true)) {
+                check(!partial.step(), "large save did not leave a bounded partial output");
+                Thread.currentThread().interrupt(); // Interrupt only this append's channel.
+            } catch (IOException expected) {
+                check(Thread.currentThread().isInterrupted(), "partial-save fixture failed for another reason");
+            } finally { Thread.interrupted(); }
+            check(metadata.budget.bytes == Files.size(cache.path(0)) + Files.size(root.resolve("cache-format")),
+                    "interrupted partial output escaped disk accounting");
+            var decoded = cache.get(previous, codec, (name, biome) -> biome ? 7
                     : Integer.parseInt(name.substring(6, name.indexOf('_'))) + 1);
+            check(Files.size(cache.path(0)) == committedBytes, "next owner did not recover interrupted writer tail");
             check(decoded != null && decoded.usedBlocks().length == 16368,
-                    "valid record over 4 MiB was skipped or lost after rotation");
+                    "interrupted append damaged its committed predecessor");
+
+            var readerEntered = new java.util.concurrent.CountDownLatch(1);
+            var readerResume = new java.util.concurrent.CountDownLatch(1);
+            var pool = java.util.concurrent.Executors.newFixedThreadPool(3);
+            final LocalSection seventh = latest;
+            try {
+                var reading = pool.submit(() -> {
+                    try (var local = new LocalSectionCodec()) {
+                        return cache.get(previous, local, (name, biome) -> {
+                            readerEntered.countDown();
+                            try { if (!readerResume.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("reader timeout"); }
+                            catch (InterruptedException stop) { throw new IOException(stop); }
+                            return biome ? 7 : Integer.parseInt(name.substring(6, name.indexOf('_'))) + 1;
+                        });
+                    }
+                });
+                check(readerEntered.await(5, java.util.concurrent.TimeUnit.SECONDS), "reader did not own old incarnation");
+                var rotating = pool.submit(() -> {
+                    try (var local = new LocalSectionCodec()) { cache.save(seventh, local, wire, catalog, () -> true, null); }
+                    return true;
+                });
+                boolean draining = false;
+                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                while (!draining && System.nanoTime() < deadline) {
+                    try (var pin = metadata.budget.pin(cache.path(0))) { Thread.sleep(1); }
+                    catch (IOException retired) { draining = true; }
+                }
+                check(draining && !rotating.isDone(), "rotation failed to drain readers or allowed new pins to starve it");
+                var waiting = pool.submit(() -> {
+                    try (var local = new LocalSectionCodec()) { cache.save(seventh, local, wire, catalog, () -> true, null); }
+                    return true;
+                });
+                readerResume.countDown();
+                check(reading.get(10, java.util.concurrent.TimeUnit.SECONDS).usedBlocks().length == 16368,
+                        "rotation closed another reader's channel");
+                check(rotating.get(10, java.util.concurrent.TimeUnit.SECONDS) && waiting.get(10, java.util.concurrent.TimeUnit.SECONDS),
+                        "rotation waiter did not re-resolve the replacement journal");
+            } finally { readerResume.countDown(); pool.shutdownNow(); check(pool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS), "rotation leaked workers"); }
+            rotations = Math.toIntExact(metadata.budget.stamp());
+            check(rotations == 1, "fixture did not exercise one real full-region replacement");
+            decoded = cache.get(latest, codec, (name, biome) -> biome ? 7 : Integer.parseInt(name.substring(6, name.indexOf('_'))) + 1);
+            check(decoded != null && decoded.usedBlocks().length == 16368, "valid oversized record lost after concurrent rotation");
             check(metadata.budget.bytes == Files.size(cache.path(0)) + Files.size(root.resolve("cache-format")),
                     "oversized append/rotation disk accounting mismatch");
             System.out.println("LOCAL_JOURNAL largeRecordRotations=" + rotations + " diskBytes=" + metadata.budget.bytes);

@@ -15,21 +15,99 @@ final class RegionalDiskBudget {
     private static final Map<Path, WeakReference<RegionalDiskBudget>> OPEN = new HashMap<>();
     final Path root;
     final long limit;
-    volatile long bytes = -1, eviction, pinRevision;
+    volatile long bytes = -1, eviction;
     enum InventoryState { NEW, SCANNING, CLEANING, READY, FAILED, CLOSED }
     private volatile InventoryState state = InventoryState.NEW;
     private volatile String inventoryFailure;
     private volatile long inventoryNanos, inventoryStarted;
     private volatile Thread maintenance;
     private final LocalCacheOwnership ownership;
-    private final Map<Path, Integer> pins = new HashMap<>();
     private final LinkedHashMap<Path, Long> files = new LinkedHashMap<>();
-    private final Map<Path, CompletedSectionJournal> journals = new HashMap<>();
-    private final Map<Path, Integer> directories = new HashMap<>();
+    private final Map<Path, Region> regions = new HashMap<>();
     private final ReentrantLock changes = new ReentrantLock();
-    private final Set<Path> removing = new HashSet<>();
     private final java.util.concurrent.CountDownLatch disposed = new java.util.concurrent.CountDownLatch(1);
     private int owners;
+
+    private static final class Region {
+        final ReentrantLock writer = new ReentrantLock(true);
+        CompletedSectionJournal journal; // Region monitor; identity outlives the file incarnation.
+        int pins, directories, writers; // Budget monitor, including waiting writer references.
+        boolean draining;
+    }
+
+    static void checkCurrent(java.util.function.BooleanSupplier current) {
+        if (!current.getAsBoolean() || Thread.currentThread().isInterrupted())
+            throw new java.util.concurrent.CancellationException("cache write superseded");
+    }
+    private static void lock(ReentrantLock lock) throws IOException {
+        try { lock.lockInterruptibly(); }
+        catch (InterruptedException stopped) {
+            Thread.currentThread().interrupt();
+            throw new java.io.InterruptedIOException("cache writer interrupted");
+        }
+    }
+    Writer writer(Path path, java.util.function.BooleanSupplier current) throws IOException {
+        Region region;
+        synchronized (this) {
+            if (this.state == InventoryState.CLOSED) throw new IOException("closed cache");
+            region = this.regions.computeIfAbsent(path, ignored -> new Region());
+            region.writers++;
+        }
+        boolean locked = false, acquired = false;
+        try {
+            checkCurrent(current);
+            lock(region.writer); locked = true;
+            checkCurrent(current);
+            var writer = new Writer(path, region);
+            acquired = true;
+            return writer;
+        } finally {
+            if (!acquired) {
+                if (locked) region.writer.unlock();
+                releaseWriter(path, region);
+            }
+        }
+    }
+    final class Writer implements AutoCloseable {
+        final Path path;
+        private final Region region;
+        private boolean closed;
+        private Writer(Path path, Region region) { this.path = path; this.region = region; }
+        void rotate(java.util.function.BooleanSupplier current) throws IOException {
+            if (!ClientLodDebug.cacheDeletionAllowed(this.path)) throw new IOException("cache rotation outside test namespace");
+            // Own no pin here. Deny fresh readers while the old incarnation drains.
+            synchronized (RegionalDiskBudget.this) {
+                this.region.draining = true;
+                try {
+                    while (this.region.pins != 0) {
+                        checkCurrent(current);
+                        RegionalDiskBudget.this.wait();
+                    }
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                    this.region.draining = false;
+                    throw new java.io.InterruptedIOException("cache rotation interrupted");
+                } catch (RuntimeException cancelled) {
+                    this.region.draining = false; throw cancelled;
+                }
+            }
+            try {
+                checkCurrent(current);
+                lock(changes);
+                try { remove(this.path, this.region); }
+                finally { changes.unlock(); }
+            } finally { synchronized (RegionalDiskBudget.this) { this.region.draining = false; } }
+        }
+        @Override public void close() {
+            if (this.closed) return;
+            this.closed = true;
+            this.region.writer.unlock(); releaseWriter(this.path, this.region);
+        }
+    }
+    private void releaseWriter(Path path, Region region) {
+        synchronized (this) { region.writers--; }
+        forgetUnused(path);
+    }
 
     static synchronized RegionalDiskBudget acquire(Path root) throws IOException {
         root = root.toAbsolutePath().normalize();
@@ -64,11 +142,23 @@ final class RegionalDiskBudget {
             if (this.owners <= 0) throw new IllegalStateException("cache owner underflow");
             if (--this.owners != 0) return;
             this.state = InventoryState.CLOSED;
+            this.notifyAll();
             if (this.maintenance != null) { this.maintenance.interrupt(); return; }
         }
         closeOwnership();
     }
     boolean ready() { return this.state == InventoryState.READY; }
+    synchronized void awaitReady(java.util.function.BooleanSupplier current) throws IOException {
+        while (this.state == InventoryState.NEW || this.state == InventoryState.SCANNING || this.state == InventoryState.CLEANING) {
+            checkCurrent(current);
+            try { this.wait(); }
+            catch (InterruptedException stopped) {
+                Thread.currentThread().interrupt(); throw new java.io.InterruptedIOException("cache inventory wait interrupted");
+            }
+        }
+        checkCurrent(current);
+        if (!ready()) throw new IOException("cache persistence unavailable: " + this.state);
+    }
     RegionalMetadataStore.Persistence persistenceUnavailable() {
         return switch (this.state) {
             case READY -> null;
@@ -124,6 +214,7 @@ final class RegionalDiskBudget {
             synchronized (this) {
                 this.inventoryNanos = System.nanoTime() - start;
                 this.maintenance = null; closed = this.state == InventoryState.CLOSED;
+                this.notifyAll();
             }
             if (closed) closeOwnership();
         }
@@ -133,56 +224,58 @@ final class RegionalDiskBudget {
     }
     private void closeOwnership() {
         // Last cache owner is released only after its worker operations/leases drain.
-        synchronized (this.journals) {
-            for (var journal : this.journals.values()) try { journal.close(); }
+        for (var region : this.regions.values()) {
+            try { if (region.journal != null) region.journal.close(); }
             catch (IOException failure) { me.cortex.voxy.common.Logger.warn("Closing local journal", failure); }
-            this.journals.clear();
         }
+        this.regions.clear();
         try { this.ownership.close(); } catch (IOException failure) { me.cortex.voxy.common.Logger.warn("Closing cache ownership", failure); }
         finally { this.disposed.countDown(); }
     }
     synchronized Pin pin(Path path) throws IOException {
-        if (this.state == InventoryState.CLOSED || this.removing.contains(path)) throw new IOException("cache file unavailable");
-        this.pins.merge(path, 1, Integer::sum);
-        return new Pin(path);
+        if (this.state == InventoryState.CLOSED) throw new IOException("cache file unavailable");
+        Region region = this.regions.computeIfAbsent(path, ignored -> new Region());
+        if (region.draining) throw new IOException("cache incarnation retiring");
+        region.pins++;
+        return new Pin(path, region);
     }
     final class Pin implements AutoCloseable {
-        private final Path path; private boolean closed;
-        private Pin(Path path) { this.path = path; }
+        private final Path path; private final Region region; private boolean closed;
+        private Pin(Path path, Region region) { this.path = path; this.region = region; }
         @Override public void close() {
             synchronized (RegionalDiskBudget.this) {
                 if (this.closed) return;
                 this.closed = true;
-                pins.compute(this.path, (key, n) -> n == null || n == 1 ? null : n - 1);
-                pinRevision++;
+                if (--this.region.pins < 0) throw new IllegalStateException("cache pin underflow");
+                RegionalDiskBudget.this.notifyAll();
             }
             forgetUnused(this.path);
         }
     }
-    synchronized void retainDirectory(Path path) { this.directories.merge(path, 1, Integer::sum); }
+    synchronized void retainDirectory(Path path) { this.regions.computeIfAbsent(path, ignored -> new Region()).directories++; }
     void releaseDirectory(Path path) {
         synchronized (this) {
-            this.directories.compute(path, (key, n) -> n == null || n == 1 ? null : n - 1);
+            var region = this.regions.get(path);
+            if (region == null || --region.directories < 0) throw new IllegalStateException("cache directory underflow");
         }
         forgetUnused(path);
     }
     private void forgetUnused(Path path) {
-        CompletedSectionJournal forgotten;
-        synchronized (this.journals) {
-            synchronized (this) {
-                if (this.pins.containsKey(path) || this.directories.containsKey(path)) return;
-                forgotten = this.journals.remove(path);
-            }
+        Region forgotten;
+        synchronized (this) {
+            forgotten = this.regions.get(path);
+            if (forgotten == null || forgotten.pins != 0 || forgotten.directories != 0 || forgotten.writers != 0) return;
+            this.regions.remove(path);
         }
         // Production journals have no idle writer handle: append/recovery closes it.
         // Releasing a retained directory therefore performs no file access on the owner.
-        if (forgotten != null) try { forgotten.close(); }
+        if (forgotten.journal != null) try { forgotten.journal.close(); }
         catch (IOException failure) { me.cortex.voxy.common.Logger.warn("Closing released directory", failure); }
     }
     long stamp() { return this.eviction; }
 
     void reserve(Path path, long added) throws IOException {
-        this.changes.lock();
+        lock(this.changes);
         try {
             if (added < 0 || added > this.limit) throw new IOException("cache reservation exceeds hard limit");
             while (true) {
@@ -206,34 +299,47 @@ final class RegionalDiskBudget {
         return false;
     }
     boolean delete(Path path) throws IOException {
+        Region region;
         synchronized (this) {
-            if (this.pins.containsKey(path) || !ClientLodDebug.cacheDeletionAllowed(path) || !this.removing.add(path)) return false;
+            region = this.regions.computeIfAbsent(path, ignored -> new Region());
+            region.writers++;
         }
+        // Never wait for another region while reserve owns the capacity-change lock.
+        boolean locked = region.writer.tryLock();
         try {
-            synchronized (this.journals) {
-                var journal = this.journals.get(path);
-                if (journal != null) {
-                    if (journal.busy()) return false;
-                    journal.close(); this.journals.remove(path);
-                }
+            if (!locked) return false;
+            synchronized (this) {
+                if (region.pins != 0 || region.draining || !ClientLodDebug.cacheDeletionAllowed(path)) return false;
+                region.draining = true;
+            }
+            try { remove(path, region); return true; }
+            finally { synchronized (this) { region.draining = false; } }
+        } finally {
+            if (locked) region.writer.unlock();
+            releaseWriter(path, region);
+        }
+    }
+    private void remove(Path path, Region region) throws IOException {
+        synchronized (region) {
+            if (region.journal != null) {
+                region.journal.close(); region.journal = null;
             }
             LocalCacheOwnership.rejectLinks(path);
             Files.deleteIfExists(path);
-            synchronized (this) {
-                Long size = this.files.remove(path);
-                if (size != null) this.bytes -= size;
-                this.eviction++;
-            }
-            return true;
-        } finally { synchronized (this) { this.removing.remove(path); } }
+        }
+        synchronized (this) {
+            Long size = this.files.remove(path);
+            if (size != null) this.bytes -= size;
+            this.eviction++;
+        }
     }
     CompletedSectionJournal journal(Path path, RegionalProtocol.Hash32 world, long region, boolean create) throws IOException {
-        this.changes.lock();
-        try {
-        // Metadata-only recovery is shared, once per retained file incarnation.
-            CompletedSectionJournal journal;
-            synchronized (this.journals) { journal = this.journals.get(path); }
-            if (journal != null) return journal;
+        Region owner;
+        synchronized (this) { owner = this.regions.get(path); }
+        if (owner == null) throw new IllegalStateException("journal requires a pin or retained directory");
+        synchronized (owner) {
+            if (owner.journal != null && !owner.journal.closed()) return owner.journal;
+            owner.journal = null;
             boolean present = Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && Files.size(path) != 0;
             if (!present && !create) return null;
             if (!present) {
@@ -242,14 +348,14 @@ final class RegionalDiskBudget {
             }
             long before = size(path);
             try {
-                journal = CompletedSectionJournal.open(path, world, region, ready());
+                var journal = CompletedSectionJournal.open(path, world, region, ready());
                 journal.closeHandle();
-                synchronized (this.journals) { this.journals.put(path, journal); }
+                owner.journal = journal;
                 return journal;
             } finally {
                 if (ready()) resized(path, size(path) - before - (!present ? CompletedSectionJournal.HEADER_BYTES : 0));
             }
-        } finally { this.changes.unlock(); }
+        }
     }
     static long size(Path path) { try { return Files.size(path); } catch (IOException missing) { return 0; } }
     private static boolean managedName(Path path) {

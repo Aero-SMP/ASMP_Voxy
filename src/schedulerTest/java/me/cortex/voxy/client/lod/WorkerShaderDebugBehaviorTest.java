@@ -315,7 +315,7 @@ public final class WorkerShaderDebugBehaviorTest {
                 worker.assign(new ClientSession.Session.SectionWorkerTask(ticket, content,
                         ClientSession.Session.WorkerSource.NETWORK, fixture.payload(),
                         new RegionalSectionCodec.Mappings(CatalogCodec.decode(fixture.catalog().canonical())), cache, () -> true));
-                until(() -> work.copy().jobs() == 4);
+                until(() -> worker.resource.pendingResult() != null);
                 completed = worker.resource.claim();
                 check(completed.value() instanceof ClientSession.Session.WorkerGeometry,
                         "disk lock prevented mesh handoff");
@@ -323,9 +323,8 @@ public final class WorkerShaderDebugBehaviorTest {
                 worker.releaseCompletion(completed.lease());
                 check(session.retainedSaveBytes() > 0 && worker.resource.acquire() == null,
                         "mesh admission dropped its pending save obligation");
-                session.processMetadata();
-                until(() -> session.metadataWorker.workerThread.getState() == Thread.State.BLOCKED);
-                check(work.copy().jobs() == 4 && worker.resource.acquire() == null,
+                until(() -> worker.workerThread.getState() == Thread.State.BLOCKED);
+                check(work.copy().jobs() == 3 && worker.resource.acquire() == null,
                         "blocked save completed twice or released section ownership");
             }
             until(() -> {

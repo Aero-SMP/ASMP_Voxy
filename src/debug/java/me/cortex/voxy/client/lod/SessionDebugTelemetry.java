@@ -13,6 +13,7 @@ final class SessionDebugTelemetry {
         final long start = System.nanoTime();
         long firstLocal, hello, localViews, localActivations, validated, replacements, invalidations, metadataBytes;
         long admissionReleases, meshToLeaseReleaseNanos, maxMeshToLeaseReleaseNanos;
+        long workerReuses, publishedToReusableNanos, maxPublishedToReusableNanos;
         long nextSample;
         long subscriptions, subscriptionPeak, subscriptionRequests, subscriptionReleases, subscriptionStale;
         long windowNanos;
@@ -56,6 +57,10 @@ final class SessionDebugTelemetry {
             case "replacement" -> stats.replacements++;
             case "invalidation", "worldCorrection" -> stats.invalidations++;
             case "metadata" -> stats.metadataBytes += bytes;
+            case "workerReusable" -> {
+                stats.workerReuses++; stats.publishedToReusableNanos += bytes;
+                stats.maxPublishedToReusableNanos = Math.max(stats.maxPublishedToReusableNanos, bytes);
+            }
         }
     }
 
@@ -143,6 +148,9 @@ final class SessionDebugTelemetry {
                 + " replacements=" + stats.replacements + " invalidations=" + stats.invalidations
                 + " metadataNetworkBytes=" + stats.metadataBytes
                 + " admissionReleases=" + stats.admissionReleases
+                + " workerReuses=" + stats.workerReuses
+                + " publishedToReusableNanos=" + stats.publishedToReusableNanos
+                + " maxPublishedToReusableNanos=" + stats.maxPublishedToReusableNanos
                 + " admittedPending=" + admittedPending
                 + " meshToLeaseReleaseNanos=" + stats.meshToLeaseReleaseNanos
                 + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos;

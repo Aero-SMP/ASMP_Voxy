@@ -28,7 +28,7 @@ public final class ClientLodDebug {
     static void workerBegin(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {}
     static void workerStage(Object state, String stage) {}
     static void workerOutcome(Object state, String outcome, long bytes) {}
-    static void workerEnd(Object state) {}
+    static void workerEnd(Object state, LocalSectionCodec codec) {}
     static void workerClosing(Object state) {}
     static void workerEvidence(String message) {}
     static void shaderArtifact(String text) {}

@@ -32,6 +32,8 @@ final class WorkerResource<T> {
         return lease != null && lease.slot == this.slot && lease.generation == this.generation
                 && this.state != State.IDLE && this.state != State.CLOSED;
     }
+    synchronized boolean savePending() { return this.savePending; }
+    synchronized boolean releaseRequested() { return this.releaseRequested; }
 
     void complete(Lease lease, T value) {
         Objects.requireNonNull(value);
@@ -89,6 +91,7 @@ final class WorkerResource<T> {
         T owned;
         synchronized (this) {
             this.state = State.CLOSED;
+            this.savePending = this.releaseRequested = false;
             owned = this.result;
             this.result = null;
         }

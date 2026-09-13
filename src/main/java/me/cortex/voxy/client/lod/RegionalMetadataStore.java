@@ -47,7 +47,8 @@ final class RegionalMetadataStore implements AutoCloseable {
         var unavailable = this.budget.persistenceUnavailable();
         if (unavailable != null) return unavailable;
         Path path = association(server, dimension), temporary = path.resolveSibling(path.getFileName() + ".pending");
-        try (var pin = this.budget.pin(path); var pending = this.budget.pin(temporary)) {
+        try (var writer = this.budget.writer(path, current);
+             var pin = this.budget.pin(path); var pending = this.budget.pin(temporary)) {
             LocalCacheOwnership.rejectLinks(path); LocalCacheOwnership.rejectLinks(temporary);
             if (world.equals(world(server, dimension))) return Persistence.PERSISTED;
             Files.createDirectories(path.getParent());

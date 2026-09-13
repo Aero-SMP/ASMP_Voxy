@@ -36,8 +36,88 @@ public final class CompletedSectionJournalBehaviorTest {
             sharedDirectoryAndReaders(root.resolve("cache"));
             abortedReservation(root.resolve("budget.vxlocal"));
             associationAndPressure(root.resolve("pressure"));
+            orderedWritersAndAbsence(root.resolve("writers"));
+            parallelCapacity(root.resolve("parallel-capacity"));
             System.out.println("local journal: truncation, integrity, catalog identity, absence, leases and disk accounting passed");
         } finally { cleanup(root); }
+    }
+    private static void orderedWritersAndAbsence(Path root) throws Exception {
+        var fixture = fixture(1, 0, 240, 1);
+        try (var metadata = new RegionalMetadataStore(root);
+             var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION)) {
+            awaitInventory(metadata.budget);
+            cache.absentRegion(77, () -> true);
+            check(!Files.exists(cache.path(77)), "no-data absence created a journal");
+            storeSection(cache, fixture, 340);
+            var content = LocalSection.from(fixture.index(), 340, fixture.catalog().fingerprint());
+            var names = CatalogCodec.decode(fixture.catalog().canonical());
+            var current = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var entered = new CountDownLatch(1);
+            var executor = Executors.newFixedThreadPool(2);
+            Future<?> obsolete, reset;
+            try {
+                try (var held = metadata.budget.writer(cache.path(0), () -> true)) {
+                    obsolete = executor.submit(() -> {
+                        try (var codec = new LocalSectionCodec(); var wire = new RegionalSectionCodec()) {
+                            byte[] canonical = wire.decompress(fixture.payload(), content.canonicalBytes());
+                            cache.save(content, codec, canonical, names,
+                                    () -> { entered.countDown(); return current.get(); }, null);
+                            throw new AssertionError("obsolete waiter saved");
+                        } catch (CancellationException expected) { }
+                        catch (IOException failure) { throw new AssertionError("contention counted as I/O failure", failure); }
+                    });
+                    check(entered.await(5, TimeUnit.SECONDS), "writer did not wait");
+                    current.set(false);
+                    reset = executor.submit(() -> {
+                        try { cache.absentRegion(0, () -> true); }
+                        catch (IOException failure) { throw new AssertionError(failure); }
+                    });
+                }
+                obsolete.get(5, TimeUnit.SECONDS); reset.get(5, TimeUnit.SECONDS);
+                long after = Files.size(cache.path(0));
+                for (int i = 0; i < 10; i++) cache.absentRegion(0, () -> true);
+                check(cache.directory(0).isEmpty() && Files.size(cache.path(0)) == after,
+                        "obsolete save resurrected absence or repeated resets grew file");
+                storeSection(cache, fixture, 340);
+                check(cache.directory(0).containsKey(KEY), "successor failed after cancelled writer/reset");
+            } finally { executor.shutdownNow(); check(executor.awaitTermination(5, TimeUnit.SECONDS), "writer wait leaked"); }
+        }
+    }
+
+    private static void parallelCapacity(Path root) throws Exception {
+        var budget = new RegionalDiskBudget(root, 700);
+        try (var metadata = new RegionalMetadataStore(budget);
+             var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION)) {
+            awaitInventory(budget);
+            var first = fixture(1, 0, 240, 1, 0, 0);
+            var second = fixture(1, 0, 240, 1, 1, 0);
+            storeSection(cache, first, 340); storeSection(cache, second, 340);
+            var entered = new CountDownLatch(2);
+            var executor = Executors.newFixedThreadPool(2);
+            var results = new ArrayList<Future<Boolean>>();
+            try {
+                for (int x = 0; x < 2; x++) {
+                    var next = fixture(2, 0, 224, 1, x, 0);
+                    results.add(executor.submit(() -> {
+                        var content = LocalSection.from(next.index(), 340, next.catalog().fingerprint());
+                        try (var wire = new RegionalSectionCodec(); var codec = new LocalSectionCodec();
+                             var save = cache.begin(content, codec, wire.decompress(next.payload(), content.canonicalBytes()),
+                                     CatalogCodec.decode(next.catalog().canonical()), () -> true)) {
+                            entered.countDown();
+                            check(entered.await(5, TimeUnit.SECONDS), "parallel append did not own its region");
+                            while (!save.step()) {}
+                            return true;
+                        } catch (IOException capacity) { return false; }
+                    }));
+                }
+                int successes = 0;
+                for (var result : results) if (result.get(5, TimeUnit.SECONDS)) successes++;
+                check(successes < 2, "capacity fixture did not exercise exhaustion");
+                check(budget.bytes <= budget.limit && budget.bytes == Files.size(root.resolve("cache-format"))
+                                + RegionalDiskBudget.size(cache.path(0)) + RegionalDiskBudget.size(cache.path(1)),
+                        "simultaneous partial writes escaped shared hard accounting");
+            } finally { executor.shutdownNow(); check(executor.awaitTermination(5, TimeUnit.SECONDS), "capacity lock deadlocked writers"); }
+        }
     }
     private static void framing(Path path) throws Exception {
         var a = fixture(1, 1, 240, 1); var b = fixture(2, 1, 224, 2);

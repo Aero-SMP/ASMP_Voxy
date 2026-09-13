@@ -392,14 +392,12 @@ final class ClientSession {
         final java.util.concurrent.ConcurrentHashMap<String, Integer> blockNames = new java.util.concurrent.ConcurrentHashMap<>();
         final java.util.concurrent.ConcurrentHashMap<String, Integer> biomeNames = new java.util.concurrent.ConcurrentHashMap<>();
         volatile long resolvedNameCharacters;
-        WorkerSlot savingWorker;
         final java.util.concurrent.ConcurrentHashMap<RegionalProtocol.Hash32,
                 java.lang.ref.WeakReference<RegionalSectionCodec.BoundCatalog>> savedMappings =
                 new java.util.concurrent.ConcurrentHashMap<>();
         final LinkedHashMap<Long, SaveMetadataTask> metadataWrites = new LinkedHashMap<>();
         volatile AssociationTask associationIntent;
         int metadataTurn;
-        int nextSaveWorker;
         PersistTask deferredPersistence;
         final long[] persistenceOutcomes = new long[RegionalMetadataStore.Persistence.values().length];
         long associationPersisted, regionPersisted;
@@ -467,7 +465,7 @@ final class ClientSession {
 
         enum WorkerSource { CACHE, NETWORK }
         sealed interface WorkerTask permits SectionWorkerTask, IndexWorkerTask, EmptyWorkerTask,
-                BootstrapTask, OpenWorldTask, LoadMetadataTask, PersistTask, CatalogWorkerTask, SaveStepTask {}
+                BootstrapTask, OpenWorldTask, LoadMetadataTask, PersistTask, CatalogWorkerTask {}
         record EmptyWorkerTask(SectionDemandTable.Ticket ticket, byte children, LocalSection content,
                                CompletedSectionCache cache, java.util.function.BooleanSupplier current)
                 implements WorkerTask {
@@ -484,7 +482,7 @@ final class ClientSession {
                 implements WorkerTask {}
         sealed interface WorkerResult permits WorkerMiss,
                 WorkerGeometry, WorkerIndex, WorkerFailure, WorkerBootstrap, WorkerWorld,
-                WorkerMetadata, WorkerSaved, WorkerCatalog, WorkerSaveStep {}
+                WorkerMetadata, WorkerSaved, WorkerCatalog {}
         record BootstrapTask(Path root, String server, String dimension) implements WorkerTask {}
         private record OpenWorldTask(long view, RegionalProtocol.Hash32 world) implements WorkerTask {}
         private record AssociationTask(long view, RegionalProtocol.Hash32 world) {}
@@ -505,11 +503,11 @@ final class ClientSession {
         private record WorkerCatalog(CatalogWorkerTask task, CatalogCodec.Catalog catalog) implements WorkerResult {}
         private record WorkerMiss(SectionDemandTable.Ticket ticket, boolean corrupt, LocalSection fallback)
                 implements WorkerResult {}
-        private record SaveStepTask(WorkerSlot slot, SaveInput input) implements WorkerTask {}
         private record SaveInput(WorkerResource.Lease lease, SectionDemandTable.Ticket ticket,
                                  LocalSection content, CompletedSectionCache cache, byte[] canonical,
                                  CatalogCodec.Catalog source, java.util.function.BooleanSupplier current) {}
-        private record WorkerSaveStep(SaveStepTask task, boolean done, boolean committed, String failure) implements WorkerResult {}
+        private record SaveOutcome(WorkerResource.Lease lease, SectionDemandTable.Ticket ticket,
+                                   LocalSection content, boolean committed, Throwable failure) {}
         private static final class NameWait {
             final String canonical; final boolean biome;
             boolean done; int id; IOException failure;
@@ -518,12 +516,7 @@ final class ClientSession {
         private record ModelWait(SectionWorkerTask task, RegionalSectionCodec.SectionData section) {}
         record WorkerGeometry(SectionDemandTable.Ticket ticket, BuiltSection geometry,
                                       long completedNanos, boolean cacheHit,
-                                      int compressedBytes, LocalSection committed) implements WorkerResult {
-            WorkerGeometry(SectionDemandTable.Ticket ticket, BuiltSection geometry, long completedNanos,
-                           boolean cacheHit, int compressedBytes) {
-                this(ticket, geometry, completedNanos, cacheHit, compressedBytes, null);
-            }
-        }
+                                      int compressedBytes) implements WorkerResult {}
         private record WorkerIndex(IndexWorkerTask task, RegionalProtocol.RegionIndex index)
                 implements WorkerResult {}
         private record WorkerFailure(WorkerTask task, int slot, Throwable failure)
@@ -538,7 +531,8 @@ final class ClientSession {
             final LocalSectionCodec localCodec = new LocalSectionCodec();
             private volatile NameWait nameWait;
             private volatile SaveInput saveInput;
-            private CompletedSectionCache.Save saveProgress; // Metadata worker only; at most one streaming append.
+            private volatile SaveOutcome saveOutcome;
+            private long geometryPublishedNanos;
             final WorkerResource<WorkerResult> resource;
             private WorkerTask task;
             private WorkerResource.Lease taskLease;
@@ -571,7 +565,17 @@ final class ClientSession {
             }
             boolean idle() { return this.resource.state() == WorkerResource.State.IDLE; }
             void releaseCompletion(WorkerResource.Lease lease) {
-                if (this.resource.release(lease)) signal();
+                if (this.resource.release(lease)) this.reusable();
+            }
+            private void reusable() {
+                if (this.geometryPublishedNanos != 0) ClientLodDebug.startupEvent(Session.this,
+                        "workerReusable", Math.max(0, System.nanoTime() - this.geometryPublishedNanos));
+                this.geometryPublishedNanos = 0;
+                signal();
+            }
+            private synchronized void cancelObsoleteSave() {
+                var input = this.saveInput;
+                if (input != null && !input.current().getAsBoolean()) this.workerThread.interrupt();
             }
 
             private void run() {
@@ -588,6 +592,7 @@ final class ClientSession {
                                 }
                             }
                             if (this.resource.state() == WorkerResource.State.CLOSED) return;
+                            Thread.interrupted(); // Cancellation belongs only to the preceding operation.
                             claimed = this.task;
                             lease = this.taskLease;
                             this.task = null;
@@ -599,12 +604,13 @@ final class ClientSession {
                                 case SectionWorkerTask section -> this.section(section);
                                 case IndexWorkerTask index -> this.index(index);
                                 case EmptyWorkerTask empty -> {
-                                    boolean committed = false;
-                                    try { if (empty.cache() != null) committed = empty.cache().put(empty.content(), null, empty.current()); }
-                                    catch (IOException optional) { /* Empty geometry does not depend on persistence. */ }
+                                    if (empty.cache() != null && empty.current().getAsBoolean()) {
+                                        this.resource.retainSave(lease);
+                                        this.saveInput = new SaveInput(lease, empty.ticket(), empty.content(),
+                                                empty.cache(), null, null, empty.current());
+                                    }
                                     yield new WorkerGeometry(empty.ticket(), BuiltSection.emptyWithChildren(empty.ticket().key(),
-                                            empty.ticket().demandRevision(), empty.children()), System.nanoTime(), true, 0,
-                                            committed ? empty.content() : null);
+                                            empty.ticket().demandRevision(), empty.children()), System.nanoTime(), true, 0);
                                 }
                                 case BootstrapTask bootstrap -> {
                                     var store = new RegionalMetadataStore(bootstrap.root());
@@ -618,7 +624,6 @@ final class ClientSession {
                                     yield new WorkerWorld(world.view(), cache);
                                 }
                                 case LoadMetadataTask load -> this.loadMetadata(load);
-                                case SaveStepTask save -> this.saveStep(save);
                                 case PersistTask save -> this.persist(save);
                                 case CatalogWorkerTask catalog -> {
                                     if (!hash32(catalog.message().canonical()).equals(catalog.message().fingerprint())) {
@@ -634,17 +639,21 @@ final class ClientSession {
                         }
                         try {
                             ClientLodDebug.workerStage(this.debugWork, "RESULT_READY");
+                            if (completion instanceof WorkerGeometry) this.geometryPublishedNanos = System.nanoTime();
                             this.resource.complete(lease, completion);
+                            // The mesh and original compressed task leave this scope BEFORE saving.
+                            completion = null;
+                            claimed = null;
+                            signal();
+                            if (this.saveInput != null) this.save();
                         } finally {
-                            ClientLodDebug.workerEnd(this.debugWork);
+                            ClientLodDebug.workerEnd(this.debugWork, this.localCodec);
                         }
                         signal();
                     }
                 } finally {
-                    if (this.saveProgress != null) try { this.saveProgress.close(); }
-                    catch (IOException optional) { Logger.warn("Closing optional cache save", optional); }
-                    this.saveProgress = null;
                     this.saveInput = null;
+                    this.saveOutcome = null;
                     this.localCodec.close();
                     this.codec.close();
                     if (this.index == -1 && metadata != null) metadata.close();
@@ -693,7 +702,7 @@ final class ClientSession {
                     ClientLodDebug.workerOutcome(this.debugWork, "MESH_BYTES",
                             geometry.geometryBuffer == null ? 0 : geometry.geometryBuffer.size);
                     return new WorkerGeometry(task.ticket(), geometry, System.nanoTime(), cacheHit,
-                            cacheHit ? Math.toIntExact(this.localCodec.decodedBytes()) : task.compressed().length, null);
+                            cacheHit ? Math.toIntExact(this.localCodec.decodedBytes()) : task.compressed().length);
                 } catch (Throwable failure) { geometry.free(); throw failure; }
             }
 
@@ -718,41 +727,29 @@ final class ClientSession {
                 }
             }
 
-            private volatile long rotationWait = -1;
-            private WorkerSaveStep saveStep(SaveStepTask task) {
-                var input = task.input();
-                boolean committed = false, done = true;
-                String failure = null;
+            private void save() {
+                var input = this.saveInput;
+                boolean committed = false;
+                Throwable failure = null;
                 try {
-                    if (input.current().getAsBoolean()) {
-                        if (this.rotationWait >= 0) {
-                            long revision = input.cache().pinRevision();
-                            if (!input.cache().rotate(input.content().region())) {
-                                this.rotationWait = revision;
-                                return new WorkerSaveStep(task, false, false, null);
-                            }
-                            this.rotationWait = -1;
-                        }
-                        if (this.saveProgress == null) this.saveProgress = input.cache().begin(input.content(), this.localCodec,
-                                input.canonical(), input.source(), input.current());
-                        done = this.saveProgress.step();
-                        committed = done;
+                    input.cache().save(input.content(), this.localCodec, input.canonical(), input.source(), input.current(), this.debugWork);
+                    committed = true;
+                    ClientLodDebug.workerOutcome(this.debugWork, "SAVE_SUCCESS", 0);
+                } catch (Throwable problem) {
+                    if (problem instanceof IOException && (Thread.currentThread().isInterrupted() || !input.current().getAsBoolean())) {
+                        var cancelled = new java.util.concurrent.CancellationException("section save cancelled");
+                        cancelled.initCause(problem); problem = cancelled;
                     }
-                } catch (CompletedSectionJournal.RotationRequired full) {
-                    try {
-                        this.saveProgress.close(); this.saveProgress = null;
-                        long revision = input.cache().pinRevision();
-                        this.rotationWait = input.cache().rotate(input.content().region()) ? -1 : revision;
-                        done = false; // Same save obligation, fresh bounded shard, ordinary streaming path.
-                    } catch (IOException optional) { failure = optional.toString(); }
-                } catch (Exception optional) { failure = optional.toString(); }
-                if (done && this.saveProgress != null) {
-                    try { this.saveProgress.close(); }
-                    catch (IOException optional) { failure = optional.toString(); }
-                    this.saveProgress = null;
+                    failure = problem;
+                    ClientLodDebug.workerOutcome(this.debugWork,
+                            problem instanceof java.util.concurrent.CancellationException
+                                    || problem instanceof java.io.InterruptedIOException ? "SAVE_CANCELLED" : "SAVE_FAILURE", 0);
                 }
-                if (done) this.rotationWait = -1;
-                return new WorkerSaveStep(task, done, committed, failure);
+                synchronized (this) {
+                    this.saveInput = null;
+                    this.saveOutcome = new SaveOutcome(input.lease(), input.ticket(), input.content(), committed, failure);
+                }
+                signal();
             }
 
             private void awaitModels(SectionWorkerTask task, RegionalSectionCodec.SectionData section)
@@ -2029,7 +2026,7 @@ final class ClientSession {
             long bytes = 0;
             for (var worker : this.sectionWorkers) {
                 var input = worker.saveInput;
-                if (input != null) bytes += input.canonical().length;
+                if (input != null && input.canonical() != null) bytes += input.canonical().length;
             }
             return bytes;
         }
@@ -2047,40 +2044,13 @@ final class ClientSession {
                 this.metadataWorker.assign(new OpenWorldTask(this.viewRevision, this.worldIdentity));
                 return;
             }
-            // A suspended streaming save cannot starve discovery, nor wait for every region
-            // discovery to finish. Each claim advances one of the three existing obligations.
-            for (int attempt = 0; attempt < 3; attempt++) {
+            // Section saving no longer participates in metadata scheduling.
+            for (int attempt = 0; attempt < 2; attempt++) {
                 int stage = this.metadataTurn;
-                this.metadataTurn = (stage + 1) % 3;
-                boolean assigned = switch (stage) {
-                    case 0 -> this.loadLocalMetadata();
-                    case 1 -> this.persistMetadata();
-                    default -> this.persistSection();
-                };
+                this.metadataTurn = 1 - stage;
+                boolean assigned = stage == 0 ? this.loadLocalMetadata() : this.persistMetadata();
                 if (assigned) return;
             }
-        }
-
-        private boolean persistSection() {
-            if (this.metadata.budget.persistenceUnavailable() == RegionalMetadataStore.Persistence.DEFERRED_INVENTORY) return false;
-            if (this.savingWorker == null) for (int offset = 0; offset < this.sectionWorkers.length; offset++) {
-                int index = (this.nextSaveWorker + offset) % this.sectionWorkers.length;
-                var worker = this.sectionWorkers[index];
-                if (worker.saveInput != null) {
-                    this.savingWorker = worker;
-                    this.nextSaveWorker = (index + 1) % this.sectionWorkers.length;
-                    break;
-                }
-            }
-            if (this.savingWorker != null) {
-                var input = this.savingWorker.saveInput;
-                if (input == null) throw new IllegalStateException("lost owned save input");
-                if (input.current().getAsBoolean() && this.metadataWorker.rotationWait >= 0
-                        && this.metadataWorker.rotationWait == input.cache().pinRevision()) return false;
-                this.metadataWorker.assign(new SaveStepTask(this.savingWorker, input));
-                return true;
-            }
-            return false;
         }
 
         private boolean loadLocalMetadata() {
@@ -2282,6 +2252,20 @@ final class ClientSession {
         }
 
         void drainWorker(WorkerSlot worker) throws IOException {
+                worker.cancelObsoleteSave();
+                SaveOutcome outcome;
+                synchronized (worker) { outcome = worker.saveOutcome; worker.saveOutcome = null; }
+                if (outcome != null && worker.resource.matches(outcome.lease())) {
+                    if (outcome.committed()) {
+                        var demand = this.demands.get(outcome.ticket().key());
+                        if (demand != null && demand.revision == outcome.ticket().demandRevision()) this.recordCommitted(demand, outcome.content());
+                    }
+                    if (worker.resource.finishSave(outcome.lease())) worker.reusable();
+                    if (outcome.failure() instanceof IOException io) this.lastPersistenceFailure = io.toString();
+                    else if (outcome.failure() != null && !(outcome.failure() instanceof java.util.concurrent.CancellationException)) {
+                        throw new IllegalStateException("Section persistence invariant failed after geometry handoff", outcome.failure());
+                    }
+                }
                 WorkerResource.Completion<WorkerResult> completion = worker.resource.claim();
                 if (completion == null) return;
                 WorkerResource.Lease lease = completion.lease();
@@ -2298,22 +2282,6 @@ final class ClientSession {
                         worker.releaseCompletion(lease);
                     }
                     case WorkerSaved saved -> { this.savedMetadata(saved); worker.releaseCompletion(lease); }
-                    case WorkerSaveStep saved -> {
-                        if (saved.done()) {
-                            var input = saved.task().input();
-                            var source = saved.task().slot();
-                            if (saved.committed()) {
-                                var demand = this.demands.get(input.ticket().key());
-                                if (demand != null && demand.revision == input.ticket().demandRevision()) this.recordCommitted(demand, input.content());
-                            }
-                            if (saved.failure() != null) this.lastPersistenceFailure = saved.failure();
-                            if (source.saveInput != input) throw new IllegalStateException("save owner changed before acknowledgement");
-                            source.saveInput = null;
-                            source.resource.finishSave(input.lease());
-                            this.savingWorker = null;
-                        }
-                        worker.releaseCompletion(lease);
-                    }
                     case WorkerMetadata saved -> {
                         this.applyLocalIndex(saved);
                         worker.releaseCompletion(lease);
@@ -2419,7 +2387,6 @@ final class ClientSession {
                         this.recordWorkerSource(geometry.cacheHit(), geometry.compressedBytes(),
                                 true);
                         demand.candidateCacheHit = geometry.cacheHit();
-                        this.recordCommitted(demand, geometry.committed());
                         // Once observed, the demand is the sole owner of the mesh buffer. The
                         // worker remains reserved until renderer admission completes, but must
                         // neither redeliver nor free a buffer that may already be uploading.

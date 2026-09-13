@@ -8,14 +8,40 @@ import java.util.function.Consumer;
 /** One bounded record per actual worker. No task, session, Thread or buffer references retained. */
 final class WorkerDebugTelemetry {
     enum Stage { IDLE, TASK, METADATA, INDEX_DECODE, CACHE_READ, DECOMPRESS, DECODE_VALIDATE,
-        REQUEST_MODELS, CACHE_WRITE, CHECK_MODELS, MESH, CACHE_QUARANTINE, RESULT_READY, WAIT_MODELS }
-    enum Outcome { CACHE_HIT, CACHE_MISS, CACHE_CORRUPT, MODEL_WAIT, FAILURE, COMPRESSED_BYTES, CANONICAL_BYTES, MESH_BYTES, MODEL_RECLAIM }
+        REQUEST_MODELS, CACHE_WRITE, CHECK_MODELS, MESH, CACHE_QUARANTINE, RESULT_READY, WAIT_MODELS,
+        SAVE_ENCODE_WRITE, WAIT_REGION_WRITER }
+    enum Outcome { CACHE_HIT, CACHE_MISS, CACHE_CORRUPT, MODEL_WAIT, FAILURE, COMPRESSED_BYTES, CANONICAL_BYTES, MESH_BYTES, MODEL_RECLAIM,
+        SAVE_SUCCESS, SAVE_FAILURE, SAVE_CANCELLED }
     private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
+    private static final java.util.concurrent.atomic.AtomicLongArray FRAMES = new java.util.concurrent.atomic.AtomicLongArray(7);
+    private static long previousFrame;
+    static void frame() {
+        if (net.minecraft.client.Minecraft.getInstance().level == null) { previousFrame = 0; return; }
+        long now = System.nanoTime(), elapsed = now - previousFrame;
+        if (previousFrame != 0) {
+            int bucket = elapsed < 4_000_000 ? 0 : elapsed < 8_000_000 ? 1 : elapsed < 16_000_000 ? 2
+                    : elapsed < 33_000_000 ? 3 : elapsed < 50_000_000 ? 4 : elapsed < 100_000_000 ? 5 : 6;
+            FRAMES.incrementAndGet(bucket);
+        }
+        previousFrame = now;
+    }
+    private static String runtimeSample() {
+        long collections = 0, millis = 0;
+        for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            collections += Math.max(0, gc.getCollectionCount()); millis += Math.max(0, gc.getCollectionTime());
+        }
+        long[] frames = new long[FRAMES.length()];
+        for (int i = 0; i < frames.length; i++) frames[i] = FRAMES.get(i);
+        return " heapUsedBytes=" + ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed()
+                + " gcCollections=" + collections + " gcMillis=" + millis
+                + " frameGapBucketsMs=4,8,16,33,50,100,inf frameGapCounts=" + Arrays.toString(frames);
+    }
 
     static final class Work {
         final long session, thread;
         final int slot;
         long lease, key, revision, regionVersion, jobStart, stageStart, lastEnd, jobs, sequence, repeats;
+        volatile long nativeHighWater;
         String kind = "NONE", source = "NONE";
         Stage stage = Stage.IDLE;
         boolean closing;
@@ -116,6 +142,11 @@ final class WorkerDebugTelemetry {
         } else work.signature = null;
         work.observedLease = copy.lease; work.observedSequence = copy.sequence;
         work.priorCpu = cpu; work.priorSample = now; work.priorJobs = copy.jobs;
+        long allocated = -1;
+        try {
+            if (threads instanceof com.sun.management.ThreadMXBean bean && bean.isThreadAllocatedMemorySupported()
+                    && bean.isThreadAllocatedMemoryEnabled()) allocated = bean.getThreadAllocatedBytes(work.thread);
+        } catch (UnsupportedOperationException | SecurityException ignored) { }
         return " worker[" + work.slot + "]={thread=" + work.thread + " lease=" + copy.lease
                 + " task=" + copy.kind + " key=" + copy.key + " revision=" + copy.revision
                 + " regionVersion=" + copy.regionVersion + " source=" + copy.source + " stage=" + copy.stage
@@ -124,6 +155,8 @@ final class WorkerDebugTelemetry {
                 + " lastCompletionNs=" + copy.lastEnd + " completedTotal=" + copy.jobs + " completedDelta=" + completedDelta
                 + " repeatedTask=" + copy.repeats + " cpu=" + cpuStatus + " cpuDeltaNs=" + cpuDelta
                 + " cpuSameStage=" + sameStage + " sampleWallNs=" + wallDelta
+                + " localCodecNativeHighWaterBytes=" + work.nativeHighWater
+                + " threadAllocatedBytes=" + allocated
                 + "}";
     }
 
@@ -141,6 +174,9 @@ final class WorkerDebugTelemetry {
             if (worker.debugWork instanceof Work work) {
                 Copy copy = work.copy();
                 result.append(sample(work, copy, now, THREADS, ClientLodDebug::workerEvidence));
+                result.append(" saveSlot[").append(worker.index).append("]={pending=")
+                        .append(worker.resource.savePending()).append(" admissionReleased=")
+                        .append(worker.resource.releaseRequested()).append('}');
                 aggregate(copy, counts, totals, maxima, outcomes);
             }
         }
@@ -148,7 +184,7 @@ final class WorkerDebugTelemetry {
                 .append(" completedStageTotalNs=").append(Arrays.toString(totals))
                 .append(" completedStageMaxNs=").append(Arrays.toString(maxima))
                 .append(" workerOutcomeTotals=").append(Arrays.toString(outcomes));
-        return result.toString();
+        return result.append(runtimeSample()).toString();
     }
     private static void aggregate(Copy copy, long[] counts, long[] totals, long[] maxima, long[] outcomes) {
         for (int i = 0; i < counts.length; i++) {

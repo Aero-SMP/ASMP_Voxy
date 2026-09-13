@@ -13,7 +13,8 @@ public final class CompletedLocalCacheBehaviorTest {
     public static void main(String[] args) throws Exception { run(); }
     static void run() throws Exception {
         fineOnlyWithoutParents();
-        saveClaimsRotate();
+        concurrentWorkerSaves();
+        for (int mode = 0; mode < 4; mode++) publicationBeforeOwnedSave(mode);
         SectionDemandTableBehaviorTest.saveAndGeometryOwnOneWorkerLease();
         parkedModelsReleaseForCoverage();
         for (boolean serverFirst : new boolean[]{false, true}) staleFineAndRejoin(serverFirst);
@@ -23,7 +24,57 @@ public final class CompletedLocalCacheBehaviorTest {
         System.out.println("completed local cache: metadata-first races, all-LOD stale detail/rejoin and unchanged queued work passed");
     }
 
-    private static void saveClaimsRotate() throws Exception {
+    private static void publicationBeforeOwnedSave(int mode) throws Exception {
+        var root = Files.createTempDirectory(java.nio.file.Path.of("project_audit"), "owned-publication-");
+        var f = fixture(1, 0, 240, 1);
+        var budget = new RegionalDiskBudget(root, mode == 3 ? 32 : RegionalDiskBudget.LIMIT);
+        try (var metadata = new RegionalMetadataStore(budget);
+             var cache = new CompletedSectionCache(metadata, WORLD, DIMENSION)) {
+            awaitInventory(budget);
+            var publisher = new Publisher();
+            var s = new ClientSession.Session(92, DIMENSION, null, publisher, Driver.mesher(), 1);
+            s.metadata = metadata; s.worldIdentity = WORLD; s.cacheOpened = true;
+            s.blockNames.put("minecraft:stone", 15); s.biomeNames.put("minecraft:plains", 0);
+            var worker = s.sectionWorkers[0];
+            try {
+                var demand = s.demands.adopt(new ClientSession.Demand(KEY));
+                demand.content = LocalSection.from(f.index(), 340, f.catalog().fingerprint());
+                var ticket = demand.ticket(s.id, 0);
+                var task = new ClientSession.Session.SectionWorkerTask(ticket, demand.content,
+                        ClientSession.Session.WorkerSource.NETWORK, f.payload(),
+                        new RegionalSectionCodec.Mappings(CatalogCodec.decode(f.catalog().canonical())), cache,
+                        () -> s.open.get() && demand.revision == ticket.demandRevision());
+                try (var held = budget.writer(cache.path(0), () -> true)) {
+                    worker.start(); demand.workLease = worker.assign(task);
+                    s.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
+                    long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                    while (s.activeCount == 0 && System.nanoTime() < end) {
+                        s.drainWorkers(); s.processStages(); s.pollPublications(); s.awaitWake(1);
+                    }
+                    check(s.activeCount == 1 && publisher.publications.size() == 1 && !worker.idle(),
+                            "real publication waited for disk or reused a pending save slot");
+                    if (mode == 1) {
+                        s.retireDemand(KEY);
+                        while (!worker.idle() && System.nanoTime() < end) { s.drainWorkers(); s.awaitWake(1); }
+                        check(worker.idle() && s.retainedSaveBytes() == 0, "obsolete waiter did not wake/cancel under ownership");
+                    } else if (mode == 2) {
+                        worker.close(); worker.workerThread.join(5000);
+                        check(!worker.workerThread.isAlive() && s.retainedSaveBytes() == 0 && !worker.resource.savePending(),
+                                "shutdown remained blocked by a different regional writer");
+                    }
+                }
+                if (mode == 0 || mode == 3) {
+                    long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                    while (!worker.idle() && System.nanoTime() < end) { s.drainWorkers(); s.awaitWake(1); }
+                    check(worker.idle() && s.activeCount == 1 && s.failure == null && s.retainedSaveBytes() == 0,
+                            "save completion/failure destroyed active geometry or leaked its lease");
+                    check((s.lastPersistenceFailure != null) == (mode == 3), "optional save outcome misclassified");
+                }
+            } finally { s.open.set(false); s.release(); }
+        } finally { cleanup(root); }
+    }
+
+    private static void concurrentWorkerSaves() throws Exception {
         var root = Files.createTempDirectory(java.nio.file.Path.of("project_audit"), "fair-cache-saves-");
         var fixture = fixture(1, 0, 240, 1);
         try (var metadata = new RegionalMetadataStore(root);
@@ -37,26 +88,30 @@ public final class CompletedLocalCacheBehaviorTest {
             var content = LocalSection.from(fixture.index(), 0, fixture.catalog().fingerprint());
             try {
                 s.metadataWorker.start();
+                try (var held = metadata.budget.writer(cache.path(0), () -> true)) {
                 for (int i = 0; i < 3; i++) {
                     var worker = s.sectionWorkers[i]; worker.start();
-                    var demand = s.demands.adopt(new ClientSession.Demand(SectionKey.pack(0, i, 0, 0)));
+                    var demand = s.demands.adopt(new ClientSession.Demand(SectionKey.pack(0, i == 2 ? 16 : i, 0, 0)));
                     demand.content = new LocalSection(demand.key, content.kind(), content.children(), content.compressedBytes(),
                             content.canonicalBytes(), content.crc(), content.fingerprint(), content.catalog());
                     tasks[i] = new ClientSession.Session.SectionWorkerTask(demand.ticket(s.id, i), demand.content,
                             ClientSession.Session.WorkerSource.NETWORK, fixture.payload(), mappings, cache, () -> s.open.get());
                     admitOwnedMesh(worker, tasks[i]);
                 }
-                for (int expected = 0; expected < 3; expected++) {
-                    s.processMetadata();
-                    check(s.savingWorker == s.sectionWorkers[expected], "lower-numbered replacement starved an older save");
-                    long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
-                    while (!s.sectionWorkers[expected].idle() && System.nanoTime() < end) {
-                        s.drainWorkers(); s.awaitWake(1);
-                    }
-                    check(s.sectionWorkers[expected].idle() && s.lastPersistenceFailure == null, "save did not finish");
-                    // Refill a just-released early slot while later slots still need service.
-                    if (expected == 0) admitOwnedMesh(s.sectionWorkers[0], tasks[0]);
+                long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                while (!s.sectionWorkers[2].idle() && System.nanoTime() < end) { s.drainWorkers(); s.awaitWake(1); }
+                check(s.sectionWorkers[2].idle() && !s.sectionWorkers[0].idle() && !s.sectionWorkers[1].idle(),
+                        "another region did not finish independently of waiting writers");
+                check(s.acceptCatalog(fixture.catalog()), "saving slots blocked catalog admission");
+                while (s.currentCatalog == null && System.nanoTime() < end) { s.drainWorkers(); s.awaitWake(1); }
+                check(s.currentCatalog != null && s.metadataWorker.idle(), "metadata did not progress beside saving slots");
                 }
+                long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                while (java.util.Arrays.stream(s.sectionWorkers).anyMatch(w -> !w.idle()) && System.nanoTime() < end) { s.drainWorkers(); s.awaitWake(1); }
+                check(java.util.Arrays.stream(s.sectionWorkers).allMatch(w -> w.idle()) && s.lastPersistenceFailure == null,
+                        "same-region contention failed saves or retained leases");
+                check(cache.directory(0).size() == 2 && cache.directory(1).size() == 1,
+                        "concurrent saves did not replay complete bindings");
             } finally {
                 s.open.set(false); s.release();
                 s.metadataWorker.workerThread.join(5000);

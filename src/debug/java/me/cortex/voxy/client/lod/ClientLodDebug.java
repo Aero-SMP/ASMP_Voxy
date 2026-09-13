@@ -135,9 +135,13 @@ public final class ClientLodDebug {
     static void workerBegin(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {
         WorkerDebugTelemetry.begin((WorkerDebugTelemetry.Work) state, task, lease);
     }
-    static void workerStage(Object state, String stage) { ((WorkerDebugTelemetry.Work) state).stage(stage); }
+    static void workerStage(Object state, String stage) { if (state != null) ((WorkerDebugTelemetry.Work) state).stage(stage); }
     static void workerOutcome(Object state, String outcome, long bytes) { ((WorkerDebugTelemetry.Work) state).outcome(outcome, bytes); }
-    static void workerEnd(Object state) { ((WorkerDebugTelemetry.Work) state).end(); }
+    static void workerEnd(Object state, LocalSectionCodec codec) {
+        var work = (WorkerDebugTelemetry.Work) state;
+        work.nativeHighWater = Math.max(work.nativeHighWater, codec.nativeContextBytes());
+        work.end();
+    }
     static void workerClosing(Object state) { ((WorkerDebugTelemetry.Work) state).closing(); }
     static void workerEvidence(String message) { emit(message); }
     public static void shaderBegin(me.cortex.voxy.client.core.VoxyRenderSystem renderer, Object pipeline, long oldResources, long newResources) {
@@ -194,7 +198,7 @@ public final class ClientLodDebug {
         NeoForge.EVENT_BUS.addListener(ClientLodDebug::waterTagsUpdated);
         NeoForge.EVENT_BUS.addListener(ClientLodDebug::forceFullSpeed);
         NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, RenderFrameEvent.Post.class,
-                LiveClientTestHarness::renderFrame);
+                event -> { WorkerDebugTelemetry.frame(); LiveClientTestHarness.renderFrame(event); });
         NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, ScreenshotEvent.class,
                 ClientLodDebug::uploadScreenshot);
     }

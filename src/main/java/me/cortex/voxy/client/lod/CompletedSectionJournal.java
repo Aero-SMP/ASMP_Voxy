@@ -108,6 +108,8 @@ final class CompletedSectionJournal implements AutoCloseable {
             this.end += FRAME_BYTES + (long) length + FOOTER_BYTES;
         }
     }
+    synchronized boolean hasBindings() { return !this.bindings.isEmpty(); }
+    synchronized boolean closed() { return this.closed; }
     synchronized Map<Long, LocalSection> directory() throws IOException {
         checkOpen();
         var result = new HashMap<Long, LocalSection>(this.bindings.size());
@@ -278,7 +280,12 @@ final class CompletedSectionJournal implements AutoCloseable {
                         synchronized (CompletedSectionJournal.this) { closed = true; }
                         throw failure;
                     }
-                    finally { this.space.resized(writer.size() - this.start - this.charged); }
+                    finally {
+                        // An interrupt can close this writer's channel. Charge the surviving
+                        // tail until the next owner recovers/truncates it, never another append.
+                        long actual = java.nio.file.Files.size(path);
+                        this.space.resized(actual - this.start - this.charged);
+                    }
                 }
             } finally {
                 synchronized (CompletedSectionJournal.this) { appending = false; closeHandle(); }
