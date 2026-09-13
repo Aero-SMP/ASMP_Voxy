@@ -70,20 +70,20 @@ final class LocalSectionCodec implements AutoCloseable {
         } catch (Throwable failure) { this.busy = false; throw failure; }
     }
 
-    final class Encoder implements AutoCloseable {
+    final class Encoder implements CompletedSectionJournal.Source {
         private final NamesInput source;
         private final Buffers buffers = LocalSectionCodec.this.buffers();
         private long written;
         private boolean ended, released;
 
         private Encoder(NamesInput source) { this.source = source; }
-        long canonicalBytes() { return this.source.length; }
+        public long canonicalBytes() { return this.source.length; }
         long compressedBytes() { return this.written; }
 
         /** One bounded input/output step. The metadata owner may service discovery between steps.
          * The sink must reserve/charge each portion before writing it to the journal.
          */
-        boolean step(OutputStream sink) throws IOException {
+        public boolean step(OutputStream sink) throws IOException {
             if (this.released) throw new IOException("released local encoder");
             if (this.ended) return true;
             var b = this.buffers;

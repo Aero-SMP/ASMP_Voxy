@@ -255,6 +255,15 @@ tasks.register('debugHarnessPythonTest', Exec) {
     commandLine 'python3', '-m', 'unittest', 'tools/test_run_live_client_test.py'
 }
 
+tasks.register('unifiedPayloadPrototypeTest', JavaExec) {
+    description = 'Opt-in unified payload feasibility gate; requires Rust-emitted fixture directory.'
+    dependsOn tasks.named('schedulerTestClasses')
+    classpath = sourceSets.schedulerTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.client.lod.UnifiedPayloadPrototypeTest')
+    maxHeapSize = '512m'
+    args providers.gradleProperty('payloadFixtures').orElse('project_audit/payload_fixtures').get()
+}
+
 tasks.register('schedulerBehaviorTest', JavaExec) {
     description = 'Run coalesced demand-table ownership and priority tests'
     dependsOn tasks.named('schedulerTestClasses')

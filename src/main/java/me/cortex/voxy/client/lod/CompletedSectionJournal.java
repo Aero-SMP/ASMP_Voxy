@@ -32,6 +32,11 @@ final class CompletedSectionJournal implements AutoCloseable {
     record Binding(LocalSection section, long offset, long previous, long payload) {}
     /** Charge BEFORE writing, reconcile aborted tails including failed truncation. */
     interface Space { void reserve(long bytes) throws IOException; void resized(long delta); }
+    interface Source extends AutoCloseable {
+        boolean step(OutputStream sink) throws IOException;
+        long canonicalBytes();
+        @Override void close() throws IOException;
+    }
     static final class RotationRequired extends IOException {
         RotationRequired() { super("local journal rotation required"); }
     }
@@ -173,7 +178,7 @@ final class CompletedSectionJournal implements AutoCloseable {
             throw invalid; // A late reader cannot quarantine a concurrently repaired payload.
         } finally { synchronized (this) { this.readers--; } }
     }
-    synchronized Append begin(LocalSection section, LocalSectionCodec.Encoder encoder, Space space,
+    synchronized Append begin(LocalSection section, Source encoder, Space space,
                               BooleanSupplier current) throws IOException {
         checkOpen();
         if (this.appending) throw new IOException("local append already owned");
@@ -190,7 +195,7 @@ final class CompletedSectionJournal implements AutoCloseable {
     /** One append can remain suspended between steps; no monitor is held during encoding or I/O. */
     final class Append extends OutputStream {
         private final LocalSection section;
-        private final LocalSectionCodec.Encoder encoder;
+        private final Source encoder;
         private final Space space;
         private final BooleanSupplier current;
         private final long start = end;
@@ -199,7 +204,7 @@ final class CompletedSectionJournal implements AutoCloseable {
         private long charged, output;
         private boolean initialized, committed, released;
         private Payload payload;
-        private Append(LocalSection section, LocalSectionCodec.Encoder encoder, Space space, BooleanSupplier current) {
+        private Append(LocalSection section, Source encoder, Space space, BooleanSupplier current) {
             this.section = section; this.encoder = encoder; this.space = space; this.current = current;
             this.payload = section == null ? null : payloads.get(token(section));
         }

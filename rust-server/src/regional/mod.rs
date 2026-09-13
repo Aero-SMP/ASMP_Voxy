@@ -17,6 +17,8 @@ mod air_lighting_tests;
 mod faults;
 #[cfg(test)]
 mod refresh_measurements;
+#[cfg(test)]
+mod payload_prototype_tests;
 
 pub use builder::{RegionalBuild, RegionalBuildStats, rebuild_region, rebuild_region_incremental};
 pub use index::RegionIndex;
