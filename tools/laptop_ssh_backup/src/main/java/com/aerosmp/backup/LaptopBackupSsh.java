@@ -171,7 +171,8 @@ public final class LaptopBackupSsh {
                 try {
                     List<String> launch = WINDOWS
                             ? (command == null ? List.of("powershell.exe", "-NoLogo", "-NoProfile", "-Command", "-")
-                                : List.of("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command))
+                                : List.of("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                                        Base64.getEncoder().encodeToString(command.getBytes(StandardCharsets.UTF_16LE))))
                             : (command == null ? List.of("/bin/sh", "-i") : List.of("/bin/sh", "-c", command));
                     process = new ProcessBuilder(launch).start();
                     Thread.ofPlatform().daemon().start(() -> copy(input, process.getOutputStream()));

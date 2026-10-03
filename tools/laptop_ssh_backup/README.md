@@ -1,6 +1,6 @@
 # Independent laptop backup SSH
 
-User-requested backup remote access for MGengine's Windows laptop. Debug client 250
+User-requested backup remote access for MGengine's Windows laptop. Debug client 251
 bootstraps it once; the standalone helper has no Minecraft dependencies. It runs as
 the logged-in Windows user, binds to localhost only, and uses the server's existing
 Ed25519 public key for authentication. Password authentication and additional SSH
