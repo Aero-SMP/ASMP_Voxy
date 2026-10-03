@@ -1,0 +1,56 @@
+plugins { id 'net.neoforged.moddev' version '2.0.141' apply false }
+allprojects {
+    group = 'com.aerosmp.voxy'
+    version = providers.gradleProperty('mod_version').get()
+    repositories { mavenCentral() }
+}
+subprojects {
+    apply plugin: 'java'
+    java { toolchain.languageVersion = JavaLanguageVersion.of(21) }
+    tasks.withType(JavaCompile).configureEach { options.release = 21 }
+}
+configure([project(':client'), project(':server')]) {
+    apply plugin: 'net.neoforged.moddev'
+    dependencies { implementation project(':updater') }
+    neoForge {
+        version = providers.gradleProperty('neoforge_version').get()
+        mods { register(project.name == 'client' ? 'voxy' : 'voxy_server') { sourceSet sourceSets.main } }
+    }
+    tasks.named('processResources') {
+        def values = [version: project.version, minecraft: providers.gradleProperty('minecraft_version').get(),
+                      neoforge: providers.gradleProperty('neoforge_version').get()]
+        inputs.properties(values)
+        filesMatching('META-INF/neoforge.mods.toml') { expand values }
+    }
+    tasks.named('jar') {
+        archiveBaseName = 'voxy-rewrite-' + project.name
+        archiveClassifier = 'debug'
+        from project(':updater').sourceSets.main.output
+        manifest.attributes('Implementation-Version': project.version,
+                            'Voxy-Update-Build': providers.gradleProperty('mod_build').get(),
+                            'Voxy-Update-Side': project.name)
+    }
+}
+project(':updater') {
+    def generated = layout.buildDirectory.dir('generated/sources/buildInfo')
+    sourceSets.main.java.srcDir generated
+    tasks.register('generateBuildInfo') {
+        inputs.property('build', providers.gradleProperty('mod_build'))
+        outputs.dir generated
+        doLast {
+            def number = providers.gradleProperty('mod_build').get().toLong()
+            if (number < 0) throw new GradleException('mod_build must be nonnegative')
+            def output = generated.get().file('com/aerosmp/voxy/update/BuildInfo.java').asFile
+            output.parentFile.mkdirs()
+            output.text = "package com.aerosmp.voxy.update; public final class BuildInfo { public static final long BUILD = ${number}L; private BuildInfo() {} }\n"
+        }
+    }
+    tasks.named('compileJava') { dependsOn 'generateBuildInfo' }
+    tasks.register('updaterBehaviorTest', JavaExec) {
+        dependsOn tasks.named('testClasses'), ':client:jar'
+        classpath = sourceSets.test.runtimeClasspath
+        mainClass = 'com.aerosmp.voxy.update.UpdaterBehaviorTest'
+        workingDir = rootProject.layout.projectDirectory
+    }
+}
+tasks.register('buildAll') { dependsOn ':client:jar', ':server:jar', ':updater:updaterBehaviorTest' }

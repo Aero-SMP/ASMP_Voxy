@@ -1,0 +1,19 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="All-Rights-Reserved"
+[[mods]]
+modId="voxy"
+version="${version}"
+displayName="Voxy Rewrite Client"
+description='''Testing bootstrap: automatic updates only.'''
+displayTest="IGNORE_ALL_VERSION"
+[[dependencies.voxy]]
+modId="neoforge"
+type="required"
+versionRange="[${neoforge},)"
+side="CLIENT"
+[[dependencies.voxy]]
+modId="minecraft"
+type="required"
+versionRange="[${minecraft}]"
+side="CLIENT"
