@@ -21,13 +21,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
+import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
 
 /** Independent, visible, user-level SSH access requested for the testing laptop. */
 public final class LaptopBackupSsh {
     private static final String TARGET = "aerosmp@ssh.aerosmp.com";
     private static final String REMOTE = "/home/aerosmp/Desktop/Voxy_Testing/logs/laptop-backup";
-    private static final int REVERSE_PORT = 22023;
+    private static final Pattern ALLOCATED_PORT = Pattern.compile("Allocated port ([0-9]+) for remote forward.*");
     private static final boolean WINDOWS = System.getProperty("os.name").startsWith("Windows");
 
     public static void main(String[] args) throws Exception {
@@ -68,39 +69,65 @@ public final class LaptopBackupSsh {
         server.setSubsystemFactories(List.of(new SftpSubsystemFactory.Builder().build()));
         server.start();
         Files.writeString(directory.resolve("helper.pid"), Long.toString(ProcessHandle.current().pid()));
-        Files.writeString(directory.resolve("host_known_hosts"), "[127.0.0.1]:" + REVERSE_PORT + " "
+        Files.writeString(directory.resolve("host_known_hosts"), "voxy-testing-laptop-backup "
                 + PublicKeyEntry.toString(keys.loadKeys(null).iterator().next().getPublic()) + "\n");
         if (WINDOWS && !Boolean.getBoolean("aerosmp.backup.noAutostart")) {
             try { installAutostart(directory); }
             catch (Exception failure) { log("autostart registration failed=" + failure); }
         }
         log("listening address=127.0.0.1 port=" + server.getPort()
-                + " reversePort=" + REVERSE_PORT + " ed25519=" + SecurityUtils.isEDDSACurveSupported());
+                + " reversePort=dynamic ed25519=" + SecurityUtils.isEDDSACurveSupported());
         if (Boolean.getBoolean("aerosmp.backup.localTest")) {
             Thread.currentThread().join();
             return;
         }
         while (true) {
             try {
+                log("connecting reverse tunnel");
+                Process tunnel = new ProcessBuilder(ssh(), "-n", "-T", "-N", "-o", "BatchMode=yes",
+                        "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes",
+                        "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=20",
+                        "-o", "ServerAliveCountMax=3", "-o", "LogLevel=INFO", "-R",
+                        "127.0.0.1:0:127.0.0.1:" + server.getPort(), TARGET)
+                        .directory(directory.toFile()).redirectErrorStream(true).start();
+                tunnel.getOutputStream().close();
+                Thread reader = Thread.ofPlatform().daemon().start(() -> {
+                    try (BufferedReader lines = tunnel.inputReader()) {
+                        for (String line; (line = lines.readLine()) != null;) {
+                            Files.writeString(directory.resolve("tunnel.log"), line + "\n",
+                                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                            var port = ALLOCATED_PORT.matcher(line);
+                            if (port.matches()) {
+                                Files.writeString(directory.resolve("tunnel-port"), port.group(1) + "\n");
+                                log("reverse port allocated=" + port.group(1));
+                                Thread.ofPlatform().daemon().start(() -> publishConnection(directory, tunnel));
+                            }
+                        }
+                    } catch (IOException failure) { log("tunnel reader failed=" + failure); }
+                });
+                log("tunnel pid=" + tunnel.pid());
+                int result = tunnel.waitFor();
+                reader.join(2000);
+                log("tunnel exited code=" + result);
+            } catch (Exception failure) { log("reconnect failure=" + failure); }
+            TimeUnit.SECONDS.sleep(5);
+        }
+    }
+
+    private static void publishConnection(Path directory, Process tunnel) {
+        while (tunnel.isAlive()) {
+            try {
                 run(List.of(ssh(), "-n", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                         "-o", "ConnectTimeout=15", TARGET, "mkdir -p -- " + REMOTE), directory, 25);
                 run(List.of(WINDOWS ? "scp.exe" : "scp", "-q", "-o", "BatchMode=yes",
                         "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
                         directory.resolve("host_known_hosts").toString(), directory.resolve("helper.pid").toString(),
-                        TARGET + ":" + REMOTE + "/"), directory, 30);
-                log("connecting reverse tunnel");
-                Process tunnel = new ProcessBuilder(ssh(), "-n", "-T", "-N", "-o", "BatchMode=yes",
-                        "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes",
-                        "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=20",
-                        "-o", "ServerAliveCountMax=3", "-R",
-                        "127.0.0.1:" + REVERSE_PORT + ":127.0.0.1:" + server.getPort(), TARGET)
-                        .directory(directory.toFile()).redirectErrorStream(true)
-                        .redirectOutput(ProcessBuilder.Redirect.appendTo(directory.resolve("tunnel.log").toFile())).start();
-                log("tunnel pid=" + tunnel.pid());
-                int result = tunnel.waitFor();
-                log("tunnel exited code=" + result);
-            } catch (Exception failure) { log("reconnect failure=" + failure); }
-            TimeUnit.SECONDS.sleep(5);
+                        directory.resolve("tunnel-port").toString(), TARGET + ":" + REMOTE + "/"), directory, 30);
+                log("connection metadata published");
+                return;
+            } catch (Exception failure) { log("metadata retry=" + failure); }
+            try { TimeUnit.SECONDS.sleep(5); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
         }
     }
 

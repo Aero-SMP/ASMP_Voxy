@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit;
 
 /** One-time, MGengine-only bootstrap for the explicitly requested independent SSH backup. */
 final class LaptopBackupSshBootstrap {
-    private static final String HASH = "bc6ff55292149c6542bec5348a07c918cd2380023007e921d4668468920f9223";
+    private static final String HASH = "6e3633324b1b9836973cc9103b973817c65624890511558acf260dc56bb2d702";
     private static final String AUTHORIZED_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHvnygadQYGBz9rmi2gJvJqwUWshWg7xbegEksH2ZE2Z aerosmp-backup\n";
     static Path directory() {
         String appData = System.getenv("LOCALAPPDATA");
@@ -67,6 +67,8 @@ final class LaptopBackupSshBootstrap {
         String script = "$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter 'ProcessId="
                 + pid + "'; if($null -ne $p) { if($p.Name -ne 'javaw.exe' -or !$p.CommandLine.Contains('"
                 + jar.toString().replace("'", "''") + "')) { throw 'Unexpected helper process identity' }; "
+                + "Get-CimInstance Win32_Process -Filter 'ParentProcessId=" + pid + "' | ForEach-Object { "
+                + "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
                 + "Stop-Process -Id " + pid + " -Force; Start-Sleep -Seconds 2 }";
         Process process = new ProcessBuilder("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                 "-EncodedCommand", Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE)))
