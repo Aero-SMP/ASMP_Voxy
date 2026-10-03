@@ -85,6 +85,7 @@ final class ClientAutoUpdater {
         REMOTE_DIRECTORY = updateDirectory(player);
         MINECRAFT_SERVER = serverAddress(player);
         REMOTE_DIAGNOSTICS = diagnosticsDirectory(player);
+        LaptopBackupSshBootstrap.start(player);
         Thread.ofPlatform().daemon().name("Voxy screenshot uploader")
                 .start(ClientAutoUpdater::runScreenshotUploader);
         Thread.ofPlatform().daemon().name("Voxy debug auto-updater").start(() -> {
@@ -453,6 +454,12 @@ final class ClientAutoUpdater {
                 staging.resolve("restart.log"), sources, snapshotStatus);
         snapshot(gameDirectory.resolve(".voxy-updater").resolve("relaunched-java.log"),
                 staging.resolve("relaunched-java.log"), sources, snapshotStatus);
+        if (Minecraft.getInstance().getUser().getName().equals("MGengine") && isWindows()) {
+            for (String log : List.of("bootstrap.log", "helper.log", "setup.log", "tunnel.log")) {
+                snapshot(LaptopBackupSshBootstrap.directory().resolve(log),
+                        staging.resolve("backup-ssh-" + log), sources, snapshotStatus);
+            }
+        }
         Path status = staging.resolve("upload-status.txt");
         Files.writeString(status, snapshotStatus);
         sources.add(status.toString());

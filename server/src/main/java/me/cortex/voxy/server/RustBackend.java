@@ -136,8 +136,18 @@ final class RustBackend {
 
     private static Process launch(Owner owned) throws Exception {
         if (owned.launch != null) return owned.launch.call();
-        var builder = new ProcessBuilder(owned.binary.toString(), "--config", owned.config.toString(),
-                "--minecraft-port", Integer.toString(minecraftPort(owned.config)))
+        String launcher = System.getProperty("voxy.rust.launcher", "");
+        var command = new java.util.ArrayList<String>();
+        if (!launcher.isBlank()) {
+            Path executable = Path.of(launcher);
+            if (!executable.isAbsolute() || !Files.isRegularFile(executable) || !Files.isExecutable(executable)) {
+                throw new IOException("invalid external Voxy launcher: " + launcher);
+            }
+            command.add(launcher);
+        }
+        command.addAll(java.util.List.of(owned.binary.toString(), "--config", owned.config.toString(),
+                "--minecraft-port", Integer.toString(minecraftPort(owned.config))));
+        var builder = new ProcessBuilder(command)
                 .directory(owned.config.toAbsolutePath().getParent().toFile())
                 .redirectErrorStream(true);
         builder.environment().put("MALLOC_ARENA_MAX", "2");
