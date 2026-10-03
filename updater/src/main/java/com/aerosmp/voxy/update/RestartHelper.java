@@ -73,12 +73,16 @@ public final class RestartHelper {
         var info = ProcessHandle.current().info(); List<String> command = new ArrayList<>();
         if (info.arguments().isPresent()) {
             command.add(info.command().orElseThrow()); command.addAll(List.of(info.arguments().get()));
-        } else if (AutoUpdater.windows()) {
-            String script = "[Console]::Out.Write((Get-CimInstance Win32_Process -Filter 'ProcessId="
-                    + ProcessHandle.current().pid() + "').CommandLine)";
-            command.addAll(parseWindows(AutoUpdater.command(15, "powershell.exe", "-NoProfile", "-NonInteractive",
-                    "-EncodedCommand", Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE)))));
-        } else throw new IOException("exact Java launch arguments unavailable");
+        } else {
+            // Runtime-owned metadata survives mods masking the operating-system command line.
+            String application = System.getProperty("sun.java.command", "");
+            String classpath = System.getProperty("java.class.path", "");
+            if (application.isBlank() || classpath.isBlank()) throw new IOException("Java launch metadata unavailable");
+            command.add(info.command().orElseThrow());
+            command.addAll(java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
+            command.add("-cp"); command.add(classpath);
+            command.addAll(parseWindows(application));
+        }
         if (command.contains("org.prismlauncher.EntryPoint")) throw new IOException("Prism restart support is not initialized");
         int wrapper = command.indexOf("com.modrinth.theseus.MinecraftLaunch");
         String exact = System.getProperty("modrinth.process.args");

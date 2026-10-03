@@ -70,3 +70,10 @@ For MGengine, `.voxy-rewrite/control.properties` supports `network=false` to
 pause only Voxy reconciliation, and a changed `screenshot` property to capture
 the real GPU view. `.voxy-rewrite/status.json` records live cache, mesh, transport,
 and GPU measurements. These controls do not execute shell commands.
+
+Camera quality uses the actual render projection and viewport, frustum visibility
+and conservative GPU hierarchical depth tests. The Sodium Voxy page exposes
+render distance and projected section pixel size (64 px default). Cached finer
+coverage can satisfy demand without downloading a parent; freshness sweeps yield
+to view changes and run in the background. See
+[visibility implementation and live receipts](project_audit/live_client/visibility_implementation.md).

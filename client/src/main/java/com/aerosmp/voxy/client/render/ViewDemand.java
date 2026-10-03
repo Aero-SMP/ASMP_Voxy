@@ -8,6 +8,8 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.Map;
+import java.util.HashMap;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -53,6 +55,7 @@ public final class ViewDemand {
         public final Matrix4f matrix;
         public final int width, height;
         private final Frustum frustum;
+        private final Map<SectionKey, float[]> projected = new java.util.concurrent.ConcurrentHashMap<>();
         public Camera(Vec3 position, Matrix4f modelView, Matrix4f projection, int width, int height) {
             this.position = position; this.width = width; this.height = height;
             matrix = new Matrix4f(projection).mul(modelView);
@@ -68,6 +71,9 @@ public final class ViewDemand {
         }
         // Rectangle, nearest depth and projected section diameter. Near-plane intersections stay eligible.
         public float[] project(SectionKey key) {
+            return projected.computeIfAbsent(key, this::projectBounds);
+        }
+        private float[] projectBounds(SectionKey key) {
             float[] px = new float[8], py = new float[8];
             float minX = 1, minY = 1, maxX = 0, maxY = 0, depth = 1;
             int size = key.size();
@@ -94,8 +100,9 @@ public final class ViewDemand {
             return Math.abs((x[b] - x[a]) * (y[c] - y[a]) - (x[c] - x[a]) * (y[b] - y[a]));
         }
     }
+    public record Known(int children, boolean complete) {}
     public static List<SectionKey> sections(Camera camera, int minY, int maxY, int radius, float pixels,
-            Function<SectionKey, Integer> children, Predicate<SectionKey> hidden, Set<SectionKey> refined) {
+            Function<SectionKey, Known> children, Predicate<SectionKey> hidden, Set<SectionKey> refined) {
         List<SectionKey> result = new ArrayList<>(); Set<SectionKey> next = new HashSet<>();
         Vec3 pos = camera.position; int span = 512;
         for (int x = floor(pos.x - radius, span); x <= floor(pos.x + radius, span); x++)
@@ -112,16 +119,18 @@ public final class ViewDemand {
         return List.copyOf(result);
     }
     private static void add(SectionKey key, Camera camera, int minY, int maxY, float pixels,
-            Function<SectionKey, Integer> children, Predicate<SectionKey> hidden, Set<SectionKey> refined,
+            Function<SectionKey, Known> children, Predicate<SectionKey> hidden, Set<SectionKey> refined,
             Set<SectionKey> next, List<SectionKey> result) {
         if (!camera.visible(key)) return;
         result.add(key);
         if (key.level() == 0 || hidden.test(key)) return;
+        Known known = children.apply(key);
+        if (known == null) return; // Discover cached/source topology before expanding unknown volume.
         float diameter = camera.project(key)[5];
-        if (diameter < pixels * (refined.contains(key) ? .9f : 1f)) return;
-        next.add(key); Integer mask = children.apply(key);
+        if (known.complete && diameter < pixels * (refined.contains(key) ? .9f : 1f)) return;
+        next.add(key); int mask = known.children;
         for (int i = 0; i < 8; i++) {
-            if (mask != null && (mask & (1 << i)) == 0) continue;
+            if ((mask & (1 << i)) == 0) continue;
             SectionKey child = key.child(i);
             if ((long)child.y() * child.size() < maxY && (long)(child.y() + 1) * child.size() > minY)
                 add(child, camera, minY, maxY, pixels, children, hidden, refined, next, result);

@@ -68,7 +68,8 @@ public final class TerrainRenderer implements AutoCloseable {
     private final DepthVisibility depth = new DepthVisibility();
     private final Set<SectionKey> refined = new HashSet<>();
     private Set<SectionKey> wantedKeys = Set.of(), drawnCoverage = Set.of();
-    private ViewDemand.Camera cameraView;
+    private volatile ViewDemand.Camera cameraView;
+    private final Map<SectionKey, ViewDemand.Known> cacheTopology = new ConcurrentHashMap<>();
     private long frustumCandidates, depthFailures;
     private String depthError = "";
     private volatile List<SectionKey> demand = List.of();
@@ -116,15 +117,21 @@ public final class TerrainRenderer implements AutoCloseable {
     public List<SectionKey> wanted() { return demand; }
     private void updateDemand(ViewDemand.Camera camera) {
         cameraView = camera; radius = ClientSettings.distance;
-        Map<SectionKey, Integer> masks = new HashMap<>();
-        published.forEach((key, geometry) -> masks.put(key, geometry.children));
-        uploading.forEach(pending -> masks.merge(pending.geometry.key, pending.geometry.children, (old, next) -> old | next));
+        Map<SectionKey, ViewDemand.Known> masks = new HashMap<>(cacheTopology);
+        published.forEach((key, geometry) -> masks.putIfAbsent(key, new ViewDemand.Known(geometry.children, true)));
+        uploading.forEach(pending -> masks.merge(pending.geometry.key, new ViewDemand.Known(pending.geometry.children, true),
+                (old, next) -> new ViewDemand.Known(old.children() | next.children(), true)));
         try { depth.poll(camera); } catch (RuntimeException failure) { depthFailures++; depthError = failure.toString(); }
         List<SectionKey> next = ViewDemand.sections(camera, minecraft.level.getMinBuildHeight(),
                 minecraft.level.getMaxBuildHeight(), radius, pixels(), masks::get,
                 key -> !coveredByParent(key) && depth.hidden(key, camera), refined);
         frustumCandidates = next.size();
         if (!next.equals(demand)) { demand = next; wantedKeys = Set.copyOf(next); }
+        cacheTopology.keySet().retainAll(wantedKeys);
+    }
+    public ViewDemand.Camera camera() { return cameraView; }
+    public void available(SectionKey key, int children, boolean complete) {
+        if (complete || children != 0) cacheTopology.put(key, new ViewDemand.Known(children, complete));
     }
     private boolean coveredByParent(SectionKey key) {
         for (SectionKey parent = key.parent(); parent != null; parent = parent.parent())

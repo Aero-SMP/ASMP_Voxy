@@ -1,4 +1,6 @@
-package com.aerosmp.voxy.client.render;
+package com.aerosmp.voxy.client.mixin;
+
+import com.aerosmp.voxy.client.render.TerrainRenderer;
 
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;

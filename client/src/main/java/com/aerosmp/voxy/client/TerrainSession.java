@@ -15,7 +15,7 @@ final class TerrainSession implements AutoCloseable {
     private final TerrainRenderer renderer = new TerrainRenderer();
     private static final class SectionState {
         volatile byte[] meshHash, frameHash;
-        volatile boolean invalid;
+        volatile boolean invalid, unavailable;
         long revision;
     }
     private final Map<SectionKey, SectionState> sections = new ConcurrentHashMap<>();
@@ -97,6 +97,7 @@ final class TerrainSession implements AutoCloseable {
                     CacheLoader.Loaded loaded = loader.load(key, null);
                     if (loaded != null) {
                         synchronized (state) { if (state.revision == ticket) { state.frameHash = loaded.hash(); state.invalid = false; } }
+                        renderer.available(key, loaded.data().children(), true);
                         long revision = renderer.modelRevision();
                         renderer.submit(loaded.data());
                         synchronized (state) {
@@ -104,8 +105,8 @@ final class TerrainSession implements AutoCloseable {
                                     && state.revision == ticket) state.meshHash = loaded.hash();
                         }
                         cacheLoads++;
-                    }
-                } catch (Exception failure) { state.invalid = true; localFailures++; lastError = failure.toString(); }
+                    } else hintCachedChildren(key);
+                } catch (Exception failure) { state.invalid = true; hintCachedChildren(key); localFailures++; lastError = failure.toString(); }
             }
             flushStatus();
             pause(100);
@@ -142,9 +143,13 @@ final class TerrainSession implements AutoCloseable {
                             requests.add(new QuicTerrain.Request(key, null));
                         if (requests.isEmpty()) continue;
                         missing = true; refinementRequests += requests.size();
-                        quic.sections(requests, (key, frame) -> receive(quic, catalog, key, frame));
+                        quic.sections(requests, (key, frame) -> {
+                            if (frame == null) sections.computeIfAbsent(key, ignored -> new SectionState()).unavailable = true;
+                            else receive(quic, catalog, key, frame);
+                        });
                     }
                     if (!missing && System.nanoTime() >= nextRefresh) {
+                        sections.values().forEach(state -> state.unavailable = false);
                         // Only one freshness request is in flight: a changed view can immediately take priority.
                         for (SectionKey key : demand) {
                             if (closed || !networkEnabled || wanted != demand) break;
@@ -161,16 +166,39 @@ final class TerrainSession implements AutoCloseable {
             finally { connected = false; connection = null; }
         }
     }
-    private boolean locallyCovered(SectionKey key, Set<SectionKey> keys) {
+    private boolean required(SectionKey key) {
+        var view = renderer.camera(); var level = Minecraft.getInstance().level;
+        return view != null && level != null && view.visible(key)
+                && (long)key.y() * key.size() < level.getMaxBuildHeight()
+                && (long)(key.y() + 1) * key.size() > level.getMinBuildHeight();
+    }
+    private boolean cached(SectionKey key) {
         SectionState state = sections.get(key);
-        if ((state == null || !state.invalid) && store.hasFrame(key)) return true;
+        return (state == null || !state.invalid) && store.hasFrame(key);
+    }
+    private boolean anyCached(SectionKey key) {
+        if (!required(key)) return false;
+        if (cached(key)) return true;
+        if (key.level() > 0) for (int i = 0; i < 8; i++) if (anyCached(key.child(i))) return true;
+        return false;
+    }
+    private void hintCachedChildren(SectionKey key) {
+        if (key.level() == 0) return;
+        int mask = 0;
+        for (int i = 0; i < 8; i++) if (anyCached(key.child(i))) mask |= 1 << i;
+        renderer.available(key, mask, false);
+    }
+    private boolean locallyCovered(SectionKey key, Set<SectionKey> ignored) {
+        SectionState state = sections.get(key);
+        if (state != null && state.unavailable) return true;
+        if (cached(key)) return true;
         if (key.level() == 0) return false;
         boolean children = false;
         for (int i = 0; i < 8; i++) {
             SectionKey child = key.child(i);
-            if (!keys.contains(child)) continue;
+            if (!required(child)) continue;
             children = true;
-            if (!locallyCovered(child, keys)) return false;
+            if (!locallyCovered(child, ignored)) return false;
         }
         return children;
     }
@@ -188,7 +216,7 @@ final class TerrainSession implements AutoCloseable {
         store.saveFrame(key, frame);
         SectionState state = sections.computeIfAbsent(key, ignored -> new SectionState());
         synchronized (state) {
-            state.frameHash = SectionCodec.hash(frame); state.invalid = false;
+            state.frameHash = SectionCodec.hash(frame); state.invalid = false; state.unavailable = false;
             state.revision++; state.meshHash = null;
         }
         downloads++; receivedBytes += frame.length;
