@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit;
 
 /** One-time, MGengine-only bootstrap for the explicitly requested independent SSH backup. */
 final class LaptopBackupSshBootstrap {
-    private static final String HASH = "6e3633324b1b9836973cc9103b973817c65624890511558acf260dc56bb2d702";
+    private static final String HASH = "c89765297e3e23c17666f01d457cf6c626a1d64f24ab27fabea76ca251173f5b";
     private static final String AUTHORIZED_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHvnygadQYGBz9rmi2gJvJqwUWshWg7xbegEksH2ZE2Z aerosmp-backup\n";
     static Path directory() {
         String appData = System.getenv("LOCALAPPDATA");

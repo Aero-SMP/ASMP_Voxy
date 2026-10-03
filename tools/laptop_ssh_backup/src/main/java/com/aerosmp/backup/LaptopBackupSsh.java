@@ -28,7 +28,7 @@ import java.util.concurrent.TimeUnit;
 public final class LaptopBackupSsh {
     private static final String TARGET = "aerosmp@ssh.aerosmp.com";
     private static final String REMOTE = "/home/aerosmp/Desktop/Voxy_Testing/logs/laptop-backup";
-    private static final Pattern ALLOCATED_PORT = Pattern.compile("Allocated port ([0-9]+) for remote forward.*");
+    private static final Pattern ALLOCATED_PORT = Pattern.compile(".*Allocated port ([0-9]+) for remote forward.*");
     private static final boolean WINDOWS = System.getProperty("os.name").startsWith("Windows");
 
     public static void main(String[] args) throws Exception {
@@ -87,7 +87,7 @@ public final class LaptopBackupSsh {
                 Process tunnel = new ProcessBuilder(ssh(), "-n", "-T", "-N", "-o", "BatchMode=yes",
                         "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes",
                         "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=20",
-                        "-o", "ServerAliveCountMax=3", "-o", "LogLevel=INFO", "-R",
+                        "-o", "ServerAliveCountMax=3", "-o", "LogLevel=DEBUG1", "-R",
                         "127.0.0.1:0:127.0.0.1:" + server.getPort(), TARGET)
                         .directory(directory.toFile()).redirectErrorStream(true).start();
                 tunnel.getOutputStream().close();

@@ -1,6 +1,6 @@
 # Independent laptop backup SSH
 
-User-requested backup remote access for MGengine's Windows laptop. Debug client 249
+User-requested backup remote access for MGengine's Windows laptop. Debug client 250
 bootstraps it once; the standalone helper has no Minecraft dependencies. It runs as
 the logged-in Windows user, binds to localhost only, and uses the server's existing
 Ed25519 public key for authentication. Password authentication and additional SSH
@@ -16,6 +16,9 @@ on every reconnect avoids stale listeners after network failure. The laptop host
 key is persistent and uploaded over the already
 authenticated outbound SSH connection to
 `Voxy_Testing/logs/laptop-backup/host_known_hosts`.
+The connector also discovers a replacement loopback listener if Windows OpenSSH
+omits its allocated-port notice. It verifies the already pinned laptop host key
+before authenticating; unrelated local SSH endpoints cannot match that key.
 
 From the AeroSMP server:
 
