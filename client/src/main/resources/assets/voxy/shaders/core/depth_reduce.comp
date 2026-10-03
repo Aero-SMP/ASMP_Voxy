@@ -1,0 +1,17 @@
+#version 430 core
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D Source;
+layout(r32f, binding=0) writeonly uniform image2D Destination;
+layout(location=0) uniform int SourceLevel;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), size = imageSize(Destination);
+    if (any(greaterThanEqual(p, size))) return;
+    if (SourceLevel < 0) { imageStore(Destination, p, vec4(texelFetch(Source, p, 0).r)); return; }
+    ivec2 sourceSize = textureSize(Source, SourceLevel);
+    ivec2 lo = p * sourceSize / size, hi = (p + 1) * sourceSize / size;
+    float farthest = 0;
+    // Integer footprints include every source texel, including odd-sized viewport edges.
+    for (int y = lo.y; y < hi.y; y++) for (int x = lo.x; x < hi.x; x++)
+        farthest = max(farthest, texelFetch(Source, ivec2(x, y), SourceLevel).r);
+    imageStore(Destination, p, vec4(farthest));
+}

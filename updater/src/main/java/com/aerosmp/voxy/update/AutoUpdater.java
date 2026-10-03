@@ -12,7 +12,7 @@ import java.util.jar.JarFile;
 /** Shared update transaction; no Minecraft, rendering, terrain, or networking libraries. */
 public final class AutoUpdater implements AutoCloseable {
     private static final String SSH = "aerosmp@ssh.aerosmp.com";
-    private static final Path RELEASES = Path.of("/home/aerosmp/Desktop/ASMP_Voxy_Rewrite/releases");
+    private static final String RELEASES = "/home/aerosmp/Desktop/ASMP_Voxy_Rewrite/releases";
     private final Path game;
     private final String side;
     private final boolean remote;
@@ -32,10 +32,11 @@ public final class AutoUpdater implements AutoCloseable {
     private void poll() {
         if (pending) return;
         try {
-            Path feed = RELEASES.resolve(side);
+            String remoteFeed = RELEASES + "/" + side;
+            Path feed = Path.of(remoteFeed);
             String text = remote ? command(30, ssh(), "-n", "-o", "BatchMode=yes", "-o",
                     "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", SSH,
-                    "head -c 4097 " + feed.resolve("latest.properties"))
+                    "head -c 4097 " + remoteFeed + "/latest.properties")
                     : (Files.exists(feed.resolve("latest.properties")) ? Files.readString(feed.resolve("latest.properties")) : "");
             if (text.isBlank()) return;
             Properties release = manifest(text);
@@ -45,7 +46,7 @@ public final class AutoUpdater implements AutoCloseable {
             Path state = game.resolve(".voxy-rewrite-updater"); Files.createDirectories(state);
             Path staged = state.resolve(file + ".part");
             if (remote) command(120, windows() ? "scp.exe" : "scp", "-q", "-o", "BatchMode=yes",
-                    "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", SSH + ":" + feed.resolve(file), staged.toString());
+                    "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", SSH + ":" + remoteFeed + "/" + file, staged.toString());
             else Files.copy(feed.resolve(file), staged, StandardCopyOption.REPLACE_EXISTING);
             verify(staged, side, build, hash);
             Path mods = game.resolve("mods");

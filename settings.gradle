@@ -6,4 +6,4 @@ pluginManagement {
     }
 }
 rootProject.name = 'ASMP_Voxy_Rewrite'
-include 'updater', 'client', 'server'
+include 'updater', 'terrain', 'client', 'server'

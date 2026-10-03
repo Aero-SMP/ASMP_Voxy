@@ -6,3 +6,7 @@ run/
 *.log
 __pycache__/
 *.pyc
+**/target/
+project_audit/load_results/**/world/
+project_audit/load_results/**/data/
+project_audit/load_results/**/cache/

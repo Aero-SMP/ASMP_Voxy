@@ -5,7 +5,7 @@ license="All-Rights-Reserved"
 modId="voxy"
 version="${version}"
 displayName="Voxy Rewrite Client"
-description='''Testing bootstrap: automatic updates only.'''
+description='''Cache-first distant terrain with camera-driven quality and automatic updates.'''
 displayTest="IGNORE_ALL_VERSION"
 [[dependencies.voxy]]
 modId="neoforge"
@@ -17,3 +17,6 @@ modId="minecraft"
 type="required"
 versionRange="[${minecraft}]"
 side="CLIENT"
+
+[[mixins]]
+config="voxy.mixins.json"

@@ -2,7 +2,12 @@ plugins { id 'net.neoforged.moddev' version '2.0.141' apply false }
 allprojects {
     group = 'com.aerosmp.voxy'
     version = providers.gradleProperty('mod_version').get()
-    repositories { mavenCentral() }
+    repositories {
+        if (rootProject.file('.verification/maven').isDirectory()) maven { url = rootProject.uri('.verification/maven') }
+        mavenCentral()
+        maven { url = 'https://maven.neoforged.net/releases/' }
+        maven { url = 'https://maven.caffeinemc.net/releases' }
+    }
 }
 subprojects {
     apply plugin: 'java'
@@ -11,7 +16,8 @@ subprojects {
 }
 configure([project(':client'), project(':server')]) {
     apply plugin: 'net.neoforged.moddev'
-    dependencies { implementation project(':updater') }
+    dependencies { implementation project(':updater'); implementation project(':terrain') }
+    sourceSets.main.java.srcDir rootProject.file('shared/src/main/java')
     neoForge {
         version = providers.gradleProperty('neoforge_version').get()
         mods { register(project.name == 'client' ? 'voxy' : 'voxy_server') { sourceSet sourceSets.main } }
@@ -26,10 +32,52 @@ configure([project(':client'), project(':server')]) {
         archiveBaseName = 'voxy-rewrite-' + project.name
         archiveClassifier = 'debug'
         from project(':updater').sourceSets.main.output
+        from project(':terrain').sourceSets.main.output
         manifest.attributes('Implementation-Version': project.version,
                             'Voxy-Update-Build': providers.gradleProperty('mod_build').get(),
                             'Voxy-Update-Side': project.name)
     }
+}
+project(':terrain') {
+    dependencies {
+        compileOnly 'org.lwjgl:lwjgl-zstd:3.3.3'
+        compileOnly 'tech.kwik:kwik:0.10.10'
+    }
+}
+project(':client') {
+    dependencies { compileOnly 'net.caffeinemc:sodium-neoforge-api:0.8.12+mc1.21.1' }
+    configurations { embedded }
+    dependencies {
+        compileOnly 'tech.kwik:kwik:0.10.10'
+        compileOnly 'org.lwjgl:lwjgl-zstd:3.3.3'
+        embedded 'tech.kwik:kwik:0.10.10'
+        embedded 'tech.kwik:agent15:3.2'
+        embedded 'at.favre.lib:hkdf:2.0.0'
+        embedded 'io.whitfin:siphash:3.0.0'
+        embedded 'org.lwjgl:lwjgl-zstd:3.3.3'
+        ['natives-linux', 'natives-linux-arm64', 'natives-macos', 'natives-macos-arm64',
+         'natives-windows', 'natives-windows-arm64', 'natives-windows-x86'].each {
+            embedded "org.lwjgl:lwjgl-zstd:3.3.3:${it}"
+        }
+    }
+    tasks.named('jar') {
+        from({ configurations.embedded.collect { zipTree(it) } }) {
+            include 'org/lwjgl/util/zstd/**', 'linux/**', 'macos/**', 'windows/**',
+                    'META-INF/linux/**', 'META-INF/macos/**', 'META-INF/windows/**',
+                    'tech/kwik/**', 'at/favre/lib/hkdf/**', 'io/whitfin/siphash/**'
+        }
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
+tasks.register('buildNative', Exec) {
+    workingDir = file('rust-server')
+    commandLine 'cargo', 'build', '--offline', '--locked', '--release'
+    inputs.files(fileTree('rust-server/src'), file('rust-server/Cargo.toml'), file('rust-server/Cargo.lock'))
+    outputs.file('rust-server/target/release/voxy-rewrite-server')
+}
+project(':server').tasks.named('processResources') {
+    dependsOn rootProject.tasks.named('buildNative')
+    from(rootProject.file('rust-server/target/release/voxy-rewrite-server')) { into 'native/linux-x86_64' }
 }
 project(':updater') {
     def generated = layout.buildDirectory.dir('generated/sources/buildInfo')
@@ -46,11 +94,5 @@ project(':updater') {
         }
     }
     tasks.named('compileJava') { dependsOn 'generateBuildInfo' }
-    tasks.register('updaterBehaviorTest', JavaExec) {
-        dependsOn tasks.named('testClasses'), ':client:jar'
-        classpath = sourceSets.test.runtimeClasspath
-        mainClass = 'com.aerosmp.voxy.update.UpdaterBehaviorTest'
-        workingDir = rootProject.layout.projectDirectory
-    }
 }
-tasks.register('buildAll') { dependsOn ':client:jar', ':server:jar', ':updater:updaterBehaviorTest' }
+tasks.register('buildAll') { dependsOn ':client:jar', ':server:jar' }

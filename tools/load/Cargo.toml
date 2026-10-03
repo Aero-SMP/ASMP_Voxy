@@ -1,0 +1,19 @@
+[package]
+name = "voxy-load"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+anyhow = "1.0"
+fastnbt = "2.5"
+flate2 = "1.1"
+voxy-rust-server = { path = "../../../ASMP_Voxy/rust-server" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+sha2 = "0.10"
+blake3 = "1.8"
+zstd = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+[profile.release]
+opt-level = 3
