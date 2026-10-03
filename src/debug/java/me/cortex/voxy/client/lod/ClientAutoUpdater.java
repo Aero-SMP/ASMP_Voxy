@@ -69,11 +69,11 @@ final class ClientAutoUpdater {
     }
 
     static String serverAddress(String player) {
-        return "ssh.aerosmp.com:" + (player.equals("MGengine") ? "25586" : "25565");
+        return player.equals("MGengine") ? "play.aerosmp.com:25587" : "ssh.aerosmp.com:25565";
     }
 
     static String diagnosticsDirectory(String player) {
-        return "/home/aerosmp/Desktop/" + (player.equals("MGengine") ? "Mod_Testing" : "Main")
+        return "/home/aerosmp/Desktop/" + (player.equals("MGengine") ? "Voxy_Testing" : "Main")
                 + "/logs/client-upload";
     }
 

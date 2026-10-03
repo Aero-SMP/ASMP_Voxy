@@ -177,7 +177,7 @@ public final class WorkerShaderDebugBehaviorTest {
                 net.minecraft.client.gui.screens.Screen.class);
         predicate.setAccessible(true);
         var destination = updater.getDeclaredMethod("serverAddress", String.class); destination.setAccessible(true);
-        check(destination.invoke(null, "MGengine").equals("ssh.aerosmp.com:25586"), "debug restart target is not Mod_Testing");
+        check(destination.invoke(null, "MGengine").equals("play.aerosmp.com:25587"), "debug restart target is not Voxy_Testing");
         check(destination.invoke(null, "AnotherPlayer").equals("ssh.aerosmp.com:25565"), "bootstrap moved another player");
         var channel = updater.getDeclaredMethod("updateDirectory", String.class); channel.setAccessible(true);
         check(channel.invoke(null, "MGengine").equals("/home/aerosmp/Desktop/ASMP_Voxy/build/libs/debug-clients/MGengine")
