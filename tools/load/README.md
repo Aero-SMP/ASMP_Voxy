@@ -33,8 +33,11 @@ apply independent seeded loss and serialization to every datagram, including
 handshakes, ACKs and retransmissions. Setup never bypasses impairment. It waits
 for all 100 live QUIC connection handles and dimension acknowledgements before
 the pressure clock starts; interrupted setup stays in its evidence directory.
-Acknowledged clients begin actual terrain demand immediately during staggered
-startup, as real clients do. They do not sit idle while poorer links connect.
+After TLS and writing the dimension, each peer pipelines actual cache-missing
+terrain requests before waiting for the world identity reply. Cached terrain
+remains usable immediately; cached refresh requests wait for identity association.
+The queued missing-key prefix is drained once in order and excluded from the
+first remaining request batch. Peers do not sit idle while poorer links connect.
 Cold first-coarse/detail times start at each actor's first connection attempt;
 warm local readiness is measured before connecting. Setup counters and the cache
 size at the simultaneous100-client barrier distinguish cold startup from the

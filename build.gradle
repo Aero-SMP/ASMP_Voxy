@@ -1,24 +1,49 @@
-plugins { id 'java'; id 'net.neoforged.moddev' version '2.0.141' }
+plugins {
+    id 'java'
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
 group = 'com.aerosmp.voxy'
 version = '0' // Mandatory numeric framework metadata, unused by updates and terrain.
-java { toolchain.languageVersion = JavaLanguageVersion.of(21) }
-tasks.withType(JavaCompile).configureEach { options.release = 21 }
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+}
+
 repositories {
     maven { url = uri('.verification/maven') }
     mavenCentral()
     maven { url = 'https://maven.neoforged.net/releases/' }
     maven { url = 'https://maven.caffeinemc.net/releases' }
 }
+
 sourceSets.main {
-    java.setSrcDirs(['client/java', 'server/java', 'shared', 'updater'])
-    java.include '*.java'
-    resources.setSrcDirs(['client/resources'])
+    java.setSrcDirs([
+        'client/src/main/java',
+        'server/src/main/java',
+        'shared/src/main/java',
+        'updater/src/main/java'
+    ])
+    resources.setSrcDirs(['client/src/main/resources'])
 }
+
 neoForge {
     version = providers.gradleProperty('neoforge_version').get()
-    mods { voxy { sourceSet sourceSets.main } }
+    mods {
+        voxy {
+            sourceSet sourceSets.main
+        }
+    }
 }
-configurations { embedded }
+
+configurations {
+    embedded
+}
+
 dependencies {
     compileOnly 'net.caffeinemc:sodium-neoforge-api:0.8.12+mc1.21.1'
     compileOnly 'net.caffeinemc:sodium-neoforge-mod:0.8.12+mc1.21.1'
@@ -28,33 +53,58 @@ dependencies {
     embedded 'at.favre.lib:hkdf:2.0.0'
     embedded 'io.whitfin:siphash:3.0.0'
 }
-def metadata = [version: '0', minecraft: providers.gradleProperty('minecraft_version').get(),
-                neoforge: providers.gradleProperty('neoforge_version').get()]
-processResources { filesMatching('META-INF/neoforge.mods.toml') { expand metadata } }
+
+def metadata = [
+    version: '0',
+    minecraft: providers.gradleProperty('minecraft_version').get(),
+    neoforge: providers.gradleProperty('neoforge_version').get()
+]
+
+processResources {
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand metadata
+    }
+}
+
 tasks.register('buildNative', Exec) {
     workingDir = file('rust-server')
     commandLine 'cargo', 'build', '--offline', '--locked', '--release'
     inputs.files(fileTree('rust-server/src'), file('rust-server/Cargo.toml'), file('rust-server/Cargo.lock'))
     outputs.file('rust-server/target/release/voxy-server')
 }
+
 tasks.register('clientJar', Jar) {
     dependsOn classes
     archiveFileName = 'voxy-client-debug.jar'
-    from(sourceSets.main.output) { exclude 'com/aerosmp/voxy/server/**' }
-    from({ configurations.embedded.collect { zipTree(it) } }) { include 'tech/kwik/**', 'at/favre/lib/hkdf/**', 'io/whitfin/siphash/**' }
+    from(sourceSets.main.output) {
+        exclude 'com/aerosmp/voxy/server/**'
+    }
+    from({ configurations.embedded.collect { zipTree(it) } }) {
+        include 'tech/kwik/**', 'at/favre/lib/hkdf/**', 'io/whitfin/siphash/**'
+    }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest.attributes('Voxy-Update-Side': 'client')
 }
+
 tasks.register('serverJar', Jar) {
     dependsOn classes, buildNative
     archiveFileName = 'voxy-server-debug.jar'
     from(sourceSets.main.output) {
         exclude 'com/aerosmp/voxy/client/**', 'com/aerosmp/voxy/mixin/**', 'assets/**', 'voxy.mixins.json', 'META-INF/neoforge.mods.toml'
     }
-    from('server/resources') { include 'META-INF/neoforge.mods.toml'; expand metadata }
-    from('rust-server/target/release/voxy-server') { into 'native/linux-x86_64' }
+    from('server/src/main/resources') {
+        include 'META-INF/neoforge.mods.toml'
+        expand metadata
+    }
+    from('rust-server/target/release/voxy-server') {
+        into 'native/linux-x86_64'
+    }
     manifest.attributes('Voxy-Update-Side': 'server')
 }
+
 jar.enabled = false
 assemble.dependsOn clientJar, serverJar
-tasks.register('buildAll') { dependsOn clientJar, serverJar }
+
+tasks.register('buildAll') {
+    dependsOn clientJar, serverJar
+}

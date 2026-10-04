@@ -1,0 +1,16 @@
+plugins { id 'java' }
+repositories { mavenCentral() }
+java { toolchain.languageVersion = JavaLanguageVersion.of(21) }
+dependencies {
+    implementation 'org.apache.sshd:sshd-core:2.20.0'
+    implementation 'org.apache.sshd:sshd-sftp:2.20.0'
+    implementation 'net.i2p.crypto:eddsa:0.3.0'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.17'
+}
+tasks.named('jar') {
+    archiveFileName = 'aerosmp-laptop-backup-ssh.jar'
+    manifest.attributes('Main-Class': 'com.aerosmp.backup.LaptopBackupSsh')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from { configurations.runtimeClasspath.collect { zipTree(it) } }
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', '**/module-info.class'
+}

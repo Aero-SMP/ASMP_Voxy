@@ -11,6 +11,14 @@ isolated diagnostics are historical evidence, not the current acceptance method.
 
 ## Objective
 
+The current authoritative goal is `../goal.txt`. The user's revised size limits
+are 10,000 maintained source lines and 50 maintained source files, replacing all
+30%-of-baseline source and folder caps. Record folder counts including empty
+folders, with no numerical folder cap. Count reused custom live tooling honestly.
+Use conventional formatting and coherent source files; preserve full features,
+correctness and performance rather than reducing counts through compression,
+field repurposing, hidden source or incomplete implementations.
+
 Increase throughput and efficiency while keeping production code as small and
 readable as possible. Demonstrate that the backend handles the Voxy workload of
 100 players spread around the map while the world receives 300 block changes per
@@ -18,13 +26,14 @@ second, without connecting 100 Minecraft players. These loads must run
 simultaneously. The change rate is aggregate across the shared world.
 
 All 100 virtual clients must also have poor network connections: seeded packet
-loss between 50% and 90% per client, a 3 Mbps link, and at least 1,000 ms round-trip
-latency. Apply impairment to real UDP packets, including QUIC handshakes and
-retransmissions, rather than delaying application replies. Model 500 ms one-way
-delay and 3 Mbps in each direction, record achieved conditions and transport
-failures, and run the same impairment against both backends. Cached clients must
-keep loading locally through these conditions. Fast loopback runs remain useful
-diagnostics but do not satisfy this acceptance case.
+loss between 50% and 90% per client, bandwidth spanning 500 kbps to 3 Mbps,
+and round-trip latency spanning 300 to 1,000 ms. These are the latest user goal's
+conditions and supersede the earlier fixed 3 Mbps / minimum 1,000 ms wording.
+Apply impairment to real UDP packets, including QUIC handshakes and
+retransmissions, rather than delaying application replies. Record achieved
+conditions and transport failures; preserve the actual 100-live-client barrier.
+Cached clients must keep loading locally through these conditions. Fast loopback
+runs remain useful diagnostics but do not satisfy this acceptance case.
 
 Prioritize complete terrain coverage and fast delivery of high-quality detail.
 Terrain freshness is secondary: clients may receive coalesced refreshes roughly
