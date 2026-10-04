@@ -22,7 +22,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         RENDERER_OWNED
     }
 
-    enum ReadyKind { SOURCE, NETWORK, RENDERER }
+    enum ReadyKind { SOURCE, RENDERER }
 
     record Ticket(long key, long sessionEpoch, long demandRevision, long regionGeneration,
                   int resourceSlot) {}
@@ -33,24 +33,10 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         final long key;
         int coverageUsers;
         int highestBucket;
-        long announcedGeneration;
-        long installedGeneration;
-        Object index;
-        boolean requested;
-        boolean subscribed;
-        int pendingResponses;
-        boolean absent;
-        boolean validated;
         boolean localTried;
         boolean localLoaded;
         Map<Long, LocalSection> localSections = Map.of();
         volatile long metadataRevision;
-        long retryAfter;
-        RegionalSectionCodec.BoundCatalog catalog;
-        RegionalProtocol.RegionIndex pendingIndex;
-        RegionalProtocol.Hash32 pendingCatalog;
-        int resourceSlot = -1;
-        WorkerResource.Lease resourceLease;
         final LinkedHashMap<Long, Demand> members = new LinkedHashMap<>();
 
         RegionDemand(long key) { this.key = key; }
@@ -186,7 +172,6 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     private final LinkedHashMap<Long, RegionDemand> readyRegions = new LinkedHashMap<>();
     private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>();
     private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>();
-    private final CoalescingMailbox<Long> regionMailbox = new CoalescingMailbox<>();
     private final ReadyGroup[][][] ready;
 
     SectionDemandTable(int pixelBuckets) { this(pixelBuckets, 1); }
@@ -216,7 +201,6 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             this.detailMailbox.offer(key, new DetailUpdate(action, bounded, epoch));
         }
     }
-    void offerRegion(long region, long generation) { this.regionMailbox.offer(region, generation); }
 
     void drainTop(BiConsumer<Long, Boolean> consumer) {
         this.topMailbox.take().forEach(consumer);
@@ -224,9 +208,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     void drainDetail(BiConsumer<Long, DetailUpdate> consumer) {
         this.detailMailbox.take().forEach(consumer);
     }
-    void drainRegions(BiConsumer<Long, Long> consumer) {
-        this.regionMailbox.take().forEach(consumer);
-    }
+
 
     D adopt(D demand) {
         Objects.requireNonNull(demand, "demand");
@@ -258,7 +240,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
 
     void readyRegion(RegionDemand region) {
         if (region != null && this.regions.get(region.key) == region
-                && (!region.localTried || !region.requested && !region.validated)) {
+                && !region.localTried) {
             this.readyRegions.put(region.key, region);
         }
     }
@@ -312,9 +294,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     }
 
     void forgetUnusedRegion(RegionDemand region) {
-        // Keep response ordering on the existing record if a retired region reenters before
-        // its old response arrives. This is not an additional subscription or demand.
-        if (region.members.isEmpty() && region.pendingResponses == 0) {
+        if (region.members.isEmpty()) {
             this.regions.remove(region.key, region);
             this.readyRegions.remove(region.key);
         }
@@ -411,12 +391,11 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     }
 
     int pendingInputCount() {
-        return this.topMailbox.size() + this.detailMailbox.size() + this.regionMailbox.size();
+        return this.topMailbox.size() + this.detailMailbox.size();
     }
 
     long overwrittenInputCount() {
-        return this.topMailbox.overwritten() + this.detailMailbox.overwritten()
-                + this.regionMailbox.overwritten();
+        return this.topMailbox.overwritten() + this.detailMailbox.overwritten();
     }
 
     boolean current(Ticket ticket) {
@@ -433,7 +412,6 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         this.readyRegions.clear();
         this.topMailbox.clear();
         this.detailMailbox.clear();
-        this.regionMailbox.clear();
     }
 
     void checkInvariants() {
@@ -465,8 +443,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             if (region.members.size() != users.getOrDefault(region.key, 0)) {
                 throw new IllegalStateException("region user mismatch");
             }
-            if (region.pendingResponses < 0
-                    || region.members.isEmpty() && region.pendingResponses == 0) {
+            if (region.members.isEmpty()) {
                 throw new IllegalStateException("region leak");
             }
             int coverage = 0;

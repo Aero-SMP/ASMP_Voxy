@@ -27,7 +27,7 @@ final class ClientUpdateRestart {
     private static final int MAX_ARGUMENT_BYTES = 16 * 1024 * 1024;
     private static final String SSH_TARGET = "aerosmp@ssh.aerosmp.com";
     private static final String REMOTE_LOG =
-            "/home/aerosmp/Desktop/Main/logs/client-upload/restart.log";
+            "/home/aerosmp/Desktop/Voxy_Testing/logs/client-upload/restart.log";
 
     private ClientUpdateRestart() {}
 

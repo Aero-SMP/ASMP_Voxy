@@ -24,18 +24,6 @@ record LocalSection(long key, int kind, int children, int compressedBytes, int c
             throw new IllegalArgumentException("absence carries decoding metadata");
     }
 
-    static LocalSection from(RegionalProtocol.RegionIndex index, int ordinal,
-                             RegionalProtocol.Hash32 catalog) {
-        long key;
-        try { key = index.key(ordinal); }
-        catch (IOException invalid) { throw new IllegalArgumentException("invalid indexed section", invalid); }
-        return new LocalSection(key, !index.isPresent(ordinal) ? ABSENT
-                : index.isEmpty(ordinal) ? EMPTY : DATA, index.childMask(ordinal),
-                index.compressedLength(ordinal), index.canonicalLength(ordinal),
-                index.compressedCrc(ordinal), index.sectionFingerprint(ordinal),
-                index.isPresent(ordinal) ? catalog : RegionalProtocol.Hash32.ZERO);
-    }
-
     long region() {
         int shift = SectionKey.MAX_LOD_LAYER - SectionKey.level(this.key);
         return Integer.toUnsignedLong(SectionKey.x(this.key) >> shift)

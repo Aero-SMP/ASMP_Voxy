@@ -73,18 +73,27 @@ public final class ClientLodDebug {
         if (transportHoldUntil.compareAndSet(deadline, 0)) persistTransportHold(0);
         return transportHoldUntil.get() == 0;
     }
-    static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) {
-        return builder.socketFactory(ignored -> new TransportDebugTelemetry.Socket());
+    static java.net.DatagramSocket quicSocket() throws java.net.SocketException {
+        return new TransportDebugTelemetry.Socket();
+    }
+    static void streamingDesire(ClientSession.Session session, ClientSession.Demand demand, RegionalProtocol.Desire desire) {
+        emit("VOXY_DESIRE session=" + session.id + " ticket=" + desire.ticket() + " key=" + desire.key()
+                + " purpose=" + desire.purpose() + " have=" + (desire.have() != null)
+                + " localProbed=true frame=" + session.renderedFrames + " cacheActivatedFrame=" + demand.cacheActivatedFrame
+                + " coveringKey=" + demand.gatingCoverKey + " coveringActivatedFrame=" + demand.gatingCoverFrame
+                + " cachedCut=" + demand.cachedCover + " cachedCutActivatedFrame=" + demand.cachedCoverActivatedFrame);
     }
     static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {
         SessionDebugTelemetry.activated(session, section, cacheHit);
+        if (cacheHit && section != null) emit("VOXY_CACHE_ACTIVATED session=" + session.id + " key=" + section.key()
+                + " frame=" + session.renderedFrames + " kind=" + section.kind() + " children=" + section.children());
     }
     static void sectionRecovery(ClientSession.Session session, SectionDemandTable.Ticket old,
                                 ClientSession.Demand demand, WorkerResource.Lease lease) {
         emit("SECTION_RECOVERY session=" + session.id + " key=" + demand.key + " oldRevision=" + old.demandRevision()
                 + " revision=" + demand.revision + " lease=" + lease + " disposition="
                 + (session.demands.get(demand.key) != demand ? "REMOVED" : demand.readyKind != null ? demand.readyKind : demand.candidate)
-                + " deferred=" + (demand.pendingIndex != null));
+                + " deferred=" + (demand.networkWanted));
     }
 
     /** Explicit five-minute test lease may span a restart; it cannot strand later launches.

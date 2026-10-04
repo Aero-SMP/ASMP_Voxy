@@ -110,7 +110,7 @@ final class RegionalDiskBudget {
     }
 
     static synchronized RegionalDiskBudget acquire(Path root) throws IOException {
-        root = root.toAbsolutePath().normalize();
+        root = LocalCacheOwnership.currentRoot(root);
         var ref = OPEN.get(root);
         var budget = ref == null ? null : ref.get();
         if (budget == null || budget.state == InventoryState.CLOSED) {
@@ -120,15 +120,18 @@ final class RegionalDiskBudget {
             } catch (InterruptedException stopped) {
                 Thread.currentThread().interrupt(); throw new IOException("cache reopen interrupted", stopped);
             }
-            budget = new RegionalDiskBudget(root, LIMIT);
+            budget = new RegionalDiskBudget(LocalCacheOwnership.openCurrent(root, me.cortex.voxy.common.Logger::info), LIMIT);
             OPEN.put(root, new WeakReference<>(budget));
         }
         budget.retain();
         return budget;
     }
     RegionalDiskBudget(Path root, long limit) throws IOException {
-        this.ownership = LocalCacheOwnership.open(root, me.cortex.voxy.common.Logger::info);
-        this.root = this.ownership.root; this.limit = limit;
+        this(LocalCacheOwnership.open(root, me.cortex.voxy.common.Logger::info), limit);
+    }
+    private RegionalDiskBudget(LocalCacheOwnership ownership, long limit) {
+        this.ownership = ownership;
+        this.root = ownership.root; this.limit = limit;
     }
     synchronized void retain() {
         if (this.state == InventoryState.CLOSED) throw new IllegalStateException("closed cache budget");
@@ -360,6 +363,7 @@ final class RegionalDiskBudget {
     static long size(Path path) { try { return Files.size(path); } catch (IOException missing) { return 0; } }
     private static boolean managedName(Path path) {
         String name = path.getFileName().toString();
-        return name.endsWith(".vxlocal") || name.endsWith(".vxlink") || name.endsWith(".vxlink.pending");
+        return name.endsWith(".vxlocal") || name.endsWith(".vxlink") || name.endsWith(".vxlink.pending")
+                || name.endsWith(".vxcat") || name.endsWith(".vxcat.pending");
     }
 }

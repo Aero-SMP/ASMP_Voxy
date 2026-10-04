@@ -13,12 +13,17 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RegionalRefresh {
     pub changed: Vec<(i32, i32, u64)>,
+    pub changed_ordinals: BTreeMap<(i32, i32), Arc<[u32]>>,
     pub removed: Vec<(i32, i32)>,
     pub metadata_only: usize,
     pub more_pending: bool,
@@ -43,6 +48,9 @@ pub struct RegionalRuntime {
     inventory: RwLock<Option<BTreeSet<(i32, i32)>>>,
     maintenance: Mutex<Maintenance>,
     priority: Mutex<PriorityRequests>,
+    dirty: Mutex<BTreeMap<(i32, i32), [u64; 16]>>,
+    freshness_attempts: Mutex<BTreeMap<(i32, i32), Instant>>,
+    freshness_millis: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -323,6 +331,9 @@ impl RegionalRuntime {
             inventory: RwLock::new(inventory_known.then_some(source_coordinates)),
             maintenance: Mutex::new(maintenance),
             priority: Mutex::new(PriorityRequests::default()),
+            dirty: Mutex::new(BTreeMap::new()),
+            freshness_attempts: Mutex::new(BTreeMap::new()),
+            freshness_millis: AtomicU64::new(1000),
         })
     }
 
@@ -378,6 +389,68 @@ impl RegionalRuntime {
                 Ok(None)
             }
         }
+    }
+
+    pub fn layout(&self) -> RegionLayout {
+        self.layout
+    }
+
+    pub fn set_freshness_interval(&self, millis: u64) {
+        self.freshness_millis
+            .store(millis.max(1000), Ordering::Relaxed);
+    }
+
+    /// Completed terrain writes only; this lock never covers source I/O or a build.
+    pub fn saved_chunks(&self, chunks: &[(i32, i32)]) -> Result<()> {
+        let mut dirty = self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?;
+        for &(x, z) in chunks {
+            let bits = dirty
+                .entry((x.div_euclid(32), z.div_euclid(32)))
+                .or_default();
+            let slot = (z.rem_euclid(32) * 32 + x.rem_euclid(32)) as usize;
+            bits[slot / 64] |= 1 << (slot % 64);
+        }
+        Ok(())
+    }
+
+    fn freshness_deferred(&self, coordinate: (i32, i32)) -> Result<bool> {
+        if !read_lock(&self.regions)?.contains_key(&coordinate) {
+            return Ok(false);
+        }
+        let attempts = self
+            .freshness_attempts
+            .lock()
+            .map_err(|_| crate::UnsafeState("freshness owner poisoned"))?;
+        Ok(attempts.get(&coordinate).is_some_and(|last| {
+            last.elapsed() < Duration::from_millis(self.freshness_millis.load(Ordering::Relaxed))
+        }))
+    }
+
+    fn take_dirty(&self, coordinate: (i32, i32)) -> Result<[u64; 16]> {
+        Ok(self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?
+            .remove(&coordinate)
+            .unwrap_or_default())
+    }
+
+    fn restore_dirty(&self, coordinate: (i32, i32), captured: [u64; 16]) -> Result<()> {
+        if captured.iter().all(|bits| *bits == 0) {
+            return Ok(());
+        }
+        let mut dirty = self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?;
+        let bits = dirty.entry(coordinate).or_default();
+        for (live, captured) in bits.iter_mut().zip(captured) {
+            *live |= captured;
+        }
+        Ok(())
     }
 
     /// Moves an explicitly requested shard ahead of background import work. Duplicate hints are
@@ -555,6 +628,11 @@ impl RegionalRuntime {
             .chain(maintenance.retry.keys().copied())
             .collect::<BTreeSet<_>>();
         for coordinate in stored.difference(&inventory).copied() {
+            self.take_dirty(coordinate)?;
+            self.freshness_attempts
+                .lock()
+                .map_err(|_| crate::UnsafeState("freshness owner poisoned"))?
+                .remove(&coordinate);
             // Logical removal precedes fallible physical cleanup and is never rolled back.
             let removed_generation = write_lock(&self.regions)?.remove(&coordinate);
             if removed_generation.is_some() {
@@ -598,6 +676,7 @@ impl RegionalRuntime {
         )?;
         for coordinate in order {
             if Self::deferred(&maintenance, coordinate, round)
+                || self.freshness_deferred(coordinate)?
                 || self.header_is_current(coordinate, &headers[&coordinate], &maintenance)?
             {
                 continue;
@@ -609,7 +688,15 @@ impl RegionalRuntime {
                 retry.kind = RetryKind::Refresh;
             }
             let before = result.changed.len();
-            if let Err(error) = self.refresh_coordinate(coordinate, &mut maintenance, &mut result) {
+            let captured = self.take_dirty(coordinate)?;
+            self.freshness_attempts
+                .lock()
+                .map_err(|_| crate::UnsafeState("freshness owner poisoned"))?
+                .insert(coordinate, Instant::now());
+            if let Err(error) =
+                self.refresh_coordinate(coordinate, &mut maintenance, &mut result, &captured)
+            {
+                self.restore_dirty(coordinate, captured)?;
                 self.failed(&mut maintenance, &mut result, coordinate, round, error)?;
             } else {
                 maintenance.retry.remove(&coordinate);
@@ -620,6 +707,7 @@ impl RegionalRuntime {
         }
         for (coordinate, header) in &headers {
             if !Self::deferred(&maintenance, *coordinate, round)
+                && !self.freshness_deferred(*coordinate)?
                 && !self.header_is_current(*coordinate, header, &maintenance)?
             {
                 result.more_pending = true;
@@ -689,6 +777,7 @@ impl RegionalRuntime {
         coordinate: (i32, i32),
         maintenance: &mut Maintenance,
         result: &mut RegionalRefresh,
+        forced: &[u64; 16],
     ) -> Result<()> {
         use super::builder::{SourceChanged, UnusableBaseline, verify_header};
         #[cfg(test)]
@@ -773,6 +862,7 @@ impl RegionalRuntime {
         if let (Some(region), Some(source)) = (&region, &stored)
             && source.terrain_generation == region.generation()
             && source.header_matches(&header.entries, header.file_marker)
+            && forced.iter().all(|bits| *bits == 0)
         {
             if !was_authoritative {
                 self.install(region.clone(), result)?;
@@ -792,7 +882,7 @@ impl RegionalRuntime {
             && previous.terrain_generation == region.generation()
         {
             let probe = self
-                .probe_saved_changes(&header, &previous, generation)
+                .probe_saved_changes(&header, &previous, generation, forced)
                 .context("source probe")?;
             if probe.changed_groups.is_empty() {
                 probe
@@ -938,6 +1028,26 @@ impl RegionalRuntime {
             .lock()
             .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?;
         if priority.subscriptions.contains_key(&coordinate) {
+            if let Some(old) = priority.active.get(&coordinate) {
+                let catalog_changed = old.catalog_fingerprint() != region.catalog_fingerprint();
+                let changed = old
+                    .entries()
+                    .iter()
+                    .zip(region.entries())
+                    .enumerate()
+                    .filter_map(|(ordinal, (a, b))| {
+                        (catalog_changed
+                            || a.flags != b.flags
+                            || a.non_empty_children != b.non_empty_children
+                            || a.fingerprint != b.fingerprint
+                            || a.compressed_crc != b.compressed_crc
+                            || a.compressed_length != b.compressed_length
+                            || a.canonical_length != b.canonical_length)
+                            .then_some(ordinal as u32)
+                    })
+                    .collect::<Vec<_>>();
+                report.changed_ordinals.insert(coordinate, changed.into());
+            }
             priority.active.insert(coordinate, Arc::new(region));
         }
         if previous != Some(generation) {
@@ -974,6 +1084,15 @@ impl RegionalRuntime {
         header: &RegionHeader,
         maintenance: &Maintenance,
     ) -> Result<bool> {
+        if self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?
+            .contains_key(&coordinate)
+        {
+            return Ok(false);
+        }
+
         if maintenance.retry.contains_key(&coordinate) {
             return Ok(false);
         }
@@ -1007,6 +1126,7 @@ impl RegionalRuntime {
         header: &RegionHeader,
         previous: &RegionSourceTable,
         generation: u64,
+        forced: &[u64; 16],
     ) -> Result<SavedChangeProbe> {
         let mut updated = RegionSourceTable::new(
             header.region_x,
@@ -1015,6 +1135,8 @@ impl RegionalRuntime {
             header.file_marker,
         )?;
         let mut changed_groups = BTreeSet::new();
+        let unnotified = header.file_marker != previous.anvil_file_marker
+            && (!previous.reconciled || forced.iter().all(|bits| *bits == 0));
         let base_x = header.region_x * 32;
         let base_z = header.region_z * 32;
         for (slot, entry) in header.entries.iter().copied().enumerate() {
@@ -1025,6 +1147,8 @@ impl RegionalRuntime {
             let record = if entry.location == old.anvil_location
                 && entry.timestamp == old.anvil_timestamp
                 && present == old.generated
+                && forced[slot / 64] & (1 << (slot % 64)) == 0
+                && !unnotified
             {
                 old
             } else {

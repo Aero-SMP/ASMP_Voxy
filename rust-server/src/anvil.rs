@@ -714,10 +714,7 @@ fn parse_chunk(
                     .iter()
                     .map(canonical_block_state)
                     .collect::<Vec<_>>(),
-                block_states
-                    .data
-                    .as_ref()
-                    .map(|data| &data[..]),
+                block_states.data.as_ref().map(|data| &data[..]),
             )
         } else {
             // Minecraft may retain only light/biome information for an all-air section.
@@ -762,14 +759,8 @@ fn parse_chunk(
                 .collect::<Result<Vec<_>>>()?;
             (blocks, biomes)
         };
-        let block_light = section
-            .block_light
-            .as_ref()
-            .map(|data| &data[..]);
-        let sky_light = section
-            .sky_light
-            .as_ref()
-            .map(|data| &data[..]);
+        let block_light = section.block_light.as_ref().map(|data| &data[..]);
+        let sky_light = section.sky_light.as_ref().map(|data| &data[..]);
         if block_light.as_ref().is_some_and(|data| data.len() != 2048)
             || sky_light.as_ref().is_some_and(|data| data.len() != 2048)
         {

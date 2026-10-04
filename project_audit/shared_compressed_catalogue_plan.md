@@ -1,8 +1,21 @@
 # Shared compressed catalogue and validated local reuse
 
-Status: implementation plan, not implemented. Work belongs to
+Status: implemented and deployed as matched debug248. Cold catalogue sharing,
+persisted catalogue reuse and cache-only restart have live PC receipts in
+[the execution report](shared_compressed_catalogue_results.md). Full visual
+correctness and a controlled latency comparison are not established. The user
+has suspended 100-client verification; it is not a completion gate until
+explicitly re-enabled. Work belongs to
 `feature/cache-first-background-updates` in `ASMP_Voxy_Cache_First_Updates`.
 Leave `ASMP_Voxy` and `ASMP_Voxy_Restart` unchanged.
+
+Execution steering: the user requested deletion of their active PC profile's
+`.voxy` before implementation. The old client exited and reset request
+`24db0342-b886-4227-8f70-13229adc7445` removed 32,243,236 bytes on 2026-10-04;
+both PC backup SSH helpers survived. Other profile caches were preserved.
+The user has suspended all 100-client verification until explicitly re-enabled.
+Update its consumer statically, but do not launch the pressure workload or mutation
+phases during this implementation. Live verification uses the real PC only.
 
 This implements approach 1 from
 [the uncached-delivery assessment](cache_first_uncached_delivery_options.md).

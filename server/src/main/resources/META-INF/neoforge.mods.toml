@@ -9,6 +9,9 @@ displayName="Voxy Server"
 description='''Runs the Rust Voxy backend and advertises its authenticated QUIC endpoint.'''
 displayTest="IGNORE_ALL_VERSION"
 
+[[mixins]]
+config="server.voxy.mixins.json"
+
 [[dependencies.voxy_server]]
 modId="neoforge"
 type="required"

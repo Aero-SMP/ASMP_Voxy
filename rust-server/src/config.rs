@@ -126,8 +126,16 @@ mod tests {
     #[test]
     fn removed_settings_are_not_part_of_the_config() {
         assert!(toml::from_str::<FileConfig>("").is_ok());
-        for setting in ["world = 'other'", "data = 'other'", "dimension = 'other:world'", "poll_ms = 100"] {
-            assert!(toml::from_str::<FileConfig>(setting).is_err(), "accepted removed setting: {setting}");
+        for setting in [
+            "world = 'other'",
+            "data = 'other'",
+            "dimension = 'other:world'",
+            "poll_ms = 100",
+        ] {
+            assert!(
+                toml::from_str::<FileConfig>(setting).is_err(),
+                "accepted removed setting: {setting}"
+            );
         }
         for setting in ["advertise_host = ''", "advertise_port = 0"] {
             assert!(toml::from_str::<FileConfig>(&format!("[quic]\n{setting}")).is_err());
@@ -136,10 +144,19 @@ mod tests {
 
     #[test]
     fn public_endpoint_does_not_change_listener() {
-        for advertise in ["", "lod.example.com", ":30000", "lod.example.com:30000", "[2001:db8::1]:30000"] {
-            let file: FileConfig = toml::from_str(&format!("[quic]\nadvertise = '{advertise}'")).unwrap();
-            assert_eq!(Config::from_file(file, false, 25586).unwrap().listen,
-                SocketAddr::from(([0, 0, 0, 0], 25786)));
+        for advertise in [
+            "",
+            "lod.example.com",
+            ":30000",
+            "lod.example.com:30000",
+            "[2001:db8::1]:30000",
+        ] {
+            let file: FileConfig =
+                toml::from_str(&format!("[quic]\nadvertise = '{advertise}'")).unwrap();
+            assert_eq!(
+                Config::from_file(file, false, 25586).unwrap().listen,
+                SocketAddr::from(([0, 0, 0, 0], 25786))
+            );
         }
     }
 }

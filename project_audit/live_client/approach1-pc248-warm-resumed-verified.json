@@ -1,0 +1,79 @@
+{
+  "utc": "2026-10-04T23:53:16.1259852Z",
+  "telemetry_time": "2026-10-04T23:53:15.762336200Z",
+  "pc": {
+    "host": "GIORKOSPC",
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP",
+    "pid": 1864,
+    "startUtc": "2026-10-04T23:43:30.3166969Z",
+    "title": "Aero smp",
+    "mods": [
+      {
+        "name": "ASMP_voxy-0.2.248-beta+1.21.1-neoforge-debug.jar",
+        "bytes": 3937951,
+        "sha256": "8e979f8fa0342d06670ac37c958c3797cb112cbec001daa8ba52edf6985864bf"
+      }
+    ],
+    "helpers": [
+      {
+        "directory": "C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSH",
+        "pid": 19916,
+        "alive": true
+      },
+      {
+        "directory": "C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSHsecondary",
+        "pid": 22444,
+        "alive": true
+      }
+    ]
+  },
+  "metrics": {
+    "regional": "ACTIVE",
+    "active": "692",
+    "coverageMissing": "60",
+    "rendererReady": "0",
+    "workers": "14/0/0",
+    "lanes": "8/0",
+    "connectionEpoch": "1",
+    "geometrySections": "691",
+    "received": "2249853",
+    "transportHeld": "false",
+    "metadataFailure": "none",
+    "localActivations": "304",
+    "firstLocalNanos": "403116800",
+    "firstHelloNanos": "246635185600",
+    "catalogueFrames": "0",
+    "catalogueCompressedBytes": "0",
+    "catalogueCacheHits": "1",
+    "connectionFailure": "null",
+    "failure": "null",
+    "cacheDiskBytes": "4373738",
+    "draws": "689/1274",
+    "cacheHits": 304,
+    "cacheHitsEvidence": "workerOutcomeTotals[0]; workerOutcomes starts CACHE_HIT"
+  },
+  "events": [
+    "2026-10-04T23:50:38.834015Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:50:59.522160100Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:51:20.291878400Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:51:41.051866100Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:52:01.781747900Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:52:22.852926700Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:52:43.536585700Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:53:04.330285700Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta"
+  ],
+  "holdMarkerExists": false,
+  "scope": "Read-only post-resume real-PC capture; no controls, pose changes, restarts, tests or pressure clients.",
+  "screenshot": {
+    "utc": "2026-10-04T23:54:34.2864944Z",
+    "pid": 1864,
+    "startUtc": "2026-10-04T23:43:30.3166969Z",
+    "method": "PrintWindow",
+    "width": 1920,
+    "height": 1081,
+    "path": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP\\.voxy-updater\\cache-first-live\\approach1-pc248-warm-resumed-20261004T235424Z.png",
+    "serverPath": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/approach1-pc248-warm-resumed-20261004T235424Z.png",
+    "sha256": "5c8346cd50c8481149cef70ad76226483fa46691925c8751b36b4fc57e464025",
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP"
+  }
+}

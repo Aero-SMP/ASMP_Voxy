@@ -29,6 +29,9 @@ public class VoxyConfig {
     public int geometryMemoryMib = 0;
     public float sectionRenderDistance = 512F / 32F;
     public float subDivisionSize = LodPixelSize.DEFAULT;
+    public int backgroundUpdateIntervalSeconds = 1;
+    // Decimal kbit/s; zero allows unlimited background download traffic.
+    public int backgroundDownloadKbps = 0;
     public int skyFogDistance = 96;
     public float fogIntensity = 1.0f;
     public float fogDensity = 0.0f;
@@ -79,6 +82,8 @@ public class VoxyConfig {
 
     public void save() {
         this.subDivisionSize = this.getSubDivisionSize();
+        this.backgroundUpdateIntervalSeconds = this.getBackgroundUpdateIntervalSeconds();
+        this.backgroundDownloadKbps = this.getBackgroundDownloadKbps();
         if (!VoxyClient.isAvailable()) {
             Logger.info("Not saving config because Voxy is unavailable");
             return;
@@ -93,6 +98,14 @@ public class VoxyConfig {
 
     public float getSubDivisionSize() {
         return LodPixelSize.validate(this.subDivisionSize);
+    }
+
+    public int getBackgroundUpdateIntervalSeconds() {
+        return Math.max(1, this.backgroundUpdateIntervalSeconds);
+    }
+
+    public int getBackgroundDownloadKbps() {
+        return Math.max(0, this.backgroundDownloadKbps);
     }
 
     private static Path getConfigPath() {

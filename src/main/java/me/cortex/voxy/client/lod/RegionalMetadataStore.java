@@ -4,12 +4,13 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.HexFormat;
 import java.util.function.BooleanSupplier;
 
-/** Only the server/dimension-to-world hint is external to self-contained section journals. */
+/** Optional world hint/catalogue metadata; named section journals remain self-contained. */
 final class RegionalMetadataStore implements AutoCloseable {
     enum Persistence { PERSISTED, DEFERRED_INVENTORY, OBSOLETE, UNAVAILABLE }
     private static final long MAGIC = 0x314b4e4c595856L; // VXYLNK1
@@ -41,6 +42,39 @@ final class RegionalMetadataStore implements AutoCloseable {
             return RegionalProtocol.Hash32.read(input);
         }
     }
+    RegionalProtocol.CatalogMessage readCatalogue(RegionalProtocol.Hash32 world, String dimension) throws IOException {
+        Path path = namespace(world, dimension).resolve("catalogue.vxcat");
+        synchronized (this) { if (this.closed) return null; this.budget.retain(); }
+        try (var pin = this.budget.pin(path)) {
+            LocalCacheOwnership.rejectLinks(path);
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return null;
+            try (var file = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+                if (file.size() < 46 || file.size() > 5L + RegionalProtocol.MAX_CATALOG_FRAME_BYTES)
+                    throw new IOException("cached catalogue extent is invalid");
+                var input = Channels.newInputStream(file);
+                var message = RegionalProtocol.readControl(input);
+                if (!(message instanceof RegionalProtocol.CatalogMessage catalog) || input.read() != -1)
+                    throw new IOException("cached catalogue contains an invalid frame");
+                return catalog;
+            } catch (NoSuchFileException missing) { return null; }
+        } finally { this.budget.release(); }
+    }
+    Persistence persistCatalogue(RegionalProtocol.Hash32 world, String dimension,
+                                 RegionalProtocol.CatalogMessage catalog, long stamp,
+                                 BooleanSupplier current) throws IOException {
+        synchronized (this) { if (this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE; this.budget.retain(); }
+        try {
+            var unavailable = this.budget.persistenceUnavailable();
+            if (unavailable != null) return unavailable;
+            Path path = namespace(world, dimension).resolve("catalogue.vxcat");
+            Path temporary = path.resolveSibling(path.getFileName() + ".pending");
+            try (var writer = this.budget.writer(path, current);
+                 var pin = this.budget.pin(path); var pending = this.budget.pin(temporary)) {
+                LocalCacheOwnership.rejectLinks(path); LocalCacheOwnership.rejectLinks(temporary);
+                return install(path, temporary, ByteBuffer.wrap(RegionalProtocol.catalogFrame(catalog)), current);
+            }
+        } finally { this.budget.release(); }
+    }
     Persistence associate(String server, String dimension, RegionalProtocol.Hash32 world,
                           long stamp, BooleanSupplier current) throws IOException {
         if (server == null || this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
@@ -51,31 +85,40 @@ final class RegionalMetadataStore implements AutoCloseable {
              var pin = this.budget.pin(path); var pending = this.budget.pin(temporary)) {
             LocalCacheOwnership.rejectLinks(path); LocalCacheOwnership.rejectLinks(temporary);
             if (world.equals(world(server, dimension))) return Persistence.PERSISTED;
-            Files.createDirectories(path.getParent());
-            long oldTemporary = RegionalDiskBudget.size(temporary);
-            this.budget.reserve(temporary, Math.max(0, BYTES - oldTemporary));
-            long before = RegionalDiskBudget.size(path);
-            boolean installed = false;
-            try {
-                var bytes = ByteBuffer.allocate(BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(MAGIC).put(world.bytes());
-                bytes.putInt(RegionalProtocol.crc32c(java.util.Arrays.copyOf(bytes.array(), 40))).flip();
-                try (var file = FileChannel.open(temporary, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
-                        StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS)) {
-                    while (bytes.hasRemaining()) if (file.write(bytes) <= 0) throw new IOException("short world hint write");
-                    file.force(true);
+            var bytes = ByteBuffer.allocate(BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(MAGIC).put(world.bytes());
+            bytes.putInt(RegionalProtocol.crc32c(java.util.Arrays.copyOf(bytes.array(), 40))).flip();
+            return install(path, temporary, bytes, current);
+        }
+    }
+    /** Caller owns the writer and both pins. Partial records never replace committed metadata. */
+    private Persistence install(Path path, Path temporary, ByteBuffer bytes, BooleanSupplier current) throws IOException {
+        if (this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
+        Files.createDirectories(path.getParent());
+        int length = bytes.remaining();
+        long oldTemporary = RegionalDiskBudget.size(temporary);
+        this.budget.reserve(temporary, Math.max(0, length - oldTemporary));
+        long before = RegionalDiskBudget.size(path);
+        boolean installed = false;
+        try {
+            try (var file = FileChannel.open(temporary, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS)) {
+                while (bytes.hasRemaining()) {
+                    RegionalDiskBudget.checkCurrent(current);
+                    if (file.write(bytes) <= 0) throw new IOException("short cache metadata write");
                 }
-                if (this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
-                Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                this.budget.resized(temporary, -Math.max(BYTES, oldTemporary));
-                this.budget.resized(path, BYTES - before);
-                installed = true;
-                return Persistence.PERSISTED;
-            } finally {
-                if (!installed) {
-                    long reserved = Math.max(BYTES, oldTemporary);
-                    try { Files.deleteIfExists(temporary); }
-                    finally { this.budget.resized(temporary, RegionalDiskBudget.size(temporary) - reserved); }
-                }
+                file.force(true);
+            }
+            if (this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
+            Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            this.budget.resized(temporary, -Math.max(length, oldTemporary));
+            this.budget.resized(path, length - before);
+            installed = true;
+            return Persistence.PERSISTED;
+        } finally {
+            if (!installed) {
+                long reserved = Math.max(length, oldTemporary);
+                try { Files.deleteIfExists(temporary); }
+                finally { this.budget.resized(temporary, RegionalDiskBudget.size(temporary) - reserved); }
             }
         }
     }
@@ -84,5 +127,5 @@ final class RegionalMetadataStore implements AutoCloseable {
     }
     static String identifier(String value) { return hex(hash(value.getBytes(StandardCharsets.UTF_8))); }
     private static String hex(RegionalProtocol.Hash32 hash) { return HexFormat.of().formatHex(hash.bytes()); }
-    @Override public void close() { if (!this.closed) { this.closed = true; this.budget.release(); } }
+    @Override public synchronized void close() { if (!this.closed) { this.closed = true; this.budget.release(); } }
 }

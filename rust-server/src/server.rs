@@ -1,63 +1,62 @@
-//! Direct QUIC endpoint and persistent certificate identity.
-
+//! Session-owned foreground desires and independently paced background terrain.
 use crate::{
     anvil::AnvilWorld,
     crc::crc32c,
+    pacer::{ENVELOPE_BYTES, PacedSocket, RateLedger, UdpMux},
     quarantine,
     regional::{
-        RegionalAnnouncement, RegionalResponder, RegionalService,
+        CatalogDefinition, PreparedSection, RegionalAnnouncement, RegionalResponder,
+        RegionalService,
         wire::{
-            ALPN, ControlMessage, STREAM_CONTROL, STREAM_SECTION_LANE, encode_control_record,
-            read_control, read_lane, read_request_batch, read_stream_role, write_reply_batch,
+            self, ALPN, ContentBinding, ControlMessage, Desire, PriorityLane, RecordStatus,
+            STREAM_BACKGROUND, STREAM_CONTROL, STREAM_SECTION_LANE, StreamingSettings,
+            encode_control_record, read_control, read_lane, read_stream_role,
         },
     },
     replace_synced, sync_parent,
 };
 use anyhow::{Context, Result, bail};
-use quinn::{Endpoint, IdleTimeout, VarInt, crypto::rustls::QuicServerConfig};
+use quinn::{Endpoint, IdleTimeout, Runtime, VarInt, crypto::rustls::QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     future::Future,
     io::Write,
     net::SocketAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
+use tokio::{sync::Notify, time::Instant};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const TERMINAL_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-const TERMINAL_CONTROL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
-// This stream carries bulk region indexes as well as controls. Strict precedence
-// over terrain starves downloads during a large cold-cache discovery sweep. Let
-// Quinn fairly interleave metadata and coverage; refinement remains below both.
-// Making coverage strictly higher can instead starve a control write on reconnect.
-const CONTROL_STREAM_PRIORITY: i32 = 2;
+const CONTROL_STREAM_PRIORITY: i32 = 3;
 const CONTROL_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
-const SECTION_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
-// Fixed unauthenticated-protocol admission bounds. These limit task/handshake amplification;
-// they are not a configurable server-wide memory governor.
 const MAX_PENDING_HANDSHAKES: usize = 128;
 const MAX_LIVE_CONNECTIONS: usize = 1_024;
-const MAX_SUBSCRIBED_REGIONS: usize = 16_384;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_IDENTITY_BYTES: usize = 64 * 1024;
 const CERTIFICATE_FILE: &str = "certificate.der";
 const PRIVATE_KEY_FILE: &str = "private-key.der";
 
+type Region = (i32, i32);
+type Subscribers = HashMap<(String, i32, i32), HashMap<usize, Weak<Session>>>;
 #[derive(Debug)]
 pub struct ServerState {
     server_instance: u64,
     regional: Arc<RegionalService>,
+    subscribers: Mutex<Subscribers>,
+    started: Instant,
+    trace: bool,
 }
-
 impl ServerState {
     pub fn new(
         dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
@@ -74,7 +73,502 @@ impl ServerState {
         Self {
             server_instance,
             regional,
+            subscribers: Mutex::new(HashMap::new()),
+            started: Instant::now(),
+            trace: std::env::var("VOXY_BACKGROUND_TRACE").as_deref() == Ok("1"),
         }
+    }
+
+    fn register(&self, session: &Arc<Session>, coordinate: Region) {
+        self.subscribers
+            .lock()
+            .expect("terrain subscriber owner poisoned")
+            .entry((session.dimension.clone(), coordinate.0, coordinate.1))
+            .or_default()
+            .insert(session.id, Arc::downgrade(session));
+    }
+    fn release(&self, session: &Session, coordinate: Region) {
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("terrain subscriber owner poisoned");
+        let key = (session.dimension.clone(), coordinate.0, coordinate.1);
+        if let Some(region) = subscribers.get_mut(&key) {
+            region.remove(&session.id);
+            if region.is_empty() {
+                subscribers.remove(&key);
+            }
+        }
+    }
+    fn publication_loop(self: &Arc<Self>) {
+        let state = self.clone();
+        let mut announcements = self.regional.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match announcements.recv().await {
+                    Ok(RegionalAnnouncement::Changed {
+                        dimension,
+                        region_x,
+                        region_z,
+                        changed_ordinals,
+                        ..
+                    }) => {
+                        let recipients = state
+                            .subscribers
+                            .lock()
+                            .expect("terrain subscriber owner poisoned")
+                            .get(&(dimension, region_x, region_z))
+                            .map(|entries| {
+                                entries
+                                    .values()
+                                    .filter_map(Weak::upgrade)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        for session in recipients {
+                            session.changed((region_x, region_z), changed_ordinals.as_deref());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Recover current state; a slow receiver never needs lost event history.
+                        let mut recipients = HashMap::new();
+                        for region in state
+                            .subscribers
+                            .lock()
+                            .expect("terrain subscriber owner poisoned")
+                            .values()
+                        {
+                            for (&id, weak) in region {
+                                if let Some(session) = weak.upgrade() {
+                                    recipients.insert(id, session);
+                                }
+                            }
+                        }
+                        for session in recipients.into_values() {
+                            session.reconcile();
+                        }
+                    }
+                    Ok(RegionalAnnouncement::Shutdown(_))
+                    | Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+}
+
+#[derive(Debug)]
+struct Interest {
+    desire: Desire,
+    known: Option<ContentBinding>,
+    primary_known: Option<ContentBinding>,
+    active: Option<(u64, u64, bool)>,
+    revision: u64,
+}
+#[derive(Debug, Default)]
+struct Wants {
+    interests: HashMap<u64, Interest>,
+    regions: HashMap<Region, HashMap<u32, u64>>,
+    foreground: [VecDeque<u64>; 2],
+    queued: [HashSet<u64>; 2],
+    background: HashSet<u64>,
+}
+impl Wants {
+    fn queue(&mut self, key: u64) {
+        let Some(interest) = self.interests.get(&key) else {
+            return;
+        };
+        if interest.desire.purpose == 2 {
+            self.background.insert(key);
+        } else if interest.active.is_none() {
+            let lane = interest.desire.purpose as usize;
+            if self.queued[lane].insert(key) {
+                self.foreground[lane].push_back(key);
+            }
+        }
+    }
+}
+#[derive(Debug)]
+struct PrimaryWriter {
+    send: quinn::SendStream,
+    failed: bool,
+}
+
+#[derive(Debug)]
+struct Session {
+    id: usize,
+    peer: SocketAddr,
+    dimension: String,
+    state: Arc<ServerState>,
+    responder: RegionalResponder,
+    wants: Mutex<Wants>,
+    foreground: [Notify; 2],
+    background: Notify,
+    stopped: Notify,
+    closed: AtomicBool,
+    settings: Mutex<StreamingSettings>,
+    ledger: Arc<RateLedger>,
+    metadata: tokio::sync::Mutex<PrimaryWriter>,
+    catalogues: Mutex<HashSet<[u8; 32]>>,
+}
+#[derive(Clone, Copy)]
+struct Claim {
+    desire: Desire,
+    revision: u64,
+    known: Option<ContentBinding>,
+}
+impl Session {
+    fn has_catalogue(&self, fingerprint: [u8; 32]) -> bool {
+        self.catalogues
+            .lock()
+            .expect("catalogue announcement owner poisoned")
+            .contains(&fingerprint)
+    }
+    async fn announce_catalogue(&self, catalogue: &CatalogDefinition) -> Result<()> {
+        let mut writer = self.metadata.lock().await;
+        if writer.failed || self.closed.load(Ordering::Acquire) {
+            bail!("primary catalogue writer is closed");
+        }
+        if self.has_catalogue(catalogue.fingerprint) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.trace_catalogue_start("foreground", catalogue);
+        if let Err(error) = writer.send.write_all(&catalogue.frame).await {
+            // A partial frame cannot be retried on this cursor. The lane error closes primary.
+            writer.failed = true;
+            return Err(error).context("primary catalogue frame failed");
+        }
+        self.catalogues
+            .lock()
+            .expect("catalogue announcement owner poisoned")
+            .insert(catalogue.fingerprint);
+        self.trace_catalogue("foreground", catalogue, started);
+        Ok(())
+    }
+    fn trace_catalogue(&self, channel: &str, catalogue: &CatalogDefinition, started: Instant) {
+        if self.state.trace {
+            eprintln!(
+                "VOXY_CATALOG_SENT session={} channel={channel} fingerprint={} canonical_bytes={} compressed_bytes={} frame_bytes={} write_ns={}",
+                self.id,
+                blake3::Hash::from(catalogue.fingerprint),
+                catalogue.canonical_length,
+                catalogue.compressed_length,
+                catalogue.frame.len(),
+                started.elapsed().as_nanos()
+            );
+        }
+    }
+    fn trace_catalogue_start(&self, channel: &str, catalogue: &CatalogDefinition) {
+        if self.state.trace {
+            eprintln!(
+                "VOXY_CATALOG_WRITE session={} channel={channel} fingerprint={} frame_bytes={}",
+                self.id,
+                blake3::Hash::from(catalogue.fingerprint),
+                catalogue.frame.len()
+            );
+        }
+    }
+    fn wake(&self) {
+        for lane in &self.foreground {
+            lane.notify_waiters();
+        }
+        self.background.notify_waiters();
+    }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.stopped.notify_waiters();
+        self.wake();
+    }
+    async fn ended(&self) {
+        loop {
+            let notified = self.stopped.notified();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    fn apply(self: &Arc<Self>, desires: Vec<Desire>) -> Result<()> {
+        let mut additions = Vec::new();
+        {
+            let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+            for desire in desires {
+                let key = crate::key::SectionKey::unpack(desire.key)?;
+                let side = 16i32 >> key.level;
+                let coordinate = (key.x.div_euclid(side), key.z.div_euclid(side));
+                let ordinal = self
+                    .responder
+                    .layout()
+                    .index(coordinate.0, coordinate.1, key.into())
+                    .map(|index| index as u32)
+                    .unwrap_or(u32::MAX);
+                let first = !wants.regions.contains_key(&coordinate);
+                wants
+                    .regions
+                    .entry(coordinate)
+                    .or_default()
+                    .insert(ordinal, desire.key);
+                if first {
+                    additions.push(coordinate);
+                }
+                let (active, revision) = wants
+                    .interests
+                    .get(&desire.key)
+                    .map_or((None, 0), |old| (old.active, old.revision.wrapping_add(1)));
+                wants.interests.insert(
+                    desire.key,
+                    Interest {
+                        desire,
+                        known: desire.have,
+                        primary_known: desire.have,
+                        active,
+                        revision,
+                    },
+                );
+                if desire.purpose != 2 {
+                    wants.queue(desire.key);
+                } else if desire.have.is_some() {
+                    wants.background.insert(desire.key);
+                }
+            }
+        }
+        for coordinate in additions {
+            self.responder
+                .subscribe_region(coordinate.0, coordinate.1)?;
+            self.state.register(self, coordinate);
+        }
+        let interval = self
+            .settings
+            .lock()
+            .expect("streaming settings owner poisoned")
+            .interval_millis;
+        if !self
+            .wants
+            .lock()
+            .expect("terrain desire owner poisoned")
+            .interests
+            .is_empty()
+        {
+            self.state.regional.set_cadence(self.id, Some(interval))?;
+        }
+        self.wake();
+        Ok(())
+    }
+    fn drop_keys(&self, keys: Vec<u64>) -> Result<()> {
+        let mut releases = Vec::new();
+        {
+            let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+            for key in keys {
+                if wants.interests.remove(&key).is_none() {
+                    continue;
+                }
+                let spatial = crate::key::SectionKey::unpack(key)?;
+                let side = 16i32 >> spatial.level;
+                let coordinate = (spatial.x.div_euclid(side), spatial.z.div_euclid(side));
+                if let Some(region) = wants.regions.get_mut(&coordinate) {
+                    let ordinal = self
+                        .responder
+                        .layout()
+                        .index(coordinate.0, coordinate.1, spatial.into())
+                        .map(|index| index as u32)
+                        .unwrap_or(u32::MAX);
+                    if region.get(&ordinal) == Some(&key) {
+                        region.remove(&ordinal);
+                    }
+                    if region.is_empty() {
+                        wants.regions.remove(&coordinate);
+                        releases.push(coordinate);
+                    }
+                }
+                wants.background.remove(&key);
+                for queued in &mut wants.queued {
+                    queued.remove(&key);
+                }
+            }
+        }
+        if self
+            .wants
+            .lock()
+            .expect("terrain desire owner poisoned")
+            .interests
+            .is_empty()
+        {
+            self.state.regional.set_cadence(self.id, None)?;
+        }
+        for coordinate in releases {
+            self.state.release(self, coordinate);
+            self.responder
+                .unsubscribe_region(coordinate.0, coordinate.1)?;
+        }
+        Ok(())
+    }
+    fn changed(&self, coordinate: Region, ordinals: Option<&[u32]>) {
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        let Some(region) = wants.regions.get(&coordinate) else {
+            return;
+        };
+        let keys = match ordinals {
+            Some(ordinals) => ordinals
+                .iter()
+                .filter_map(|ordinal| region.get(ordinal).copied())
+                .collect::<Vec<_>>(),
+            None => region.values().copied().collect(),
+        };
+        for key in keys {
+            let Some(interest) = wants.interests.get_mut(&key) else {
+                continue;
+            };
+            interest.revision = interest.revision.wrapping_add(1);
+            if interest.known.is_none() && interest.desire.purpose != 2 {
+                wants.queue(key);
+            } else {
+                wants.background.insert(key);
+            }
+        }
+        drop(wants);
+        self.wake();
+    }
+    fn reconcile(&self) {
+        let coordinates = self
+            .wants
+            .lock()
+            .expect("terrain desire owner poisoned")
+            .regions
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for coordinate in coordinates {
+            self.changed(coordinate, None);
+        }
+    }
+    fn reconcile_background(&self) {
+        // Reliable writes are not durable receipt. An abandoned background connection may
+        // have buffered records; only peer holdings and the still-live primary are a safe base.
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        for interest in wants.interests.values_mut() {
+            interest.known = interest.primary_known;
+            if interest.active.is_some_and(|(_, _, background)| background) {
+                interest.active = None;
+            }
+        }
+        drop(wants);
+        self.reconcile();
+    }
+
+    fn claim(&self, lane: usize) -> Option<Claim> {
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        while let Some(key) = wants.foreground[lane].pop_front() {
+            if !wants.queued[lane].remove(&key) {
+                continue;
+            }
+            let Some(interest) = wants.interests.get_mut(&key) else {
+                continue;
+            };
+            if interest
+                .active
+                .is_some_and(|(_, _, background)| !background)
+                || interest.desire.purpose as usize != lane
+            {
+                continue;
+            }
+            // Urgent misses may supersede a slow background owner; its frame is not cancelled.
+            interest.active = Some((interest.desire.ticket, interest.revision, false));
+            return Some(Claim {
+                desire: interest.desire,
+                revision: interest.revision,
+                known: interest.known,
+            });
+        }
+        None
+    }
+    fn background_keys(&self) -> Vec<u64> {
+        self.wants
+            .lock()
+            .expect("terrain desire owner poisoned")
+            .background
+            .iter()
+            .copied()
+            .collect()
+    }
+    fn claim_background(&self, key: u64) -> Option<Claim> {
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        let interest = wants.interests.get_mut(&key)?;
+        if interest.active.is_some() {
+            return None;
+        }
+        interest.active = Some((interest.desire.ticket, interest.revision, true));
+        let claim = Claim {
+            desire: interest.desire,
+            revision: interest.revision,
+            known: interest.known,
+        };
+        wants.background.remove(&key);
+        Some(claim)
+    }
+    fn finish(&self, claim: Claim, binding: Option<ContentBinding>, background: bool) {
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        let Some(interest) = wants.interests.get_mut(&claim.desire.key) else {
+            return;
+        };
+        if interest.active != Some((claim.desire.ticket, claim.revision, background)) {
+            return;
+        }
+        interest.active = None;
+        if interest.desire.ticket == claim.desire.ticket {
+            if let Some(binding) = binding {
+                interest.known = Some(binding);
+                if !background {
+                    interest.primary_known = Some(binding);
+                }
+            }
+        }
+        if interest.desire.ticket != claim.desire.ticket || interest.revision != claim.revision {
+            if interest.desire.purpose != 2
+                && (interest.desire.ticket != claim.desire.ticket || interest.known.is_none())
+            {
+                wants.queue(claim.desire.key);
+            } else {
+                wants.background.insert(claim.desire.key);
+            }
+        }
+        drop(wants);
+        self.wake();
+    }
+    fn policy(&self, settings: StreamingSettings) -> Result<()> {
+        settings.validate()?;
+        *self
+            .settings
+            .lock()
+            .expect("streaming settings owner poisoned") = settings;
+        self.ledger.update(settings.bandwidth_kbps);
+        let interested = !self
+            .wants
+            .lock()
+            .expect("terrain desire owner poisoned")
+            .interests
+            .is_empty();
+        self.state
+            .regional
+            .set_cadence(self.id, interested.then_some(settings.interval_millis))?;
+        self.wake();
+        Ok(())
+    }
+    fn trace(&self, phase: &str, sequence: u64, keys: usize, port: u16) {
+        if !self.state.trace {
+            return;
+        }
+        let settings = *self
+            .settings
+            .lock()
+            .expect("streaming settings owner poisoned");
+        let (bytes, datagrams) = self.ledger.counters();
+        eprintln!(
+            "VOXY_BACKGROUND_BATCH phase={phase} session={} peer={} port={port} seq={sequence} monotonic_ns={} interval_ms={} keys={keys} ip_bytes={bytes} datagrams={datagrams}",
+            self.id,
+            self.peer,
+            self.state.started.elapsed().as_nanos(),
+            settings.interval_millis
+        );
     }
 }
 
@@ -86,48 +580,47 @@ pub async fn serve(
 ) -> Result<()> {
     let identity = load_or_create_identity(identity_directory)?;
     let server_config = make_server_config(&identity)?;
-    let endpoint = Endpoint::server(server_config, listen)
+    let runtime = Arc::new(quinn::TokioRuntime);
+    let socket = std::net::UdpSocket::bind(listen)
         .with_context(|| format!("bind Voxy QUIC UDP endpoint {listen}"))?;
+    let multiplex = UdpMux::new(runtime.wrap_udp_socket(socket)?);
+    let endpoint = Endpoint::new_with_abstract_socket(
+        Default::default(),
+        Some(server_config.clone()),
+        multiplex.foreground(),
+        runtime,
+    )?;
+    let mut background_config = server_config.clone();
+    background_config.transport_config(make_transport_config(true)?);
     let actual = endpoint.local_addr()?;
     eprintln!(
         "VOXY_READY udp_port={} alpn={} cert_sha256={}",
         actual.port(),
-        std::str::from_utf8(ALPN).expect("ALPN is static ASCII"),
+        std::str::from_utf8(ALPN).expect("static ALPN"),
         identity.fingerprint
     );
-
-    let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
-    let live_connections = Arc::new(tokio::sync::Semaphore::new(MAX_LIVE_CONNECTIONS));
+    state.publication_loop();
+    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+    let live = Arc::new(tokio::sync::Semaphore::new(MAX_LIVE_CONNECTIONS));
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else {
-                    return Ok(());
-                };
-                let Ok(live_permit) = live_connections.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
-                };
-                let Ok(handshake_permit) = pending_handshakes.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
-                };
-                let peer = incoming.remote_address();
-                let state = state.clone();
+            incoming=endpoint.accept()=> {
+                let Some(incoming)=incoming else { return Ok(()); };
+                let Ok(live_permit)=live.clone().try_acquire_owned() else {incoming.refuse();continue;};
+                let Ok(handshake_permit)=pending.clone().try_acquire_owned() else {incoming.refuse();continue;};
+                let state=state.clone();let config=background_config.clone();let multiplex=multiplex.clone();
                 tokio::spawn(async move {
-                    let result = serve_connection(state, incoming, handshake_permit, live_permit).await;
-                    if let Err(error) = result {
-                        eprintln!("Voxy QUIC client {peer} disconnected: {error:#}");
+                    if let Err(error)=serve_connection(state,incoming,config,multiplex,handshake_permit,live_permit).await {
+                        eprintln!("Voxy QUIC session ended: {error:#}");
                     }
                 });
             }
-            result = &mut shutdown => {
-                result?;
-                state.regional.shutdown("Voxy server shutting down");
+            result=&mut shutdown=> {
+                result?; state.regional.shutdown("Voxy server shutting down");
                 tokio::time::sleep(SERVICE_SHUTDOWN_GRACE).await;
-                endpoint.close(VarInt::from_u32(0), b"Voxy server shutting down");
-                let _ = tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT, endpoint.wait_idle()).await;
+                endpoint.close(VarInt::from_u32(0),b"Voxy server shutting down");
+                let _=tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT,endpoint.wait_idle()).await;
                 return Ok(());
             }
         }
@@ -137,202 +630,355 @@ pub async fn serve(
 async fn serve_connection(
     state: Arc<ServerState>,
     incoming: quinn::Incoming,
+    config: quinn::ServerConfig,
+    multiplex: Arc<UdpMux>,
     handshake_permit: tokio::sync::OwnedSemaphorePermit,
-    live_permit: tokio::sync::OwnedSemaphorePermit,
+    _live_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
-    let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming)
-        .await
-        .context("QUIC handshake timeout")??;
-    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
-        .await
-        .context("control-stream timeout")??;
-    send.set_priority(CONTROL_STREAM_PRIORITY)
-        .context("set QUIC control-stream priority")?;
-    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        if read_stream_role(&mut recv).await? != Some(STREAM_CONTROL) {
-            bail!("the first bidirectional stream must be the control stream");
-        }
+    // Quinn's idle timeout owns handshake loss recovery; a second five-second timer rejected impaired clients.
+    let connection = incoming.await?;
+    let (send, mut recv) = connection.accept_bi().await?;
+    send.set_priority(CONTROL_STREAM_PRIORITY)?;
+    if read_stream_role(&mut recv).await? != Some(STREAM_CONTROL) {
+        bail!("first stream must be control");
+    }
+    let (dimension, expected_world, held_catalog, settings, desires) =
         match read_control(&mut recv).await? {
-            Some(ControlMessage::Hello { dimension }) => Ok(dimension),
-            Some(_) => bail!("HELLO must be the first control message"),
-            None => bail!("control stream ended before HELLO"),
-        }
-    })
-    .await;
-    let dimension = match handshake {
-        Ok(Ok(dimension)) => dimension,
-        Ok(Err(error)) => {
-            write_terminal_control(
-                &mut send,
-                &ControlMessage::Error {
-                    code: 1,
-                    message: error.to_string(),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-        Err(_) => {
-            let error = anyhow::anyhow!("control HELLO timeout");
-            write_terminal_control(
-                &mut send,
-                &ControlMessage::Error {
-                    code: 1,
-                    message: error.to_string(),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
+            Some(ControlMessage::Open {
+                dimension,
+                expected_world,
+                held_catalog,
+                settings,
+                desires,
+            }) => (dimension, expected_world, held_catalog, settings, desires),
+            _ => bail!("OPEN must be the first control message"),
+        };
     drop(handshake_permit);
     let responder = state
         .regional
         .responder(&dimension, state.server_instance)?;
-    let result = serve_regional_connection(
-        state.regional.clone(),
-        responder,
-        connection,
-        send,
-        recv,
+    let mut token = [0; 32];
+    connection
+        .export_keying_material(&mut token, b"voxy-background-session", b"")
+        .map_err(|_| anyhow::anyhow!("session token export failed"))?;
+    let ledger = RateLedger::new(settings.bandwidth_kbps);
+    let runtime = Arc::new(quinn::TokioRuntime);
+    let socket = PacedSocket::new(multiplex.background(&token)?, ledger.clone());
+    let background_endpoint =
+        Endpoint::new_with_abstract_socket(Default::default(), Some(config), socket, runtime)?;
+    let port = background_endpoint.local_addr()?.port();
+    let matched = expected_world == [0; 32] || expected_world == responder.world_identity();
+    let mut catalogues = HashSet::new();
+    if matched && held_catalog != [0; 32] {
+        catalogues.insert(held_catalog);
+    }
+    let session = Arc::new(Session {
+        id: connection.stable_id(),
+        peer: connection.remote_address(),
         dimension,
-    )
-    .await;
-    drop(live_permit);
-    result
-}
-
-async fn serve_regional_connection(
-    service: Arc<RegionalService>,
-    responder: RegionalResponder,
-    connection: quinn::Connection,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    dimension: String,
-) -> Result<()> {
-    write_control(
-        &mut send,
-        &responder.hello()?,
-        CONTROL_WRITE_PROGRESS_TIMEOUT,
-    )
-    .await?;
-    let mut announcements = service.subscribe();
-    let mut subscribed_regions = HashSet::new();
-    let result = async {
-        loop {
-            tokio::select! {
-            incoming = connection.accept_bi() => {
-                let (section_send, section_recv) = incoming.context("accept regional section lane")?;
-                let lane_responder = responder.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_section_lane(lane_responder, section_send, section_recv).await {
-                        eprintln!("regional section lane ended: {error:#}");
-                    }
-                });
-            }
-            control = read_control(&mut recv) => {
-                let Some(control) = control? else {
-                    return Ok(());
-                };
-                let response = match control {
-                    ControlMessage::RegionRequest { region_x, region_z } => {
-                        if !subscribed_regions.contains(&(region_x, region_z))
-                                && subscribed_regions.len() == MAX_SUBSCRIBED_REGIONS {
-                            bail!("regional subscription set exceeded its safety bound");
-                        }
-                        if subscribed_regions.insert((region_x, region_z)) {
-                            responder.subscribe_region(region_x, region_z)?;
-                        }
-                        Some(responder.region(region_x, region_z)?)
-                    }
-                    ControlMessage::RegionRelease { region_x, region_z } => {
-                        if subscribed_regions.remove(&(region_x, region_z)) {
-                            responder.unsubscribe_region(region_x, region_z)?;
-                        }
-                        None
-                    }
-                    ControlMessage::CatalogRequest => Some(responder.catalog_response()?),
-                    _ => bail!("client sent a server-only or duplicate regional control record"),
-                };
-                if let Some(response) = response {
-                    write_control(&mut send, &response, CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
+        state: state.clone(),
+        responder,
+        wants: Mutex::new(Wants::default()),
+        foreground: [Notify::new(), Notify::new()],
+        background: Notify::new(),
+        stopped: Notify::new(),
+        closed: AtomicBool::new(false),
+        settings: Mutex::new(settings),
+        ledger,
+        metadata: tokio::sync::Mutex::new(PrimaryWriter {
+            send,
+            failed: false,
+        }),
+        catalogues: Mutex::new(catalogues),
+    });
+    session.policy(settings)?;
+    if state.trace {
+        let misses = desires.iter().filter(|desire| desire.purpose != 2).count();
+        eprintln!(
+            "VOXY_STREAM_SESSION session={} peer={} port={} interval_ms={} bandwidth_kbps={} initial_misses={} initial_interests={} held_catalog={}",
+            session.id,
+            session.peer,
+            port,
+            settings.interval_millis,
+            settings.bandwidth_kbps,
+            misses,
+            desires.len(),
+            blake3::Hash::from(held_catalog)
+        );
+    }
+    if matched {
+        session.apply(desires)?;
+    }
+    let result=async {
+        {
+            let mut writer=session.metadata.lock().await;
+            write_control(&mut writer.send,&session.responder.hello(token)?,CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
+        }
+        let background_session=session.clone();let background=background_endpoint.clone();
+        let mut background_task=Some(tokio::spawn(async move {serve_background(background_session,background,token).await}));
+        let mut lanes=tokio::task::JoinSet::new();
+        // One reader owns the byte cursor. Cancelling read_control after accepting another lane
+        // would discard an already-read frame prefix and corrupt the next control message.
+        let control_session=session.clone();
+        let mut controls=tokio::spawn(async move {
+            loop {
+                match read_control(&mut recv).await? {
+                    Some(ControlMessage::Desires(desires))=>control_session.apply(desires)?,
+                    Some(ControlMessage::Drop(keys))=>control_session.drop_keys(keys)?,
+                    Some(ControlMessage::Settings(settings))=>control_session.policy(settings)?,
+                    None=>return Ok::<(),anyhow::Error>(()),
+                    Some(_)=>bail!("unexpected primary control record"),
                 }
             }
-            announcement = announcements.recv() => {
-                let announcement = match announcement {
-                    Ok(value) => value,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        bail!("regional client missed {skipped} current-state announcements");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-                };
-                let message = match announcement {
-                    RegionalAnnouncement::Changed {
-                        dimension: changed, region_x, region_z, generation,
-                    } if changed == dimension
-                            && subscribed_regions.contains(&(region_x, region_z)) => Some(ControlMessage::RegionChanged {
-                        region_x, region_z, generation,
-                    }),
-                    RegionalAnnouncement::Shutdown(message) => {
-                        write_control(&mut send, &ControlMessage::Shutdown { message }, CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
-                        return Ok(());
-                    }
-                    _ => None,
-                };
-                if let Some(message) = message {
-                    write_control(&mut send, &message, CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
-                }
-            }
-            }
-        }
-    }.await;
-    for (region_x, region_z) in subscribed_regions {
-        if let Err(error) = responder.unsubscribe_region(region_x, region_z) {
-            eprintln!(
-                "cannot release disconnected regional subscription ({region_x},{region_z}): {error:#}"
-            );
-        }
-    }
-    result
-}
-
-async fn serve_section_lane(
-    responder: RegionalResponder,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-) -> Result<()> {
-    let role = tokio::time::timeout(SECTION_HEADER_TIMEOUT, read_stream_role(&mut recv))
-        .await
-        .context("regional section-lane role timeout")??;
-    if role != Some(STREAM_SECTION_LANE) {
-        bail!("non-section role on a regional section lane");
-    }
-    let lane = tokio::time::timeout(SECTION_HEADER_TIMEOUT, read_lane(&mut recv))
-        .await
-        .context("regional section-lane priority timeout")??;
-    send.set_priority(match lane {
-        crate::regional::wire::PriorityLane::Coverage => CONTROL_STREAM_PRIORITY,
-        crate::regional::wire::PriorityLane::Refinement => CONTROL_STREAM_PRIORITY - 1,
-    })?;
-    while let Some(request) = read_request_batch(&mut recv).await? {
-        let responder = responder.clone();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
-        let response_worker = tokio::task::spawn_blocking(move || {
-            responder.sections(&request, |response| {
-                sender
-                    .blocking_send(response)
-                    .map_err(|_| anyhow::anyhow!("regional section lane closed"))
-            })
         });
-        while let Some(response) = receiver.recv().await {
-            write_reply_batch(&mut send, &response).await?;
-        }
-        response_worker
-            .await
-            .context("regional section response task failed")??;
+        let mut controls_finished=false;
+        let result=loop {
+            tokio::select! {
+                incoming=connection.accept_bi()=> {
+                    let (send,recv)=match incoming {Ok(pair)=>pair,Err(error)=>break Err(error.into())};
+                    let owner=session.clone();lanes.spawn(async move {serve_lane(owner,send,recv).await});
+                }
+                message=&mut controls=> {
+                    controls_finished=true;
+                    break match message { Ok(result)=>result,Err(error)=>Err(error.into()) };
+                }
+                lane=lanes.join_next(),if !lanes.is_empty()=> {
+                    match lane {Some(Ok(Ok(())))=>{},Some(Ok(Err(error)))=>break Err(error),Some(Err(error))=>break Err(error.into()),None=>{}}
+                }
+                background=async { background_task.as_mut().unwrap().await },if background_task.is_some()=> {
+                    if let Ok(Err(error))=background {eprintln!("Voxy background connection failed: {error:#}; foreground remains available");}
+                    background_task=None;
+                }
+            }
+        };
+        session.close();connection.close(VarInt::from_u32(0),b"session ended");
+        while lanes.join_next().await.is_some() {}
+        if !controls_finished { let _=controls.await; }
+        if let Some(background_task)=background_task { let _=background_task.await; }
+        result
+    }.await;
+    session.close();
+    connection.close(VarInt::from_u32(0), b"primary session ended");
+    background_endpoint.close(VarInt::from_u32(0), b"primary session ended");
+    background_endpoint.wait_idle().await;
+    let coordinates = session
+        .wants
+        .lock()
+        .expect("terrain desire owner poisoned")
+        .regions
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for coordinate in coordinates {
+        state.release(&session, coordinate);
+        session
+            .responder
+            .unsubscribe_region(coordinate.0, coordinate.1)?;
     }
-    send.finish()?;
-    Ok(())
+    state.regional.set_cadence(session.id, None)?;
+    if state.trace {
+        let (bytes, datagrams) = session.ledger.counters();
+        eprintln!(
+            "VOXY_BACKGROUND_STATS session={} peer={} port={} ip_bytes={} datagrams={}",
+            session.id, session.peer, port, bytes, datagrams
+        );
+    }
+    result
+}
+
+async fn serve_lane(
+    session: Arc<Session>,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    if read_stream_role(&mut recv).await? != Some(STREAM_SECTION_LANE) {
+        bail!("invalid foreground stream role");
+    }
+    let lane = read_lane(&mut recv).await?;
+    send.set_priority(match lane {
+        PriorityLane::Coverage => 2,
+        PriorityLane::Refinement => 1,
+    })?;
+    let lane = lane as usize;
+    loop {
+        let notified = session.foreground[lane].notified();
+        if session.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(claim) = session.claim(lane) {
+            let sent = tokio::select! {result=send_claim(&session,&mut send,claim,None)=>result?,_=session.ended()=>return Ok(())};
+            session.finish(claim, sent, false);
+        } else {
+            tokio::select! {_=notified=>{},_=session.ended()=>return Ok(())}
+        }
+    }
+}
+
+async fn send_claim(
+    session: &Session,
+    send: &mut quinn::SendStream,
+    claim: Claim,
+    background_catalogues: Option<&mut HashSet<[u8; 32]>>,
+) -> Result<Option<ContentBinding>> {
+    let background = background_catalogues.is_some();
+    let responder = session.responder.clone();
+    let desire = claim.desire;
+    let mut prepared: PreparedSection =
+        tokio::task::spawn_blocking(move || responder.prepare(desire.ticket, desire.key)).await??;
+    let descriptor = prepared.descriptor;
+    if background
+        && claim.known == Some(descriptor.binding)
+        && descriptor.status != RecordStatus::NotReady
+    {
+        return Ok(Some(descriptor.binding));
+    }
+    if descriptor.binding.catalog_fingerprint != [0; 32] {
+        if let Some(announced) = background_catalogues {
+            if !announced.contains(&descriptor.binding.catalog_fingerprint)
+                && !session.has_catalogue(descriptor.binding.catalog_fingerprint)
+            {
+                let started = Instant::now();
+                session.trace_catalogue_start("background", &prepared.catalog);
+                send.write_all(&prepared.catalog.frame).await?;
+                announced.insert(descriptor.binding.catalog_fingerprint);
+                session.trace_catalogue("background", &prepared.catalog, started);
+            }
+        } else {
+            session.announce_catalogue(&prepared.catalog).await?;
+        }
+    }
+    if descriptor.status == RecordStatus::Data
+        && claim
+            .known
+            .is_some_and(|known| known.has_body() && known.same_body(descriptor.binding))
+    {
+        prepared.descriptor.status = RecordStatus::Reuse;
+    }
+    let descriptor = prepared.descriptor;
+    let body = tokio::task::spawn_blocking(move || prepared.body()).await??;
+    wire::write_record(send, descriptor, &body).await?;
+    Ok((descriptor.status != RecordStatus::NotReady).then_some(descriptor.binding))
+}
+
+async fn serve_background(
+    session: Arc<Session>,
+    endpoint: Endpoint,
+    token: [u8; 32],
+) -> Result<()> {
+    let mut last_start = Instant::now();
+    let mut sequence = 0u64;
+    loop {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => incoming,
+            _ = session.ended() => return Ok(()),
+        };
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
+        let connection = tokio::select! {
+            result = incoming => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    eprintln!("background handshake failed: {error}");
+                    continue;
+                }
+            },
+            _ = session.ended() => return Ok(()),
+        };
+        let transfer = async {
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            if read_stream_role(&mut recv).await? != Some(STREAM_BACKGROUND) {
+                bail!("invalid background stream role");
+            }
+            let mut supplied = [0; 32];
+            recv.read_exact(&mut supplied).await?;
+            if supplied != token {
+                bail!("background session token mismatch");
+            }
+            let mut held_catalog = [0; 32];
+            recv.read_exact(&mut held_catalog).await?;
+            if session.state.trace {
+                let (bytes, datagrams) = session.ledger.counters();
+                eprintln!(
+                    "VOXY_BACKGROUND_CONNECTED session={} peer={} port={} ip_bytes={} datagrams={}",
+                    session.id,
+                    connection.remote_address(),
+                    endpoint.local_addr()?.port(),
+                    bytes,
+                    datagrams
+                );
+            }
+            session.reconcile_background();
+            let mut catalogues = HashSet::new();
+            if held_catalog != [0; 32] {
+                catalogues.insert(held_catalog);
+            }
+            loop {
+                let settings = *session
+                    .settings
+                    .lock()
+                    .expect("streaming settings owner poisoned");
+                let deadline = last_start + Duration::from_millis(settings.interval_millis);
+                if Instant::now() < deadline {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {},
+                        _ = session.background.notified() => continue,
+                        _ = session.ended() => return Ok::<(), anyhow::Error>(()),
+                    }
+                }
+                // Observe wakeups before the predicate: notify_waiters retains changes
+                // for an existing future, but not for one created after the last key arrives.
+                let notified = session.background.notified();
+                let keys = session.background_keys();
+                if keys.is_empty() {
+                    tokio::select! {
+                        _ = notified => {},
+                        _ = session.ended() => return Ok(()),
+                    }
+                    continue;
+                }
+                last_start = Instant::now();
+                sequence = sequence
+                    .checked_add(1)
+                    .context("background batch counter exhausted")?;
+                session.trace("start", sequence, keys.len(), endpoint.local_addr()?.port());
+                for &key in &keys {
+                    let Some(claim) = session.claim_background(key) else {
+                        continue;
+                    };
+                    let sent = tokio::select! {
+                        result = send_claim(&session, &mut send, claim, Some(&mut catalogues)) => match result {
+                            Ok(binding) => binding,
+                            Err(error) => {
+                                session.finish(claim, None, true);
+                                return Err(error);
+                            }
+                        },
+                        _ = session.ended() => return Ok(()),
+                    };
+                    session.finish(claim, sent, true);
+                }
+                session.trace(
+                    "finish",
+                    sequence,
+                    keys.len(),
+                    endpoint.local_addr()?.port(),
+                );
+            }
+        };
+        let result = tokio::select! {
+            result = transfer => result,
+            error = connection.closed() => Err(error.into()),
+            _ = session.ended() => Ok(()),
+        };
+        connection.close(VarInt::from_u32(0), b"background stream ended");
+        if let Err(error) = result {
+            eprintln!("Voxy background reconnect required: {error:#}");
+        }
+        if session.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+    }
 }
 
 async fn write_control(
@@ -352,33 +998,8 @@ async fn write_control(
             bail!("regional control write accepted zero bytes");
         }
         remaining = &remaining[written..];
-        #[cfg(test)]
-        control_write_tests::record_progress(written);
     }
     Ok(())
-}
-
-#[cfg(test)]
-#[path = "control_write_tests.rs"]
-mod control_write_tests;
-
-async fn write_terminal_control(send: &mut quinn::SendStream, message: &ControlMessage) {
-    let Ok(record) = encode_control_record(message) else {
-        let _ = send.reset(VarInt::from_u32(1));
-        return;
-    };
-    match tokio::time::timeout(TERMINAL_CONTROL_WRITE_TIMEOUT, send.write_all(&record)).await {
-        Ok(Ok(())) => drain_terminal_control(send).await,
-        Ok(Err(_)) | Err(_) => {
-            let _ = send.reset(VarInt::from_u32(1));
-        }
-    }
-}
-
-async fn drain_terminal_control(send: &mut quinn::SendStream) {
-    if send.finish().is_ok() {
-        let _ = tokio::time::timeout(TERMINAL_CONTROL_DRAIN_TIMEOUT, send.stopped()).await;
-    }
 }
 
 struct PersistentIdentity {
@@ -454,6 +1075,11 @@ fn make_server_config(identity: &PersistentIdentity) -> Result<quinn::ServerConf
     tls.max_early_data_size = 0;
     let crypto = QuicServerConfig::try_from(tls).context("configure QUIC TLS")?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server.transport_config(make_transport_config(false)?);
+    Ok(server)
+}
+
+fn make_transport_config(background: bool) -> Result<Arc<quinn::TransportConfig>> {
     let mut transport = quinn::TransportConfig::default();
     // One permanent control stream plus eight persistent client-opened section lanes.
     transport.max_concurrent_bidi_streams(VarInt::from_u32(9));
@@ -465,8 +1091,13 @@ fn make_server_config(identity: &PersistentIdentity) -> Result<quinn::ServerConf
     transport.datagram_send_buffer_size(0);
     transport.max_idle_timeout(Some(IdleTimeout::try_from(IDLE_TIMEOUT)?));
     transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
-    server.transport_config(Arc::new(transport));
-    Ok(server)
+    if background {
+        // Reserve the framing bytes within Quinn's existing IPv6-safe 1452-byte ceiling.
+        let mut discovery = quinn::MtuDiscoveryConfig::default();
+        discovery.upper_bound(1452 - ENVELOPE_BYTES as u16);
+        transport.mtu_discovery_config(Some(discovery));
+    }
+    Ok(Arc::new(transport))
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
@@ -501,75 +1132,4 @@ fn replace_private_key(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()
     drop(file);
     fs::rename(temporary, path)?;
     sync_parent(path)
-}
-
-#[cfg(test)]
-mod priority_tests {
-    use super::*;
-
-    // Exercise the production priorities with both prerequisites exceeding a small
-    // receive window. Neither stream may require the other to finish first.
-    async fn metadata_and_coverage_progress() -> Result<()> {
-        let cert = rcgen::generate_simple_self_signed(vec!["voxy.local".into()])?;
-        let identity =
-            PersistentIdentity::new(cert.cert.der().to_vec(), cert.key_pair.serialize_der())?;
-        let server = Endpoint::server(make_server_config(&identity)?, "127.0.0.1:0".parse()?)?;
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(CertificateDer::from(identity.certificate))?;
-        let mut tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        let mut config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-        ));
-        let mut receive = quinn::TransportConfig::default();
-        receive.receive_window(VarInt::from_u32(16 * 1024));
-        receive.stream_receive_window(VarInt::from_u32(16 * 1024));
-        config.transport_config(Arc::new(receive));
-        let mut client = Endpoint::client("127.0.0.1:0".parse()?)?;
-        client.set_default_client_config(config);
-        let address = server.local_addr()?;
-        let incoming = tokio::spawn(async move {
-            let connection = server.accept().await.unwrap().await?;
-            let (mut metadata, _metadata_input) = connection.accept_bi().await?;
-            let (mut terrain, _terrain_input) = connection.accept_bi().await?;
-            metadata.set_priority(CONTROL_STREAM_PRIORITY)?;
-            terrain.set_priority(CONTROL_STREAM_PRIORITY)?;
-            let metadata_body = vec![0; 32 * 1024];
-            let terrain_body = vec![7; 32 * 1024];
-            tokio::try_join!(
-                metadata.write_all(&metadata_body),
-                terrain.write_all(&terrain_body)
-            )?;
-            metadata.finish()?;
-            terrain.finish()?;
-            connection.closed().await;
-            Ok::<_, anyhow::Error>(())
-        });
-        let connection = client.connect(address, "voxy.local")?.await?;
-        let (mut request, mut metadata) = connection.open_bi().await?;
-        request.write_all(&[0]).await?;
-        let (mut request, mut terrain) = connection.open_bi().await?;
-        request.write_all(&[1]).await?;
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::try_join!(
-                metadata.read_to_end(32 * 1024),
-                terrain.read_to_end(32 * 1024)
-            )
-        })
-        .await;
-        connection.close(VarInt::from_u32(0), b"test complete");
-        incoming.abort();
-        let _ = incoming.await;
-        let (metadata, terrain) = result.context("concurrent streams failed to progress")??;
-        assert_eq!(metadata, vec![0; 32 * 1024]);
-        assert_eq!(terrain, vec![7; 32 * 1024]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bulk_metadata_and_coverage_share_bounded_transport() -> Result<()> {
-        metadata_and_coverage_progress().await
-    }
 }

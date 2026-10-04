@@ -1,38 +1,33 @@
 {
   "voxy.config.general": "General",
   "voxy.config.rendering": "Rendering",
-
   "voxy.config.general.enabled": "Enable Voxy",
   "voxy.config.general.enabled.tooltip": "Fully enables or disables voxy",
-
   "voxy.config.general.rendering": "Voxy Rendering",
   "voxy.config.general.rendering.tooltip": "Enables or disables voxy rendering",
-
-
   "voxy.config.general.renderDistance": "Render distance",
   "voxy.config.general.renderDistance.tooltip": "Render distance of voxy in chunks",
-
   "voxy.config.general.subDivisionSize": "LOD pixel size",
   "voxy.config.general.subDivisionSize.tooltip": "Approximate target projected section size in render pixels. Smaller = finer terrain and more work; larger = coarser terrain and less work. Zooming still increases detail. GPU memory may limit the requested quality. This is not the width of an individual block.",
-
   "voxy.config.general.geometry_memory": "GPU Memory",
   "voxy.config.general.geometry_memory.tooltip": "Controls how much GPU memory Voxy can use for LOD geometry. Larger values allow more detailed LODs to stay loaded, but consequently reduce FPS. The default is selected automatically for your GPU; unsafe sizes are hidden.",
-
   "voxy.config.general.environmental_fog": "Enable environmental fog",
   "voxy.config.general.environmental_fog.tooltip": "Enables or disables voxy rendering environmental fog",
-
   "voxy.config.general.ssao_mode": "SSAO Mode",
   "voxy.config.general.ssao_mode.tooltip": "The mode used for screenspace ambient occlusion (Auto attempts to pick the best option while reducing performance impact)",
-
   "voxy.config.general.adaptCloudDistance": "Adaptive cloud distance",
   "voxy.config.general.adaptCloudDistance.tooltip": "Enables or disables adaptive cloud distance",
   "voxy.config.general.cloudDistance": "Cloud distance",
   "voxy.config.general.cloudDistance.tooltip": "Cloud distance in chunks (Only used if adaptive cloud distance is disabled)",
-
   "voxy.config.general.fogIntensity": "Fog intensity",
   "voxy.config.general.fogIntensity.tooltip": "Intensity of the fog, higher values make the fog thicker and reduce visibility",
   "voxy.config.general.fogDensity": "Fog density",
   "voxy.config.general.fogDensity.tooltip": "Density of the fog, higher values make the fog thicker",
   "voxy.config.general.skyFogDistance": "Sky fog distance",
-  "voxy.config.general.skyFogDistance.tooltip": "Distance at which sky fog starts to render in chunks"
+  "voxy.config.general.skyFogDistance.tooltip": "Distance at which sky fog starts to render in chunks",
+  "voxy.config.streaming.update_interval": "Terrain Update Interval",
+  "voxy.config.streaming.update_interval.tooltip": "Minimum time between background terrain update batches. Cached terrain stays visible; missing terrain and zoom detail load immediately.",
+  "voxy.config.streaming.background_bandwidth": "Background Download Bandwidth",
+  "voxy.config.streaming.background_bandwidth.tooltip": "Maximum background Voxy download traffic, including QUIC retransmissions and IP/UDP overhead. Missing terrain and zoom detail use your available connection.",
+  "voxy.config.streaming.unlimited": "Unlimited"
 }

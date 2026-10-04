@@ -1,0 +1,20 @@
+[
+  {
+    "artifact": "ASMP_voxy-0.2.248-beta+1.21.1-neoforge-debug.jar",
+    "before_bytes": 3928361,
+    "after_bytes": 3937951,
+    "delta_bytes": 9590
+  },
+  {
+    "artifact": "voxy-server-0.2.248-beta+1.21.1-neoforge-debug.jar",
+    "before_bytes": 1713872,
+    "after_bytes": 1722338,
+    "delta_bytes": 8466
+  },
+  {
+    "artifact": "voxy-rust-server",
+    "before_bytes": 3376032,
+    "after_bytes": 3398304,
+    "delta_bytes": 22272
+  }
+]

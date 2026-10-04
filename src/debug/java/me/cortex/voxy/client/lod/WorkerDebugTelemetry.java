@@ -96,8 +96,7 @@ final class WorkerDebugTelemetry {
             version = section.ticket().regionGeneration(); source = section.source().name();
         } else if (task instanceof ClientSession.Session.EmptyWorkerTask empty) {
             key = empty.ticket().key(); revision = empty.ticket().demandRevision(); source = "EMPTY";
-        } else if (task instanceof ClientSession.Session.IndexWorkerTask index) {
-            key = index.region(); revision = index.revision(); version = index.generation(); source = "INDEX";
+
         }
         work.begin(lease.generation(), task.getClass().getSimpleName(), key, revision, version, source);
     }

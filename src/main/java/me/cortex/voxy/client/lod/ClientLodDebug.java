@@ -18,7 +18,8 @@ public final class ClientLodDebug {
     static void inventoryDelay(java.nio.file.Path root) throws java.io.IOException {}
     static void cacheCommitted(CompletedSectionCache cache, LocalSection section) {}
     static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) {}
-    static tech.kwik.core.QuicClientConnection.Builder quicBuilder(tech.kwik.core.QuicClientConnection.Builder builder) { return builder; }
+    static java.net.DatagramSocket quicSocket() throws java.net.SocketException { return new java.net.DatagramSocket(); }
+    static void streamingDesire(ClientSession.Session session, ClientSession.Demand demand, RegionalProtocol.Desire desire) {}
     static void sectionActivated(ClientSession.Session session, LocalSection section, boolean cacheHit) {}
     static void sectionRecovery(ClientSession.Session session, SectionDemandTable.Ticket old,
                                 ClientSession.Demand demand, WorkerResource.Lease lease) {}

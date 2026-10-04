@@ -3,6 +3,8 @@ package me.cortex.voxy.server;
 import com.electronwill.nightconfig.toml.TomlParser;
 import me.cortex.voxy.network.QuicEndpointPayload;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.Level;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.common.NeoForge;
@@ -37,6 +39,10 @@ public final class VoxyServer {
         accepting = false;
         RustBackend.start();
         accepting = true;
+    }
+
+    public static void completedTerrainSave(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
+        RustBackend.savedChunk(dimension, chunkX, chunkZ);
     }
 
     private static void serverStopping(ServerStoppingEvent event) {

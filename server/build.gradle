@@ -22,48 +22,9 @@ sourceSets {
         java.srcDirs = ['src/debug/java', rootProject.file('shared/src/debug/java')]
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
-    lifecycleTest {
-        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
-        runtimeClasspath += output + compileClasspath
-    }
 }
 
 repositories { mavenCentral() }
-dependencies { lifecycleTestImplementation 'tech.kwik:kwik:0.10.10' }
-
-tasks.register('serverRustIntegrationTest', JavaExec) {
-    dependsOn tasks.named('lifecycleTestClasses'), tasks.named('debugClasses')
-    classpath = files(sourceSets.debug.output) + sourceSets.lifecycleTest.runtimeClasspath
-    mainClass = 'me.cortex.voxy.server.SupervisorRustIntegrationTest'
-}
-
-tasks.register('serverLifecycleTest', JavaExec) {
-    dependsOn tasks.named('lifecycleTestClasses')
-    classpath = sourceSets.lifecycleTest.runtimeClasspath
-    mainClass = 'me.cortex.voxy.server.ServerLifecycleBehaviorTest'
-    workingDir = layout.buildDirectory.dir('lifecycle-test').get().asFile
-    doFirst {
-        workingDir.mkdirs()
-        copy {
-            from 'src/lifecycleTest/resources/voxy-rust.toml'
-            into workingDir
-        }
-    }
-}
-
-tasks.register('debugServerLifecycleTest', JavaExec) {
-    dependsOn tasks.named('lifecycleTestClasses'), tasks.named('debugClasses')
-    classpath = files(sourceSets.debug.output) + sourceSets.lifecycleTest.runtimeClasspath
-    mainClass = 'me.cortex.voxy.server.ServerLifecycleBehaviorTest'
-    workingDir = layout.buildDirectory.dir('debug-lifecycle-test').get().asFile
-    doFirst {
-        workingDir.mkdirs()
-        copy {
-            from 'src/lifecycleTest/resources/voxy-rust.toml'
-            into workingDir
-        }
-    }
-}
 
 tasks.withType(JavaCompile).configureEach {
     options.release.set(21)
@@ -95,8 +56,14 @@ tasks.register('debugJar', Jar) {
     manifest.attributes('Implementation-Version': modVersion)
     from(sourceSets.main.output) {
         exclude 'me/cortex/voxy/server/ServerDebug.class'
+        exclude 'META-INF/neoforge.mods.toml'
     }
     from sourceSets.debug.output
+    from('src/main/resources/META-INF/neoforge.mods.toml') {
+        into 'META-INF'
+        expand(version: project.version, minecraft: minecraftVersion, neoforge: neoForgeVersion)
+        filter { line -> line == 'config="server.voxy.mixins.json"' ? line + '\n\n[[mixins]]\nconfig="server.voxy.debug.mixins.json"' : line }
+    }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 

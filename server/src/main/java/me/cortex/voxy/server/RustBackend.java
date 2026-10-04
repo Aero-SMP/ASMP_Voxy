@@ -1,6 +1,8 @@
 package me.cortex.voxy.server;
 
 import me.cortex.voxy.network.QuicEndpointPayload;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.Level;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,6 +41,7 @@ final class RustBackend {
     static final class Owner {
         final Path config;
         final Object termination = new Object();
+        final ChunkSaveNotifications saves = new ChunkSaveNotifications();
         volatile boolean wanted = true;
         volatile State state = State.STARTING;
         volatile Failure failure = Failure.NONE;
@@ -151,12 +154,14 @@ final class RustBackend {
                 .directory(owned.config.toAbsolutePath().getParent().toFile())
                 .redirectErrorStream(true);
         builder.environment().put("MALLOC_ARENA_MAX", "2");
+        builder.environment().put("VOXY_BACKGROUND_TRACE", System.getProperty("voxy.background.trace", "0"));
         return builder.start();
     }
 
     private static void supervise(Owner owned) {
         try {
             if (!owned.wanted) return;
+            owned.saves.start();
             if (owned.launch == null) extract(owned);
             event(owned, State.STARTING);
             while (owned.wanted) {
@@ -177,6 +182,7 @@ final class RustBackend {
                                     if (owned.ready != null) throw new IllegalStateException("duplicate Rust readiness");
                                     owned.ready = record;
                                     owned.state = State.READY;
+                                    owned.saves.attach(child);
                                 }
                             }
                         }
@@ -215,6 +221,7 @@ final class RustBackend {
         } finally {
             owned.wanted = false;
             owned.ready = null;
+            owned.saves.close();
             if (terminate(owned)) cleanup(owned);
             owned.state = owned.fatal ? State.FAILED : State.STOPPED;
             terminalReport(owned);
@@ -281,6 +288,7 @@ final class RustBackend {
 
     /** Only this lock serializes termination; no lifecycle lock or thread join is held here. */
     private static boolean terminate(Owner owned) {
+        owned.saves.attach(null);
         synchronized (owned.termination) {
             Process child = owned.child;
             if (child == null) return true;
@@ -355,6 +363,11 @@ final class RustBackend {
         }
     }
 
+    static void savedChunk(ResourceKey<Level> dimension, int x, int z) {
+        Owner current = owner;
+        if (current != null && current.wanted) current.saves.saved(dimension, x, z);
+    }
+
     static ReadyRecord ready() {
         Owner owned = owner;
         if (owned == null) return null;
@@ -397,6 +410,7 @@ final class RustBackend {
             if (!owned.fatal && owned.state != State.STOPPED) owned.state = State.STOPPING;
         }
         // Reentrant diagnostic stop requests must not join their own supervisor.
+        owned.saves.close();
         if (owned.thread == Thread.currentThread()) return;
         boolean interrupted = Thread.interrupted();
         try {

@@ -1,0 +1,18 @@
+{
+  "recorded_utc": "2026-10-04T23:53:12.842367+00:00",
+  "scope": "Read-only native warm-client248 log verification; no runtime controls or fake clients. Receipt write explicitly authorized.",
+  "source_log": "/home/aerosmp/Desktop/Voxy_Testing/logs/latest.log",
+  "session": "94155766476464",
+  "open_log": "[04Oct2026 23:48:15.822] [Voxy Rust supervisor/INFO] [Voxy Rust Backend/]: [Rust] VOXY_STREAM_SESSION session=94155766476464 peer=192.168.1.1:63406 port=25787 interval_ms=2000 bandwidth_kbps=1000 initial_misses=297 initial_interests=512 held_catalog=dd9d633e3da37dee2d4dc2df8b5817cf4d77550402ef80812b9b0289a904bf16",
+  "held_catalogue": "dd9d633e3da37dee2d4dc2df8b5817cf4d77550402ef80812b9b0289a904bf16",
+  "catalogue_trace_count": 0,
+  "catalogue_trace_logs": [],
+  "catalogue_write_count": 0,
+  "catalogue_sent_count": 0,
+  "background_connected_logs": [
+    "[04Oct2026 23:48:17.072] [Voxy Rust supervisor/INFO] [Voxy Rust Backend/]: [Rust] VOXY_BACKGROUND_CONNECTED session=94155766476464 peer=192.168.1.1:50879 port=25787 ip_bytes=1582 datagrams=3"
+  ],
+  "observed_session_through": "[04Oct2026 23:53:12.213] [Voxy Rust supervisor/INFO] [Voxy Rust Backend/]: [Rust] VOXY_BACKGROUND_BATCH phase=finish session=94155766476464 peer=192.168.1.1:63406 port=25787 seq=137 monotonic_ns=943530570668 interval_ms=2000 keys=3 ip_bytes=11114 datagrams=39",
+  "source_log_snapshot_final_line": "[04Oct2026 23:53:12.213] [Voxy Rust supervisor/INFO] [Voxy Rust Backend/]: [Rust] VOXY_BACKGROUND_BATCH phase=finish session=94155766476464 peer=192.168.1.1:63406 port=25787 seq=137 monotonic_ns=943530570668 interval_ms=2000 keys=3 ip_bytes=11114 datagrams=39",
+  "qualification": "Trace enabled for deployed native process. Zero catalogue traces confirms no definition write was attempted/sent for this held-fingerprint session within the observed log interval. It does not prove all terrain or screenshot correctness. Server OPEN at23:48:15.822 precedes reported client hold expiry23:48:19, so exact hold timing is not inferred."
+}

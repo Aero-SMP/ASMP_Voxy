@@ -9,7 +9,7 @@ For an explicitly authorized player:
 python3 tools/request_debug_client_cache_reset.py MGengine
 ```
 
-This creates/replaces `build/libs/debug-client-reset/MGengine.request` with a fresh UUID.
+This creates/replaces `build/libs/debug-clients/MGengine/debug-client-reset/MGengine.request` with a fresh UUID.
 Only a debug client logged in with that Minecraft name reads the request. The request
 is permanent until replaced/removed, but a completed UUID is remembered outside the
 cache, so ordinary repeated polling/restarts do not repeat the deletion. Multiple
@@ -31,7 +31,6 @@ Verify `cache-reset-complete request=<UUID> removedBytes=<count>` in the uploade
 `restart.log`, followed by the new client's version and pipeline/cache-start evidence.
 Creating the request is not proof that the client reset or restarted.
 
-Current uploads: `/home/aerosmp/Desktop/Main/logs/client-upload`.
-The client reconnects through Velocity and may land in the lobby. The authorized
-Velocity-console command `send MGengine main` routes it back to the test destination.
+Current uploads: `/home/aerosmp/Desktop/Voxy_Testing/logs/client-upload`.
+The debug client reconnects directly to `play.aerosmp.com:25587`.
 Do not restart or modify Main or Velocity to perform this test.

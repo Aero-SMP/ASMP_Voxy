@@ -12,10 +12,10 @@ starts the helper on Windows login. Its exclusive file lock prevents duplicate
 helpers. Native Windows OpenSSH maintains the reverse tunnel to
 `aerosmp@ssh.aerosmp.com`, reconnecting after failure. The server listens only on
 an automatically allocated loopback port, recorded in `tunnel-port`. A fresh port
-on every reconnect avoids stale listeners after network failure. The laptop host
-key is persistent and uploaded over the already
-authenticated outbound SSH connection to
-`Voxy_Testing/logs/laptop-backup/host_known_hosts`.
+on every reconnect avoids stale listeners after network failure. The helper host
+key is persistent. Each reverse-tunnel attempt publishes its public host pin and
+helper PID immediately over authenticated outbound SSH. It does not wait for an
+allocated-port log message; `tunnel-port` uploads separately if OpenSSH reports it.
 The connector also discovers a replacement loopback listener if Windows OpenSSH
 omits its allocated-port notice. It verifies the already pinned laptop host key
 before authenticating; unrelated local SSH endpoints cannot match that key.
@@ -37,3 +37,16 @@ machine-wide Windows OpenSSH service, firewall, administrator accounts, or Main.
 
 Build with `./gradlew -p tools/laptop_ssh_backup jar`. If the helper is rebuilt,
 update the bootstrap's SHA-256 pin before publishing the client.
+
+For the PC's two existing independent installations, keep the default and
+`secondary` names and current host aliases. Select a separate metadata directory:
+
+```powershell
+& "$JavaBin\javaw.exe" -Xms16m -Xmx96m -Daerosmp.backup.metadata=pc-backup -jar "$Primary\aerosmp-laptop-backup-ssh.jar" "$Primary"
+& "$JavaBin\javaw.exe" -Xms16m -Xmx96m -Daerosmp.backup.name=secondary -Daerosmp.backup.metadata=pc-backup -jar "$Secondary\aerosmp-laptop-backup-ssh.jar" "$Secondary"
+```
+
+Each installation owns its lock, persistent key, reconnect loop and existing HKCU
+Run entry. Autostart preserves the connection name and metadata selection. PC
+public metadata lands in `Voxy_Testing/logs/pc-backup` and
+`Voxy_Testing/logs/pc-backup/secondary`, keeping laptop metadata separate.

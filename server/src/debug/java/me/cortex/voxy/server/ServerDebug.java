@@ -17,6 +17,7 @@ final class ServerDebug {
         LOGGER.info("Voxy version {} role=server debug=true",
                 version == null ? "<UNKNOWN>" : version);
         LiveServerTestHarness.register(modBus);
+        LiveTerrainChanges.register();
     }
 
     static void rustState(RustBackend.Status status) {

@@ -1,8 +1,6 @@
 use super::{
     RegionalRuntime,
-    wire::{
-        ControlMessage, SectionReply, SectionReplyBatch, SectionReplyStatus, SectionRequestBatch,
-    },
+    wire::{ContentBinding, ControlMessage, RecordDescriptor, RecordStatus, encode_control_record},
 };
 use crate::anvil::AnvilWorld;
 use crate::{catalog::Catalog, read_lock, registry::Registry};
@@ -19,7 +17,6 @@ use tokio::{
 };
 
 const ANNOUNCEMENT_CAPACITY: usize = 4_096;
-const TARGET_SECTION_BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct RefreshStatus {
@@ -81,6 +78,7 @@ pub enum RegionalAnnouncement {
         region_x: i32,
         region_z: i32,
         generation: u64,
+        changed_ordinals: Option<Arc<[u32]>>,
     },
     Shutdown(String),
 }
@@ -88,6 +86,12 @@ pub enum RegionalAnnouncement {
 /// Owns the current regional runtimes and their bounded publication loop. Each refresh publishes
 /// at most one shard per dimension; serving remains independent and never waits for a world-wide
 /// root or garbage-collection pass.
+#[derive(Debug, Default)]
+struct SharedCadence {
+    sessions: BTreeMap<usize, u64>,
+    intervals: BTreeMap<u64, usize>,
+}
+
 #[derive(Debug)]
 pub struct RegionalService {
     runtimes: BTreeMap<String, Arc<RegionalRuntime>>,
@@ -95,6 +99,7 @@ pub struct RegionalService {
     announcements: broadcast::Sender<RegionalAnnouncement>,
     wake: Arc<Notify>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    cadences: Mutex<SharedCadence>,
 }
 
 impl RegionalService {
@@ -126,6 +131,7 @@ impl RegionalService {
             announcements,
             wake: Arc::new(Notify::new()),
             worker: Mutex::new(None),
+            cadences: Mutex::new(SharedCadence::default()),
         })
     }
 
@@ -145,20 +151,101 @@ impl RegionalService {
         )
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RegionalAnnouncement> {
-        self.announcements.subscribe()
+    pub fn set_cadence(&self, session: usize, millis: Option<u64>) -> Result<()> {
+        let mut cadences = self
+            .cadences
+            .lock()
+            .map_err(|_| crate::UnsafeState("cadence owner poisoned"))?;
+        let millis = millis.map(|value| value.max(1000));
+        let previous = cadences.sessions.get(&session).copied();
+        if previous == millis {
+            return Ok(());
+        }
+        if let Some(previous) = previous {
+            let count = cadences
+                .intervals
+                .get_mut(&previous)
+                .expect("registered cadence");
+            *count -= 1;
+            if *count == 0 {
+                cadences.intervals.remove(&previous);
+            }
+        }
+        if let Some(millis) = millis {
+            cadences.sessions.insert(session, millis);
+            *cadences.intervals.entry(millis).or_default() += 1;
+        } else {
+            cadences.sessions.remove(&session);
+        }
+        let shortest = cadences
+            .intervals
+            .first_key_value()
+            .map_or(1000, |(&interval, _)| interval);
+        for runtime in self.runtimes.values() {
+            runtime.set_freshness_interval(shortest);
+        }
+        self.wake.notify_one();
+        Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_overflow_announcements(&self) {
-        for generation in 1..=(ANNOUNCEMENT_CAPACITY * 2) as u64 {
-            let _ = self.announcements.send(RegionalAnnouncement::Changed {
-                dimension: "minecraft:overworld".into(),
-                region_x: 0,
-                region_z: 0,
-                generation,
+    pub fn saved_chunks(&self, dimension: &str, chunks: &[(i32, i32)]) -> Result<()> {
+        self.runtime(dimension)?.saved_chunks(chunks)
+    }
+
+    /// The Java supervisor owns stdin and sends coalesced completed-save coordinates.
+    pub fn start_save_reader(self: &Arc<Self>) {
+        let service = self.clone();
+        // Tokio's stdin uses an uncancellable blocking task that can hold runtime shutdown open.
+        // This process-owned thread exits at pipe EOF and never participates in Tokio shutdown.
+        let started = std::thread::Builder::new()
+            .name("Voxy completed saves".into())
+            .spawn(move || {
+                use std::io::Read;
+                let stdin = std::io::stdin();
+                let mut input = std::io::BufReader::new(stdin.lock());
+                let result: Result<()> = (|| {
+                    loop {
+                        let mut length = [0; 2];
+                        match input.read_exact(&mut length) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        let size = u16::from_le_bytes(length) as usize;
+                        if size == 0 || size > super::wire::MAX_DIMENSION_BYTES {
+                            bail!("invalid save notification dimension");
+                        }
+                        let mut name = vec![0; size];
+                        input.read_exact(&mut name)?;
+                        let runtime = service.runtime(std::str::from_utf8(&name)?)?;
+                        let mut count = [0; 4];
+                        input.read_exact(&mut count)?;
+                        for _ in 0..u32::from_le_bytes(count) {
+                            let mut chunk = [0; 8];
+                            input.read_exact(&mut chunk)?;
+                            let x = i32::from_le_bytes(chunk[..4].try_into().unwrap());
+                            let z = i32::from_le_bytes(chunk[4..].try_into().unwrap());
+                            runtime.saved_chunks(&[(x, z)])?;
+                        }
+                    }
+                })();
+                if let Err(error) = result {
+                    eprintln!(
+                        "Voxy completed-save pipe ended: {error:#}; source reconciliation continues"
+                    );
+                }
             });
+        if let Err(error) = started {
+            eprintln!(
+                "Voxy completed-save reader unavailable: {error}; source reconciliation continues"
+            );
         }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RegionalAnnouncement> {
+        self.announcements.subscribe()
     }
 
     pub fn refresh_all(&self, round: u64) -> Result<RefreshStatus> {
@@ -176,6 +263,7 @@ impl RegionalService {
                     region_x,
                     region_z,
                     generation,
+                    changed_ordinals: refresh.changed_ordinals.get(&(region_x, region_z)).cloned(),
                 });
             }
             for (region_x, region_z) in refresh.removed {
@@ -184,6 +272,7 @@ impl RegionalService {
                     region_x,
                     region_z,
                     generation: 0,
+                    changed_ordinals: None,
                 });
             }
         }
@@ -297,40 +386,77 @@ impl RegionalResponder {
         })
     }
 
-    pub fn hello(&self) -> Result<ControlMessage> {
+    pub fn hello(&self, background_token: [u8; 32]) -> Result<ControlMessage> {
         let catalog = self.catalog.get()?;
         Ok(ControlMessage::ServerHello {
             server_instance: self.server_instance,
             world_identity: self.runtime.world_identity(),
             catalog_id: catalog.catalog_id,
-            catalog_fingerprint: catalog.fingerprint,
+            catalog_fingerprint: catalog.definition.fingerprint,
+            background_token,
         })
     }
 
-    pub fn catalog_response(&self) -> Result<ControlMessage> {
-        let catalog = self.catalog.get()?;
-        Ok(ControlMessage::Catalog {
-            fingerprint: catalog.fingerprint,
-            canonical: catalog.canonical.to_vec(),
-        })
+    pub fn world_identity(&self) -> [u8; 32] {
+        self.runtime.world_identity()
+    }
+    pub fn layout(&self) -> super::RegionLayout {
+        self.runtime.layout()
     }
 
-    pub fn region(&self, region_x: i32, region_z: i32) -> Result<ControlMessage> {
-        let Some(region) = self.runtime.region(region_x, region_z)? else {
-            return Ok(ControlMessage::RegionUnavailable {
-                region_x,
-                region_z,
-                confirmed_absent: self.runtime.confirmed_absent(region_x, region_z)?,
-            });
+    pub fn prepare(&self, ticket: u64, key: u64) -> Result<PreparedSection> {
+        let coordinate = crate::key::SectionKey::unpack(key)?;
+        let side = 16i32 >> coordinate.level;
+        let region_x = coordinate.x.div_euclid(side);
+        let region_z = coordinate.z.div_euclid(side);
+        let region = self.runtime.region(region_x, region_z)?;
+        let catalog = self.catalog.get()?.definition;
+        let mut descriptor = RecordDescriptor {
+            ticket,
+            key,
+            generation: 0,
+            status: RecordStatus::NotReady,
+            binding: ContentBinding::default(),
         };
-        let catalog = self.catalog.get()?;
-        Ok(ControlMessage::Region {
-            region_x,
-            region_z,
-            generation: region.generation(),
-            fingerprint: region.index_fingerprint(),
-            catalog_fingerprint: catalog.fingerprint,
-            compressed: region.compressed_index().to_vec(),
+        let mut ordinal = 0;
+        if let Some(region) = &region {
+            descriptor.generation = region.generation();
+            match region.layout().index(region_x, region_z, coordinate.into()) {
+                Ok(index) => {
+                    ordinal = index as u32;
+                    let entry = region.entry_ordinal(ordinal)?;
+                    descriptor.status = if !entry.is_present() {
+                        RecordStatus::Absent
+                    } else if !entry.has_payload() {
+                        RecordStatus::Empty
+                    } else {
+                        RecordStatus::Data
+                    };
+                    descriptor.binding = ContentBinding {
+                        flags: entry.flags,
+                        children: entry.non_empty_children,
+                        catalog_fingerprint: catalog.fingerprint,
+                        fingerprint: entry.fingerprint,
+                        compressed_length: entry.compressed_length,
+                        canonical_length: entry.canonical_length,
+                        compressed_crc: entry.compressed_crc,
+                    };
+                    if !entry.is_present() {
+                        descriptor.binding = ContentBinding::default();
+                    }
+                }
+                Err(_) => descriptor.status = RecordStatus::Absent,
+            }
+        } else if self.runtime.confirmed_absent(region_x, region_z)? {
+            descriptor.status = RecordStatus::Absent;
+        }
+        Ok(PreparedSection {
+            descriptor,
+            region,
+            ordinal,
+            catalog,
+            runtime: self.runtime.clone(),
+            wake: self.wake.clone(),
         })
     }
 
@@ -343,93 +469,39 @@ impl RegionalResponder {
     pub fn unsubscribe_region(&self, region_x: i32, region_z: i32) -> Result<()> {
         self.runtime.unsubscribe_region(region_x, region_z)
     }
+}
 
-    /// Completes exactly the requested coverage or refinement records from immutable generations.
-    pub fn sections(
-        &self,
-        request: &SectionRequestBatch,
-        mut emit: impl FnMut(SectionReplyBatch) -> Result<()>,
-    ) -> Result<()> {
-        let region = self.runtime.region(request.region_x, request.region_z)?;
-        let current_generation = region.as_ref().map(|region| region.generation());
-        let mut current = Vec::new();
-        let mut current_bytes = 12usize;
-        let mut start = 0u16;
-        let mut damaged = false;
-        for (position, &ordinal) in request.ordinals.iter().enumerate() {
-            let reply = if let Some(region) = region.as_ref() {
-                if damaged || current_generation != Some(request.generation) {
-                    terminal_reply(SectionReplyStatus::StaleGeneration)
-                } else {
-                    let entry = region.entry_ordinal(ordinal)?;
-                    if !entry.is_present() {
-                        terminal_reply(SectionReplyStatus::Absent)
-                    } else if entry.is_empty() {
-                        SectionReply {
-                            status: SectionReplyStatus::Empty,
-                            compressed: Vec::new(),
-                        }
-                    } else {
-                        match region.read_compressed_ordinal(ordinal) {
-                            Ok(Some(compressed)) => SectionReply {
-                                status: SectionReplyStatus::Data,
-                                compressed,
-                            },
-                            Ok(None) => terminal_reply(SectionReplyStatus::StaleGeneration),
-                            Err(error) => {
-                                let removed = self.runtime.quarantine_generation(
-                                    request.region_x,
-                                    request.region_z,
-                                    region.generation(),
-                                )?;
-                                if removed {
-                                    eprintln!(
-                                        "{}: quarantined damaged regional shard ({},{}) generation {} after payload read: {error:#}",
-                                        self.runtime.dimension(),
-                                        request.region_x,
-                                        request.region_z,
-                                        region.generation(),
-                                    );
-                                    self.wake.notify_one();
-                                }
-                                damaged = true;
-                                terminal_reply(SectionReplyStatus::StaleGeneration)
-                            }
-                        }
-                    }
+pub struct PreparedSection {
+    pub descriptor: RecordDescriptor,
+    region: Option<Arc<super::RegionFile>>,
+    ordinal: u32,
+    pub catalog: Arc<CatalogDefinition>,
+    runtime: Arc<RegionalRuntime>,
+    wake: Arc<Notify>,
+}
+impl PreparedSection {
+    pub fn body(&self) -> Result<Vec<u8>> {
+        if self.descriptor.status != RecordStatus::Data {
+            return Ok(Vec::new());
+        }
+        let region = self
+            .region
+            .as_ref()
+            .context("terrain record lost its snapshot")?;
+        match region.read_compressed_ordinal(self.ordinal) {
+            Ok(body) => body.context("terrain record lost its body"),
+            Err(error) => {
+                let coordinate = region.region();
+                if self.runtime.quarantine_generation(
+                    coordinate.0,
+                    coordinate.1,
+                    region.generation(),
+                )? {
+                    self.wake.notify_one();
                 }
-            } else {
-                terminal_reply(SectionReplyStatus::Absent)
-            };
-            let reply_bytes = 1usize
-                .checked_add(reply.compressed.len())
-                .context("regional reply size overflow")?;
-            if !current.is_empty() && current_bytes + reply_bytes > TARGET_SECTION_BATCH_BYTES {
-                let batch = SectionReplyBatch {
-                    epoch: request.epoch,
-                    start,
-                    replies: std::mem::take(&mut current),
-                };
-                batch.encode()?;
-                emit(batch)?;
-                start = position as u16;
-                current_bytes = 12;
+                Err(error.context("quarantined damaged terrain snapshot"))
             }
-            current_bytes = current_bytes
-                .checked_add(reply_bytes)
-                .context("regional reply batch size overflow")?;
-            current.push(reply);
         }
-        if !current.is_empty() {
-            let batch = SectionReplyBatch {
-                epoch: request.epoch,
-                start,
-                replies: current,
-            };
-            batch.encode()?;
-            emit(batch)?;
-        }
-        Ok(())
     }
 }
 
@@ -437,14 +509,23 @@ impl RegionalResponder {
 struct CachedCatalog {
     generation: u64,
     catalog_id: u64,
-    fingerprint: [u8; 32],
-    canonical: Arc<[u8]>,
+    definition: Arc<CatalogDefinition>,
+}
+
+/// One immutable, globally encoded definition retained by its prepared records and writers.
+#[derive(Debug)]
+pub struct CatalogDefinition {
+    pub fingerprint: [u8; 32],
+    pub canonical_length: u32,
+    pub compressed_length: u32,
+    pub frame: Arc<[u8]>,
 }
 
 #[derive(Debug)]
 struct CatalogCache {
     registry: Arc<RwLock<Registry>>,
     current: Mutex<Option<CachedCatalog>>,
+    trace: bool,
 }
 
 impl CatalogCache {
@@ -452,6 +533,7 @@ impl CatalogCache {
         Self {
             registry,
             current: Mutex::new(None),
+            trace: std::env::var_os("VOXY_BACKGROUND_TRACE").is_some_and(|value| value == "1"),
         }
     }
 
@@ -466,22 +548,40 @@ impl CatalogCache {
         {
             return Ok(cached.clone());
         }
+        let started = Instant::now();
         let snapshot = read_lock(&self.registry)?.snapshot();
-        let canonical: Arc<[u8]> = Catalog::from_snapshot(&snapshot)?.encode()?.into();
+        let canonical = Catalog::from_snapshot(&snapshot)?.encode()?;
+        let fingerprint = *blake3::hash(&canonical).as_bytes();
+        let canonical_length = u32::try_from(canonical.len())?;
+        let compressed =
+            zstd::bulk::compress(&canonical, 1).context("compress catalogue definition")?;
+        let compressed_length = u32::try_from(compressed.len())?;
+        let frame: Arc<[u8]> = encode_control_record(&ControlMessage::Catalog {
+            fingerprint,
+            canonical_length,
+            compressed,
+        })?
+        .into();
+        if self.trace {
+            eprintln!(
+                "VOXY_CATALOG_BUILT catalog_id={} generation={} fingerprint={} canonical_bytes={canonical_length} compressed_bytes={compressed_length} build_ns={}",
+                snapshot.catalog_id,
+                snapshot.generation,
+                blake3::Hash::from(fingerprint),
+                started.elapsed().as_nanos()
+            );
+        }
         let cached = CachedCatalog {
             generation: snapshot.generation,
             catalog_id: snapshot.catalog_id,
-            fingerprint: *blake3::hash(&canonical).as_bytes(),
-            canonical,
+            definition: Arc::new(CatalogDefinition {
+                fingerprint,
+                canonical_length,
+                compressed_length,
+                frame,
+            }),
         };
         *current = Some(cached.clone());
         Ok(cached)
-    }
-}
-
-fn terminal_reply(status: SectionReplyStatus) -> SectionReply {
-    SectionReply {
-        status,
-        compressed: Vec::new(),
     }
 }

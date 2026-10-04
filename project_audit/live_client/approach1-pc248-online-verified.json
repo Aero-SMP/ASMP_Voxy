@@ -1,0 +1,55 @@
+{
+  "utc": "2026-10-04T23:41:41.378496+00:00",
+  "telemetry_time": "2026-10-04T23:41:44.218202900Z",
+  "metrics": {
+    "regional": "ACTIVE",
+    "desired": "570",
+    "active": "172",
+    "coverageMissing": "227",
+    "rendererReady": "0",
+    "workers": "14/0/0",
+    "lanes": "8/0",
+    "connectionEpoch": "1",
+    "geometryUsed": "3870720",
+    "geometrySections": "172",
+    "received": "700793",
+    "metadataFailure": "none",
+    "firstLocalNanos": "0",
+    "firstHelloNanos": "19669891500",
+    "catalogueFrames": "1",
+    "catalogueCompressedBytes": "48096",
+    "catalogueCacheHits": "0",
+    "connectionFailure": "null",
+    "failure": "null",
+    "heapUsedBytes": "9548333056",
+    "cacheDiskBytes": "938886",
+    "draws": "186/344"
+  },
+  "pc": {
+    "pid": 27184,
+    "startUtc": "2026-10-04T23:37:42.1414952Z",
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP",
+    "client_sha256": "8e979f8fa0342d06670ac37c958c3797cb112cbec001daa8ba52edf6985864bf",
+    "helpers": [
+      19916,
+      22444
+    ]
+  },
+  "server": {
+    "java_pid": 1744451,
+    "java_start_ticks": "38018311",
+    "native_pid": 1745212,
+    "native_start_ticks": "38019679",
+    "native_executable_sha256": "6006cda57c29bbd9aa71fc744462f6fa67b592ad7aaf2383e2b7de9ab8e0bb48",
+    "native_cgroup": "/sys/fs/cgroup/user.slice/user-1007.slice/user@1007.service/app.slice/voxy-testing-rust-1745207.service",
+    "limits": {
+      "memory.max": "999997440",
+      "memory.swap.max": "0",
+      "memory.current": "109178880",
+      "memory.peak": "639102976",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+    }
+  },
+  "source": "/home/aerosmp/Desktop/Voxy_Testing/logs/client-upload/voxy-client-debug.log",
+  "scope": "Read-only verification; no fake clients, settings/runtime changes, tests or restarts."
+}

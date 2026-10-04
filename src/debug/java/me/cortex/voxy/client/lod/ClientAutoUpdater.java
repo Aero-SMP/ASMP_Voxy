@@ -40,9 +40,9 @@ import java.util.regex.Pattern;
 /** Development updater included only in debug client builds. */
 final class ClientAutoUpdater {
     private static final String SSH_TARGET = "aerosmp@ssh.aerosmp.com";
-    private static String REMOTE_DIRECTORY = "/home/aerosmp/Desktop/ASMP_Voxy/build/libs";
-    private static String MINECRAFT_SERVER = "ssh.aerosmp.com:25565";
-    private static String REMOTE_DIAGNOSTICS = "/home/aerosmp/Desktop/Main/logs/client-upload";
+    private static String REMOTE_DIRECTORY = "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/debug-clients/MGengine";
+    private static String MINECRAFT_SERVER = "play.aerosmp.com:25587";
+    private static String REMOTE_DIAGNOSTICS = "/home/aerosmp/Desktop/Voxy_Testing/logs/client-upload";
     private static final String REMOTE_SCREENSHOTS = "/home/aerosmp/screenshots";
     private static final long POLL_SECONDS = 20;
     private static final int SCREENSHOT_QUEUE_CAPACITY = 256;
@@ -64,17 +64,15 @@ final class ClientAutoUpdater {
     private ClientAutoUpdater() {}
 
     static String updateDirectory(String player) {
-        return "/home/aerosmp/Desktop/ASMP_Voxy/build/libs"
-                + (player.equals("MGengine") ? "/debug-clients/MGengine" : "");
+        return "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/debug-clients/" + player;
     }
 
     static String serverAddress(String player) {
-        return player.equals("MGengine") ? "play.aerosmp.com:25587" : "ssh.aerosmp.com:25565";
+        return "play.aerosmp.com:25587";
     }
 
     static String diagnosticsDirectory(String player) {
-        return "/home/aerosmp/Desktop/" + (player.equals("MGengine") ? "Voxy_Testing" : "Main")
-                + "/logs/client-upload";
+        return "/home/aerosmp/Desktop/Voxy_Testing/logs/client-upload";
     }
 
     static void start() {

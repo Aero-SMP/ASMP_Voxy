@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-state=/home/aerosmp/Desktop/Voxy_Testing/logs/laptop-backup
+metadata=${VOXY_BACKUP_METADATA:-laptop-backup}
+[[ "$metadata" =~ ^[A-Za-z0-9_-]+$ ]] || exit 1
+state=/home/aerosmp/Desktop/Voxy_Testing/logs/$metadata
 port=22023
-alias_args=(-o HostKeyAlias=voxy-testing-laptop-backup)
+connection=${VOXY_BACKUP_CONNECTION:-}
+[[ "$connection" =~ ^[A-Za-z0-9_-]*$ ]] || exit 1
+alias_name=voxy-testing-laptop-backup
+if [[ -n "$connection" ]]; then state+="/$connection"; alias_name+="-$connection"; fi
+alias_args=(-o "HostKeyAlias=$alias_name")
 if [[ -s "$state/tunnel-port" ]]; then
   read -r port < "$state/tunnel-port"
   [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port <= 65535)) || exit 1
@@ -14,12 +20,12 @@ probe() { ssh -n "${ssh_options[@]}" -p "$1" voxy-backup@127.0.0.1 'exit 0' >/de
 if ! probe "$port"; then
   found=false
   # Some Windows OpenSSH builds omit the allocation notice. Discover only local
-  # reverse listeners owned by our account; the pinned laptop key must match
+  # reverse listeners owned by our account; the pinned host key must match
   # before authentication or execution, so unrelated SSH endpoints are rejected.
   while read -r candidate; do
     if probe "$candidate"; then port=$candidate; found=true; break; fi
   done < <(ss -ltnpe | awk -v uid="$(id -u)" '$0 ~ "uid:"uid" " && $0 !~ /users:/ && $4 ~ /^127[.]0[.]0[.]1:/ { split($4, address, ":"); print address[2] }')
-  "$found" || { echo 'Laptop backup SSH is reconnecting; no pinned endpoint available.' >&2; exit 255; }
+  "$found" || { echo 'Backup SSH is reconnecting; no pinned endpoint available.' >&2; exit 255; }
   printf '%s\n' "$port" > "$state/tunnel-port"
 fi
 exec ssh "${ssh_options[@]}" -o ConnectTimeout=10 -p "$port" voxy-backup@127.0.0.1 "$@"

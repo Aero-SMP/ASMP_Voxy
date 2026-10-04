@@ -119,7 +119,7 @@ final class SessionDebugTelemetry {
         long cpuStarted = WorkerDebugTelemetry.samplerCpuTime();
         long admittedPending = 0, pendingRefresh = 0;
         for (var demand : session.demands.values()) {
-            if (demand.pendingIndex != null) pendingRefresh++;
+            if (demand.networkWanted) pendingRefresh++;
             if (demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
                     && demand.geometryBytes > 0 && demand.workLease == null
                     && demand.publication != null && demand.publication.rendererAdmitted()) admittedPending++;
@@ -127,7 +127,7 @@ final class SessionDebugTelemetry {
         String startup = " transportHeld=" + transportHeld + " localViews=" + stats.localViews
                 + " usableBindingDiscoveriesLod=" + java.util.Arrays.toString(stats.discoveredBindings)
                 + " usableDemandedRootDiscoveries=" + stats.discoveredRoots
-                + " metadataPendingRegions=" + session.metadataWrites.size()
+                + " metadataPendingRegions=" + (session.associationPending ? 1 : 0)
                 + " retainedSaveInputBytes=" + session.retainedSaveBytes()
                 + " resolverBlockNames=" + session.blockNames.size()
                 + " resolverBiomeNames=" + session.biomeNames.size()
@@ -141,12 +141,16 @@ final class SessionDebugTelemetry {
                 + " subscriptionWindow=" + session.subscriptionWindow()
                 + " acceptedSubscriptions=" + stats.subscriptions + " acceptedSubscriptionPeak=" + stats.subscriptionPeak
                 + " subscriptionRequests=" + stats.subscriptionRequests + " subscriptionReleases=" + stats.subscriptionReleases
-                + " pendingReleases=" + session.regionReleases.size() + " staleRegionResponses=" + stats.subscriptionStale
+                + " pendingReleases=" + session.interestDrops.size() + " staleRegionResponses=" + stats.subscriptionStale
                 + " windowReconciliations=" + session.windowReconciliations + " windowReconcileNanos=" + stats.windowNanos
                 + " localActivations=" + stats.localActivations + " firstLocalNanos=" + stats.firstLocal
                 + " firstHelloNanos=" + stats.hello + " validatedViews=" + stats.validated
                 + " replacements=" + stats.replacements + " invalidations=" + stats.invalidations
                 + " metadataNetworkBytes=" + stats.metadataBytes
+                + " catalogueFrames=" + session.catalogueFrames
+                + " catalogueCompressedBytes=" + session.catalogueCompressedBytes
+                + " catalogueCacheHits=" + session.catalogueCacheHits
+                + " catalogueValidationNanos=" + session.catalogueValidationNanos
                 + " admissionReleases=" + stats.admissionReleases
                 + " workerReuses=" + stats.workerReuses
                 + " publishedToReusableNanos=" + stats.publishedToReusableNanos

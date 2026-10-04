@@ -60,7 +60,7 @@ final class CompletedSectionCache implements AutoCloseable {
             return journal.get(section, codec, names);
         } finally { released(); }
     }
-    Save begin(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Catalog source,
+    Save begin(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
                BooleanSupplier current) throws IOException {
         var writer = writer(section.region(), current);
         try { return beginOwned(section, codec, canonical, source, current, writer); }
@@ -79,7 +79,7 @@ final class CompletedSectionCache implements AutoCloseable {
         Writer(RegionalDiskBudget.Writer owned) { this.owned = owned; }
         public void close() { this.owned.close(); released(); }
     }
-    private Save beginOwned(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Catalog source,
+    private Save beginOwned(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
                             BooleanSupplier current, Writer releaseWriter) throws IOException {
         RegionalDiskBudget.checkCurrent(current);
         long region = section.region();
@@ -98,7 +98,7 @@ final class CompletedSectionCache implements AutoCloseable {
     }
 
     /** Called by the section's worker after its sole geometry completion was handed off. */
-    void save(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Catalog source,
+    void save(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
               BooleanSupplier current, Object debugWork) throws IOException {
         ClientLodDebug.workerStage(debugWork, "WAIT_REGION_WRITER");
         try (var writer = writer(section.region(), current)) {

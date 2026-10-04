@@ -52,7 +52,8 @@ async fn main() -> Result<()> {
         service.refresh_once()?;
         return Ok(());
     }
-    service.start(Duration::from_secs(2))?;
+    service.start_save_reader();
+    service.start(Duration::from_secs(1))?;
     let state = Arc::new(ServerState::new(&dimensions, catalog_id, service.clone()));
 
     let quic_identity = data.join("quic");

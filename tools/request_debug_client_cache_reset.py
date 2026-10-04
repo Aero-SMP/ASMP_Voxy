@@ -31,7 +31,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("player")
     arguments = parser.parse_args()
-    directory = Path(__file__).resolve().parents[1] / "build/libs/debug-client-reset"
+    directory = Path(__file__).resolve().parents[1] / "build/libs/debug-clients" / arguments.player / "debug-client-reset"
     request = request_reset(arguments.player, directory)
     print(f"Requested permanent .voxy reset and restart for {arguments.player}: {request}")
     print("Verify cache-reset-complete in the uploaded restart.log; request creation is not completion.")

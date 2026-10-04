@@ -66,6 +66,8 @@ pub struct RegionSourceTable {
     pub region_z: i32,
     pub terrain_generation: u64,
     pub anvil_file_marker: u64,
+    /// Volatile only: a restarted reader cannot assume successful pipe delivery.
+    pub(crate) reconciled: bool,
     records: Box<[ChunkSourceRecord; CHUNKS_PER_REGION]>,
 }
 
@@ -84,6 +86,7 @@ impl RegionSourceTable {
             region_z,
             terrain_generation,
             anvil_file_marker,
+            reconciled: true,
             records: Box::new([ChunkSourceRecord::default(); CHUNKS_PER_REGION]),
         })
     }
@@ -191,6 +194,7 @@ impl RegionSourceTable {
             region_z: i32::from_le_bytes(bytes[12..16].try_into().unwrap()),
             terrain_generation: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
             anvil_file_marker: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            reconciled: false,
             records: Box::new(records),
         };
         if table.terrain_generation == 0 {

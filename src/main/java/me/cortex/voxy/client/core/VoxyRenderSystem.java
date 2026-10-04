@@ -761,6 +761,7 @@ public class VoxyRenderSystem {
 
         //The entire rendering pipeline (excluding the chunkbound thing)
         this.pipeline.runPipeline(viewport, boundFB, dims[2], dims[3]);
+        if (!IrisUtil.irisShadowActive()) me.cortex.voxy.client.lod.ClientSession.frameRendered(this);
         this.resumedDraws++;
 
         //As much dynamic runtime stuff here

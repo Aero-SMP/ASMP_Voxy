@@ -1,0 +1,100 @@
+{
+  "utc": "2026-10-04T23:47:10.0583831Z",
+  "telemetry_time": "2026-10-04T23:47:08.912712200Z",
+  "pc": {
+    "host": "GIORKOSPC",
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP",
+    "pid": 1864,
+    "startUtc": "2026-10-04T23:43:30.3166969Z",
+    "title": "Aero smp",
+    "mods": [
+      {
+        "name": "ASMP_voxy-0.2.248-beta+1.21.1-neoforge-debug.jar",
+        "bytes": 3937951,
+        "sha256": "8e979f8fa0342d06670ac37c958c3797cb112cbec001daa8ba52edf6985864bf"
+      }
+    ],
+    "helpers": [
+      {
+        "directory": "C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSH",
+        "pid": 19916,
+        "alive": true
+      },
+      {
+        "directory": "C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSHsecondary",
+        "pid": 22444,
+        "alive": true
+      }
+    ]
+  },
+  "metrics": {
+    "regional": "ACTIVE",
+    "active": "304",
+    "coverageMissing": "194",
+    "rendererReady": "0",
+    "workers": "14/0/0",
+    "lanes": "0/0",
+    "connectionEpoch": "0",
+    "geometrySections": "304",
+    "received": "0",
+    "transportHeld": "true",
+    "metadataFailure": "none",
+    "localActivations": "304",
+    "firstLocalNanos": "403116800",
+    "firstHelloNanos": "0",
+    "catalogueFrames": "0",
+    "catalogueCompressedBytes": "0",
+    "catalogueCacheHits": "1",
+    "connectionFailure": "null",
+    "failure": "null",
+    "cacheDiskBytes": "1733601",
+    "draws": "363/671",
+    "cacheHits": 304,
+    "cacheHitsEvidence": "workerOutcomeTotals[0]; workerOutcomes starts CACHE_HIT"
+  },
+  "events": [
+    "2026-10-04T23:44:27.376586400Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:44:47.966364200Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:45:08.547165900Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:45:29.186162600Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:45:49.794753600Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:46:10.429561600Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:46:31.016318800Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta",
+    "2026-10-04T23:46:51.634376600Z VOXY_UPDATER state=CURRENT local=0.2.248-beta remote=0.2.248-beta"
+  ],
+  "restartTail": [
+    "2026-10-04T23:43:29.807887400Z old-process-stopped",
+    "2026-10-04T23:43:30.329538100Z new-process-started pid=1864 launcherDispatch=false",
+    "2026-10-04T23:44:15.332294400Z new-process-alive-after-45-seconds",
+    "2026-10-04T23:44:15.333797900Z launch-copy-cleanup-failed message=C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP\\.voxy-updater\\launch-96679597945275112\\launch-javaagent-19.jar: The process cannot access the file because it is being used by another process",
+    ""
+  ],
+  "hold_deadline_utc": "2026-10-04T23:48:19Z",
+  "cache_preserving_restart_request": "7504caa6-9167-46d2-84ba-64a4ae6cefd8",
+  "scope": "Read-only real-PC observation; no controls, network/settings changes or test launches.",
+  "required_offline_checks": {
+    "transport_held": true,
+    "no_connection": true,
+    "no_terrain_download": true,
+    "no_hello": true,
+    "cache_hits": true,
+    "geometry": true,
+    "draws": true,
+    "cached_catalogue": true,
+    "build248": true,
+    "helpers_alive": true
+  },
+  "screenshot": {
+    "utc": "2026-10-04T23:47:51.8529659Z",
+    "pid": 1864,
+    "startUtc": "2026-10-04T23:43:30.3166969Z",
+    "method": "PrintWindow",
+    "width": 1920,
+    "height": 1081,
+    "path": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP\\.voxy-updater\\cache-first-live\\approach1-pc248-offline-20261004T234741Z.png",
+    "serverPath": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/approach1-pc248-offline-20261004T234741Z.png",
+    "sha256": "657c6b6f32176be6dd9eeb726461d581409ac954be63f0a62794ed347c63846b",
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP"
+  },
+  "screenshot_before_hold_deadline": true
+}

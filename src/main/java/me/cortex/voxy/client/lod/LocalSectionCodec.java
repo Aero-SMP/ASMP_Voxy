@@ -54,7 +54,7 @@ final class LocalSectionCodec implements AutoCloseable {
     /** Takes the already validated canonical wire palette/index bytes, not expanded cells.
      * Source catalog ownership is shared; no catalog copy or decompression is performed here.
      */
-    Encoder encode(byte[] canonical, CatalogCodec.Catalog source) throws IOException {
+    Encoder encode(byte[] canonical, CatalogCodec.Source source) throws IOException {
         claim();
         try {
             var input = new NamesInput(canonical, source);
@@ -195,7 +195,7 @@ final class LocalSectionCodec implements AutoCloseable {
 
     /** Pulls one expanded name at a time, followed by compact palette/index bytes. */
     private static final class NamesInput extends InputStream {
-        final CatalogCodec.Catalog catalog;
+        final CatalogCodec.Source catalog;
         final byte[] canonical, palette;
         final int[] blocks, biomes;
         final long length;
@@ -203,7 +203,7 @@ final class LocalSectionCodec implements AutoCloseable {
         private byte[] part;
         private long consumed;
 
-        NamesInput(byte[] canonical, CatalogCodec.Catalog catalog) throws IOException {
+        NamesInput(byte[] canonical, CatalogCodec.Source catalog) throws IOException {
             this.catalog = catalog; this.canonical = canonical;
             if (canonical.length < 2) throw new IOException("truncated wire palette");
             var input = ByteBuffer.wrap(canonical).order(ByteOrder.LITTLE_ENDIAN);

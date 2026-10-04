@@ -4,6 +4,7 @@ pub mod config;
 pub mod crc;
 pub mod key;
 pub mod lod;
+mod pacer;
 pub mod regional;
 pub mod registry;
 pub mod server;
@@ -65,10 +66,6 @@ pub(crate) fn take_u8(input: &mut &[u8]) -> anyhow::Result<u8> {
 
 pub(crate) fn take_u32(input: &mut &[u8]) -> anyhow::Result<u32> {
     Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
-}
-
-pub(crate) fn take_i32(input: &mut &[u8]) -> anyhow::Result<i32> {
-    Ok(i32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
 }
 
 pub(crate) fn take_u64(input: &mut &[u8]) -> anyhow::Result<u64> {

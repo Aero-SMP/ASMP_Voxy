@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.lwjgl.util.zstd.Zstd.ZSTD_createDCtx;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_decompressDCtx;
+import static org.lwjgl.util.zstd.Zstd.ZSTD_findFrameCompressedSize;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_freeDCtx;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_getErrorName;
 import static org.lwjgl.util.zstd.Zstd.ZSTD_getFrameContentSize;
@@ -23,9 +24,9 @@ public final class RegionalSectionCodec implements AutoCloseable {
     static final int SECTION_CELLS = 32 * 32 * 32;
     private static final int HEADER_BYTES = 2;
 
-    record Mappings(int[] blocks, int[] biomes, CatalogCodec.Catalog source) {
+    record Mappings(int[] blocks, int[] biomes, CatalogCodec.Source source) {
         Mappings(int[] blocks, int[] biomes) { this(blocks, biomes, null); }
-        Mappings(CatalogCodec.Catalog source) { this(null, null, Objects.requireNonNull(source)); }
+        Mappings(CatalogCodec.Source source) { this(null, null, Objects.requireNonNull(source)); }
         Mappings {
             if (source == null) {
                 blocks = Objects.requireNonNull(blocks, "blocks").clone();
@@ -54,28 +55,42 @@ public final class RegionalSectionCodec implements AutoCloseable {
     private volatile boolean closed;
 
     byte[] decompress(byte[] compressed, int canonicalLength) throws IOException {
+        return decompress(compressed, canonicalLength, HEADER_BYTES,
+                RegionalProtocol.MAX_SECTION_BYTES, RegionalProtocol.MAX_SECTION_BYTES, false);
+    }
+
+    byte[] decompressCatalogue(byte[] compressed, int canonicalLength) throws IOException {
+        return decompress(compressed, canonicalLength, 40, CatalogCodec.MAX_BYTES,
+                RegionalProtocol.MAX_CATALOG_COMPRESSED_BYTES, true);
+    }
+
+    private byte[] decompress(byte[] compressed, int canonicalLength, int minimum,
+                              int canonicalMaximum, int compressedMaximum, boolean catalogue) throws IOException {
         Objects.requireNonNull(compressed, "compressed");
-        if (this.closed || compressed.length < 1 || compressed.length > RegionalProtocol.MAX_SECTION_BYTES
-                || canonicalLength < HEADER_BYTES
-                || canonicalLength > RegionalProtocol.MAX_SECTION_BYTES) {
-            throw new IOException("invalid regional compressed section bounds");
+        if (this.closed || compressed.length < 1 || compressed.length > compressedMaximum
+                || canonicalLength < minimum || canonicalLength > canonicalMaximum) {
+            throw new IOException("invalid regional compressed payload bounds");
         }
         ByteBuffer source = MemoryUtil.memAlloc(compressed.length);
-        ByteBuffer destination = MemoryUtil.memAlloc(canonicalLength);
+        ByteBuffer destination = null;
         try {
             source.put(compressed).flip();
+            if (catalogue && (ZSTD_findFrameCompressedSize(source) != compressed.length
+                    || ZSTD_getFrameContentSize(source) != canonicalLength))
+                throw new IOException("catalogue Zstd frame extent disagrees with its descriptor");
+            destination = MemoryUtil.memAlloc(canonicalLength);
             long result = ZSTD_decompressDCtx(this.local.get().address, destination, source);
             if (ZSTD_isError(result)) {
                 throw new IOException("regional Zstd decode failed: " + ZSTD_getErrorName(result));
             }
             if (result != canonicalLength) {
-                throw new IOException("regional Zstd length disagrees with section header");
+                throw new IOException("regional Zstd length disagrees with payload header");
             }
             byte[] canonical = new byte[canonicalLength];
             destination.position(0).limit(canonicalLength).get(canonical);
             return canonical;
         } finally {
-            MemoryUtil.memFree(destination);
+            if (destination != null) MemoryUtil.memFree(destination);
             MemoryUtil.memFree(source);
         }
     }

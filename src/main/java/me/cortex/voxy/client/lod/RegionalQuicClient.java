@@ -4,7 +4,6 @@ import tech.kwik.core.ConnectionListener;
 import tech.kwik.core.ConnectionTerminatedEvent;
 import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicStream;
-
 import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.io.InputStream;
@@ -20,23 +19,20 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Pinned current-only QUIC connection with reusable, independently progressing section lanes. */
+/** Pinned current-only transport. Reader ownership and QUIC flow control carry backpressure. */
 final class RegionalQuicClient implements AutoCloseable {
-    interface BatchReceiver {
-        void reply(RegionalProtocol.SectionReply reply) throws Exception;
-        void complete();
-        void failed(Throwable failure);
+    interface RecordReceiver {
+        void record(RegionalProtocol.SectionReply reply, boolean background, RegionalSectionCodec.BoundCatalog catalog) throws Exception;
+        RegionalSectionCodec.BoundCatalog catalog(RegionalProtocol.CatalogMessage catalog, boolean background) throws Exception;
     }
-
     private static final String TLS_SERVER_NAME = "voxy.local";
-    private static final long STREAM_ERROR_CANCELLED = 0x10;
-    private static final long STREAM_RECEIVE_BYTES = 5L * 1024 * 1024;
+    private static final long STREAM_ERROR_CANCELLED = 0x10, STREAM_RECEIVE_BYTES = 5L * 1024 * 1024;
     private static final int[] LANE_COUNTS = {2, 6};
-
     private final QuicClientConnection connection;
     private final QuicStream control;
     private final InputStream controlInput;
@@ -45,163 +41,125 @@ final class RegionalQuicClient implements AutoCloseable {
             Thread.ofVirtual().name("Voxy regional QUIC-", 0).factory());
     private final Object controlHandoffLock = new Object();
     private RegionalProtocol.Control controlHandoff;
-    @SuppressWarnings("unchecked")
-    private final List<LaneWorker>[] lanes = new List[RegionalProtocol.Lane.values().length];
-    private final AtomicInteger[] nextLane = new AtomicInteger[RegionalProtocol.Lane.values().length];
+    private final List<LaneWorker> lanes = new ArrayList<>();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final AtomicReference<Runnable> activity = new AtomicReference<>(() -> {});
-    private final AtomicBoolean closed = new AtomicBoolean();
-    private final String description;
+    private final AtomicBoolean closed = new AtomicBoolean(), listening = new AtomicBoolean();
+    private final String description, alpn;
+    private final InetAddress address;
+    private final int port;
+    private final byte[] certificateSha256;
+    private final boolean background;
+    private final ConcurrentHashMap<RegionalProtocol.Hash32, CompletableFuture<RegionalSectionCodec.BoundCatalog>> catalogues;
+    private volatile RecordReceiver receiver;
 
     static RegionalQuicClient connect(InetAddress[] addresses, int port, String alpn,
                                       byte[] certificateSha256) throws IOException {
-        Objects.requireNonNull(addresses, "addresses");
-        Objects.requireNonNull(alpn, "alpn");
-        Objects.requireNonNull(certificateSha256, "certificate fingerprint");
-        if (addresses.length == 0 || port < 1 || port > 0xffff || alpn.isEmpty()
-                || certificateSha256.length != 32) {
-            throw new IOException("invalid Voxy regional QUIC endpoint");
-        }
         Throwable last = null;
-        for (InetAddress address : addresses) {
-            if (Thread.currentThread().isInterrupted()) throw new IOException("regional connection attempt cancelled");
-            QuicClientConnection connection = null;
-            try {
-                ConnectionOwner owner = new ConnectionOwner();
-                connection = ClientLodDebug.quicBuilder(QuicClientConnection.newBuilder())
-                        .host(TLS_SERVER_NAME).proxy(address.getHostAddress()).port(port)
-                        .applicationProtocol(alpn).connectTimeout(Duration.ofSeconds(5))
-                        .maxIdleTimeout(Duration.ofSeconds(60))
-                        .defaultStreamReceiveBufferSize(STREAM_RECEIVE_BYTES)
-                        .maxOpenPeerInitiatedBidirectionalStreams(0)
-                        .maxOpenPeerInitiatedUnidirectionalStreams(0)
-                        .customTrustManager(new FingerprintTrustManager(certificateSha256))
-                        .build();
-                connection.setPeerInitiatedStreamCallback(RegionalQuicClient::rejectRemoteStream);
-                connection.setConnectionListener(owner);
-                connection.connect();
-                QuicStream control = connection.createStream(true);
-                OutputStream output = control.getOutputStream();
-                output.write(RegionalProtocol.STREAM_CONTROL);
-                output.flush();
-                String host = address instanceof Inet6Address
-                        ? '[' + address.getHostAddress() + "]:" + port
-                        : address.getHostAddress() + ':' + port;
-                RegionalQuicClient result = new RegionalQuicClient(connection, control, host);
-                owner.publish(result);
-                result.start();
-                return result;
-            } catch (Throwable failure) {
-                last = failure;
-                if (connection != null) connection.close();
-            }
+        for (InetAddress address : Objects.requireNonNull(addresses)) {
+            try { return connectEndpoint(address, port, alpn, certificateSha256, null, null, null); }
+            catch (IOException failure) { last = failure; }
         }
         throw new IOException("could not connect to the Voxy regional endpoint", last);
     }
-
-    private RegionalQuicClient(QuicClientConnection connection, QuicStream control,
-                               String description) {
-        this.connection = connection;
-        this.control = control;
-        this.controlInput = control.getInputStream();
-        this.controlWriter = new ControlWriter(control.getOutputStream(), this::signalActivity,
-                this::fail);
-        this.description = description;
-        for (RegionalProtocol.Lane lane : RegionalProtocol.Lane.values()) {
-            this.nextLane[lane.ordinal()] = new AtomicInteger();
-            List<LaneWorker> workers = new ArrayList<>(LANE_COUNTS[lane.ordinal()]);
-            for (int index = 0; index < LANE_COUNTS[lane.ordinal()]; index++) {
-                workers.add(new LaneWorker(lane));
-            }
-            this.lanes[lane.ordinal()] = List.copyOf(workers);
+    static RegionalQuicClient connectBackground(RegionalQuicClient primary,
+                                                byte[] token, RegionalSectionCodec.BoundCatalog held,
+                                                RecordReceiver receiver) throws IOException {
+        if (token == null || token.length != 32) throw new IOException("invalid background token");
+        var result = connectEndpoint(primary.address, primary.port, primary.alpn, primary.certificateSha256,
+                token, primary.catalogues, held);
+        result.listen(receiver); return result;
+    }
+    private static RegionalQuicClient connectEndpoint(InetAddress address, int port, String alpn,
+                                                       byte[] pin, byte[] token,
+                                                       ConcurrentHashMap<RegionalProtocol.Hash32, CompletableFuture<RegionalSectionCodec.BoundCatalog>> catalogues,
+                                                       RegionalSectionCodec.BoundCatalog held) throws IOException {
+        if (address == null || port < 1 || port > 65535 || alpn == null || alpn.isEmpty() || pin == null || pin.length != 32)
+            throw new IOException("invalid Voxy QUIC endpoint");
+        QuicClientConnection connection = null;
+        try {
+            var owner = new ConnectionOwner();
+            connection = QuicClientConnection.newBuilder()
+                    .socketFactory(ignored -> token == null ? ClientLodDebug.quicSocket()
+                            : new BackgroundDatagramSocket(ClientLodDebug.quicSocket(), token))
+                    .host(TLS_SERVER_NAME).proxy(address.getHostAddress()).port(port)
+                    .applicationProtocol(alpn).connectTimeout(Duration.ofSeconds(5))
+                    .maxIdleTimeout(Duration.ofSeconds(60)).defaultStreamReceiveBufferSize(STREAM_RECEIVE_BYTES)
+                    .maxOpenPeerInitiatedBidirectionalStreams(0).maxOpenPeerInitiatedUnidirectionalStreams(0)
+                    .customTrustManager(new FingerprintTrustManager(pin)).build();
+            connection.setPeerInitiatedStreamCallback(RegionalQuicClient::rejectRemoteStream);
+            connection.setConnectionListener(owner); connection.connect();
+            var stream = connection.createStream(true); var output = stream.getOutputStream();
+            output.write(token == null ? RegionalProtocol.STREAM_CONTROL : RegionalProtocol.STREAM_BACKGROUND);
+            if (token != null) { output.write(token); output.write(held == null ? RegionalProtocol.Hash32.ZERO.bytes() : held.fingerprint().bytes()); }
+            output.flush();
+            String host = address instanceof Inet6Address ? '[' + address.getHostAddress() + "]:" + port
+                    : address.getHostAddress() + ':' + port;
+            var result = new RegionalQuicClient(connection, stream, host, address, port, alpn, pin, token != null, catalogues);
+            if (held != null) result.remember(held);
+            owner.publish(result);
+            if (token == null) { result.workers.submit(result::readControls); result.workers.submit(result.controlWriter); }
+            return result;
+        } catch (Throwable failure) {
+            if (connection != null) connection.close();
+            throw new IOException("could not connect to the Voxy endpoint", failure);
         }
     }
-
-    private void start() {
-        this.workers.submit(this::readControls);
-        this.workers.submit(this.controlWriter);
-        for (List<LaneWorker> group : this.lanes) {
-            for (LaneWorker lane : group) this.workers.submit(lane::run);
+    private RegionalQuicClient(QuicClientConnection connection, QuicStream control, String description,
+                                InetAddress address, int port, String alpn, byte[] pin, boolean background,
+                                ConcurrentHashMap<RegionalProtocol.Hash32, CompletableFuture<RegionalSectionCodec.BoundCatalog>> catalogues) {
+        this.connection = connection; this.control = control; this.controlInput = control.getInputStream();
+        this.description = description; this.address = address; this.port = port; this.alpn = alpn;
+        this.certificateSha256 = pin.clone(); this.background = background;
+        this.catalogues = catalogues == null ? new ConcurrentHashMap<>() : catalogues;
+        this.controlWriter = background ? null : new ControlWriter(control.getOutputStream(), this::signalActivity, this::fail);
+    }
+    void listen(RecordReceiver receiver) {
+        Objects.requireNonNull(receiver);
+        if (!this.listening.compareAndSet(false, true)) throw new IllegalStateException("record receiver already installed");
+        this.receiver = receiver;
+        if (this.background) { this.workers.submit(() -> readRecords(this.controlInput, receiver, null)); return; }
+        for (var priority : RegionalProtocol.Lane.values()) for (int i = 0; i < LANE_COUNTS[priority.ordinal()]; i++) {
+            var lane = new LaneWorker(priority, receiver); this.lanes.add(lane); this.workers.submit(lane::run);
         }
     }
-
     String description() { return this.description; }
     record LaneSnapshot(int idle, int active, int activeSections, long bodyBytes) {}
     LaneSnapshot laneSnapshot() {
-        int idle = 0;
-        int active = 0;
-        int activeSections = 0;
-        long bodyBytes = 0;
-        for (List<LaneWorker> group : this.lanes) for (LaneWorker lane : group) {
-            synchronized (lane) {
-                if (lane.active) {
-                    active++;
-                    activeSections += lane.activeSections;
-                    bodyBytes += lane.currentBodyBytes;
-                } else {
-                    idle++;
-                }
-            }
-        }
-        return new LaneSnapshot(idle, active, activeSections, bodyBytes);
+        int active = 0; long bytes = 0;
+        for (var lane : this.lanes) { if (lane.active) active++; bytes += lane.bodyBytes; }
+        return new LaneSnapshot(this.lanes.size() - active, active, active, bytes);
     }
-    boolean isOpen() {
-        return !this.closed.get() && this.failure.get() == null && this.connection.isConnected();
-    }
+    boolean isOpen() { return !this.closed.get() && this.failure.get() == null && this.connection.isConnected(); }
     Throwable failure() { return this.failure.get(); }
     RegionalProtocol.Control pollControl() {
         synchronized (this.controlHandoffLock) {
-            RegionalProtocol.Control result = this.controlHandoff;
-            if (result != null) {
-                this.controlHandoff = null;
-                this.controlHandoffLock.notifyAll();
-            }
+            var result = this.controlHandoff;
+            if (result != null) { this.controlHandoff = null; this.controlHandoffLock.notifyAll(); }
             return result;
         }
     }
-
     void setActivityListener(Runnable listener) {
-        this.activity.set(Objects.requireNonNull(listener, "listener"));
-        synchronized (this.controlHandoffLock) {
-            if (this.controlHandoff != null || !isOpen()) signalActivity();
-        }
+        this.activity.set(Objects.requireNonNull(listener));
+        synchronized (this.controlHandoffLock) { if (this.controlHandoff != null || !isOpen()) signalActivity(); }
     }
-
-    void hello(String dimension) throws IOException {
-        if (!sendControl(RegionalProtocol.hello(dimension))) {
-            throw new IOException("regional hello must be the first control write");
-        }
+    boolean open(String dimension, RegionalProtocol.Hash32 expectedWorld, RegionalSectionCodec.BoundCatalog held, long intervalMillis,
+                 long bandwidthKbps, List<RegionalProtocol.Desire> desires) throws IOException {
+        if (held != null) remember(held);
+        return sendControl(RegionalProtocol.open(dimension, expectedWorld, held == null ? null : held.fingerprint(), intervalMillis, bandwidthKbps, desires));
     }
-    boolean requestRegion(int regionX, int regionZ) throws IOException {
-        return sendControl(RegionalProtocol.regionRequest(regionX, regionZ));
+    void remember(RegionalSectionCodec.BoundCatalog catalog) {
+        this.catalogues.computeIfAbsent(catalog.fingerprint(), ignored -> new CompletableFuture<>()).complete(catalog);
     }
-    boolean releaseRegion(int regionX, int regionZ) throws IOException {
-        return sendControl(RegionalProtocol.regionRelease(regionX, regionZ));
+    boolean desire(List<RegionalProtocol.Desire> desires) throws IOException { return sendControl(RegionalProtocol.desire(desires)); }
+    boolean drop(List<Long> keys) throws IOException { return sendControl(RegionalProtocol.drop(keys)); }
+    boolean settings(long intervalMillis, long bandwidthKbps) throws IOException {
+        return sendControl(RegionalProtocol.settings(intervalMillis, bandwidthKbps));
     }
-    boolean requestCatalog() throws IOException {
-        return sendControl(RegionalProtocol.catalogRequest());
-    }
-
-    boolean requestSections(RegionalProtocol.Lane priority, long epoch,
-                            RegionalProtocol.RegionIndex index, List<Integer> ordinals,
-                            BatchReceiver receiver) throws IOException {
-        Objects.requireNonNull(priority, "priority");
-        LaneTask task = new LaneTask(epoch, Objects.requireNonNull(index, "index"),
-                List.copyOf(ordinals),
-                Objects.requireNonNull(receiver, "receiver"));
-        List<LaneWorker> group = this.lanes[priority.ordinal()];
-        int start = Math.floorMod(this.nextLane[priority.ordinal()].getAndIncrement(), group.size());
-        for (int offset = 0; offset < group.size(); offset++) {
-            if (group.get((start + offset) % group.size()).tryAssign(task)) return true;
-        }
-        return false;
-    }
-
     private boolean sendControl(byte[] record) throws IOException {
-        if (!isOpen()) throw closedFailure();
+        if (!isOpen() || this.controlWriter == null) throw closedFailure();
         return this.controlWriter.offer(record);
     }
-
     /** One writer-owned record, no backlog. The owner must stay free to drain responses even
      * when the peer cannot read another request until its response has been consumed. */
     static final class ControlWriter implements Runnable, AutoCloseable {
@@ -254,155 +212,81 @@ final class RegionalQuicClient implements AutoCloseable {
         }
     }
 
+
     private void readControls() {
         try {
             while (!this.closed.get()) {
-                RegionalProtocol.Control control = RegionalProtocol.readControl(this.controlInput);
+                var incoming = RegionalProtocol.readControl(this.controlInput);
+                if (incoming instanceof RegionalProtocol.CatalogMessage catalog) {
+                    remember(this.receiver.catalog(catalog, false));
+                    continue;
+                }
                 synchronized (this.controlHandoffLock) {
-                    while (this.controlHandoff != null && !this.closed.get()) {
-                        this.controlHandoffLock.wait();
-                    }
+                    while (this.controlHandoff != null && !this.closed.get()) this.controlHandoffLock.wait();
                     if (this.closed.get()) return;
-                    this.controlHandoff = control;
+                    this.controlHandoff = incoming;
                 }
                 signalActivity();
             }
-        } catch (Throwable failure) {
-            if (!this.closed.get()) fail(failure);
-        }
+        } catch (Throwable failure) { if (!this.closed.get()) fail(failure); }
     }
-
+    private void readRecords(InputStream input, RecordReceiver receiver, LaneWorker lane) {
+        try {
+            while (!this.closed.get()) {
+                var frame = RegionalProtocol.readControl(input);
+                if (lane != null) { lane.active = true; lane.bodyBytes = frame instanceof RegionalProtocol.SectionReply reply ? reply.compressed().length : 0; }
+                try {
+                    switch (frame) {
+                        case RegionalProtocol.SectionReply reply -> {
+                            RegionalSectionCodec.BoundCatalog binding = null;
+                            if (reply.content().kind() == LocalSection.DATA)
+                                binding = this.catalogues.computeIfAbsent(reply.content().catalog(), ignored -> new CompletableFuture<>()).get();
+                            receiver.record(reply, this.background, binding);
+                        }
+                        case RegionalProtocol.CatalogMessage catalog -> {
+                            if (!this.background) throw new IOException("catalogue on a foreground terrain lane");
+                            remember(receiver.catalog(catalog, true));
+                        }
+                        case RegionalProtocol.ServerError error -> throw new IOException("Voxy server error " + error.code() + ": " + error.message());
+                        case RegionalProtocol.ServerShutdown shutdown -> throw new IOException(shutdown.message());
+                        default -> throw new IOException("unexpected terrain lane frame");
+                    }
+                } finally { if (lane != null) { lane.active = false; lane.bodyBytes = 0; } }
+            }
+        } catch (Throwable failure) { if (!this.closed.get()) fail(failure); }
+    }
     private final class LaneWorker {
-        private final RegionalProtocol.Lane priority;
-        private LaneTask task;
-        private boolean active;
-        private int activeSections;
-        private long currentBodyBytes;
-        private volatile QuicStream stream;
-
-        private LaneWorker(RegionalProtocol.Lane priority) { this.priority = priority; }
-
-        private synchronized boolean tryAssign(LaneTask offered) {
-            if (this.active || closed.get()) return false;
-            this.active = true;
-            this.activeSections = offered.ordinals.size();
-            this.task = offered;
-            this.notifyAll();
-            return true;
-        }
-
-        private synchronized LaneTask awaitTask() throws InterruptedException {
-            while (this.task == null && !closed.get()) this.wait();
-            LaneTask result = this.task;
-            this.task = null;
-            return result;
-        }
-
-        private synchronized void finishTask() {
-            this.active = false;
-            this.activeSections = 0;
-            this.currentBodyBytes = 0;
-            this.notifyAll();
-            signalActivity();
-        }
-
-        private void run() {
+        final RegionalProtocol.Lane priority; final RecordReceiver receiver;
+        volatile QuicStream stream; volatile boolean active; volatile long bodyBytes;
+        LaneWorker(RegionalProtocol.Lane priority, RecordReceiver receiver) { this.priority = priority; this.receiver = receiver; }
+        void run() {
             try {
                 this.stream = connection.createStream(true);
-                OutputStream output = this.stream.getOutputStream();
-                InputStream input = this.stream.getInputStream();
-                output.write(RegionalProtocol.STREAM_SECTION_LANE);
-                output.write(this.priority.id);
-                output.flush();
-                while (!closed.get()) {
-                    LaneTask task = this.awaitTask();
-                    if (task == null) return;
-                    try {
-                        output.write(RegionalProtocol.sectionRequest(
-                                task.epoch, task.index, task.ordinals));
-                        output.flush();
-                        int received = 0;
-                        while (received < task.ordinals.size()) {
-                            received += RegionalProtocol.readReplyBatch(input, task.epoch,
-                                    task.index, task.ordinals, received, reply -> {
-                                        synchronized (this) {
-                                            this.currentBodyBytes = reply.compressed() == null
-                                                    ? 0 : reply.compressed().length;
-                                        }
-                                        try {
-                                            task.receiver.reply(reply);
-                                        } finally {
-                                            synchronized (this) { this.currentBodyBytes = 0; }
-                                        }
-                                    });
-                        }
-                        task.receiver.complete();
-                        this.finishTask();
-                    } catch (Throwable taskFailure) {
-                        task.receiver.failed(taskFailure);
-                        fail(taskFailure);
-                        return;
-                    }
-                }
-            } catch (Throwable failure) {
-                if (!closed.get()) fail(failure);
-            }
+                var output = this.stream.getOutputStream();
+                output.write(RegionalProtocol.STREAM_SECTION_LANE); output.write(this.priority.id); output.flush();
+                readRecords(this.stream.getInputStream(), this.receiver, this);
+            } catch (Throwable failure) { if (!closed.get()) fail(failure); }
         }
-
-        private void stop() {
-            QuicStream current = this.stream;
-            if (current != null) rejectRemoteStream(current);
-            LaneTask pending;
-            synchronized (this) {
-                pending = this.task;
-                this.task = null;
-                this.active = false;
-                this.activeSections = 0;
-                this.currentBodyBytes = 0;
-                this.notifyAll();
-            }
-            if (pending != null) pending.receiver.failed(closedFailure());
-        }
+        void stop() { if (this.stream != null) rejectRemoteStream(this.stream); }
     }
-
-    private record LaneTask(long epoch, RegionalProtocol.RegionIndex index,
-                            List<Integer> ordinals, BatchReceiver receiver) {}
-
     private void fail(Throwable cause) {
-        Throwable actual = cause == null ? new IOException("regional QUIC connection failed") : cause;
-        if (this.failure.compareAndSet(null, actual)) {
-            signalActivity();
-            close();
+        if (this.failure.compareAndSet(null, cause == null ? new IOException("regional QUIC connection failed") : cause)) {
+            signalActivity(); close();
         }
     }
-
-    private void signalActivity() {
-        try { this.activity.get().run(); } catch (RuntimeException ignored) {}
-    }
-
-    private IOException closedFailure() {
-        return new IOException("Voxy regional QUIC connection is closed", this.failure.get());
-    }
-
-    @Override
-    public void close() {
+    private void signalActivity() { try { this.activity.get().run(); } catch (RuntimeException ignored) {} }
+    private IOException closedFailure() { return new IOException("Voxy regional QUIC connection is closed", this.failure.get()); }
+    @Override public void close() {
         if (!this.closed.compareAndSet(false, true)) return;
-        this.controlWriter.close();
-        for (List<LaneWorker> group : this.lanes) for (LaneWorker lane : group) lane.stop();
-        synchronized (this.controlHandoffLock) {
-            this.controlHandoffLock.notifyAll();
-        }
-        rejectRemoteStream(this.control);
-        this.connection.close();
-        this.workers.shutdownNow();
-        signalActivity();
+        if (this.controlWriter != null) this.controlWriter.close();
+        for (var lane : this.lanes) lane.stop();
+        synchronized (this.controlHandoffLock) { this.controlHandoffLock.notifyAll(); }
+        if (!this.background) this.catalogues.values().forEach(waiter -> waiter.completeExceptionally(closedFailure()));
+        rejectRemoteStream(this.control); this.connection.close(); this.workers.shutdownNow(); signalActivity();
     }
-
     private static void rejectRemoteStream(QuicStream stream) {
-        stream.abortReading(STREAM_ERROR_CANCELLED);
-        stream.resetStream(STREAM_ERROR_CANCELLED);
+        stream.abortReading(STREAM_ERROR_CANCELLED); stream.resetStream(STREAM_ERROR_CANCELLED);
     }
-
     private static final class ConnectionOwner implements ConnectionListener {
         private RegionalQuicClient owner;
         private ConnectionTerminatedEvent early;

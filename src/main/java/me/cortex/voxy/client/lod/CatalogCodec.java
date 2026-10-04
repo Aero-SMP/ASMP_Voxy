@@ -5,9 +5,11 @@ import java.nio.ByteOrder;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.RandomAccess;
 
 /** Bounded decoder for the canonical block/biome catalog. */
 public final class CatalogCodec {
@@ -29,8 +31,16 @@ public final class CatalogCodec {
         }
     }
 
+    public interface Source {
+        long catalogId();
+        long generation();
+        long mipGeneration();
+        List<Block> blocks();
+        List<String> biomes();
+    }
+
     public record Catalog(long catalogId, long generation, long mipGeneration,
-                          List<Block> blocks, List<String> biomes) {
+                          List<Block> blocks, List<String> biomes) implements Source {
         public Catalog {
             if (catalogId == 0) throw new IllegalArgumentException("catalog identity zero is reserved");
             blocks = List.copyOf(Objects.requireNonNull(blocks, "blocks"));
@@ -53,6 +63,51 @@ public final class CatalogCodec {
                 }
                 if (!biomeNames.add(biome)) throw new IllegalArgumentException("duplicate canonical biome name");
             }
+        }
+    }
+
+    /** One live catalogue domain owns names once. Older definitions keep fixed prefix bounds. */
+    public static final class SharedNames {
+        private long catalogId;
+        private final List<Block> blocks = new ArrayList<>();
+        private final List<String> biomes = new ArrayList<>();
+
+        public synchronized Source bind(Catalog snapshot) throws DecodeException {
+            Objects.requireNonNull(snapshot, "snapshot");
+            if (this.catalogId != 0 && this.catalogId != snapshot.catalogId())
+                throw new DecodeException("catalog identity changed");
+            for (int index = 0; index < Math.min(this.blocks.size(), snapshot.blocks().size()); index++)
+                if (!this.blocks.get(index).equals(snapshot.blocks().get(index)))
+                    throw new DecodeException("catalog block prefix changed");
+            for (int index = 0; index < Math.min(this.biomes.size(), snapshot.biomes().size()); index++)
+                if (!this.biomes.get(index).equals(snapshot.biomes().get(index)))
+                    throw new DecodeException("catalog biome prefix changed");
+            // Validate both prefixes before changing either table. A rejected snapshot is atomic.
+            this.catalogId = snapshot.catalogId();
+            for (int index = this.blocks.size(); index < snapshot.blocks().size(); index++)
+                this.blocks.add(snapshot.blocks().get(index));
+            for (int index = this.biomes.size(); index < snapshot.biomes().size(); index++)
+                this.biomes.add(snapshot.biomes().get(index));
+            return new Prefix(snapshot.catalogId(), snapshot.generation(), snapshot.mipGeneration(),
+                    new PrefixList<>(this, this.blocks, snapshot.blocks().size()),
+                    new PrefixList<>(this, this.biomes, snapshot.biomes().size()));
+        }
+    }
+
+    private record Prefix(long catalogId, long generation, long mipGeneration,
+                          List<Block> blocks, List<String> biomes) implements Source {}
+
+    private static final class PrefixList<T> extends AbstractList<T> implements RandomAccess {
+        private final SharedNames owner;
+        private final List<T> entries;
+        private final int length;
+        private PrefixList(SharedNames owner, List<T> entries, int length) {
+            this.owner = owner; this.entries = entries; this.length = length;
+        }
+        @Override public int size() { return this.length; }
+        @Override public T get(int index) {
+            Objects.checkIndex(index, this.length);
+            synchronized (this.owner) { return this.entries.get(index); }
         }
     }
 
@@ -122,7 +177,7 @@ public final class CatalogCodec {
         }
     }
 
-    public static final class DecodeException extends Exception {
+    public static final class DecodeException extends java.io.IOException {
         public DecodeException(String message) { super(message); }
         public DecodeException(String message, Throwable cause) { super(message, cause); }
     }

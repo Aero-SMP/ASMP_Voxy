@@ -16,15 +16,18 @@ mod air_lighting_tests;
 #[cfg(test)]
 mod faults;
 #[cfg(test)]
-mod refresh_measurements;
-#[cfg(test)]
 mod payload_prototype_tests;
+#[cfg(test)]
+mod refresh_measurements;
 
 pub use builder::{RegionalBuild, RegionalBuildStats, rebuild_region, rebuild_region_incremental};
 pub use index::RegionIndex;
 pub use runtime::{RegionalRefresh, RegionalRuntime};
 pub use section::SectionFrame;
-pub use service::{RefreshStatus, RegionalAnnouncement, RegionalResponder, RegionalService};
+pub use service::{
+    CatalogDefinition, PreparedSection, RefreshStatus, RegionalAnnouncement, RegionalResponder,
+    RegionalService,
+};
 pub use source::{CHUNKS_PER_REGION, ChunkSourceRecord, RegionSourceTable};
 pub use store::{
     RegionFile, RegionFileBuilder, RegionLayout, RegionSectionEntry, SECTION_FLAG_EMPTY,

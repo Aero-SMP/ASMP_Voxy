@@ -5,6 +5,7 @@ import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
 import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.client.iris.IrisUtil;
+import me.cortex.voxy.client.lod.ClientSession;
 import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPointForge;
@@ -33,6 +34,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
     private static final ResourceLocation RENDERING = id("rendering");
     private static final ResourceLocation GEOMETRY_MEMORY = id("geometry_memory");
     private static final ResourceLocation RENDER_DISTANCE = id("render_distance");
+    private static final ResourceLocation STREAMING_SETTINGS = id("streaming_settings");
     private static final ResourceLocation RENDER_RELOAD = OptionFlag.REQUIRES_RENDERER_RELOAD.getId();
 
     @Override
@@ -68,6 +70,21 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
         var pixelSize = pixelSizeOption(builder);
+
+        var updateInterval = option(builder.createIntegerOption(id("background_update_interval")),
+                "voxy.config.streaming.update_interval", CFG::getBackgroundUpdateIntervalSeconds,
+                value -> CFG.backgroundUpdateIntervalSeconds = value, STREAMING_SETTINGS)
+                .setRange(new Range(1, 60, 1))
+                .setValueFormatter(value -> Component.literal(value + " s"))
+                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
+        var backgroundBandwidth = option(builder.createIntegerOption(id("background_download_bandwidth")),
+                "voxy.config.streaming.background_bandwidth", CFG::getBackgroundDownloadKbps,
+                value -> CFG.backgroundDownloadKbps = value, STREAMING_SETTINGS)
+                .setRange(new Range(0, 100_000, 100))
+                .setValueFormatter(value -> value == 0
+                        ? Component.translatable("voxy.config.streaming.unlimited")
+                        : Component.literal(String.format(java.util.Locale.ROOT, "%.1f Mbps", value / 1000.0)))
+                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
 
         int[] geometryMemoryChoices = GeometryMemoryOptions.available(
                 RenderResourceReuse.getSafeGeometryMemoryLimitBytes());
@@ -133,6 +150,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
                 .addOptionGroup(group(builder, renderDistance, pixelSize, geometryMemory))
+                .addOptionGroup(group(builder, updateInterval, backgroundBandwidth))
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
                 .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));
@@ -145,6 +163,8 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
             for (var identifier : identifiers) {
                 if (identifier.equals(IRIS_RELOAD)) {
                     IrisUtil.reload();
+                } else if (identifier.equals(STREAMING_SETTINGS)) {
+                    ClientSession.streamingSettingsChanged();
                 } else if (identifier.equals(ENABLED)) {
                     if (!CFG.enabled) {
                         var renderer = (IGetVoxyRenderSystem) Minecraft.getInstance().levelRenderer;
@@ -169,7 +189,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                     }
                 }
             }
-        }, IRIS_RELOAD, ENABLED, RENDERING, RENDER_DISTANCE);
+        }, IRIS_RELOAD, ENABLED, RENDERING, RENDER_DISTANCE, STREAMING_SETTINGS);
     }
 
     static IntegerOptionBuilder pixelSizeOption(ConfigBuilder builder) {

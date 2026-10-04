@@ -1,0 +1,38 @@
+{
+  "utc": "2026-10-04T23:57:57.522359+00:00",
+  "originals": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy",
+      "head": "60aa5d434ad13331075d7c91a45e046095848ca1",
+      "branch": "prototype/unified-section-payload",
+      "status_sha256": "13750d2cef065e86b02882791662a025efc093b87c7c8136d2ec67e9313882ac"
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Restart",
+      "head": "60aa5d434ad13331075d7c91a45e046095848ca1",
+      "branch": "prototype/unified-section-payload",
+      "status_sha256": "18b49fb412591bd6b6b023e37eb4b496136819c76c5c83c9d9cf6bae8a3348be"
+    }
+  ],
+  "runtime": [
+    {
+      "pid": 1744451,
+      "cwd": "/home/aerosmp/Desktop/Voxy_Testing",
+      "comm": "java"
+    },
+    {
+      "pid": 1745212,
+      "cwd": "/home/aerosmp/Desktop/Voxy_Testing",
+      "comm": "voxy-rust-serve",
+      "executable_sha256": "6006cda57c29bbd9aa71fc744462f6fa67b592ad7aaf2383e2b7de9ab8e0bb48",
+      "cgroup": "/sys/fs/cgroup/user.slice/user-1007.slice/user@1007.service/app.slice/voxy-testing-rust-1745207.service",
+      "memory": {
+        "memory.current": "394358784",
+        "memory.peak": "639102976",
+        "memory.max": "999997440",
+        "memory.swap.max": "0",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+      }
+    }
+  ]
+}
