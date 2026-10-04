@@ -1,9 +1,0 @@
-pluginManagement {
-    repositories {
-        gradlePluginPortal()
-        mavenCentral()
-        maven { url = 'https://maven.neoforged.net/releases/' }
-    }
-}
-rootProject.name = 'ASMP_Voxy_Rewrite'
-include 'updater', 'terrain', 'client', 'server'

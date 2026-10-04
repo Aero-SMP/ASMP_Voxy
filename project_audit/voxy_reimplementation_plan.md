@@ -1,10 +1,10 @@
-# Voxy reimplementation plan
+# Voxy development plan
 
 Date: 2026-10-03 UTC.
 Status: Implementation and matched-load verification in progress.
 
 Validation policy, updated by the user: no integration tests or automated test
-suites. Remove the existing integration tests from this rewrite repository. Use
+suites. Remove the existing integration tests from this Voxy branch. Use
 only live testing with the user's real player and the 100 virtual Voxy clients;
 compilation and artifact inspection remain part of building releases. Earlier
 isolated diagnostics are historical evidence, not the current acceptance method.
@@ -36,7 +36,7 @@ terrain must start loading immediately, independently of server availability,
 endpoint discovery, handshakes, metadata refresh, or freshness confirmation.
 
 Remove custom memory reservation managers, byte budgets, per-stage quotas, and
-arbitrary operating-memory targets from the rewrite design. Achieve low memory
+arbitrary operating-memory targets from the Voxy design. Achieve low memory
 use through ownership, streaming, reuse, shared data, and avoiding obsolete work.
 Do not replace those managers with equivalent accounting under different names.
 
@@ -90,7 +90,12 @@ separately, rather than counting it as delivered coverage.
 - Coarse terrain stays visible until its finer replacements are complete and
   their GPU publication fence has passed.
 - Keep automatic updates separate from terrain processing and rendering. The
-  existing rewrite repository currently contains the updater bootstrap.
+  current branch supplies content-based updates using fixed jar names and SHA-256.
+- Maintain one current implementation only. Remove superseded paths, codecs,
+  identifiers, version negotiation, and compatibility adapters rather than
+  supporting prior releases. Use coordinated deployment when formats change.
+  Any one-time preservation of existing data happens outside the mod. NeoForge's
+  mandatory numeric metadata remains a fixed `0`; it does not govern updates.
 
 ## Cache-first client path: hard requirement
 
@@ -102,8 +107,8 @@ sections. Local disk reads, validation, model preparation, meshing, and GPU
 publication still take time; there must be no server-dependent wait in this path.
 
 - Persist enough local context to discover and interpret the cache: its namespace,
-  last-known world association, dimension, spatial section metadata, format
-  version, and any required catalog or palette. A cached section and its decoding
+  last-known world association, dimension, spatial section metadata, and any
+  required catalog or palette. A cached section and its decoding
   dependencies must remain usable together after a client restart.
 - Validate cached data locally. Use Minecraft's local registries and models to
   interpret it. A server catalog fetch must not be required to decode previously
@@ -136,7 +141,7 @@ missing or updated data without becoming a prerequisite for local terrain use.
 | --- | --- | --- |
 | 1. Bounded working set with explicit budgets | Replace | Keep the Rust process boundary. Process terrain lazily, reuse worker scratch, and stream results. Remove the arbitrary 750–800 MB target and internal budget accounting. |
 | 2. One payload representation | Keep, revise | Reuse validated compressed section bytes across storage, transport, and client cache. Start by testing compact numeric data with its catalog cached alongside it. Cached data and its decoding dependencies must be usable without contacting the server. Do not assume names inside every section improve the result. |
-| 3. Ownership and lifecycle | Keep, simplify | Store authoritative state once. Give work a clear owner and minimal cancellation/version information. Avoid generic scheduling frameworks and overlapping state machines. |
+| 3. Ownership and lifecycle | Keep, simplify | Store authoritative state once. Give work a clear owner and minimal cancellation/revision information. Avoid generic scheduling frameworks and overlapping state machines. |
 | 4. Spatial storage and coverage priority | Keep most | Preserve direct lookup and atomic publication. Read metadata on demand, fill coarse coverage, then deliver high-quality refinement. Refresh existing terrain at a coalesced background cadence. Add custom caches or eviction machinery only when measurements justify them. |
 | 5. Renderer milestones | Keep the method | Preserve replacement correctness and GPU fences. Choose meshing and rendering techniques through measurement. Remove the arbitrary upload quota. |
 | 6. Existing transport libraries | Keep, simplify | Use Quinn/Kwik, a small protocol, and transport backpressure. Avoid a separate global budget manager. Retain protocol validation needed for decoding correctness. |
@@ -252,9 +257,9 @@ selection merely because it generates section requests.
   cannot be mistaken for successful backend capacity.
 
 Use deterministic seeds and routes, the same terrain dataset, and recorded
-configuration to compare old and new implementations. If protocols differ, keep
-the logical workload identical through driver adapters; do not add production
-compatibility machinery solely to support the benchmark.
+configuration to compare old and new implementations. Keep the logical workload
+identical when comparing archived baseline measurements. The current driver uses
+only the current production codec and protocol; keep no compatibility adapters.
 
 Camera movement follows wall-clock time even when responses fall behind. Record
 unfulfilled demand and latency so the driver does not silently reduce the offered

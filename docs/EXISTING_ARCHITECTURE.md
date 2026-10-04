@@ -1,4 +1,8 @@
-# Existing implementation reviewed before the rewrite
+# Architecture reference for the original ASMP Voxy
+
+This records the review before implementation of this branch. Current source
+ownership and build instructions are in `../README.md`; current verification
+and remaining work are recorded in `../project_audit`.
 
 Source reviewed in `../ASMP_Voxy`: the root and Rust READMEs, build wiring,
 `VoxyClient`, `ClientLodClient`, `ClientSession`, `CompletedSectionCache`,
@@ -15,13 +19,13 @@ Source reviewed in `../ASMP_Voxy`: the root and Rust READMEs, build wiring,
 
 Saved world data remains authoritative. The old backend does not generate chunks.
 Derived data and persistent certificate/catalog identity are distinct from world
-files and must not be erased as part of a rewrite by default.
+files and must not be erased as part of this branch by default.
 
 The broadest coordination surface is `ClientSession`: lifecycle authority, demand,
 network/cache admission, worker stages, and renderer publication share its session
 owner. The backend separates source refresh/publication from request serving.
-The rewrite should define ownership and bounded memory before adding parallel
-work. No replacement terrain or renderer implementation has started yet.
+This review identified lifecycle coordination and repeated source work as areas
+to simplify. It describes the reference implementation, not the current branch.
 
 Testing baseline: legacy debug client 251, server 248, Minecraft port 25587,
 Voxy UDP 25787. Only the testing native process is placed under the external

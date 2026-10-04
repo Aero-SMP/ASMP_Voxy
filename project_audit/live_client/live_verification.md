@@ -1,6 +1,6 @@
 # Real-player live verification
 
-Status: rewrite 252 is running on the real player. Renderer coverage has visible failures; acceptance remains incomplete. No integration tests are used.
+Status: rewrite258 is running in-world on the real player, and retained GPU cache reuse passed a brief live check. Earlier252 screenshots show coverage failures and are retained; no full no-holes/performance acceptance is claimed. No integration tests are used.
 
 The independent pinned laptop SSH connection was live on 2026-10-03 at 18:55 UTC. The helper PID was 21200 and the running Minecraft PID was 8408. The installed legacy client was `ASMP_voxy-0.2.251-beta+1.21.1-neoforge-debug.jar`, SHA-256 `eef93c0080a6243e3d6f365fbbdb1e6f1ce5d934c6701e2b62a890053b112a3a`. Primitive telemetry and selective log tails are recorded beside this file. Launch arguments and authentication credentials are excluded.
 
@@ -27,3 +27,12 @@ The real screenshots `252_online.png` and `252_horizon.png` show substantial blu
 The new updater initially failed on Windows because using `java.nio.file.Path` to construct the Unix release path introduced backslashes into remote shell and SFTP paths. A direct live check confirmed that the shell looked for `homeaerosmpDesktopASMP_Voxy_Rewritereleasesclientlatest.properties`. Some outgoing laptop SSH connections also timed out intermittently; the independent backup tunnel remained usable. The source is being repaired and a later live update will verify it.
 
 Only Voxy reconciliation was disabled from 19:20:36 until 19:25:10 UTC for the cache check. Minecraft stayed connected and terrain continued drawing, but new terrain could not arrive during that interval. The player was actively moving, so this interval is not evidence of complete offline coverage outside the cached footprint. Networking was restored immediately when the active user reported updates had stopped. At 19:26:35 QUIC was connected again, downloads increased from 3,241 to 3,373, and all 1,174 requested sections were GPU-ready.
+
+## Camera quality implementation, builds253–256
+
+Frustum demand, projection-driven pixel quality, cached topology discovery, asynchronous GPU depth visibility, parent fallback, slow freshness checks, and Sodium terrain options are implemented. [Implementation and current receipts](visibility_implementation.md) distinguish the255 real GPU evidence from the256 process/artifact evidence and invalid-session blocker. The current user scope is minimal verification on the one real client; additional load testing and performance optimization are deferred.
+
+
+## Retained GPU cache, build258
+
+The real client automatically installed final258 (`0.3.7-beta-debug`), SHA256`73cab9bc4837fc7048a10859a29c8cfae3f9cc510dd0b01ddbcc1b04124a13a3`, and joined successfully. Its driver-derived automatic geometry capacity was6,561,361,920 bytes. A brief stationary cached-only pixel-quality round trip retained204 inactive meshes and reused all204 when restoring detail, without eviction or additional downloads. Original networking/settings were restored. The four Sodium controls and geometry accounting are described in [the GPU cache audit](../gpu_geometry_cache.md).

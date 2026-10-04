@@ -1,21 +1,15 @@
 [package]
-name = "voxy-rewrite-server"
-version = "0.1.0"
+name = "voxy-server"
 edition = "2024"
 publish = false
 
 [dependencies]
 anyhow = "1.0"
-fastnbt = "2.5"
-flate2 = "1.1"
-lz4-java-wrc = "0.2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
-tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-zstd = { version = "0.13", default-features = false, features = ["pkg-config"] }
+tokio = { version = "1.47", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [profile.release]
 lto = "thin"

@@ -1,69 +1,67 @@
-# Live virtual-client workload
+# Live pressure operator
 
-This tool opens 100 real QUIC connections against an isolated native Voxy backend.
-It does not launch Minecraft bots, mock a handler, or modify Main. Production code
-and GPU rendering are outside this tool. All compilation uses cached dependencies.
+This opens 100 actual QUIC connections without Minecraft players. The existing
+testing Java server publishes terrain; its existing native process retains the
+external 1 GB guard. The operator starts no server and never controls Main.
 
 ```sh
 cargo build --offline --release --manifest-path tools/load/Cargo.toml
-python3 tools/load/fixture.py create project_audit/load_results/fixture-base/world
-python3 tools/load/run_suite.py old --name old-run
-python3 tools/load/run_suite.py new --name new-run
-python3 tools/load/run_suite.py new --name impaired-run --impaired --cases changing
+python3 tools/load/pressure.py run --name cold-pressure --seconds 120 \
+  --server 127.0.0.1:25787 --cert /path/to/current/server-cert.der \
+  --pids NATIVE_PID,JAVA_PID
+python3 tools/load/pressure.py run --name warm-pressure --seconds 120 \
+  --server 127.0.0.1:25787 --cert /path/to/current/server-cert.der \
+  --pids NATIVE_PID,JAVA_PID \
+  --warm-from project_audit/load_results/cold-pressure/cache
 ```
 
-The fixture contains 100 separated Anvil regions. Each saves an 8-by-8 chunk patch,
-four vertical 16-block sections, nonuniform stone/dirt/grass/water topography,
-biomes, and explicit light arrays. Each synthetic view requests one level-2
-coverage section and 32 level-0 detail sections spanning 128-by-128-by-64 blocks.
-This is documented synthetic demand, not a captured GPU selection trace or a
-claim about every possible Minecraft view distance or modpack.
+The existing immutable fixture snapshot and its manifest are recorded under
+`project_audit/load_results/fixture-current-frozen`. Its live copy is at
+`Voxy_Testing/world/dimensions/voxy/pressure/region`, a separate `voxy:pressure`
+saved dimension containing 100 spread-out regions. Each contains a 32×32 chunk
+patch with four vertical sections, stone/dirt/grass/water topography, biomes and
+light. A synthetic view asks for levels4 through1 coverage and512 level-0 detail
+sections, up to597 hierarchical nodes per peer across512 blocks.
+Moving priority is synthetic demand, not captured GPU visibility. The default
+always requests597 nodes for comparable pressure. `--zoom` runs a separate quality
+case alternating597 and85 nodes every ten seconds. The real player establishes
+rendered correctness.
 
-The mutation driver applies seeded, non-no-op edits to packed saved block states
-at 300 edits/second on wall-clock time and publishes changed `.mca` files once
-per second using atomic replacement. It records actual counts, source-save lag,
-distinct blocks/chunks/regions, CPU, bytes written, and final save-drain time.
-Backend completion never controls the mutation clock. The final level-0 digests
-are checked against the final authoritative saved-Anvil input after edits stop.
-Coarse LOD rules differ between implementations; compare coverage and level-0
-content separately, and do not infer identical coarse visual appearance.
+Each peer has a separate actual UDP link. Loss rises from 50% to 90%, RTT from
+300 to 1,000 ms, and bandwidth decreases from 3 Mbps to 500 kbps. Both directions
+apply independent seeded loss and serialization to every datagram, including
+handshakes, ACKs and retransmissions. Setup never bypasses impairment. It waits
+for all 100 live QUIC connection handles and dimension acknowledgements before
+the pressure clock starts; interrupted setup stays in its evidence directory.
+Acknowledged clients begin actual terrain demand immediately during staggered
+startup, as real clients do. They do not sit idle while poorer links connect.
+Cold first-coarse/detail times start at each actor's first connection attempt;
+warm local readiness is measured before connecting. Setup counters and the cache
+size at the simultaneous100-client barrier distinguish cold startup from the
+later pressure interval, which has mixed cache state. No post-barrier all-cold
+claim is made. Both native server and virtual peers use Quinn's default BBR.
 
-Each native backend runs as its own transient user service with external
-`MemoryMax=1000000000`, `MemorySwapMax=0`, `OOMPolicy=kill`, and
-`KillMode=control-group`. The fixture writer, virtual clients, and impairment
-proxies are separate processes. The program stops only its named benchmark unit.
-An external-guard termination is recorded as a failed run.
+An independent writer receives 300 unique non-no-op edits each wall-clock second
+and saves only dirty chunk bodies, allocation entries and timestamps, then fsyncs
+touched regions. Sector growth receives a valid appended allocation. Dirty raw
+chunks are released after each publication. Actual completed commits before the
+pressure deadline determine the persisted rate; drain time cannot manufacture
+300 changes/second. The client interval includes 30 additional seconds for final
+refresh observation. A deliberate disconnect occurs at 60% of that interval,
+while cached data remains available and clients reconnect under the same links.
 
-`--impaired` gives every client a distinct UDP listener and upstream socket. Loss
-probability rises deterministically from 50% to 90% across the 100 clients; each
-direction has its own seeded random sequence. Every datagram, including TLS and
-ACKs, consumes serialization time at 3 Mbps and is subject to loss. Surviving
-packets receive at least 500 ms propagation delay in each direction, giving at
-least 1,000 ms RTT before queueing or retransmission. Packet counters and raw
-resource samples are retained. Handshake failures count as failures; the driver
-does not lower loss or bypass the actual protocol to produce 100 successes.
+Warm cache frames are decoded before any connection begins. Cache persistence
+keeps the exact validated compressed payload, without catalog dependencies or
+recompression. Payload requests carry their cached SHA so unchanged records do
+not transfer again. Current-format validation checks palette fields, all 39,304
+halo indices, padded Minecraft packed storage, children and entity fields.
 
-The load clock begins after all connection attempts reach the simultaneous start
-barrier; setup latency and failures are recorded separately. The connection
-deadline is 120 seconds. A running case ends at its specified wall-clock deadline
-and reports unfinished cycles instead of silently reducing movement or waiting
-indefinitely. Synthetic movement changes request order, and teleports replace the
-currently requested region using wall-clock time.
-
-Warm/offline driver cache entries record validated terrain content digests and
-payload identities. Their lookup readiness is a receipt/coverage proxy; it does
-not prove persistent-payload decoding, Minecraft model preparation, visible GPU
-coverage, rendering seams, or frame time. Those require the real player client.
-Initial cold gaps, missing saved terrain, and incomplete refreshes remain separate
-from a claim about holes in rendered terrain.
-
-Raw reports include per-client coverage/detail readiness, actual payload bytes,
-latencies, errors, incomplete work, final-state validation, backend SHA-256,
-certificate identity, external guard settings, and process memory/CPU/I/O. Cgroup
-I/O accounting is not enabled in this user's slice; `/proc/PID/io` is captured
-instead. Host filesystem cache is uncontrolled and Internet paths are not part
-of an unimpaired loopback comparison.
-
-Results are append-only: the runner refuses an existing output directory. Failed
-experiments stay beside successful ones. No standalone unit, mock, codec, or
-integration test suite is included.
+Each run creates a new `project_audit/load_results/NAME` directory and preserves
+client events, detailed final client records, saved-commit timestamps, impairment
+counters, host memory, native/Java/writer/client process and cgroup samples,
+certificate and artifact hashes. Existing directories are never overwritten.
+Confirmed watched-process death, changed existing ceilings, OOM-kill increments,
+failed setup, unverified final process health and insufficient persisted changes fail
+the run. Low coverage and slow refinement remain explicit in the raw records;
+successful operator exit alone does not prove rendering quality or throughput.
+No unit, mock, integration or automated test suite is included.

@@ -1,0 +1,11 @@
+# One-time warm-cache conversion
+
+The original client was closed gracefully before conversion. Its exact jar (SHA-256 `9b13c7510eef97903cb6883c472cb4536c1011ed5ccb5815001a6debf30cdb65`) and unchanged cache were preserved in the testing profile under `.voxy/updater/baseline-original-client.jar` and `.voxy/updater/baseline-original-cache`.
+
+A temporary standalone Java operator converted old catalog/Zstd section frames into the current self-contained zlib/NBT regional format. This converter is not shipped, invoked by the client, or retained as production compatibility. The completed conversion contains 151,806 frames, one association, 63 source catalogs, 1,247,879 decoded neighbor frames, 2,332,170,258 source bytes, and 474,379,562 output bytes. It finished with zero errors in 777.515 seconds. Peak observed Windows working set was 522,665,984 bytes. The complete marker was validated before activation at 2026-10-04 00:28:08 UTC.
+
+The first unbuffered run was explicitly stopped at owned converter PID 22752 after 37,000 frames because each packed-long write called into the compressor individually. The corrected operator adds the standard buffered stream before Deflater. Its first 37,000 frames took 115.847 seconds versus 381.237 seconds in the partial run, but the second run also benefited from warmer OS file cache; these are operational timings, not a controlled production-performance comparison. Both partial and complete logs remain preserved. The partial output was archived separately and never activated.
+
+Missing old neighboring sections contribute 62,129,110 halo cells filled with air/plains/sky15. Old sections did not contain block-entity NBT, so migrated entities are empty. Current server publication can replace migrated records with complete halo and entity information. These limitations are explicit rather than hidden by a legacy reader.
+
+Both independent backup SSH helpers and their tunnel children retained their identities through Minecraft absence, both converter runs, and activation. Raw evidence: `cache-conversion-unbuffered.jsonl`, `cache-conversion-buffered.jsonl`, `candidate_conversion_buffered_restart.json`, the progress receipts, and `candidate_conversion_activated.json`.

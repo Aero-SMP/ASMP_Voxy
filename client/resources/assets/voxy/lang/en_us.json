@@ -1,0 +1,10 @@
+{
+  "voxy.config.general": "General",
+  "voxy.config.rendering": "Rendering",
+  "voxy.config.general.enabled": "Enable Voxy",
+  "voxy.config.general.enabled.tooltip": "Fully enables or disables Voxy.",
+  "voxy.config.general.renderDistance": "Render distance",
+  "voxy.config.general.renderDistance.tooltip": "Render distance of Voxy in chunks.",
+  "voxy.config.general.subDivisionSize": "LOD pixel size",
+  "voxy.config.general.subDivisionSize.tooltip": "Approximate target projected section size in render pixels. Smaller values give finer terrain; larger values give coarser terrain. Zooming increases detail. Cached terrain is used first. GPU memory may limit the requested quality. This is not the width of an individual block."
+}

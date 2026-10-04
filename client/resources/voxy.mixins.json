@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.aerosmp.voxy.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["VoxyMixins$FarPlane", "VoxyMixins$SodiumCoverage", "VoxyMixins$VertexAccess", "VoxyMixins$CoveragePixels", "VoxyMixins$WeightedModels"],
+  "injectors": {"defaultRequire": 1}
+}
