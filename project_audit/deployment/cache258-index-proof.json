@@ -1,0 +1,58 @@
+{
+  "source": "project_audit/live_client/cache258-capture/voxy-client-debug.log",
+  "lines": [
+    123887,
+    131699
+  ],
+  "before": {
+    "prefetchCommitted": 36,
+    "prefetchFailures": 9,
+    "prefetchRetainedIndexes": 1,
+    "prefetchPending": 14,
+    "prefetchJobRegions": 1,
+    "journalIndex": {
+      "recoveries": 660,
+      "frameVisits": 189879,
+      "recoveryNs": 1555648900,
+      "reuses": 59503,
+      "commits": 7840
+    }
+  },
+  "after": {
+    "prefetchCommitted": 7755,
+    "prefetchFailures": 9,
+    "prefetchRetainedIndexes": 1,
+    "prefetchPending": 13,
+    "prefetchJobRegions": 1,
+    "journalIndex": {
+      "recoveries": 660,
+      "frameVisits": 189879,
+      "recoveryNs": 1555648900,
+      "reuses": 73737,
+      "commits": 15577
+    }
+  },
+  "commitSummaries": [
+    {
+      "region": "0",
+      "journal": "774102477",
+      "commits": 1913
+    },
+    {
+      "region": "-4294967296",
+      "journal": "288469541",
+      "commits": 2051
+    },
+    {
+      "region": "-1",
+      "journal": "1059203724",
+      "commits": 2017
+    },
+    {
+      "region": "4294967295",
+      "journal": "65030127",
+      "commits": 1744
+    }
+  ],
+  "loggedCommits": 7725
+}

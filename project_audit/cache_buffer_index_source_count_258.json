@@ -1,0 +1,270 @@
+{
+  "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates": {
+    "plan_main_paths": {
+      "files": 190,
+      "lines": 41651,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "client_main": {
+      "files": 157,
+      "lines": 27212,
+      "directories": 45,
+      "empty_directories": 0
+    },
+    "server_main": {
+      "files": 6,
+      "lines": 1110,
+      "directories": 9,
+      "empty_directories": 0
+    },
+    "rust_main_paths": {
+      "files": 27,
+      "lines": 13329,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "debug": {
+      "files": 22,
+      "lines": 4715,
+      "directories": 17,
+      "empty_directories": 0
+    },
+    "java_tests": {
+      "files": 15,
+      "lines": 1922,
+      "directories": 18,
+      "empty_directories": 0
+    },
+    "rust_test_files": {
+      "files": 6,
+      "lines": 1935,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "native_pressure": {
+      "files": 1,
+      "lines": 693,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "main_without_standalone_tests_pressure": {
+      "files": 183,
+      "lines": 39023,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "embedded_rust_tests": {
+      "lines": 1181,
+      "ranges": {
+        "rust-server/src/config.rs": [
+          {
+            "first": 96,
+            "last": 156,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/anvil.rs": [
+          {
+            "first": 993,
+            "last": 995,
+            "item": "mod array_tests;"
+          },
+          {
+            "first": 997,
+            "last": 1099,
+            "item": "mod region_boundary_tests {"
+          }
+        ],
+        "rust-server/src/lod.rs": [
+          {
+            "first": 162,
+            "last": 182,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/service.rs": [
+          {
+            "first": 55,
+            "last": 75,
+            "item": "mod round_tests {"
+          }
+        ],
+        "rust-server/src/regional/store.rs": [
+          {
+            "first": 537,
+            "last": 538,
+            "item": "super::faults::hit(                       , path)?;"
+          },
+          {
+            "first": 540,
+            "last": 541,
+            "item": "super::faults::hit(                      , path)?;"
+          },
+          {
+            "first": 549,
+            "last": 550,
+            "item": "super::faults::hit(                , path)?;"
+          },
+          {
+            "first": 837,
+            "last": 1320,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/source.rs": [
+          {
+            "first": 165,
+            "last": 166,
+            "item": "super::faults::hit(                      , path)?;"
+          },
+          {
+            "first": 168,
+            "last": 169,
+            "item": "super::faults::hit(                     , path)?;"
+          },
+          {
+            "first": 232,
+            "last": 263,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/builder.rs": [
+          {
+            "first": 71,
+            "last": 72,
+            "item": "super::faults::hit(             , output.as_ref())?;"
+          },
+          {
+            "first": 265,
+            "last": 266,
+            "item": "super::faults::hit(      , output.as_ref())?;"
+          },
+          {
+            "first": 484,
+            "last": 485,
+            "item": "super::faults::hit(               , &source.root)?;"
+          },
+          {
+            "first": 502,
+            "last": 527,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/runtime.rs": [
+          {
+            "first": 126,
+            "last": 173,
+            "item": "fn refresh_order<T>("
+          },
+          {
+            "first": 175,
+            "last": 261,
+            "item": "mod order_tests {"
+          },
+          {
+            "first": 715,
+            "last": 718,
+            "item": "pub(crate) fn test_subscription_count(&self) -> usize {"
+          },
+          {
+            "first": 1159,
+            "last": 1160,
+            "item": "super::faults::hit(         , &self.terrain_path(coordinate))?;"
+          },
+          {
+            "first": 1173,
+            "last": 1174,
+            "item": "super::faults::hit(           , &self.terrain_path(coordinate))?;"
+          },
+          {
+            "first": 1574,
+            "last": 1575,
+            "item": "super::faults::hit(             , path)?;"
+          },
+          {
+            "first": 1584,
+            "last": 1585,
+            "item": "super::faults::hit(                , path)?;"
+          },
+          {
+            "first": 1590,
+            "last": 1592,
+            "item": "mod refresh_tests;"
+          }
+        ],
+        "rust-server/src/regional/section.rs": [
+          {
+            "first": 215,
+            "last": 428,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/mod.rs": [
+          {
+            "first": 14,
+            "last": 15,
+            "item": "mod air_lighting_tests;"
+          },
+          {
+            "first": 16,
+            "last": 17,
+            "item": "mod faults;"
+          },
+          {
+            "first": 18,
+            "last": 19,
+            "item": "mod payload_prototype_tests;"
+          },
+          {
+            "first": 20,
+            "last": 21,
+            "item": "mod refresh_measurements;"
+          }
+        ],
+        "rust-server/src/regional/index.rs": [
+          {
+            "first": 141,
+            "last": 182,
+            "item": "mod tests {"
+          }
+        ]
+      }
+    },
+    "release_source": {
+      "files": 183,
+      "lines": 37842,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "tools_runtime": {
+      "files": 8,
+      "lines": 1211,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "tools_tests": {
+      "files": 3,
+      "lines": 381,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "tools_all": {
+      "files": 11,
+      "lines": 1592,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "maintained_all_sources": {
+      "files": 238,
+      "lines": 49880,
+      "directories": 101,
+      "empty_directories": 0
+    },
+    "resources": {
+      "files": 12,
+      "text_lines": 1026,
+      "bytes": 96222
+    }
+  }
+}

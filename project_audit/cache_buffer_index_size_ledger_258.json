@@ -1,0 +1,48 @@
+{
+  "base": "7aa10d3b",
+  "implementation": "4512f56f",
+  "method": "Same count_cache_first_sources.py scope as pre-repair256. Physical lines including comments and blanks, tracked/untracked source; main/debug/fixture/tool roots, shared separately. Generated and project_audit excluded; all selected descendant directories including empty counted. Excludes standalone native test fixture/pressure and cfg(test) source from release scope. No tests executed. Audit-only helper scripts are additional files outside this unchanged counting scope.",
+  "beforeRelease": {
+    "files": 183,
+    "lines": 37716,
+    "directories": 56,
+    "empty_directories": 0
+  },
+  "afterRelease": {
+    "files": 183,
+    "lines": 37842,
+    "directories": 56,
+    "empty_directories": 0
+  },
+  "beforeAllIncludingShared": {
+    "lines": 50680,
+    "files": 249,
+    "directories": 122,
+    "empty_directories": 0
+  },
+  "afterAllIncludingShared": {
+    "lines": 50827,
+    "files": 249,
+    "directories": 122,
+    "empty_directories": 0
+  },
+  "sourceDelta": {
+    "releaseLines": 126,
+    "allLines": 147,
+    "files": 0,
+    "directories": 0
+  },
+  "normalClientBytesBefore": 3907988,
+  "artifacts258": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.258-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "a54dce7c4ec1f3ee05f084898684a348337dc08e59acd69e17086536535075a4",
+      "bytes": 4065180
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.258-beta+1.21.1-neoforge.jar",
+      "sha256": "be7dc1fc808d84c2175ba3a023ff1ad1337676a4dd16c08e6e6f7699f72ebafc",
+      "bytes": 3909781
+    }
+  ]
+}

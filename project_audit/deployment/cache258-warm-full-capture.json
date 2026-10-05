@@ -1,0 +1,26 @@
+{
+  "source": "project_audit/live_client/cache258-capture/voxy-client-debug.log",
+  "elapsedSeconds": 37.0853473,
+  "firstHits": 0,
+  "lastHits": 50906,
+  "hits": 50906,
+  "workerAllocatedBytes": 2376325432,
+  "workerBytesPerHit": 46680.655168349505,
+  "workerMBps": 64.07720582409107,
+  "workerSlots": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ]
+}

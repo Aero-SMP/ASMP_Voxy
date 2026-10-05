@@ -1,7 +1,8 @@
 # Reuse cache-worker buffers and active region journal indexes
 
-Status: implementation plan only, written 2026-10-05. Creating this document
-does not implement, build, deploy or test either fix.
+Status: implemented on 2026-10-05, commit `4512f56f`; debug client 258 deployed
+to the real PC. See [implementation and live evidence](cache_worker_buffers_and_journal_index_reuse_implementation.md).
+The live window lasted 465.744807 seconds, within the hard ten-minute limit.
 
 Repository: `/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates`.
 Branch: `feature/cache-first-background-updates`.

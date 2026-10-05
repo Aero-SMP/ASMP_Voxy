@@ -1,0 +1,10 @@
+{
+  "utc_start": "2026-10-05T18:47:30.058715+00:00",
+  "monotonic_start": 449198.951042598,
+  "limit_seconds": 600,
+  "target_seconds": 300,
+  "status": "ended",
+  "run": "6a3d1e67-9607-4f53-b973-397f6272a5eb",
+  "utc_end": "2026-10-05T18:55:15.803524+00:00",
+  "elapsed_seconds": 465.744807081006
+}
