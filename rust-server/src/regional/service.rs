@@ -1,6 +1,9 @@
 use super::{
     RegionalRuntime,
-    wire::{ContentBinding, ControlMessage, DimensionMetadata, RecordDescriptor, RecordStatus},
+    wire::{
+        ContentBinding, ControlMessage, DEFAULT_UPDATE_INTERVAL_MILLIS, DimensionMetadata,
+        RecordDescriptor, RecordStatus,
+    },
 };
 use crate::anvil::AnvilWorld;
 use crate::{catalog::Catalog, read_lock, registry::Registry};
@@ -387,7 +390,7 @@ impl RegionalService {
         let shortest = cadences
             .intervals
             .first_key_value()
-            .map_or(1000, |(&interval, _)| interval);
+            .map_or(DEFAULT_UPDATE_INTERVAL_MILLIS, |(&interval, _)| interval);
         for entry in read_lock(&self.runtimes)?.values() {
             entry.runtime.set_freshness_interval(shortest);
         }

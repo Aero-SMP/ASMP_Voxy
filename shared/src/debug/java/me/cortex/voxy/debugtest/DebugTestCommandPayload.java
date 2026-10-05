@@ -87,15 +87,14 @@ public record DebugTestCommandPayload(
         }
     }
 
-    /** Exact units match the settings: kbps, decimal bytes, seconds, displayed Minecraft chunks. */
+    /** Exact units match the settings: kbps, decimal bytes, displayed Minecraft chunks. */
     public static long downloadPolicyValue(String option, String value) {
         if (option.equals("storage") && value.equals("entire")) return Long.MAX_VALUE;
         if (!value.matches("[0-9]+")) throw new IllegalArgumentException("download policy value must be a positive integer");
         long number = Long.parseLong(value);
         boolean valid = switch (option) {
-            case "bandwidth" -> number >= 100 && number <= 10_000;
+            case "bandwidth" -> number >= 100 && number <= 20_000;
             case "storage" -> number >= 100_000_000;
-            case "interval" -> number >= 1 && number <= 60;
             case "render_distance" -> number >= 20 && number <= 2048 && (number & 1) == 0;
             default -> false;
         };

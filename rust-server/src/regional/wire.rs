@@ -14,6 +14,7 @@ pub const MAX_SECTION_REQUESTS: usize = u16::MAX as usize;
 pub const RECORD_DESCRIPTOR_BYTES: usize = 88;
 pub const RECORD_SCOPE_BYTES: usize = 36;
 pub const S_RECORD: u8 = 0x85;
+pub const DEFAULT_UPDATE_INTERVAL_MILLIS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -43,8 +44,8 @@ impl StreamingSettings {
         if self.interval_millis < 1000 {
             bail!("terrain update interval must be at least one second");
         }
-        if !(100..=10_000).contains(&self.bandwidth_kbps) {
-            bail!("total download rate must be 100 through 10000 kbps");
+        if !(100..=20_000).contains(&self.bandwidth_kbps) {
+            bail!("total download rate must be 100 through 20000 kbps");
         }
         if self.interval_millis > u64::MAX / 1_000_000 {
             bail!("terrain interval overflow");

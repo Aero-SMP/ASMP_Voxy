@@ -102,7 +102,7 @@ impl ServerState {
         }
     }
     fn register_route(self: &Arc<Self>, token: [u8; 32], kbps: u64) -> Result<()> {
-        if token == [0; 32] || !(100..=10_000).contains(&kbps) {
+        if token == [0; 32] || !(100..=20_000).contains(&kbps) {
             bail!("invalid authenticated route policy")
         }
         let mut routes = self.routes.lock().expect("Minecraft route owner poisoned");

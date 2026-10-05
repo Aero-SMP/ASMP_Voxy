@@ -1,6 +1,7 @@
 use super::{
     ChunkSourceRecord, RegionFile, RegionLayout, RegionSourceTable, rebuild_region,
     rebuild_region_incremental,
+    wire::DEFAULT_UPDATE_INTERVAL_MILLIS,
 };
 use crate::{
     anvil::{AnvilWorld, RegionAvailability, RegionHeader},
@@ -390,7 +391,7 @@ impl RegionalRuntime {
             waiting_ready: Mutex::new(BTreeSet::new()),
             dirty_discovery: Mutex::new(BTreeSet::new()),
             freshness_attempts: Mutex::new(BTreeMap::new()),
-            freshness_millis: AtomicU64::new(1000),
+            freshness_millis: AtomicU64::new(DEFAULT_UPDATE_INTERVAL_MILLIS),
             retired: AtomicBool::new(false),
         })
     }

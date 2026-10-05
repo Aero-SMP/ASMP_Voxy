@@ -64,13 +64,6 @@ public final class ClientSession {
     private static volatile VoxyRenderSystem activeRenderer;
     private static volatile long retryAfter;
     private static volatile ConnectionOwner connectionOwner;
-    private record ServerStorageStatus(String server, String description) {}
-    private static volatile ServerStorageStatus storageStatus;
-    public static String storageStatus(String serverId) {
-        var value = storageStatus;
-        return value != null && value.server().equals(serverId) ? value.description() : "";
-    }
-
     /** Network/cache ownership follows the Minecraft connection, independently of the renderer. */
     private static final class ConnectionOwner implements AutoCloseable {
         final Object minecraftConnection;
@@ -611,13 +604,12 @@ public final class ClientSession {
         boolean helloAccepted;
         boolean openSent, bootstrapComplete;
         volatile long renderedFrames;
-        long sentIntervalMillis = -1, sentBandwidthKbps = -1;
+        long sentBandwidthKbps = -1;
         RegionalProtocol.ServerHello welcome;
         boolean sentRefreshAllowed;
         int sentDimensionId = -1;
         int sentAnchorX = Integer.MIN_VALUE, sentAnchorZ = Integer.MIN_VALUE;
         long sentStorageBytes = -1;
-        RegionalDiskBudget.StorageState reportedStorage;
         volatile int cameraBlockX, cameraBlockZ;
         volatile VisibleCut visibleInput;
         volatile DownloadFrustum downloadFrustum;
@@ -1095,7 +1087,7 @@ public final class ClientSession {
                     || connectionOwner.minecraftConnection != this.minecraftConnection))
                 ServerDownloadSettings.reloadUnavailable();
             this.policy = this.serverKey == null ? null : ServerDownloadSettings.forServer(this.serverKey);
-            this.connector = () -> QuicEndpointDiscovery.connect(listener, this.policy == null ? 1000 : this.policy.downloadKbps());
+            this.connector = () -> QuicEndpointDiscovery.connect(listener, this.policy == null ? ServerDownloadSettings.DEFAULT_KBPS : this.policy.downloadKbps());
         }
 
         Session(long id, String dimension, VoxyRenderSystem renderer,
@@ -2249,15 +2241,15 @@ public final class ClientSession {
             if (this.checkedFrame != this.renderedFrames) {
                 this.checkedFrame = this.renderedFrames; this.interestChanges.addAll(this.frameInterests); this.frameInterests.clear();
             }
-            long interval = Math.multiplyExact((long) VoxyConfig.CONFIG.getBackgroundUpdateIntervalSeconds(), 1000L);
+            long interval = RegionalProtocol.UPDATE_INTERVAL_MILLIS;
             long bandwidth = this.policy.available() ? this.policy.downloadKbps() : this.sentBandwidthKbps;
             boolean refresh = this.helloAccepted && (this.metadata == null || this.metadata.canDownload()) && this.refreshAllowed();
-            if (this.openSent && this.dimensionId >= 0 && (interval != this.sentIntervalMillis || bandwidth != this.sentBandwidthKbps
+            if (this.openSent && this.dimensionId >= 0 && (bandwidth != this.sentBandwidthKbps
                     || refresh != this.sentRefreshAllowed || this.dimensionId != this.sentDimensionId || this.cameraBlockX != this.sentAnchorX || this.cameraBlockZ != this.sentAnchorZ)) {
                 var anchors = this.networkOwner.downloads == null ? List.of(new RegionalProtocol.DimensionAnchor(this.dimensionId, this.cameraBlockX, this.cameraBlockZ))
                         : this.networkOwner.downloads.anchors();
                 if (!this.quic.settings(interval, bandwidth, refresh, this.dimensionId, anchors)) return;
-                this.sentIntervalMillis = interval; this.sentBandwidthKbps = bandwidth; this.sentRefreshAllowed = refresh;
+                this.sentBandwidthKbps = bandwidth; this.sentRefreshAllowed = refresh;
                 this.sentAnchorX = this.cameraBlockX; this.sentAnchorZ = this.cameraBlockZ; this.sentDimensionId = this.dimensionId;
             }
             if (this.openSent && !this.helloAccepted) return;
@@ -2305,7 +2297,7 @@ public final class ClientSession {
                     : this.quic.open(this.dimension, this.worldIdentity, this.currentCatalog, interval, bandwidth, refresh, this.cameraBlockX, this.cameraBlockZ, changes);
             if (!accepted) return;
             this.openSent = true; this.networkOwner.opened = true;
-            this.sentIntervalMillis = interval; this.sentBandwidthKbps = bandwidth; this.sentRefreshAllowed = refresh;
+            this.sentBandwidthKbps = bandwidth; this.sentRefreshAllowed = refresh;
             for (var change : changes) {
                 var demand = this.demands.get(change.key());
                 ClientLodDebug.streamingDesire(this, demand, change);
@@ -2321,14 +2313,6 @@ public final class ClientSession {
         void processCacheDownloads() throws IOException {
             if (this.metadata == null || this.policy == null) return;
             var downloads = this.networkOwner == null ? null : this.networkOwner.downloads;
-            var storage = this.metadata.namespaceBudget();
-            if (!storage.equals(this.reportedStorage)) {
-                this.reportedStorage = storage;
-                storageStatus = new ServerStorageStatus(this.policy.serverId(), storage.ready()
-                        ? String.format(java.util.Locale.ROOT, "Cache files: %.1f MB%s", storage.bytes() / 1_000_000.0,
-                        storage.downloadPaused() ? "; downloads paused: " + storage.reason() : "")
-                        : "Cache file inventory pending");
-            }
             if (this.sentStorageBytes != this.policy.storageBytes()) {
                 this.metadata.bindServer(this.policy, this.serverKey);
                 this.resetMetadataRetry();

@@ -60,7 +60,7 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
             throw new IllegalArgumentException("invalid Voxy QUIC certificate fingerprint");
         }
         routeToken = routeToken == null ? null : routeToken.clone();
-        if (routeToken == null || routeToken.length != 32 || bandwidthKbps < 100 || bandwidthKbps > 10_000)
+        if (routeToken == null || routeToken.length != 32 || bandwidthKbps < 100 || bandwidthKbps > 20_000)
             throw new IllegalArgumentException("invalid Voxy QUIC route or download bandwidth");
 
         if (udpPort == 0) {
@@ -75,11 +75,6 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
 
     public static QuicEndpointPayload request(int bandwidthKbps) {
         return new QuicEndpointPayload("", 0, "", new byte[CERTIFICATE_SHA256_BYTES], bandwidthKbps, new byte[32]);
-    }
-
-    public static QuicEndpointPayload endpoint(String host, int udpPort, String alpn,
-                                               byte[] certificateSha256, byte[] routeToken) {
-        return endpoint(host, udpPort, alpn, certificateSha256, routeToken, 1000);
     }
 
     public static QuicEndpointPayload endpoint(String host, int udpPort, String alpn,

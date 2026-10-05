@@ -25,7 +25,7 @@ import java.util.Objects;
 
 /** User-selected download and disk policies belong to a Minecraft server, across dimensions. */
 public final class ServerDownloadSettings {
-    public static final int MIN_KBPS = 100, MAX_KBPS = 10_000, DEFAULT_KBPS = 1_000;
+    public static final int MIN_KBPS = 100, MAX_KBPS = 20_000, DEFAULT_KBPS = 5_000;
     public static final long MIN_STORAGE_BYTES = 100_000_000, DEFAULT_STORAGE_BYTES = 500_000_000;
     private static final Gson JSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Object LOCK = new Object();
@@ -104,7 +104,7 @@ public final class ServerDownloadSettings {
     }
     public int downloadKbps() { synchronized (LOCK) { return store == null ? DEFAULT_KBPS : policy().downloadKbps; } }
     public void setDownloadKbps(int kbps) {
-        if (kbps < MIN_KBPS || kbps > MAX_KBPS) throw new IllegalArgumentException("download bandwidth outside 100–10000 kbps");
+        if (kbps < MIN_KBPS || kbps > MAX_KBPS) throw new IllegalArgumentException("download bandwidth outside 100–20000 kbps");
         synchronized (LOCK) { policy().downloadKbps = kbps; }
     }
     public long storageBytes() { synchronized (LOCK) { return store == null ? -1 : policy().storageBytes; } }

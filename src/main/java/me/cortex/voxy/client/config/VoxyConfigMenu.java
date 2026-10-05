@@ -24,6 +24,9 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -71,13 +74,6 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setEnabledProvider(VoxyConfigMenu::renderingEnabled, ENABLED, RENDERING);
 
         var pixelSize = pixelSizeOption(builder);
-
-        var updateInterval = option(builder.createIntegerOption(id("background_update_interval")),
-                "voxy.config.streaming.update_interval", CFG::getBackgroundUpdateIntervalSeconds,
-                value -> CFG.backgroundUpdateIntervalSeconds = value, STREAMING_SETTINGS)
-                .setRange(new Range(1, 60, 1))
-                .setValueFormatter(value -> Component.literal(value + " s"))
-                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
 
         int[] geometryMemoryChoices = GeometryMemoryOptions.available(
                 RenderResourceReuse.getSafeGeometryMemoryLimitBytes());
@@ -142,8 +138,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         var renderingPage = builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
-                .addOptionGroup(group(builder, renderDistance, pixelSize, geometryMemory))
-                .addOptionGroup(group(builder, updateInterval));
+                .addOptionGroup(group(builder, renderDistance, pixelSize, geometryMemory));
         renderingPage.addOptionGroup(serverDownloadOptions(builder));
         renderingPage
                 .addOptionGroup(group(builder, environmentalFog, ssao))
@@ -201,12 +196,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                         : String.format(java.util.Locale.ROOT, "%.1f Mbps", value / 1000.0)))
                 .setEnabledProvider(state -> ServerDownloadSettings.current() != null && !unavailablePolicy() && voxyEnabled(state),
                         ENABLED, ConfigState.UPDATE_ON_REBUILD);
-        bandwidth.setTooltip(value -> {
-            var policy = ServerDownloadSettings.current();
-            return policy == null ? Component.translatable("voxy.config.streaming.no_server")
-                    : Component.translatable("voxy.config.streaming.bandwidth.tooltip", policy.serverId())
-                    .append(Component.literal(policy.available() ? "" : "\n" + policy.failureReason()));
-        });
+        bandwidth.setTooltip(value -> serverPolicyTooltip("voxy.config.streaming.bandwidth.tooltip"));
         bandwidth.setDefaultValue(ServerDownloadSettings.DEFAULT_KBPS);
         bandwidth.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
 
@@ -215,14 +205,9 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 "voxy.config.streaming.storage", values::index, values::apply, STREAMING_SETTINGS)
                 .setValidator(values)
                 .setValueFormatter(values::label)
-                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && !unavailablePolicy() && voxyEnabled(state),
+                .setEnabledProvider(state -> values.available() && voxyEnabled(state),
                         ENABLED, ConfigState.UPDATE_ON_REBUILD);
-        storage.setTooltip(value -> {
-            var policy = ServerDownloadSettings.current();
-            return policy == null ? Component.translatable("voxy.config.streaming.no_server")
-                    : Component.translatable("voxy.config.streaming.storage.tooltip", policy.serverId())
-                    .append(Component.literal("\n" + (policy.available() ? ClientSession.storageStatus(policy.serverId()) : policy.failureReason())));
-        });
+        storage.setTooltip(value -> serverPolicyTooltip("voxy.config.streaming.storage.tooltip"));
         storage.setDefaultProvider(state -> values.defaultIndex(), ConfigState.UPDATE_ON_REBUILD);
         storage.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
         group.addOption(bandwidth);
@@ -235,70 +220,98 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         return policy != null && !policy.available();
     }
 
+    private static Component serverPolicyTooltip(String translation) {
+        var policy = ServerDownloadSettings.current();
+        return Component.translatable(policy == null ? "voxy.config.streaming.no_server"
+                : policy.available() ? translation : "voxy.config.streaming.settings_unavailable");
+    }
+
     private static void saveCurrentServerPolicy() {
         var policy = ServerDownloadSettings.current();
         if (policy != null) policy.save();
     }
 
-    /** Refresh choices with binding resets when a menu opens, keeping slider indices stable while editing. */
+    /** Capture exact byte anchors on binding load; asynchronous estimates cannot move an edit. */
     private static final class CacheStorageOptions implements SteppedValidator {
+        private static final int ENTIRE_WORLD = 1 << 20, FINITE_MAX = ENTIRE_WORLD - 1;
         private String serverId;
-        private long[] choices;
-
-        private ServerDownloadSettings select(boolean rebuild) {
-            var policy = ServerDownloadSettings.current();
-            String selected = policy == null ? null : policy.serverId();
-            long bytes = policy == null || !policy.available() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
-            if (rebuild || this.choices == null || !java.util.Objects.equals(this.serverId, selected)
-                    || bytes != Long.MAX_VALUE && java.util.Arrays.binarySearch(this.choices, bytes) < 0) {
-                this.serverId = selected;
-                this.choices = storageChoices(policy);
-            }
-            return policy;
-        }
+        private final long[] anchors = new long[4];
+        private final int[] positions = new int[4];
+        private int count;
 
         int index() {
-            var policy = select(true);
-            return policy != null && policy.entireWorld() ? this.choices.length : java.util.Arrays.binarySearch(this.choices,
-                    policy == null || !policy.available() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes());
+            var policy = ServerDownloadSettings.current();
+            this.serverId = policy == null ? null : policy.serverId();
+            long saved = policy == null || !policy.available() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
+            long current = saved == Long.MAX_VALUE ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : saved;
+            long maximum = Math.min(Long.MAX_VALUE - 1, Math.max(current, Math.max(
+                    ServerDownloadSettings.DEFAULT_STORAGE_BYTES, policy == null ? 0 : policy.estimatedWorldBytes())));
+            this.anchors[0] = ServerDownloadSettings.MIN_STORAGE_BYTES;
+            this.anchors[1] = ServerDownloadSettings.DEFAULT_STORAGE_BYTES;
+            this.anchors[2] = current;
+            this.anchors[3] = maximum;
+            Arrays.sort(this.anchors);
+            this.count = 0;
+            for (long bytes : this.anchors) {
+                if (this.count == 0 || this.anchors[this.count - 1] != bytes) this.anchors[this.count++] = bytes;
+            }
+            this.positions[0] = 0;
+            this.positions[this.count - 1] = FINITE_MAX;
+            for (int i = 1; i < this.count - 1; i++) {
+                int proportional = (int) Math.round((this.anchors[i] - (double) this.anchors[0])
+                        / (maximum - (double) this.anchors[0]) * FINITE_MAX);
+                this.positions[i] = Math.clamp(proportional, this.positions[i - 1] + 1,
+                        FINITE_MAX - (this.count - 1 - i));
+            }
+            return saved == Long.MAX_VALUE ? ENTIRE_WORLD : position(saved);
         }
 
         void apply(int value) {
-            var policy = select(false);
-            if (policy != null && policy.available()) policy.setStorageBytes(value == this.choices.length ? Long.MAX_VALUE : this.choices[value]);
+            var policy = selectedPolicy();
+            if (policy != null) policy.setStorageBytes(bytes(value));
         }
 
         @Override public int min() { return 0; }
-        @Override public int max() { select(false); return this.choices.length; }
+        @Override public int max() { return ENTIRE_WORLD; }
         @Override public int step() { return 1; }
-        int defaultIndex() { select(false); return java.util.Arrays.binarySearch(this.choices, ServerDownloadSettings.DEFAULT_STORAGE_BYTES); }
-        Component label(int value) {
-            select(false);
-            if (unavailablePolicy()) return Component.translatable("voxy.config.streaming.policy_unavailable");
-            return value == this.choices.length ? Component.translatable("voxy.config.streaming.entire_world")
-                    : Component.literal(storageLabel(this.choices[value]));
-        }
-    }
+        int defaultIndex() { return position(ServerDownloadSettings.DEFAULT_STORAGE_BYTES); }
+        boolean available() { return selectedPolicy() != null; }
 
-    private static long[] storageChoices(ServerDownloadSettings policy) {
-        var choices = new java.util.TreeSet<Long>();
-        choices.add(ServerDownloadSettings.DEFAULT_STORAGE_BYTES);
-        long current = policy == null || !policy.available() || policy.entireWorld() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
-        choices.add(current);
-        long maximum = Math.min(Long.MAX_VALUE - 1, Math.max(current,
-                Math.max(ServerDownloadSettings.DEFAULT_STORAGE_BYTES, policy == null ? 0 : policy.estimatedWorldBytes())));
-        for (long bytes = ServerDownloadSettings.MIN_STORAGE_BYTES; bytes < maximum;) {
-            choices.add(bytes);
-            if (bytes > maximum / 2) break;
-            bytes *= 2;
+        private ServerDownloadSettings selectedPolicy() {
+            var policy = ServerDownloadSettings.current();
+            return policy != null && policy.available() && Objects.equals(this.serverId, policy.serverId()) ? policy : null;
         }
-        choices.add(maximum);
-        return choices.stream().mapToLong(Long::longValue).toArray();
+
+        private int position(long bytes) {
+            for (int i = 0; i < this.count; i++) if (this.anchors[i] == bytes) return this.positions[i];
+            throw new IllegalStateException("Missing exact cache storage anchor");
+        }
+
+        private long bytes(int value) {
+            if (value == ENTIRE_WORLD) return Long.MAX_VALUE;
+            value = Math.clamp(value, 0, FINITE_MAX);
+            for (int i = 0; i < this.count; i++) {
+                if (value == this.positions[i]) return this.anchors[i];
+                if (value < this.positions[i]) {
+                    double fraction = (value - this.positions[i - 1]) / (double) (this.positions[i] - this.positions[i - 1]);
+                    long interpolated = Math.round(this.anchors[i - 1]
+                            + (this.anchors[i] - (double) this.anchors[i - 1]) * fraction);
+                    return Math.clamp(interpolated, this.anchors[i - 1], this.anchors[i]);
+                }
+            }
+            return this.anchors[this.count - 1];
+        }
+
+        Component label(int value) {
+            if (unavailablePolicy()) return Component.translatable("voxy.config.streaming.policy_unavailable");
+            return value == ENTIRE_WORLD ? Component.translatable("voxy.config.streaming.entire_world")
+                    : Component.literal(storageLabel(bytes(value)));
+        }
     }
 
     private static String storageLabel(long bytes) {
         double unit = bytes < 1_000_000_000 ? 1_000_000.0 : 1_000_000_000.0;
-        return String.format(java.util.Locale.ROOT, "%.1f %s", bytes / unit, bytes < 1_000_000_000 ? "MB" : "GB");
+        return String.format(Locale.ROOT, "%.1f %s", bytes / unit, bytes < 1_000_000_000 ? "MB" : "GB");
     }
 
     static IntegerOptionBuilder pixelSizeOption(ConfigBuilder builder) {

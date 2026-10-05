@@ -260,7 +260,6 @@ final class LiveClientTestHarness {
                     switch (command.option()) {
                         case "bandwidth" -> policy.setDownloadKbps((int) value);
                         case "storage" -> policy.setStorageBytes(value);
-                        case "interval" -> VoxyConfig.CONFIG.backgroundUpdateIntervalSeconds = (int) value;
                         case "render_distance" -> {
                             VoxyConfig.CONFIG.sectionRenderDistance = value / 32.0f;
                             active.renderer.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
@@ -271,7 +270,7 @@ final class LiveClientTestHarness {
                     ClientLodDebug.updaterEvent("state=DOWNLOAD_POLICY_APPLIED run=" + active.runId + " step=" + active.stepId
                             + " server=" + policy.serverId() + " option=" + command.option() + " value=" + command.value()
                             + " bandwidthKbps=" + policy.downloadKbps() + " storageBytes=" + policy.storageBytes()
-                            + " intervalSeconds=" + VoxyConfig.CONFIG.getBackgroundUpdateIntervalSeconds()
+                            + " intervalSeconds=" + RegionalProtocol.UPDATE_INTERVAL_MILLIS / 1000
                             + " renderDistanceChunks=" + Math.round(VoxyConfig.CONFIG.sectionRenderDistance * 32)
                             + " renderer=" + active.renderer.rendererIdentity());
                     requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,

@@ -391,7 +391,7 @@ async fn main() -> Result<()> {
                 "Authenticated single live consumer; not a 100-player pressure test.\n\
                 --server IP:PORT --cert FILE --route-token32 HEX64 --dimension NAME --cache OWNED_DIRECTORY\n\
                 [--route-token-file FILE instead of --route-token32] [--x BLOCK --y BLOCK --z BLOCK]\n\
-                [--duration SECONDS --cap-kbps 100..10000 --interval-ms >=1000 --refresh true|false]\n\
+                [--duration SECONDS --cap-kbps 100..20000 --interval-ms >=1000 --refresh true|false]\n\
                 The Minecraft server must already have registered this route and selected cap.\n\
                 No session registration, block mutation, network impairment or player simulation is performed."
             );
@@ -445,8 +445,12 @@ async fn main() -> Result<()> {
         "anchor outside Minecraft domain"
     );
     let settings = StreamingSettings {
-        interval_millis: number(&args, "interval-ms", "1000")?,
-        bandwidth_kbps: number(&args, "cap-kbps", "1000")?,
+        interval_millis: number(
+            &args,
+            "interval-ms",
+            &wire::DEFAULT_UPDATE_INTERVAL_MILLIS.to_string(),
+        )?,
+        bandwidth_kbps: number(&args, "cap-kbps", "5000")?,
         refresh_allowed: number(&args, "refresh", "false")?,
     };
     settings.validate()?;

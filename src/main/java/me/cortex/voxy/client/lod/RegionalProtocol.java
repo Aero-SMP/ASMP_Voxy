@@ -16,6 +16,7 @@ import java.util.zip.CRC32C;
 
 /** Current spatial-key protocol. Storage indexes stay on the server; local journals stay independent. */
 final class RegionalProtocol {
+    static final long UPDATE_INTERVAL_MILLIS = 2_000;
     static final String ALPN = "voxy-region-cache-start";
     static final int STREAM_CONTROL = 0, STREAM_SECTION_LANE = 1, STREAM_DISCOVERY = 2;
     static final int MAX_DIMENSION_BYTES = 1024, MAX_CATALOG_BYTES = 64 * 1024 * 1024;
@@ -144,7 +145,7 @@ final class RegionalProtocol {
         return control(C_SETTINGS, payload.toByteArray());
     }
     private static void settings(ByteArrayOutputStream payload, long intervalMillis, long bandwidthKbps) throws IOException {
-        if (intervalMillis < 1000 || bandwidthKbps < 100 || bandwidthKbps > 10_000) throw new IOException("invalid download settings");
+        if (intervalMillis < 1000 || bandwidthKbps < 100 || bandwidthKbps > 20_000) throw new IOException("invalid download settings");
         Math.multiplyExact(bandwidthKbps, 125L);
         putLong(payload, intervalMillis); putLong(payload, bandwidthKbps);
     }
