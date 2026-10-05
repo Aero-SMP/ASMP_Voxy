@@ -75,5 +75,35 @@
     "serverPath": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/approach1-pc248-warm-resumed-20261004T235424Z.png",
     "sha256": "5c8346cd50c8481149cef70ad76226483fa46691925c8751b36b4fc57e464025",
     "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP"
+  },
+  "warm_catalogue_reuse_checks": {
+    "transport_released": true,
+    "hello_accepted": true,
+    "cached_catalogue_used": true,
+    "no_catalogue_frames_received": true,
+    "no_compressed_catalogue_bytes_received": true,
+    "geometry_draws_present": true,
+    "no_reported_failure": true
+  },
+  "visual_observation": {
+    "screenshot_viewed": true,
+    "description": "Coarse terrain fragments persist and expand in this view after transport resumes. Their projected screen position and size alone do not establish incorrect world coordinates.",
+    "world_coordinate_error_confirmed": false,
+    "earlier246_offline_screenshot": "Contains a distant floating-looking treed fragment and discontinuous water/cliff geometry from another camera pose. Actual airborne builds exist in this world; it does not prove the same defect predates248."
+  },
+  "narrow_transform_source_review": {
+    "comparison_original": "/home/aerosmp/Desktop/ASMP_Voxy_Restart",
+    "core_rendering_files_byte_identical": 24,
+    "shader_files_byte_identical": 35,
+    "camera_relative_vertex_algebra": "32 * (1 << lod) * section_xyz + (1 << lod) * local_vertex - camera_xyz",
+    "references": [
+      "src/main/java/me/cortex/voxy/client/core/rendering/SectionKey.java:9",
+      "src/main/java/me/cortex/voxy/client/core/rendering/section/BasicAsyncGeometryManager.java:305",
+      "src/main/resources/assets/voxy/shaders/lod/pos_util.glsl:4",
+      "src/main/resources/assets/voxy/shaders/lod/quad_util.glsl:115",
+      "src/main/java/me/cortex/voxy/client/core/rendering/Viewport.java:119",
+      "src/main/java/me/cortex/voxy/client/core/rendering/section/MDICSectionRenderer.java:146"
+    ],
+    "finding": "No key layout, endian split, camera translation or LOD scaling mismatch found in this read-only source check. Runtime world-coordinate correctness remains unproven; sparse coarse coverage is a plausible explanation requiring sampled world-coordinate comparison."
   }
 }
