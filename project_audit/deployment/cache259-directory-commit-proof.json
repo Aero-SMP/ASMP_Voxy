@@ -1,0 +1,2937 @@
+{
+  "source": "project_audit/live_client/cache259-capture/voxy-client-debug.log",
+  "sha256": "ff75735935fca42e87f73df92cb0c965eed04d77781c6f0132e5b3b04e3a860c",
+  "header": "Voxy version 0.2.259-beta",
+  "beforeResume": {
+    "line": 76184,
+    "utc": "2026-10-05T19:59:36.974466Z",
+    "sampleNanos": 83906512791400,
+    "fields": {
+      "active": 74953,
+      "localActivations": 74953,
+      "localViews": 13273,
+      "localAbsent": 12669,
+      "localPatches": 238,
+      "prefetchCommitted": 0,
+      "prefetchBytes": 0,
+      "prefetchFailures": 0,
+      "received": 0,
+      "transportHeld": "true",
+      "connectionEpoch": 0,
+      "geometryUsed": 1551125504,
+      "cacheDiskBytes": 819997609,
+      "cacheInventoryNs": 211603600,
+      "firstLocalNanos": 1034101800,
+      "metadataPendingRegions": 0,
+      "invalidations": 0,
+      "replacements": 0,
+      "metadataNetworkBytes": 0,
+      "catalogueFrames": 0,
+      "quicUdpSentBytesJvm": 0,
+      "quicUdpReceivedBytesJvm": 0
+    },
+    "outcomes": {
+      "CACHE_HIT": 74898,
+      "CACHE_MISS": 0,
+      "CACHE_CORRUPT": 0,
+      "MODEL_WAIT": 987,
+      "FAILURE": 421,
+      "COMPRESSED_BYTES": 0,
+      "CANONICAL_BYTES": 0,
+      "MESH_BYTES": 1515842728,
+      "MODEL_RECLAIM": 424,
+      "SAVE_SUCCESS": 238,
+      "SAVE_FAILURE": 0,
+      "SAVE_CANCELLED": 0
+    },
+    "workerThreadIds": {
+      "0": 291,
+      "1": 292,
+      "2": 293,
+      "3": 294,
+      "4": 295,
+      "5": 296,
+      "6": 297,
+      "7": 298,
+      "8": 299,
+      "9": 300,
+      "10": 301,
+      "11": 302,
+      "12": 303,
+      "13": 304
+    }
+  },
+  "finalSnapshot": {
+    "line": 183185,
+    "utc": "2026-10-05T20:01:48.155282100Z",
+    "sampleNanos": 84037969288000,
+    "fields": {
+      "active": 79661,
+      "localActivations": 74953,
+      "localViews": 13273,
+      "localAbsent": 12669,
+      "localPatches": 14946,
+      "prefetchCommitted": 191,
+      "prefetchBytes": 209683,
+      "prefetchFailures": 0,
+      "received": 69281317,
+      "transportHeld": "false",
+      "connectionEpoch": 1,
+      "geometryUsed": 1627858944,
+      "cacheDiskBytes": 896881678,
+      "cacheInventoryNs": 211603600,
+      "firstLocalNanos": 1034101800,
+      "metadataPendingRegions": 0,
+      "invalidations": 0,
+      "replacements": 0,
+      "metadataNetworkBytes": 0,
+      "catalogueFrames": 0,
+      "quicUdpSentBytesJvm": 13358969,
+      "quicUdpReceivedBytesJvm": 77002448
+    },
+    "outcomes": {
+      "CACHE_HIT": 74898,
+      "CACHE_MISS": 0,
+      "CACHE_CORRUPT": 0,
+      "MODEL_WAIT": 996,
+      "FAILURE": 421,
+      "COMPRESSED_BYTES": 69309306,
+      "CANONICAL_BYTES": 366509594,
+      "MESH_BYTES": 1771095928,
+      "MODEL_RECLAIM": 424,
+      "SAVE_SUCCESS": 14762,
+      "SAVE_FAILURE": 0,
+      "SAVE_CANCELLED": 0
+    },
+    "workerThreadIds": {
+      "0": 291,
+      "1": 292,
+      "2": 293,
+      "3": 294,
+      "4": 295,
+      "5": 296,
+      "6": 297,
+      "7": 298,
+      "8": 299,
+      "9": 300,
+      "10": 301,
+      "11": 302,
+      "12": 303,
+      "13": 304
+    }
+  },
+  "postResumeDeltas": {
+    "localViews": 0,
+    "localAbsent": 0,
+    "localPatches": 14708,
+    "prefetchCommitted": 191,
+    "prefetchBytes": 209683,
+    "prefetchFailures": 0,
+    "received": 69281317,
+    "localActivations": 0,
+    "active": 4708,
+    "invalidations": 0,
+    "replacements": 0
+  },
+  "outcomeDeltas": {
+    "CACHE_HIT": 0,
+    "CACHE_MISS": 0,
+    "CACHE_CORRUPT": 0,
+    "MODEL_WAIT": 9,
+    "FAILURE": 0,
+    "COMPRESSED_BYTES": 69309306,
+    "CANONICAL_BYTES": 366509594,
+    "MESH_BYTES": 255253200,
+    "MODEL_RECLAIM": 0,
+    "SAVE_SUCCESS": 14524,
+    "SAVE_FAILURE": 0,
+    "SAVE_CANCELLED": 0
+  },
+  "stageDeltas": {
+    "TASK": {
+      "count": 14521,
+      "workerSeconds": 0.0855025
+    },
+    "METADATA": {
+      "count": 208,
+      "workerSeconds": 0.0118645
+    },
+    "DECOMPRESS": {
+      "count": 14521,
+      "workerSeconds": 0.6345746
+    },
+    "DECODE_VALIDATE": {
+      "count": 14521,
+      "workerSeconds": 3.0901455
+    },
+    "REQUEST_MODELS": {
+      "count": 14521,
+      "workerSeconds": 0.0247615
+    },
+    "CHECK_MODELS": {
+      "count": 14521,
+      "workerSeconds": 0.0131616
+    },
+    "MESH": {
+      "count": 14521,
+      "workerSeconds": 23.5846227
+    },
+    "RESULT_READY": {
+      "count": 14729,
+      "workerSeconds": 0.0296971
+    },
+    "WAIT_MODELS": {
+      "count": 9,
+      "workerSeconds": 0.2803335
+    },
+    "SAVE_ENCODE_WRITE": {
+      "count": 14715,
+      "workerSeconds": 369.2545607
+    },
+    "WAIT_REGION_WRITER": {
+      "count": 14720,
+      "workerSeconds": 675.5670319
+    },
+    "CACHE_ONLY_VALIDATE": {
+      "count": 191,
+      "workerSeconds": 0.017595
+    },
+    "CACHE_ONLY_COMMIT": {
+      "count": 191,
+      "workerSeconds": 0.0001204
+    }
+  },
+  "snapshotSeries": [
+    {
+      "line": 76267,
+      "utc": "2026-10-05T19:59:37.981926Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 238,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 0,
+        "localActivations": 74953,
+        "active": 74953,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 79533,
+      "utc": "2026-10-05T19:59:39.006077900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 247,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 0,
+        "localActivations": 74953,
+        "active": 74969,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 82920,
+      "utc": "2026-10-05T19:59:40.061851Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 331,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 379872,
+        "localActivations": 74953,
+        "active": 75067,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 89342,
+      "utc": "2026-10-05T19:59:41.355934300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 452,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 938885,
+        "localActivations": 74953,
+        "active": 75188,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 93525,
+      "utc": "2026-10-05T19:59:42.168967100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 566,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 1467011,
+        "localActivations": 74953,
+        "active": 75299,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 97677,
+      "utc": "2026-10-05T19:59:43.234460400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 652,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 1832767,
+        "localActivations": 74953,
+        "active": 75388,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 103535,
+      "utc": "2026-10-05T19:59:44.327722800Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 748,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 2250853,
+        "localActivations": 74953,
+        "active": 75484,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 108631,
+      "utc": "2026-10-05T19:59:45.371086600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 850,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 2634226,
+        "localActivations": 74953,
+        "active": 75573,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 115144,
+      "utc": "2026-10-05T19:59:46.477731Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 946,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 3079761,
+        "localActivations": 74953,
+        "active": 75668,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 119219,
+      "utc": "2026-10-05T19:59:47.258994Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1038,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 3485622,
+        "localActivations": 74953,
+        "active": 75754,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 124593,
+      "utc": "2026-10-05T19:59:48.345714400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1131,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 3957267,
+        "localActivations": 74953,
+        "active": 75856,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 131409,
+      "utc": "2026-10-05T19:59:49.335764700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1248,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 4448385,
+        "localActivations": 74953,
+        "active": 75964,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 138315,
+      "utc": "2026-10-05T19:59:50.378043400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1346,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 4883321,
+        "localActivations": 74953,
+        "active": 76076,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 144148,
+      "utc": "2026-10-05T19:59:51.524550800Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1449,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 5253864,
+        "localActivations": 74953,
+        "active": 76170,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 153651,
+      "utc": "2026-10-05T19:59:52.862920100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1565,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 5808122,
+        "localActivations": 74953,
+        "active": 76300,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 156201,
+      "utc": "2026-10-05T19:59:53.451067900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1680,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 6317001,
+        "localActivations": 74953,
+        "active": 76391,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 156411,
+      "utc": "2026-10-05T19:59:54.461106700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1778,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 6665017,
+        "localActivations": 74953,
+        "active": 76494,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 156685,
+      "utc": "2026-10-05T19:59:55.505757600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 1896,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 7256468,
+        "localActivations": 74953,
+        "active": 76602,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 156915,
+      "utc": "2026-10-05T19:59:56.560785700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2010,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 7722364,
+        "localActivations": 74953,
+        "active": 76744,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 157181,
+      "utc": "2026-10-05T19:59:57.560630400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2147,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 8312396,
+        "localActivations": 74953,
+        "active": 76860,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 157416,
+      "utc": "2026-10-05T19:59:58.561713900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2264,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 8801509,
+        "localActivations": 74953,
+        "active": 76995,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 157644,
+      "utc": "2026-10-05T19:59:59.607950300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2387,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 9329896,
+        "localActivations": 74953,
+        "active": 77100,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 157858,
+      "utc": "2026-10-05T20:00:00.611959200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2489,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 9697120,
+        "localActivations": 74953,
+        "active": 77209,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 158058,
+      "utc": "2026-10-05T20:00:01.659652200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2594,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 10113026,
+        "localActivations": 74953,
+        "active": 77316,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 158306,
+      "utc": "2026-10-05T20:00:02.710437Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2705,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 10586419,
+        "localActivations": 74953,
+        "active": 77415,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 158528,
+      "utc": "2026-10-05T20:00:03.751669700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2823,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 11080427,
+        "localActivations": 74953,
+        "active": 77552,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 158761,
+      "utc": "2026-10-05T20:00:04.756764900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 2929,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 11486018,
+        "localActivations": 74953,
+        "active": 77665,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 159017,
+      "utc": "2026-10-05T20:00:05.810149900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3036,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 11901405,
+        "localActivations": 74953,
+        "active": 77752,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 159291,
+      "utc": "2026-10-05T20:00:06.850800400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3145,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 12462840,
+        "localActivations": 74953,
+        "active": 77881,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 159464,
+      "utc": "2026-10-05T20:00:07.859739900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3262,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 12922086,
+        "localActivations": 74953,
+        "active": 77998,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 159706,
+      "utc": "2026-10-05T20:00:08.903958200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3390,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 13393366,
+        "localActivations": 74953,
+        "active": 78116,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 159903,
+      "utc": "2026-10-05T20:00:09.960666900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3502,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 13857670,
+        "localActivations": 74953,
+        "active": 78216,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 160143,
+      "utc": "2026-10-05T20:00:11.006848700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3606,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 14301683,
+        "localActivations": 74953,
+        "active": 78330,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 160381,
+      "utc": "2026-10-05T20:00:12.051007500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3720,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 14817984,
+        "localActivations": 74953,
+        "active": 78431,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 160595,
+      "utc": "2026-10-05T20:00:13.059695200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3826,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 15286180,
+        "localActivations": 74953,
+        "active": 78536,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 160897,
+      "utc": "2026-10-05T20:00:14.102867900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 3927,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 15816771,
+        "localActivations": 74953,
+        "active": 78663,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 161277,
+      "utc": "2026-10-05T20:00:15.110743700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4038,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 16238499,
+        "localActivations": 74953,
+        "active": 78762,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 161598,
+      "utc": "2026-10-05T20:00:16.154184400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4124,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 16657266,
+        "localActivations": 74953,
+        "active": 78840,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 161774,
+      "utc": "2026-10-05T20:00:17.160323600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4216,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 17122357,
+        "localActivations": 74953,
+        "active": 78930,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 161956,
+      "utc": "2026-10-05T20:00:18.234191200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4306,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 17480660,
+        "localActivations": 74953,
+        "active": 79016,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 162147,
+      "utc": "2026-10-05T20:00:19.234106300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4403,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 17996302,
+        "localActivations": 74953,
+        "active": 79120,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 162324,
+      "utc": "2026-10-05T20:00:20.258988Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4506,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 18442070,
+        "localActivations": 74953,
+        "active": 79242,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 162492,
+      "utc": "2026-10-05T20:00:21.258643600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4614,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 18962545,
+        "localActivations": 74953,
+        "active": 79336,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 162755,
+      "utc": "2026-10-05T20:00:22.306974200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4735,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 19646552,
+        "localActivations": 74953,
+        "active": 79462,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 162940,
+      "utc": "2026-10-05T20:00:23.311896600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4828,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 20114120,
+        "localActivations": 74953,
+        "active": 79541,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 163112,
+      "utc": "2026-10-05T20:00:24.359769600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4925,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 20616419,
+        "localActivations": 74953,
+        "active": 79651,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 163219,
+      "utc": "2026-10-05T20:00:25.409043700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 4941,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 20623980,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 163418,
+      "utc": "2026-10-05T20:00:26.452966300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5030,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 21227133,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 163601,
+      "utc": "2026-10-05T20:00:27.461543200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5124,
+        "prefetchCommitted": 1,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 21872247,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 163781,
+      "utc": "2026-10-05T20:00:28.460969400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5213,
+        "prefetchCommitted": 3,
+        "prefetchBytes": 30,
+        "prefetchFailures": 0,
+        "received": 22495803,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 164007,
+      "utc": "2026-10-05T20:00:29.506983400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5316,
+        "prefetchCommitted": 9,
+        "prefetchBytes": 56,
+        "prefetchFailures": 0,
+        "received": 23113170,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 164233,
+      "utc": "2026-10-05T20:00:30.508352600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5422,
+        "prefetchCommitted": 13,
+        "prefetchBytes": 215,
+        "prefetchFailures": 0,
+        "received": 23735863,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 164452,
+      "utc": "2026-10-05T20:00:31.509321600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5545,
+        "prefetchCommitted": 18,
+        "prefetchBytes": 500,
+        "prefetchFailures": 0,
+        "received": 24351114,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 164685,
+      "utc": "2026-10-05T20:00:32.553264700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5651,
+        "prefetchCommitted": 23,
+        "prefetchBytes": 526,
+        "prefetchFailures": 0,
+        "received": 25016398,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 164897,
+      "utc": "2026-10-05T20:00:33.562502500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5774,
+        "prefetchCommitted": 28,
+        "prefetchBytes": 927,
+        "prefetchFailures": 0,
+        "received": 25636735,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 165137,
+      "utc": "2026-10-05T20:00:34.606431500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 5882,
+        "prefetchCommitted": 34,
+        "prefetchBytes": 1063,
+        "prefetchFailures": 0,
+        "received": 26280823,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 165357,
+      "utc": "2026-10-05T20:00:35.660754400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6002,
+        "prefetchCommitted": 38,
+        "prefetchBytes": 1225,
+        "prefetchFailures": 0,
+        "received": 26869950,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 165605,
+      "utc": "2026-10-05T20:00:36.704849100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6110,
+        "prefetchCommitted": 44,
+        "prefetchBytes": 9003,
+        "prefetchFailures": 0,
+        "received": 27501243,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 165842,
+      "utc": "2026-10-05T20:00:37.751326500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6226,
+        "prefetchCommitted": 49,
+        "prefetchBytes": 12734,
+        "prefetchFailures": 0,
+        "received": 28154058,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 166083,
+      "utc": "2026-10-05T20:00:38.760858600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6350,
+        "prefetchCommitted": 52,
+        "prefetchBytes": 16440,
+        "prefetchFailures": 0,
+        "received": 28774080,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 166325,
+      "utc": "2026-10-05T20:00:39.805285600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6471,
+        "prefetchCommitted": 54,
+        "prefetchBytes": 16440,
+        "prefetchFailures": 0,
+        "received": 29405601,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 166555,
+      "utc": "2026-10-05T20:00:40.862289600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6581,
+        "prefetchCommitted": 55,
+        "prefetchBytes": 16440,
+        "prefetchFailures": 0,
+        "received": 30035838,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 166808,
+      "utc": "2026-10-05T20:00:41.906478200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6691,
+        "prefetchCommitted": 59,
+        "prefetchBytes": 16599,
+        "prefetchFailures": 0,
+        "received": 30646587,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 167044,
+      "utc": "2026-10-05T20:00:42.950437500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6820,
+        "prefetchCommitted": 65,
+        "prefetchBytes": 22831,
+        "prefetchFailures": 0,
+        "received": 31267807,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 167293,
+      "utc": "2026-10-05T20:00:43.962741500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 6940,
+        "prefetchCommitted": 69,
+        "prefetchBytes": 27313,
+        "prefetchFailures": 0,
+        "received": 31915325,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 167547,
+      "utc": "2026-10-05T20:00:45.007716600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7049,
+        "prefetchCommitted": 75,
+        "prefetchBytes": 37137,
+        "prefetchFailures": 0,
+        "received": 32510587,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 167807,
+      "utc": "2026-10-05T20:00:46.053399700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7177,
+        "prefetchCommitted": 78,
+        "prefetchBytes": 37376,
+        "prefetchFailures": 0,
+        "received": 33178239,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 168059,
+      "utc": "2026-10-05T20:00:47.060514900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7304,
+        "prefetchCommitted": 78,
+        "prefetchBytes": 37376,
+        "prefetchFailures": 0,
+        "received": 33844618,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 168316,
+      "utc": "2026-10-05T20:00:48.103557900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7566,
+        "prefetchCommitted": 83,
+        "prefetchBytes": 37459,
+        "prefetchFailures": 0,
+        "received": 35134210,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 168557,
+      "utc": "2026-10-05T20:00:49.161761900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7679,
+        "prefetchCommitted": 86,
+        "prefetchBytes": 37489,
+        "prefetchFailures": 0,
+        "received": 35709117,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 168809,
+      "utc": "2026-10-05T20:00:50.205031500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7798,
+        "prefetchCommitted": 89,
+        "prefetchBytes": 37663,
+        "prefetchFailures": 0,
+        "received": 36331698,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 169077,
+      "utc": "2026-10-05T20:00:51.251252900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 7925,
+        "prefetchCommitted": 96,
+        "prefetchBytes": 40840,
+        "prefetchFailures": 0,
+        "received": 36953434,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 169309,
+      "utc": "2026-10-05T20:00:52.252766600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8044,
+        "prefetchCommitted": 100,
+        "prefetchBytes": 46568,
+        "prefetchFailures": 0,
+        "received": 37592694,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 169533,
+      "utc": "2026-10-05T20:00:53.261288900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8165,
+        "prefetchCommitted": 103,
+        "prefetchBytes": 49476,
+        "prefetchFailures": 0,
+        "received": 38240667,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 169797,
+      "utc": "2026-10-05T20:00:54.303711600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8290,
+        "prefetchCommitted": 109,
+        "prefetchBytes": 53470,
+        "prefetchFailures": 0,
+        "received": 38804051,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 170064,
+      "utc": "2026-10-05T20:00:55.361082400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8417,
+        "prefetchCommitted": 109,
+        "prefetchBytes": 53470,
+        "prefetchFailures": 0,
+        "received": 39487108,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 170322,
+      "utc": "2026-10-05T20:00:56.402936400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8552,
+        "prefetchCommitted": 110,
+        "prefetchBytes": 53470,
+        "prefetchFailures": 0,
+        "received": 40112349,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 170577,
+      "utc": "2026-10-05T20:00:57.411573500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8681,
+        "prefetchCommitted": 112,
+        "prefetchBytes": 53522,
+        "prefetchFailures": 0,
+        "received": 40726880,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 170836,
+      "utc": "2026-10-05T20:00:58.454124300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8798,
+        "prefetchCommitted": 115,
+        "prefetchBytes": 53577,
+        "prefetchFailures": 0,
+        "received": 41349203,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 171084,
+      "utc": "2026-10-05T20:00:59.462119500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 8930,
+        "prefetchCommitted": 119,
+        "prefetchBytes": 57755,
+        "prefetchFailures": 0,
+        "received": 41982720,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 171318,
+      "utc": "2026-10-05T20:01:00.506502700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9049,
+        "prefetchCommitted": 126,
+        "prefetchBytes": 76456,
+        "prefetchFailures": 0,
+        "received": 42572102,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 171587,
+      "utc": "2026-10-05T20:01:01.565192100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9171,
+        "prefetchCommitted": 131,
+        "prefetchBytes": 76486,
+        "prefetchFailures": 0,
+        "received": 43194356,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 171806,
+      "utc": "2026-10-05T20:01:02.577177300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9287,
+        "prefetchCommitted": 133,
+        "prefetchBytes": 76512,
+        "prefetchFailures": 0,
+        "received": 43821365,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 172067,
+      "utc": "2026-10-05T20:01:03.584639500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9409,
+        "prefetchCommitted": 138,
+        "prefetchBytes": 76967,
+        "prefetchFailures": 0,
+        "received": 44447183,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 172326,
+      "utc": "2026-10-05T20:01:04.603574400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9539,
+        "prefetchCommitted": 141,
+        "prefetchBytes": 77253,
+        "prefetchFailures": 0,
+        "received": 45042388,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 172599,
+      "utc": "2026-10-05T20:01:05.657714Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9668,
+        "prefetchCommitted": 142,
+        "prefetchBytes": 77253,
+        "prefetchFailures": 0,
+        "received": 45645406,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 172872,
+      "utc": "2026-10-05T20:01:06.711599400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9789,
+        "prefetchCommitted": 143,
+        "prefetchBytes": 79136,
+        "prefetchFailures": 0,
+        "received": 46318694,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 173134,
+      "utc": "2026-10-05T20:01:07.753698200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 9924,
+        "prefetchCommitted": 144,
+        "prefetchBytes": 81501,
+        "prefetchFailures": 0,
+        "received": 46901873,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 173391,
+      "utc": "2026-10-05T20:01:08.810835200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10045,
+        "prefetchCommitted": 147,
+        "prefetchBytes": 86443,
+        "prefetchFailures": 0,
+        "received": 47598320,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 173657,
+      "utc": "2026-10-05T20:01:09.856664400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10170,
+        "prefetchCommitted": 153,
+        "prefetchBytes": 111795,
+        "prefetchFailures": 0,
+        "received": 48168198,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 173924,
+      "utc": "2026-10-05T20:01:10.902813100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10300,
+        "prefetchCommitted": 154,
+        "prefetchBytes": 117858,
+        "prefetchFailures": 0,
+        "received": 48807614,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 174184,
+      "utc": "2026-10-05T20:01:11.959701300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10428,
+        "prefetchCommitted": 159,
+        "prefetchBytes": 121643,
+        "prefetchFailures": 0,
+        "received": 49420469,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 174445,
+      "utc": "2026-10-05T20:01:13.003915200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10555,
+        "prefetchCommitted": 162,
+        "prefetchBytes": 131488,
+        "prefetchFailures": 0,
+        "received": 50041783,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 174688,
+      "utc": "2026-10-05T20:01:14.011442900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10677,
+        "prefetchCommitted": 163,
+        "prefetchBytes": 131514,
+        "prefetchFailures": 0,
+        "received": 50630209,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 174952,
+      "utc": "2026-10-05T20:01:15.053499500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10804,
+        "prefetchCommitted": 168,
+        "prefetchBytes": 138776,
+        "prefetchFailures": 0,
+        "received": 51240115,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 175207,
+      "utc": "2026-10-05T20:01:16.059455Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 10933,
+        "prefetchCommitted": 169,
+        "prefetchBytes": 138776,
+        "prefetchFailures": 0,
+        "received": 51802692,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 175471,
+      "utc": "2026-10-05T20:01:17.112017Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11057,
+        "prefetchCommitted": 171,
+        "prefetchBytes": 147798,
+        "prefetchFailures": 0,
+        "received": 52416916,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 175737,
+      "utc": "2026-10-05T20:01:18.154181500Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11186,
+        "prefetchCommitted": 171,
+        "prefetchBytes": 147798,
+        "prefetchFailures": 0,
+        "received": 53048937,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 175992,
+      "utc": "2026-10-05T20:01:19.200112900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11311,
+        "prefetchCommitted": 173,
+        "prefetchBytes": 155713,
+        "prefetchFailures": 0,
+        "received": 53592550,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 176244,
+      "utc": "2026-10-05T20:01:20.201020800Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11438,
+        "prefetchCommitted": 173,
+        "prefetchBytes": 155713,
+        "prefetchFailures": 0,
+        "received": 54152443,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 176511,
+      "utc": "2026-10-05T20:01:21.210841600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11568,
+        "prefetchCommitted": 174,
+        "prefetchBytes": 155822,
+        "prefetchFailures": 0,
+        "received": 54738815,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 176766,
+      "utc": "2026-10-05T20:01:22.253124700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11694,
+        "prefetchCommitted": 174,
+        "prefetchBytes": 155822,
+        "prefetchFailures": 0,
+        "received": 55381194,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 177030,
+      "utc": "2026-10-05T20:01:23.312689300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11826,
+        "prefetchCommitted": 174,
+        "prefetchBytes": 155822,
+        "prefetchFailures": 0,
+        "received": 55909575,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 177293,
+      "utc": "2026-10-05T20:01:24.351222200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 11951,
+        "prefetchCommitted": 176,
+        "prefetchBytes": 155848,
+        "prefetchFailures": 0,
+        "received": 56451373,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 177549,
+      "utc": "2026-10-05T20:01:25.359919100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12084,
+        "prefetchCommitted": 176,
+        "prefetchBytes": 155848,
+        "prefetchFailures": 0,
+        "received": 57039494,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 177810,
+      "utc": "2026-10-05T20:01:26.404117200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12203,
+        "prefetchCommitted": 177,
+        "prefetchBytes": 155874,
+        "prefetchFailures": 0,
+        "received": 57557312,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 178080,
+      "utc": "2026-10-05T20:01:27.460031400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12327,
+        "prefetchCommitted": 177,
+        "prefetchBytes": 155874,
+        "prefetchFailures": 0,
+        "received": 58095008,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 178330,
+      "utc": "2026-10-05T20:01:28.504297Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12450,
+        "prefetchCommitted": 177,
+        "prefetchBytes": 155874,
+        "prefetchFailures": 0,
+        "received": 58600245,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 178594,
+      "utc": "2026-10-05T20:01:29.560113Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12696,
+        "prefetchCommitted": 180,
+        "prefetchBytes": 169121,
+        "prefetchFailures": 0,
+        "received": 59708243,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 178843,
+      "utc": "2026-10-05T20:01:30.604176600Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12817,
+        "prefetchCommitted": 182,
+        "prefetchBytes": 180871,
+        "prefetchFailures": 0,
+        "received": 60270406,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 179098,
+      "utc": "2026-10-05T20:01:31.612223800Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 12945,
+        "prefetchCommitted": 183,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 60770682,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 179353,
+      "utc": "2026-10-05T20:01:32.656096400Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13070,
+        "prefetchCommitted": 183,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 61361146,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 179608,
+      "utc": "2026-10-05T20:01:33.710969100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13196,
+        "prefetchCommitted": 183,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 61853378,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 179854,
+      "utc": "2026-10-05T20:01:34.757255800Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13308,
+        "prefetchCommitted": 183,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 62367774,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 180119,
+      "utc": "2026-10-05T20:01:35.812245200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13438,
+        "prefetchCommitted": 184,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 62903144,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 180376,
+      "utc": "2026-10-05T20:01:36.854028200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13564,
+        "prefetchCommitted": 184,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 63426955,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 180626,
+      "utc": "2026-10-05T20:01:37.864338800Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13684,
+        "prefetchCommitted": 184,
+        "prefetchBytes": 182531,
+        "prefetchFailures": 0,
+        "received": 63945524,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 180882,
+      "utc": "2026-10-05T20:01:38.874119200Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13811,
+        "prefetchCommitted": 185,
+        "prefetchBytes": 189519,
+        "prefetchFailures": 0,
+        "received": 64531133,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 181134,
+      "utc": "2026-10-05T20:01:39.884647300Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 13937,
+        "prefetchCommitted": 186,
+        "prefetchBytes": 192856,
+        "prefetchFailures": 0,
+        "received": 65014884,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 181394,
+      "utc": "2026-10-05T20:01:40.906350900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14065,
+        "prefetchCommitted": 187,
+        "prefetchBytes": 195289,
+        "prefetchFailures": 0,
+        "received": 65567103,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 181657,
+      "utc": "2026-10-05T20:01:41.950159Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14201,
+        "prefetchCommitted": 189,
+        "prefetchBytes": 207736,
+        "prefetchFailures": 0,
+        "received": 66130306,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 181920,
+      "utc": "2026-10-05T20:01:42.960291900Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14329,
+        "prefetchCommitted": 189,
+        "prefetchBytes": 207736,
+        "prefetchFailures": 0,
+        "received": 66673064,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 182176,
+      "utc": "2026-10-05T20:01:44.003995100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14448,
+        "prefetchCommitted": 190,
+        "prefetchBytes": 209654,
+        "prefetchFailures": 0,
+        "received": 67217992,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 182436,
+      "utc": "2026-10-05T20:01:45.012223700Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14581,
+        "prefetchCommitted": 190,
+        "prefetchBytes": 209654,
+        "prefetchFailures": 0,
+        "received": 67807408,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 182692,
+      "utc": "2026-10-05T20:01:46.056346100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14702,
+        "prefetchCommitted": 190,
+        "prefetchBytes": 209654,
+        "prefetchFailures": 0,
+        "received": 68347814,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 182931,
+      "utc": "2026-10-05T20:01:47.109719100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14820,
+        "prefetchCommitted": 191,
+        "prefetchBytes": 209683,
+        "prefetchFailures": 0,
+        "received": 68809584,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    },
+    {
+      "line": 183185,
+      "utc": "2026-10-05T20:01:48.155282100Z",
+      "fields": {
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 14946,
+        "prefetchCommitted": 191,
+        "prefetchBytes": 209683,
+        "prefetchFailures": 0,
+        "received": 69281317,
+        "localActivations": 74953,
+        "active": 79661,
+        "invalidations": 0,
+        "replacements": 0
+      },
+      "cacheHit": 74898,
+      "workerFAILURE": 421,
+      "cacheCorrupt": 0
+    }
+  ],
+  "journalCommitEvents": 14784,
+  "distinctCommittedJournalIds": 48,
+  "serialJournalExamples": [
+    {
+      "region": 8589934590,
+      "journal": 1793049773,
+      "commits": 1755,
+      "recoveries": 1,
+      "first": {
+        "line": 163115,
+        "utc": "2026-10-05T20:00:24.802616Z",
+        "key": 4607182419873759168,
+        "journalBytes": 9514123
+      },
+      "last": {
+        "line": 183147,
+        "utc": "2026-10-05T20:01:48.039340300Z",
+        "key": 4503608217304608,
+        "journalBytes": 18837511
+      }
+    },
+    {
+      "region": 8589934591,
+      "journal": 1365946507,
+      "commits": 1722,
+      "recoveries": 1,
+      "first": {
+        "line": 163113,
+        "utc": "2026-10-05T20:00:24.768976500Z",
+        "key": 2310346610183241680,
+        "journalBytes": 9198538
+      },
+      "last": {
+        "line": 178298,
+        "utc": "2026-10-05T20:01:28.357078500Z",
+        "key": 1148417913569410816,
+        "journalBytes": 18177845
+      }
+    },
+    {
+      "region": 4294967296,
+      "journal": 1752330520,
+      "commits": 1326,
+      "recoveries": 1,
+      "first": {
+        "line": 163147,
+        "utc": "2026-10-05T20:00:25.047555500Z",
+        "key": 3454260915535347712,
+        "journalBytes": 8386882
+      },
+      "last": {
+        "line": 178899,
+        "utc": "2026-10-05T20:01:30.836875500Z",
+        "key": 1143914313673605360,
+        "journalBytes": 15260695
+      }
+    },
+    {
+      "region": 25769803778,
+      "journal": 1935005259,
+      "commits": 1166,
+      "recoveries": 1,
+      "first": {
+        "line": 77279,
+        "utc": "2026-10-05T19:59:38.380861700Z",
+        "key": 18014425353028128,
+        "journalBytes": 2853744
+      },
+      "last": {
+        "line": 162999,
+        "utc": "2026-10-05T20:00:23.646570300Z",
+        "key": 1148417933433635568,
+        "journalBytes": 9064659
+      }
+    },
+    {
+      "region": 30064771074,
+      "journal": 429492342,
+      "commits": 1127,
+      "recoveries": 1,
+      "first": {
+        "line": 77112,
+        "utc": "2026-10-05T19:59:38.354308500Z",
+        "key": 18014428574253728,
+        "journalBytes": 2252801
+      },
+      "last": {
+        "line": 162627,
+        "utc": "2026-10-05T20:00:21.681831300Z",
+        "key": 18014429111124672,
+        "journalBytes": 7538781
+      }
+    },
+    {
+      "region": 12884901887,
+      "journal": 1878259454,
+      "commits": 1088,
+      "recoveries": 1,
+      "first": {
+        "line": 163162,
+        "utc": "2026-10-05T20:00:25.138933500Z",
+        "key": 3458764515431153648,
+        "journalBytes": 8298803
+      },
+      "last": {
+        "line": 183218,
+        "utc": "2026-10-05T20:01:48.293760Z",
+        "key": 9007210529029888,
+        "journalBytes": 14078037
+      }
+    },
+    {
+      "region": 4294967295,
+      "journal": 1230894202,
+      "commits": 1038,
+      "recoveries": 1,
+      "first": {
+        "line": 163117,
+        "utc": "2026-10-05T20:00:24.864374600Z",
+        "key": 1157425105576394688,
+        "journalBytes": 9840498
+      },
+      "last": {
+        "line": 169278,
+        "utc": "2026-10-05T20:00:52.115124700Z",
+        "key": 13510803177078528,
+        "journalBytes": 15419194
+      }
+    },
+    {
+      "region": 8589934592,
+      "journal": 390525309,
+      "commits": 931,
+      "recoveries": 1,
+      "first": {
+        "line": 163116,
+        "utc": "2026-10-05T20:00:24.862870900Z",
+        "key": 3458764514894282768,
+        "journalBytes": 7369399
+      },
+      "last": {
+        "line": 183216,
+        "utc": "2026-10-05T20:01:48.263362800Z",
+        "key": 9007210529030144,
+        "journalBytes": 12116932
+      }
+    },
+    {
+      "region": 12884901886,
+      "journal": 515859401,
+      "commits": 586,
+      "recoveries": 1,
+      "first": {
+        "line": 163145,
+        "utc": "2026-10-05T20:00:25.044550900Z",
+        "key": 3458764515162718160,
+        "journalBytes": 9151015
+      },
+      "last": {
+        "line": 183217,
+        "utc": "2026-10-05T20:01:48.292760500Z",
+        "key": 4503609827917488,
+        "journalBytes": 12794346
+      }
+    },
+    {
+      "region": 25769803777,
+      "journal": 1930432520,
+      "commits": 448,
+      "recoveries": 1,
+      "first": {
+        "line": 77115,
+        "utc": "2026-10-05T19:59:38.355813Z",
+        "key": 18014425889898976,
+        "journalBytes": 5758689
+      },
+      "last": {
+        "line": 157276,
+        "utc": "2026-10-05T19:59:57.946905700Z",
+        "key": 1148417934775812592,
+        "journalBytes": 7841412
+      }
+    }
+  ],
+  "interpretation": [
+    "localViews increments only when a region binding snapshot is installed; localPatches increments successful active-region commit patches.",
+    "After resume, serial commits increase localPatches while localViews remains unchanged; ordinary commits did not install a replacement whole-region snapshot in the observed window.",
+    "prefetchCommitted is only cache-only background jobs; localPatches includes foreground writes as well, so these counts must not be equated.",
+    "Foreground Rust DATA passes CRC, decompression and fingerprint/format validation; CACHE_ONLY_VALIDATE additionally handles EMPTY/ABSENT, so191 jobs are not all proven DATA.",
+    "No CACHE_HIT increment after resume: a readback of newly appended259 DATA is not proven in this capture."
+  ]
+}

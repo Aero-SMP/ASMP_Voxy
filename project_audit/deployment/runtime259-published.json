@@ -1,0 +1,53 @@
+{
+  "utc": "2026-10-05T19:56:57.175674+00:00",
+  "artifact": {
+    "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.259-beta+1.21.1-neoforge-debug.jar",
+    "sha256": "140f41e1f6ca61edaa6943d16d623a20c67abe1918a886b15e091a38e716c354",
+    "bytes": 4071384
+  },
+  "client": 259,
+  "serverExpected": 257,
+  "serverObserved": {
+    "utc": "2026-10-05T19:56:36.420997+00:00",
+    "processes": [
+      {
+        "pid": 4176932,
+        "comm": "java",
+        "start_ticks": "44596567",
+        "heap_bytes": {
+          "InitialHeapSize": 1073741824,
+          "MaxHeapSize": 4294967296
+        }
+      },
+      {
+        "pid": 4177620,
+        "comm": "voxy-rust-serve",
+        "start_ticks": "44597892",
+        "sha256": "85dd01efb215ec1c33629b8bf1f8cbd7805f128e46b843c0bae1827215f06a01",
+        "memory": {
+          "memory.max": "999997440",
+          "memory.swap.max": "0",
+          "memory.current": "460509184",
+          "memory.events": "low 0\nhigh 0\nmax 1347\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+        }
+      }
+    ],
+    "jars": [
+      {
+        "path": "/home/aerosmp/Desktop/Voxy_Testing/mods/voxy-server-0.2.257-beta+1.21.1-neoforge-debug.jar",
+        "sha256": "51a6046ad551d7486b691d228ea76bc1a024ec9432f754efe762f3e9105636da",
+        "version": "0.2.257-beta+1.21.1-neoforge"
+      }
+    ],
+    "expectedServer": 257,
+    "serverRestartedByThisAction": false
+  },
+  "serverRestarted": false,
+  "feed": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/debug-clients/MGengine/ASMP_voxy-0.2.259-beta+1.21.1-neoforge-debug.jar",
+  "feedRequests": {
+    "reset": "24db0342-b886-4227-8f70-13229adc7445",
+    "profile": "94d59422-a56a-4277-8800-dc9583c145b1 off 1791224021284 0",
+    "profileExpires": 1791224021284,
+    "profileCurrent": false
+  }
+}

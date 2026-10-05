@@ -1,0 +1,12 @@
+{
+  "utc_start": "2026-10-05T19:56:29.468780+00:00",
+  "monotonic_start": 453338.361108063,
+  "boot_id": "9f129e1b-f8c2-444a-8dba-15679f924562",
+  "limit_seconds": 600,
+  "target_seconds": 300,
+  "status": "ended",
+  "run": "7fdfbc26-471a-476f-ac88-10505d045880",
+  "utc_end": "2026-10-05T20:01:54.650147+00:00",
+  "elapsed_seconds": 325.18136645195773,
+  "exceeded_limit": false
+}

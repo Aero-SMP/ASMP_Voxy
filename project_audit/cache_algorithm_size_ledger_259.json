@@ -44,5 +44,11 @@
       "sha256": "91a34cf3ca681c7564ef5bbea11aa8361f733d53f56baad2d523048f269fd6cd",
       "bytes": 3915855
     }
-  ]
+  ],
+  "sharedVerifiedCurrent": {
+    "files": 11,
+    "lines": 947,
+    "directories": 21,
+    "empty_directories": 0
+  }
 }

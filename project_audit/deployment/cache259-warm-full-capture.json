@@ -1,0 +1,482 @@
+{
+  "source": "project_audit/live_client/cache259-capture/warm-voxy-client-debug.log",
+  "sha256": "8811cd176658d5a8b6d3343fa2a612d83b8c039bdcc924a94d0aa4b9c6f2fee2",
+  "header": "Voxy version 0.2.259-beta",
+  "uploadStatus": "time=2026-10-05T19:59:38.936884900Z\nversion=0.2.259-beta\nvoxy-client-debug.log=OK\nvoxy-shader-reload.log=OK\nlatest.log=OK\nrestart.log=OK\nrelaunched-java.log=OK\nbootstrap.log=OK\nhelper.log=OK\nsetup.log=OK\ntunnel.log=OK\n",
+  "activeLoadInterval": {
+    "first": {
+      "line": 64,
+      "utc": "2026-10-05T19:58:10.965150900Z",
+      "sampleNanos": 83820300731500,
+      "fields": {
+        "active": 0,
+        "localActivations": 0,
+        "localViews": 0,
+        "localAbsent": 0,
+        "localPatches": 0,
+        "prefetchCommitted": null,
+        "prefetchBytes": null,
+        "prefetchFailures": null,
+        "received": 0,
+        "transportHeld": "true",
+        "connectionEpoch": 0,
+        "geometryUsed": 0,
+        "cacheDiskBytes": null,
+        "cacheInventoryNs": null,
+        "firstLocalNanos": 0,
+        "metadataPendingRegions": 0,
+        "invalidations": 0,
+        "replacements": 0,
+        "metadataNetworkBytes": 0,
+        "catalogueFrames": 0,
+        "quicUdpSentBytesJvm": 0,
+        "quicUdpReceivedBytesJvm": 0
+      },
+      "outcomes": {
+        "CACHE_HIT": 0,
+        "CACHE_MISS": 0,
+        "CACHE_CORRUPT": 0,
+        "MODEL_WAIT": 0,
+        "FAILURE": 0,
+        "COMPRESSED_BYTES": 0,
+        "CANONICAL_BYTES": 0,
+        "MESH_BYTES": 0,
+        "MODEL_RECLAIM": 0,
+        "SAVE_SUCCESS": 0,
+        "SAVE_FAILURE": 0,
+        "SAVE_CANCELLED": 0
+      },
+      "workerThreadIds": {
+        "0": 291,
+        "1": 292,
+        "2": 293,
+        "3": 294,
+        "4": 295,
+        "5": 296,
+        "6": 297,
+        "7": 298,
+        "8": 299,
+        "9": 300,
+        "10": 301,
+        "11": 302,
+        "12": 303,
+        "13": 304
+      }
+    },
+    "last": {
+      "line": 76087,
+      "utc": "2026-10-05T19:58:42.711105900Z",
+      "sampleNanos": 83852341746500,
+      "fields": {
+        "active": 74953,
+        "localActivations": 74953,
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 238,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 0,
+        "transportHeld": "true",
+        "connectionEpoch": 0,
+        "geometryUsed": 1551125504,
+        "cacheDiskBytes": 819997609,
+        "cacheInventoryNs": 211603600,
+        "firstLocalNanos": 1034101800,
+        "metadataPendingRegions": 0,
+        "invalidations": 0,
+        "replacements": 0,
+        "metadataNetworkBytes": 0,
+        "catalogueFrames": 0,
+        "quicUdpSentBytesJvm": 0,
+        "quicUdpReceivedBytesJvm": 0
+      },
+      "outcomes": {
+        "CACHE_HIT": 74898,
+        "CACHE_MISS": 0,
+        "CACHE_CORRUPT": 0,
+        "MODEL_WAIT": 987,
+        "FAILURE": 421,
+        "COMPRESSED_BYTES": 0,
+        "CANONICAL_BYTES": 0,
+        "MESH_BYTES": 1515842728,
+        "MODEL_RECLAIM": 424,
+        "SAVE_SUCCESS": 238,
+        "SAVE_FAILURE": 0,
+        "SAVE_CANCELLED": 0
+      },
+      "workerThreadIds": {
+        "0": 291,
+        "1": 292,
+        "2": 293,
+        "3": 294,
+        "4": 295,
+        "5": 296,
+        "6": 297,
+        "7": 298,
+        "8": 299,
+        "9": 300,
+        "10": 301,
+        "11": 302,
+        "12": 303,
+        "13": 304
+      }
+    },
+    "elapsedSeconds": 32.041015,
+    "hits": 74898,
+    "workerAllocatedBytes": 1669435184,
+    "workerBytesPerHit": 22289.449437902214,
+    "workerMBps": 52.10306802078524,
+    "workerSlots": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "threadIdentityStable": true,
+    "stageDeltas": [
+      {
+        "stage": "MESH",
+        "count": 74831,
+        "workerSeconds": 179.1229621,
+        "meanMs": 2.393699965255041,
+        "cumulativeMaxMsAtEnd": 62.1636
+      },
+      {
+        "stage": "CACHE_READ",
+        "count": 75252,
+        "workerSeconds": 51.4438644,
+        "meanMs": 0.6836212246850583,
+        "cumulativeMaxMsAtEnd": 714.6451
+      },
+      {
+        "stage": "WAIT_MODELS",
+        "count": 987,
+        "workerSeconds": 6.6341069,
+        "meanMs": 6.721486220871327,
+        "cumulativeMaxMsAtEnd": 124.8422
+      },
+      {
+        "stage": "METADATA",
+        "count": 843,
+        "workerSeconds": 5.382954,
+        "meanMs": 6.385473309608541,
+        "cumulativeMaxMsAtEnd": 92.0893
+      },
+      {
+        "stage": "SAVE_ENCODE_WRITE",
+        "count": 238,
+        "workerSeconds": 0.3937396,
+        "meanMs": 1.6543680672268908,
+        "cumulativeMaxMsAtEnd": 9.8183
+      },
+      {
+        "stage": "RESULT_READY",
+        "count": 76095,
+        "workerSeconds": 0.2487758,
+        "meanMs": 0.0032692791904855773,
+        "cumulativeMaxMsAtEnd": 1.6735
+      },
+      {
+        "stage": "WAIT_REGION_WRITER",
+        "count": 238,
+        "workerSeconds": 0.1837098,
+        "meanMs": 0.7718899159663866,
+        "cumulativeMaxMsAtEnd": 12.1266
+      },
+      {
+        "stage": "TASK",
+        "count": 75252,
+        "workerSeconds": 0.176266,
+        "meanMs": 0.0023423430606495507,
+        "cumulativeMaxMsAtEnd": 1.9169
+      },
+      {
+        "stage": "REQUEST_MODELS",
+        "count": 74898,
+        "workerSeconds": 0.1239202,
+        "meanMs": 0.0016545194798258966,
+        "cumulativeMaxMsAtEnd": 1.9067
+      },
+      {
+        "stage": "CHECK_MODELS",
+        "count": 74898,
+        "workerSeconds": 0.0368511,
+        "meanMs": 0.0004920171433149082,
+        "cumulativeMaxMsAtEnd": 0.0702
+      }
+    ],
+    "outcomeDeltas": {
+      "CACHE_HIT": 74898,
+      "CACHE_MISS": 0,
+      "CACHE_CORRUPT": 0,
+      "MODEL_WAIT": 987,
+      "FAILURE": 421,
+      "COMPRESSED_BYTES": 0,
+      "CANONICAL_BYTES": 0,
+      "MESH_BYTES": 1515842728,
+      "MODEL_RECLAIM": 424,
+      "SAVE_SUCCESS": 238,
+      "SAVE_FAILURE": 0,
+      "SAVE_CANCELLED": 0
+    }
+  },
+  "wholePreservedHeldInterval": {
+    "first": {
+      "line": 64,
+      "utc": "2026-10-05T19:58:10.965150900Z",
+      "sampleNanos": 83820300731500,
+      "fields": {
+        "active": 0,
+        "localActivations": 0,
+        "localViews": 0,
+        "localAbsent": 0,
+        "localPatches": 0,
+        "prefetchCommitted": null,
+        "prefetchBytes": null,
+        "prefetchFailures": null,
+        "received": 0,
+        "transportHeld": "true",
+        "connectionEpoch": 0,
+        "geometryUsed": 0,
+        "cacheDiskBytes": null,
+        "cacheInventoryNs": null,
+        "firstLocalNanos": 0,
+        "metadataPendingRegions": 0,
+        "invalidations": 0,
+        "replacements": 0,
+        "metadataNetworkBytes": 0,
+        "catalogueFrames": 0,
+        "quicUdpSentBytesJvm": 0,
+        "quicUdpReceivedBytesJvm": 0
+      },
+      "outcomes": {
+        "CACHE_HIT": 0,
+        "CACHE_MISS": 0,
+        "CACHE_CORRUPT": 0,
+        "MODEL_WAIT": 0,
+        "FAILURE": 0,
+        "COMPRESSED_BYTES": 0,
+        "CANONICAL_BYTES": 0,
+        "MESH_BYTES": 0,
+        "MODEL_RECLAIM": 0,
+        "SAVE_SUCCESS": 0,
+        "SAVE_FAILURE": 0,
+        "SAVE_CANCELLED": 0
+      },
+      "workerThreadIds": {
+        "0": 291,
+        "1": 292,
+        "2": 293,
+        "3": 294,
+        "4": 295,
+        "5": 296,
+        "6": 297,
+        "7": 298,
+        "8": 299,
+        "9": 300,
+        "10": 301,
+        "11": 302,
+        "12": 303,
+        "13": 304
+      }
+    },
+    "last": {
+      "line": 76267,
+      "utc": "2026-10-05T19:59:37.981926Z",
+      "sampleNanos": 83907521012200,
+      "fields": {
+        "active": 74953,
+        "localActivations": 74953,
+        "localViews": 13273,
+        "localAbsent": 12669,
+        "localPatches": 238,
+        "prefetchCommitted": 0,
+        "prefetchBytes": 0,
+        "prefetchFailures": 0,
+        "received": 0,
+        "transportHeld": "true",
+        "connectionEpoch": 0,
+        "geometryUsed": 1551125504,
+        "cacheDiskBytes": 819997609,
+        "cacheInventoryNs": 211603600,
+        "firstLocalNanos": 1034101800,
+        "metadataPendingRegions": 0,
+        "invalidations": 0,
+        "replacements": 0,
+        "metadataNetworkBytes": 0,
+        "catalogueFrames": 0,
+        "quicUdpSentBytesJvm": 0,
+        "quicUdpReceivedBytesJvm": 0
+      },
+      "outcomes": {
+        "CACHE_HIT": 74898,
+        "CACHE_MISS": 0,
+        "CACHE_CORRUPT": 0,
+        "MODEL_WAIT": 987,
+        "FAILURE": 421,
+        "COMPRESSED_BYTES": 0,
+        "CANONICAL_BYTES": 0,
+        "MESH_BYTES": 1515842728,
+        "MODEL_RECLAIM": 424,
+        "SAVE_SUCCESS": 238,
+        "SAVE_FAILURE": 0,
+        "SAVE_CANCELLED": 0
+      },
+      "workerThreadIds": {
+        "0": 291,
+        "1": 292,
+        "2": 293,
+        "3": 294,
+        "4": 295,
+        "5": 296,
+        "6": 297,
+        "7": 298,
+        "8": 299,
+        "9": 300,
+        "10": 301,
+        "11": 302,
+        "12": 303,
+        "13": 304
+      }
+    },
+    "elapsedSeconds": 87.2202807,
+    "hits": 74898,
+    "workerAllocatedBytes": 1669435184,
+    "workerBytesPerHit": 22289.449437902214,
+    "workerMBps": 19.14044727443763,
+    "workerSlots": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "threadIdentityStable": true,
+    "stageDeltas": [
+      {
+        "stage": "MESH",
+        "count": 74831,
+        "workerSeconds": 179.1229621,
+        "meanMs": 2.393699965255041,
+        "cumulativeMaxMsAtEnd": 62.1636
+      },
+      {
+        "stage": "CACHE_READ",
+        "count": 75252,
+        "workerSeconds": 51.4438644,
+        "meanMs": 0.6836212246850583,
+        "cumulativeMaxMsAtEnd": 714.6451
+      },
+      {
+        "stage": "WAIT_MODELS",
+        "count": 987,
+        "workerSeconds": 6.6341069,
+        "meanMs": 6.721486220871327,
+        "cumulativeMaxMsAtEnd": 124.8422
+      },
+      {
+        "stage": "METADATA",
+        "count": 843,
+        "workerSeconds": 5.382954,
+        "meanMs": 6.385473309608541,
+        "cumulativeMaxMsAtEnd": 92.0893
+      },
+      {
+        "stage": "SAVE_ENCODE_WRITE",
+        "count": 238,
+        "workerSeconds": 0.3937396,
+        "meanMs": 1.6543680672268908,
+        "cumulativeMaxMsAtEnd": 9.8183
+      },
+      {
+        "stage": "RESULT_READY",
+        "count": 76095,
+        "workerSeconds": 0.2487758,
+        "meanMs": 0.0032692791904855773,
+        "cumulativeMaxMsAtEnd": 1.6735
+      },
+      {
+        "stage": "WAIT_REGION_WRITER",
+        "count": 238,
+        "workerSeconds": 0.1837098,
+        "meanMs": 0.7718899159663866,
+        "cumulativeMaxMsAtEnd": 12.1266
+      },
+      {
+        "stage": "TASK",
+        "count": 75252,
+        "workerSeconds": 0.176266,
+        "meanMs": 0.0023423430606495507,
+        "cumulativeMaxMsAtEnd": 1.9169
+      },
+      {
+        "stage": "REQUEST_MODELS",
+        "count": 74898,
+        "workerSeconds": 0.1239202,
+        "meanMs": 0.0016545194798258966,
+        "cumulativeMaxMsAtEnd": 1.9067
+      },
+      {
+        "stage": "CHECK_MODELS",
+        "count": 74898,
+        "workerSeconds": 0.0368511,
+        "meanMs": 0.0004920171433149082,
+        "cumulativeMaxMsAtEnd": 0.0702
+      }
+    ],
+    "outcomeDeltas": {
+      "CACHE_HIT": 74898,
+      "CACHE_MISS": 0,
+      "CACHE_CORRUPT": 0,
+      "MODEL_WAIT": 987,
+      "FAILURE": 421,
+      "COMPRESSED_BYTES": 0,
+      "CANONICAL_BYTES": 0,
+      "MESH_BYTES": 1515842728,
+      "MODEL_RECLAIM": 424,
+      "SAVE_SUCCESS": 238,
+      "SAVE_FAILURE": 0,
+      "SAVE_CANCELLED": 0
+    }
+  },
+  "comparison258": {
+    "source": "project_audit/live_client/cache258-capture/voxy-client-debug.log",
+    "workerBytesPerHit": 46680.655168349505,
+    "observedBytesPerHitReductionPercent": 52.251206934612725,
+    "controlledComparison": false,
+    "limitations": [
+      "Cache contents, section mix, required models, rendering scene and shader settings are not a matched A/B comparison.",
+      "Per-worker allocation is not whole-mod or whole-JVM allocation.",
+      "Stage elapsed durations overlap across workers and are not wall-clock or CPU measurements.",
+      "The full held interval includes idle plateau time; activeLoadInterval ends at first sampled maximum CACHE_HIT."
+    ]
+  },
+  "integrity": {
+    "CACHE_CORRUPT": 0,
+    "CACHE_MISS": 0,
+    "SAVE_FAILURE": 0,
+    "rawWorkerFAILURE": 421,
+    "SECTION_RECOVERY_events": 424,
+    "rawFailureInterpretation": "FAILURE counts all thrown worker outcomes, including superseded/interrupted model/name work. It does not identify integrity failures; cancellation cause of all421 is not independently established in this log."
+  }
+}

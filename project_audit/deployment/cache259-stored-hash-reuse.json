@@ -1,0 +1,16 @@
+{
+  "prechangeSource": "project_audit/live_client/cache258-capture/voxy-client-debug.log",
+  "newSource": "project_audit/live_client/cache259-capture/warm-voxy-client-debug.log",
+  "matchingDataIdentities": 0,
+  "identities": [],
+  "interpretation": "Each identity is key:source fingerprint:catalogue hash for cached DATA activation. Matching identities provide direct examples of prechange DATA also decoded/activated by259. Stored local BLAKE3 fingerprints are verified in Journal.get before CACHE_HIT, but their bytes are not individually logged.",
+  "cachedReadsBeforeFirstActualJournalCommit": 74898,
+  "completedWarmLine": 76087,
+  "firstActualJournalCommit": {
+    "line": 76245,
+    "text": "2026-10-05T19:59:37.931851700Z VOXY_CACHE_JOURNAL_COMMIT region=4294967284 journal=1718618522 key=4611686018695823168 journalBytes=184"
+  },
+  "receivedBytesAtWarmCompletion": 0,
+  "actualStoredHashReuseEvidence": "74,898 successful CACHE_HIT operations completed while transport was held, received bytes were0 and before the first logged journal commit. Each Journal.get verified the existing stored local BLAKE3 fingerprint and CRC before returning. This establishes successful reads of existing committed cache records under the new hasher. Individual stored-local-hash hex values are not logged.",
+  "sparseIdentityComparisonLimitation": "The sparse last-activated DATA identities have no exact intersection between the preserved258 and259 snapshots. They cannot identify a particular shared payload or support a matched section-level performance comparison."
+}
