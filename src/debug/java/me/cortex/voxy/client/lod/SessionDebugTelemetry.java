@@ -12,6 +12,7 @@ final class SessionDebugTelemetry {
     private static final class Stats {
         final long start = System.nanoTime();
         long firstLocal, hello, localViews, localActivations, validated, replacements, invalidations, metadataBytes;
+        long localAbsent, localPatches;
         long admissionReleases, meshToLeaseReleaseNanos, maxMeshToLeaseReleaseNanos;
         long workerReuses, publishedToReusableNanos, maxPublishedToReusableNanos;
         long nextSample;
@@ -49,6 +50,8 @@ final class SessionDebugTelemetry {
             case "subscriptionWindow" -> stats.windowNanos += bytes;
             case "hello" -> { if (stats.hello == 0) stats.hello = System.nanoTime() - stats.start; }
             case "localView" -> stats.localViews++;
+            case "localAbsent" -> stats.localAbsent++;
+            case "localPatch" -> stats.localPatches++;
             case "localActivation" -> {
                 stats.localActivations++;
                 if (stats.firstLocal == 0) stats.firstLocal = System.nanoTime() - stats.start;
@@ -125,6 +128,7 @@ final class SessionDebugTelemetry {
                     && demand.publication != null && demand.publication.rendererAdmitted()) admittedPending++;
         }
         String startup = " transportHeld=" + transportHeld + " localViews=" + stats.localViews
+                + " localAbsent=" + stats.localAbsent + " localPatches=" + stats.localPatches
                 + " usableBindingDiscoveriesLod=" + java.util.Arrays.toString(stats.discoveredBindings)
                 + " usableDemandedRootDiscoveries=" + stats.discoveredRoots
                 + " metadataPendingRegions=" + (session.associationPending ? 1 : 0)

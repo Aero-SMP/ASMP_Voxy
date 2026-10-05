@@ -1,6 +1,8 @@
 # Improve cache loading algorithms and remove repeated work
 
-Status: planned, not implemented. Written 2026-10-05.
+Status: implemented in debug client 259; build complete, scoped live verification pending. Written 2026-10-05.
+
+Implementation and evidence: `cache_loading_algorithm_improvements_implementation_259.md`.
 
 Repository: `/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates`.
 Branch: `feature/cache-first-background-updates`.

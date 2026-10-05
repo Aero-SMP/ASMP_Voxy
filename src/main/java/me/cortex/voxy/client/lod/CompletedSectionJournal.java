@@ -175,6 +175,7 @@ final class CompletedSectionJournal implements AutoCloseable {
             long at = HEADER_BYTES;
             var copied = new HashMap<Token, Long>();
             byte[] transfer = new byte[8192];
+            var hash = new Blake3.Hasher();
             for (var binding : latest.values()) {
                 RegionalDiskBudget.checkCurrent(current);
                 LocalSection section = binding.section(); long bodyAt = 0;
@@ -188,7 +189,7 @@ final class CompletedSectionJournal implements AutoCloseable {
                         byte[] metadata = buffer(PAYLOAD_METADATA_BYTES).put(token.catalog().bytes()).put(token.source().bytes())
                                 .putInt(body.compressed()).putInt(body.canonical()).putInt(body.crc()).put(body.local().bytes()).array();
                         bodyAt = at + FRAME_BYTES + PAYLOAD_METADATA_BYTES;
-                        var crc = new CRC32C(); var hash = new Blake3.Hasher();
+                        var crc = new CRC32C(); hash.reset();
                         for (int done = 0; done < body.compressed();) {
                             RegionalDiskBudget.checkCurrent(current);
                             int count = Math.min(transfer.length, body.compressed() - done);
@@ -259,7 +260,7 @@ final class CompletedSectionJournal implements AutoCloseable {
             this.readers++;
         }
         try (var file = FileChannel.open(this.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
-            var crc = new CRC32C(); var hash = new Blake3.Hasher();
+            var crc = new CRC32C(); var hash = codec.readHash();
             var input = new InputStream() {
                 long consumed;
                 @Override public int read() throws IOException { throw new IOException("buffered local read required"); }

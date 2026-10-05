@@ -1,5 +1,7 @@
 package me.cortex.voxy.client.lod;
 
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+
 import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -33,13 +35,25 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         final long key;
         int coverageUsers;
         int highestBucket;
+        final int[] bucketCounts;
+        int occupiedBuckets;
+        int metadataBucket = -1;
+        boolean metadataCoverage;
+        RegionDemand metadataPrevious;
+        RegionDemand metadataNext;
         boolean localTried;
         boolean localLoaded;
+        long localIncarnation;
         Map<Long, LocalSection> localSections = Map.of();
+        final Long2IntOpenHashMap localCoverage = new Long2IntOpenHashMap(0);
+        final Map<Long, LocalSection> localCommits = new HashMap<>();
         volatile long metadataRevision;
         final LinkedHashMap<Long, Demand> members = new LinkedHashMap<>();
 
-        RegionDemand(long key) { this.key = key; }
+        RegionDemand(long key, int pixelBuckets) {
+            this.key = key;
+            this.bucketCounts = new int[pixelBuckets];
+        }
     }
 
     static class Demand {
@@ -141,10 +155,45 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         }
     }
 
+    /** One metadata admission per region, directly unlinked when its priority changes. */
+    private static final class RegionList {
+        RegionDemand head;
+        RegionDemand tail;
+
+        void add(RegionDemand region) {
+            region.metadataPrevious = this.tail;
+            region.metadataNext = null;
+            if (this.tail == null) this.head = region;
+            else this.tail.metadataNext = region;
+            this.tail = region;
+        }
+
+        void remove(RegionDemand region) {
+            RegionDemand previous = region.metadataPrevious;
+            RegionDemand next = region.metadataNext;
+            if (previous == null) this.head = next;
+            else previous.metadataNext = next;
+            if (next == null) this.tail = previous;
+            else next.metadataPrevious = previous;
+            region.metadataPrevious = null;
+            region.metadataNext = null;
+        }
+    }
+
     /** Latest-value mailbox; its memory is bounded by distinct identities, not event count. */
     private static final class CoalescingMailbox<V> {
-        private Map<Long, V> pending = new HashMap<>();
+        private final boolean ordered;
+        private Map<Long, V> pending;
         private long overwritten;
+
+        CoalescingMailbox(boolean ordered) {
+            this.ordered = ordered;
+            this.pending = this.newMap();
+        }
+
+        private Map<Long, V> newMap() {
+            return this.ordered ? new LinkedHashMap<>() : new HashMap<>();
+        }
 
         synchronized void offer(long key, V value) {
             if (this.pending.put(key, Objects.requireNonNull(value, "value")) != null) {
@@ -155,7 +204,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         synchronized Map<Long, V> take() {
             if (this.pending.isEmpty()) return Map.of();
             Map<Long, V> result = this.pending;
-            this.pending = new HashMap<>();
+            this.pending = this.newMap();
             return result;
         }
 
@@ -169,18 +218,23 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     private long nextRevision;
     private final Map<Long, D> demands = new LinkedHashMap<>();
     private final Map<Long, RegionDemand> regions = new HashMap<>();
-    private final LinkedHashMap<Long, RegionDemand> readyRegions = new LinkedHashMap<>();
-    private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>();
-    private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>();
+    private final RegionList[][] regionalReady;
+    private int readyRegions;
+    private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>(true);
+    private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>(false);
     private final ReadyGroup[][][] ready;
 
     SectionDemandTable(int pixelBuckets) { this(pixelBuckets, 1); }
 
     SectionDemandTable(int pixelBuckets, long sessionEpoch) {
-        if (pixelBuckets < 1) throw new IllegalArgumentException("pixelBuckets");
+        if (pixelBuckets < 1 || pixelBuckets > Integer.SIZE) throw new IllegalArgumentException("pixelBuckets");
         if (sessionEpoch == 0) throw new IllegalArgumentException("sessionEpoch");
         this.pixelBuckets = pixelBuckets;
         this.sessionEpoch = sessionEpoch;
+        this.regionalReady = new RegionList[2][pixelBuckets];
+        for (var classes : this.regionalReady) {
+            for (int bucket = 0; bucket < pixelBuckets; bucket++) classes[bucket] = new RegionList();
+        }
         this.ready = new ReadyGroup[ReadyKind.values().length][2][pixelBuckets];
         for (int kind = 0; kind < this.ready.length; kind++) {
             for (int coverage = 0; coverage < 2; coverage++) {
@@ -219,10 +273,12 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         demand.pixelBucket = Math.max(0, Math.min(this.pixelBuckets - 1,
                 demand.pixelBucket));
         this.demands.put(demand.key, demand);
-        RegionDemand region = this.regions.computeIfAbsent(demand.regionKey, RegionDemand::new);
+        RegionDemand region = this.regions.computeIfAbsent(demand.regionKey,
+                key -> new RegionDemand(key, this.pixelBuckets));
         if (demand.coverage) region.coverageUsers++;
         region.members.put(demand.key, demand);
-        region.highestBucket = Math.max(region.highestBucket, demand.pixelBucket);
+        this.changeBucket(region, demand.pixelBucket, 1);
+        this.reclassifyRegion(region);
         return demand;
     }
 
@@ -241,32 +297,55 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     void readyRegion(RegionDemand region) {
         if (region != null && this.regions.get(region.key) == region
                 && !region.localTried) {
-            this.readyRegions.put(region.key, region);
+            if (region.metadataBucket >= 0) this.reclassifyRegion(region);
+            else this.linkRegion(region);
         }
     }
 
     RegionDemand pollRegion() {
-        return this.pollRegion(region -> true);
-    }
-
-    RegionDemand pollRegion(java.util.function.Predicate<RegionDemand> eligible) {
-        if (this.readyRegions.isEmpty()) return null;
-        RegionDemand selected = null;
-        for (RegionDemand candidate : this.readyRegions.values()) {
-            if (!eligible.test(candidate)) continue;
-            if (selected == null
-                    || candidate.coverageUsers > 0 && selected.coverageUsers == 0
-                    || (candidate.coverageUsers > 0) == (selected.coverageUsers > 0)
-                    && candidate.highestBucket > selected.highestBucket) {
-                selected = candidate;
+        for (int coverage = 1; coverage >= 0; coverage--) {
+            for (int bucket = this.pixelBuckets - 1; bucket >= 0; bucket--) {
+                RegionDemand selected = this.regionalReady[coverage][bucket].head;
+                if (selected != null) {
+                    this.unlinkRegion(selected);
+                    return selected;
+                }
             }
         }
-        if (selected == null) return null;
-        long key = selected.key;
-        return this.readyRegions.remove(key);
+        return null;
     }
 
-    int readyRegionCount() { return this.readyRegions.size(); }
+    int readyRegionCount() { return this.readyRegions; }
+
+    private void changeBucket(RegionDemand region, int bucket, int delta) {
+        int count = region.bucketCounts[bucket] += delta;
+        if (count < 0) throw new IllegalStateException("regional priority accounting underflow");
+        if (count == 0) region.occupiedBuckets &= ~(1 << bucket);
+        else region.occupiedBuckets |= 1 << bucket;
+        region.highestBucket = region.occupiedBuckets == 0 ? 0
+                : Integer.SIZE - 1 - Integer.numberOfLeadingZeros(region.occupiedBuckets);
+    }
+
+    private void linkRegion(RegionDemand region) {
+        region.metadataCoverage = region.coverageUsers > 0;
+        region.metadataBucket = region.highestBucket;
+        this.regionalReady[region.metadataCoverage ? 1 : 0][region.metadataBucket].add(region);
+        this.readyRegions++;
+    }
+
+    private void unlinkRegion(RegionDemand region) {
+        if (region.metadataBucket < 0) return;
+        this.regionalReady[region.metadataCoverage ? 1 : 0][region.metadataBucket].remove(region);
+        region.metadataBucket = -1;
+        if (--this.readyRegions < 0) throw new IllegalStateException("regional ready accounting underflow");
+    }
+
+    private void reclassifyRegion(RegionDemand region) {
+        if (region.metadataBucket < 0 || region.metadataBucket == region.highestBucket
+                && region.metadataCoverage == (region.coverageUsers > 0)) return;
+        this.unlinkRegion(region);
+        this.linkRegion(region);
+    }
 
     D remove(long key) {
         D demand = this.demands.get(key);
@@ -281,14 +360,10 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         if (demand.coverage && --region.coverageUsers < 0) {
             throw new IllegalStateException("regional coverage accounting underflow");
         }
-        if (demand.pixelBucket == region.highestBucket) {
-            region.highestBucket = region.members.values().stream()
-                    .mapToInt(member -> member.pixelBucket).max().orElse(0);
-        }
+        this.changeBucket(region, demand.pixelBucket, -1);
         if (region.members.isEmpty()) {
             this.forgetUnusedRegion(region);
-            this.readyRegions.remove(region.key);
-        }
+        } else this.reclassifyRegion(region);
         demand.revision++;
         return demand;
     }
@@ -296,7 +371,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     void forgetUnusedRegion(RegionDemand region) {
         if (region.members.isEmpty()) {
             this.regions.remove(region.key, region);
-            this.readyRegions.remove(region.key);
+            this.unlinkRegion(region);
         }
     }
 
@@ -310,11 +385,9 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         demand.pixelBucket = bucket;
         RegionDemand region = this.regions.get(demand.regionKey);
         if (region != null) {
-            if (bucket > region.highestBucket) region.highestBucket = bucket;
-            else if (previousBucket == region.highestBucket && bucket < previousBucket) {
-                region.highestBucket = region.members.values().stream()
-                        .mapToInt(member -> member.pixelBucket).max().orElse(0);
-            }
+            this.changeBucket(region, previousBucket, -1);
+            this.changeBucket(region, bucket, 1);
+            this.reclassifyRegion(region);
         }
         if (kind != null) ready(demand, kind);
     }
@@ -407,9 +480,9 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
 
     @Override public void clear() {
         for (Demand demand : this.demands.values()) unlinkReady(demand);
+        for (RegionDemand region : this.regions.values()) this.unlinkRegion(region);
         this.demands.clear();
         this.regions.clear();
-        this.readyRegions.clear();
         this.topMailbox.clear();
         this.detailMailbox.clear();
     }
@@ -439,6 +512,25 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
             }
         }
         if (memberships != indexed) throw new IllegalStateException("ready count mismatch");
+        int metadataReady = 0;
+        for (int coverage = 0; coverage < this.regionalReady.length; coverage++) {
+            for (int bucket = 0; bucket < this.pixelBuckets; bucket++) {
+                RegionList list = this.regionalReady[coverage][bucket];
+                RegionDemand previous = null;
+                for (RegionDemand region = list.head; region != null; region = region.metadataNext) {
+                    if (++metadataReady > this.regions.size() || this.regions.get(region.key) != region
+                            || region.localTried || region.metadataPrevious != previous
+                            || region.metadataBucket != bucket || region.highestBucket != bucket
+                            || region.metadataCoverage != (coverage != 0)
+                            || region.metadataCoverage != (region.coverageUsers > 0)) {
+                        throw new IllegalStateException("invalid regional ready membership");
+                    }
+                    previous = region;
+                }
+                if (list.tail != previous) throw new IllegalStateException("invalid regional ready tail");
+            }
+        }
+        if (metadataReady != this.readyRegions) throw new IllegalStateException("regional ready count mismatch");
         for (RegionDemand region : this.regions.values()) {
             if (region.members.size() != users.getOrDefault(region.key, 0)) {
                 throw new IllegalStateException("region user mismatch");
@@ -447,6 +539,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
                 throw new IllegalStateException("region leak");
             }
             int coverage = 0;
+            int[] counts = new int[this.pixelBuckets];
             for (var entry : region.members.entrySet()) {
                 Demand member = entry.getValue();
                 if (entry.getKey() != member.key || member.regionKey != region.key
@@ -454,9 +547,24 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
                     throw new IllegalStateException("stale regional member");
                 }
                 if (member.coverage) coverage++;
+                counts[member.pixelBucket]++;
             }
             if (coverage != region.coverageUsers) {
                 throw new IllegalStateException("region coverage mismatch");
+            }
+            int occupied = 0;
+            for (int bucket = 0; bucket < counts.length; bucket++) {
+                if (counts[bucket] != region.bucketCounts[bucket]) {
+                    throw new IllegalStateException("region priority count mismatch");
+                }
+                if (counts[bucket] != 0) occupied |= 1 << bucket;
+            }
+            int highest = occupied == 0 ? 0 : Integer.SIZE - 1 - Integer.numberOfLeadingZeros(occupied);
+            if (occupied != region.occupiedBuckets || highest != region.highestBucket) {
+                throw new IllegalStateException("region priority mask mismatch");
+            }
+            if (region.metadataBucket < 0 && (region.metadataPrevious != null || region.metadataNext != null)) {
+                throw new IllegalStateException("unindexed region retains metadata links");
             }
         }
     }

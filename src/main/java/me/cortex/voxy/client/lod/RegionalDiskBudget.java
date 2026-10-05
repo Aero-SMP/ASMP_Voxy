@@ -34,16 +34,19 @@ final class RegionalDiskBudget {
     private long pausedFree = -1, requiredGrowth = 1, physicalRecovery;
     private final Map<Path, Ranked> ranked = new HashMap<>();
     private final Map<Path, Region> regions = new HashMap<>();
+    private long regionIncarnations;
     private final ReentrantLock changes = new ReentrantLock();
     private final java.util.concurrent.CountDownLatch disposed = new java.util.concurrent.CountDownLatch(1);
     private int owners;
 
-    private static final class Region {
+    static final class Region {
         final ReentrantLock writer = new ReentrantLock(true);
         CompletedSectionJournal journal; // Region monitor; identity outlives the file incarnation.
         int pins, directories, writers; // Budget monitor, including waiting writer references.
         long rejectedBeforeBusy;
+        volatile long incarnation;
         boolean draining;
+        Region(long incarnation) { this.incarnation = incarnation; }
     }
 
     static void checkCurrent(java.util.function.BooleanSupplier current) {
@@ -61,7 +64,7 @@ final class RegionalDiskBudget {
         Region region;
         synchronized (this) {
             requireMutation(path);
-            region = this.regions.computeIfAbsent(path, ignored -> new Region());
+            region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
             if (region.pins == 0 && region.writers == 0) region.rejectedBeforeBusy = owner(path).rejections;
             region.writers++; this.mutations++; rekey(path);
         }
@@ -344,7 +347,7 @@ final class RegionalDiskBudget {
     }
     synchronized Pin pin(Path path) throws IOException {
         if (this.state == InventoryState.CLOSED) throw new IOException("cache file unavailable");
-        Region region = this.regions.computeIfAbsent(path, ignored -> new Region());
+        Region region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
         while (region.draining) try { this.wait(); }
         catch (InterruptedException stopped) {
             Thread.currentThread().interrupt(); throw new InterruptedIOException("cache replacement wait interrupted");
@@ -359,6 +362,7 @@ final class RegionalDiskBudget {
     final class Pin implements AutoCloseable {
         private final Path path; private final Region region; private boolean closed;
         private Pin(Path path, Region region) { this.path = path; this.region = region; }
+        long incarnation() { return this.region.incarnation; }
         @Override public void close() {
             synchronized (RegionalDiskBudget.this) {
                 if (this.closed) return;
@@ -378,7 +382,18 @@ final class RegionalDiskBudget {
             forgetUnused(this.path);
         }
     }
-    synchronized void retainDirectory(Path path) { this.regions.computeIfAbsent(path, ignored -> new Region()).directories++; }
+    synchronized Region retainDirectory(Path path) {
+        var region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
+        region.directories++; return region;
+    }
+    synchronized void invalidateDirectory(Path path) {
+        var region = this.regions.get(path);
+        if (region != null) region.incarnation = ++this.regionIncarnations;
+    }
+    synchronized long incarnation(Path path) {
+        var region = this.regions.get(path);
+        return region == null ? 0 : region.incarnation;
+    }
     void releaseDirectory(Path path) {
         synchronized (this) {
             var region = this.regions.get(path);
@@ -399,6 +414,12 @@ final class RegionalDiskBudget {
         catch (IOException failure) { me.cortex.voxy.common.Logger.warn("Closing released directory", failure); }
     }
     long stamp() { return this.eviction; }
+
+    synchronized boolean knownAbsent(Path path) {
+        if (this.state != InventoryState.READY || this.files.getOrDefault(path, 0L) != 0) return false;
+        var region = this.regions.get(path);
+        return region == null || region.writers == 0 && !region.draining;
+    }
 
     enum Admission { READY, INVENTORY, POLICY, OWNERSHIP, QUOTA, DISK_FULL }
     static final class Capacity extends IOException {
@@ -881,7 +902,7 @@ final class RegionalDiskBudget {
         if (!path.getFileName().toString().endsWith(".vxlocal")) return false;
         Region region;
         synchronized (this) {
-            region = this.regions.computeIfAbsent(path, ignored -> new Region());
+            region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
             region.writers++; rekey(path);
         }
         // Never wait for another region while reserve owns the capacity-change lock.
@@ -915,6 +936,7 @@ final class RegionalDiskBudget {
         synchronized (this) {
             long length = this.files.getOrDefault(path, 0L);
             resized(path, -length);
+            region.incarnation = ++this.regionIncarnations;
             this.eviction++; eligibilityChanged(owner(path));
         }
     }

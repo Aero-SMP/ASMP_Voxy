@@ -66,13 +66,14 @@ public final class SectionMesher {
         Workspace workspace = this.workspaces.get();
         workspace.reset();
         long[] cells = section.cells();
-        boolean fluidOverlays = prepare(cells, workspace);
+        int aabb = prepare(cells, workspace);
 
         for (int face = 0; face < 6; face++) {
+            int overlayDepths = workspace.overlayDepths[face >>> 1];
             for (int depth = 0; depth < EDGE; depth++) {
                 fillPlane(cells, workspace, face, depth, false);
                 mergePlane(workspace, face, depth);
-                if (fluidOverlays) {
+                if ((overlayDepths & (1 << depth)) != 0) {
                     fillPlane(cells, workspace, face, depth, true);
                     mergePlane(workspace, face, depth);
                 }
@@ -87,6 +88,7 @@ public final class SectionMesher {
             return BuiltSection.emptyWithChildren(section.key(), sourceRevision,
                     (byte) section.childMask());
         }
+        if (aabb == -1) throw new IllegalStateException("geometry emitted for an empty section");
         MemoryBuffer geometry = new MemoryBuffer((long) total * Long.BYTES);
         try {
             int[] offsets = new int[BUCKETS];
@@ -100,7 +102,7 @@ public final class SectionMesher {
                 }
             }
             BuiltSection result = new BuiltSection(section.key(), sourceRevision,
-                    (byte) section.childMask(), aabb(cells), geometry, offsets);
+                    (byte) section.childMask(), aabb, geometry, offsets);
             geometry = null;
             return result;
         } finally {
@@ -108,8 +110,8 @@ public final class SectionMesher {
         }
     }
 
-    private boolean prepare(long[] cells, Workspace workspace) {
-        boolean overlays = false;
+    private int prepare(long[] cells, Workspace workspace) {
+        int minX = EDGE, minY = EDGE, minZ = EDGE, maxX = 0, maxY = 0, maxZ = 0;
         for (int index = 0; index < CELLS; index++) {
             long cell = cells[index];
             if (CatalogMapper.isAir(cell)) {
@@ -121,9 +123,23 @@ public final class SectionMesher {
             long metadata = this.models.getModelMetadataFromClientId(model);
             workspace.modelIds[index] = model;
             workspace.metadata[index] = metadata;
-            overlays |= ModelQueries.containsFluid(metadata) && !ModelQueries.isFluid(metadata);
+            int x = index & 31, z = index >>> 5 & 31, y = index >>> 10;
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            minZ = Math.min(minZ, z);
+            maxX = Math.max(maxX, x + 1);
+            maxY = Math.max(maxY, y + 1);
+            maxZ = Math.max(maxZ, z + 1);
+            if (ModelQueries.containsFluid(metadata) && !ModelQueries.isFluid(metadata)) {
+                // Face axes are Y, Z, X, matching cellIndex() and neighbor strides.
+                workspace.overlayDepths[0] |= 1 << y;
+                workspace.overlayDepths[1] |= 1 << z;
+                workspace.overlayDepths[2] |= 1 << x;
+            }
         }
-        return overlays;
+        if (minX == EDGE) return -1;
+        return minX | minY << 5 | minZ << 10 | (maxX - minX - 1) << 15
+                | (maxY - minY - 1) << 20 | (maxZ - minZ - 1) << 25;
     }
 
     private void fillPlane(long[] cells, Workspace workspace, int face, int depth,
@@ -250,24 +266,11 @@ public final class SectionMesher {
                 | x << 21 | y << 16 | z << 11;
     }
 
-    private static int aabb(long[] cells) {
-        int minX = 32, minY = 32, minZ = 32, maxX = 0, maxY = 0, maxZ = 0;
-        for (int index = 0; index < CELLS; index++) {
-            if (CatalogMapper.isAir(cells[index])) continue;
-            int x = index & 31, z = index >>> 5 & 31, y = index >>> 10;
-            minX = Math.min(minX, x); minY = Math.min(minY, y); minZ = Math.min(minZ, z);
-            maxX = Math.max(maxX, x + 1); maxY = Math.max(maxY, y + 1);
-            maxZ = Math.max(maxZ, z + 1);
-        }
-        if (minX == 32) throw new IllegalStateException("geometry emitted for an empty section");
-        return minX | minY << 5 | minZ << 10 | (maxX - minX - 1) << 15
-                | (maxY - minY - 1) << 20 | (maxZ - minZ - 1) << 25;
-    }
-
     private static final class Workspace {
         final int[] modelIds = new int[CELLS];
         final long[] metadata = new long[CELLS];
         final long[] plane = new long[PLANE];
+        final int[] overlayDepths = new int[3];
         final LongArrayList[] buckets = new LongArrayList[BUCKETS];
 
         Workspace() {
@@ -277,6 +280,7 @@ public final class SectionMesher {
         }
 
         void reset() {
+            Arrays.fill(this.overlayDepths, 0);
             for (LongArrayList bucket : this.buckets) bucket.clear();
         }
     }

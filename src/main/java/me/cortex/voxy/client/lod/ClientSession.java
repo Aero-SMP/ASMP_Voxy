@@ -735,27 +735,28 @@ public final class ClientSession {
                 WorkerMetadata, WorkerSaved, WorkerCached {}
         record CacheOnlyTask(WorldCacheDownloads owner, WorldCacheDownloads.Job job,
                                      RegionalProtocol.SectionReply reply, RegionalSectionCodec.BoundCatalog catalog) implements WorkerTask {}
-        private record WorkerCached(CacheOnlyTask task) implements WorkerResult {}
+        private record WorkerCached(CacheOnlyTask task, long incarnation) implements WorkerResult {}
         record BootstrapTask(Path root, String server, String dimension) implements WorkerTask {}
         private record OpenWorldTask(long view, RegionalProtocol.Hash32 world) implements WorkerTask {}
         private record AssociationTask(long view, RegionalProtocol.Hash32 world) {}
         private record LoadMetadataTask(long view, long region, long revision,
-                                        RegionalProtocol.Hash32 world, CompletedSectionCache cache) implements WorkerTask {}
+                                        RegionalProtocol.Hash32 world, CompletedSectionCache cache,
+                                        SectionDemandTable.RegionDemand owner) implements WorkerTask {}
         private record PersistTask(Object intent, CompletedSectionCache cache, long stamp, long admissionGeneration,
                                    java.util.function.BooleanSupplier current) implements WorkerTask {}
         private record WorkerBootstrap(RegionalMetadataStore metadata, RegionalProtocol.Hash32 hint)
                 implements WorkerResult {}
         private record WorkerWorld(long view, CompletedSectionCache cache) implements WorkerResult {}
-        private record WorkerMetadata(LoadMetadataTask task, Map<Long, LocalSection> sections) implements WorkerResult {}
+        private record WorkerMetadata(LoadMetadataTask task, Map<Long, LocalSection> sections, long incarnation) implements WorkerResult {}
         private record WorkerSaved(PersistTask task, RegionalMetadataStore.Persistence outcome, String reason,
                                    boolean retryOnAdmission) implements WorkerResult {}
-        private record WorkerMiss(SectionDemandTable.Ticket ticket, boolean corrupt, LocalSection fallback)
+        private record WorkerMiss(SectionDemandTable.Ticket ticket, boolean corrupt, LocalSection fallback, long incarnation)
                 implements WorkerResult {}
         private record SaveInput(WorkerResource.Lease lease, SectionDemandTable.Ticket ticket,
                                  LocalSection content, CompletedSectionCache cache, byte[] canonical,
                                  CatalogCodec.Source source, java.util.function.BooleanSupplier current) {}
         private record SaveOutcome(WorkerResource.Lease lease, SectionDemandTable.Ticket ticket,
-                                   LocalSection content, boolean committed, Throwable failure) {}
+                                   LocalSection content, boolean committed, long incarnation, Throwable failure) {}
         private static final class NameWait {
             final String canonical; final boolean biome;
             boolean done; int id; IOException failure;
@@ -863,8 +864,8 @@ public final class ClientSession {
                                         source = task.catalog().mappings().source();
                                     }
                                     ClientLodDebug.workerStage(this.debugWork, "CACHE_ONLY_COMMIT");
-                                    cache.save(content, this.localCodec, canonical, source, current, this.debugWork);
-                                    yield new WorkerCached(task);
+                                    long incarnation = cache.save(content, this.localCodec, canonical, source, current, this.debugWork);
+                                    yield new WorkerCached(task, incarnation);
                                 }
                                 case SectionWorkerTask section -> this.section(section);
                                 case EmptyWorkerTask empty -> {
@@ -990,9 +991,10 @@ public final class ClientSession {
             private void save() {
                 var input = this.saveInput;
                 boolean committed = false;
+                long incarnation = 0;
                 Throwable failure = null;
                 try {
-                    input.cache().save(input.content(), this.localCodec, input.canonical(), input.source(), input.current(), this.debugWork);
+                    incarnation = input.cache().save(input.content(), this.localCodec, input.canonical(), input.source(), input.current(), this.debugWork);
                     committed = true;
                     ClientLodDebug.workerOutcome(this.debugWork, "SAVE_SUCCESS", 0);
                 } catch (Throwable problem) {
@@ -1007,7 +1009,7 @@ public final class ClientSession {
                 }
                 synchronized (this) {
                     this.saveInput = null;
-                    this.saveOutcome = new SaveOutcome(input.lease(), input.ticket(), input.content(), committed, failure);
+                    this.saveOutcome = new SaveOutcome(input.lease(), input.ticket(), input.content(), committed, incarnation, failure);
                 }
                 signal();
             }
@@ -1026,16 +1028,23 @@ public final class ClientSession {
 
             private WorkerMiss cacheMiss(SectionWorkerTask task, boolean corrupt) {
                 LocalSection fallback = null;
+                long incarnation = 0;
                 if (corrupt) ClientLodDebug.workerStage(this.debugWork, "CACHE_QUARANTINE");
                 ClientLodDebug.workerOutcome(this.debugWork, corrupt ? "CACHE_CORRUPT" : "CACHE_MISS", 0);
-                if (task.cache() != null) try { fallback = task.cache().previous(task.content()); }
+                if (task.cache() != null) try {
+                    var previous = task.cache().previous(task.content());
+                    fallback = previous.section(); incarnation = previous.incarnation();
+                }
                 catch (IOException invalid) { }
-                return new WorkerMiss(task.ticket(), corrupt, fallback);
+                return new WorkerMiss(task.ticket(), corrupt, fallback, incarnation);
             }
 
             private WorkerResult loadMetadata(LoadMetadataTask task) {
-                try { return new WorkerMetadata(task, task.cache().directory(task.region())); }
-                catch (IOException invalid) { return new WorkerMetadata(task, new HashMap<>()); }
+                try {
+                    task.cache().retain(task.region());
+                    var directory = task.cache().inspectDirectory(task.region());
+                    return new WorkerMetadata(task, directory.sections(), directory.incarnation());
+                } catch (IOException invalid) { return new WorkerMetadata(task, new HashMap<>(), task.cache().incarnation(task.region())); }
             }
 
             private WorkerSaved persist(PersistTask task) {
@@ -1980,13 +1989,14 @@ public final class ClientSession {
         boolean bindAvailable(Demand demand) {
             var region = this.demands.region(demand.regionKey);
             if (region == null) return false;
+            this.refreshLocalIncarnation(region);
             if (this.worldIdentity != null && !region.localLoaded && !this.metadataUnavailable && this.metadata != null) return false;
             var local = region.localSections.get(demand.key);
             if (demand.content == null && local != null && local.kind() != LocalSection.ABSENT) {
                 this.bindLocal(demand, local); return true;
             }
             if (demand.content != null) return true;
-            if (!demand.cachedCover) {
+            if (!demand.cachedCover && localCovered(region, demand.key)) {
                 var cut = new ArrayList<Long>();
                 demand.cachedCover = this.collectCachedCut(region.localSections, demand.key, cut);
                 if (demand.cachedCover) {
@@ -2408,7 +2418,10 @@ public final class ClientSession {
                 region.metadataRevision++;
                 region.localTried = false;
                 region.localLoaded = false;
+                region.localIncarnation = 0;
                 region.localSections = Map.of();
+                region.localCoverage.clear();
+                region.localCommits.clear();
                 this.queueRegion(region.key);
                 this.interestChanges.addAll(region.members.keySet());
             }
@@ -2455,7 +2468,7 @@ public final class ClientSession {
             return bytes;
         }
 
-        void processMetadata() {
+        void processMetadata() throws IOException {
             this.probeCatalogue();
             if (this.metadataUnavailable && this.cache == null) {
                 long count = (this.associationPending ? 1 : 0);
@@ -2485,14 +2498,17 @@ public final class ClientSession {
             this.catalogueProbeThread = Thread.ofVirtual().name("Voxy catalogue cache probe").start(() -> { task.run(); this.signal(); });
         }
 
-        private boolean loadLocalMetadata() {
+        private boolean loadLocalMetadata() throws IOException {
             if (this.cache == null) return false;
-            var local = this.demands.pollRegion(region -> !region.localTried);
+            var local = this.demands.pollRegion();
             if (local != null) {
                 local.localTried = true;
-                this.metadataWorker.assign(new LoadMetadataTask(this.viewRevision, local.key,
-                        local.metadataRevision, this.worldIdentity, this.cache));
-                this.demands.readyRegion(local);
+                var task = new LoadMetadataTask(this.viewRevision, local.key,
+                        local.metadataRevision, this.worldIdentity, this.cache, local);
+                if (this.cache.knownAbsent(local.key)) {
+                    ClientLodDebug.startupEvent(this, "localAbsent", 0);
+                    this.applyLocalIndex(new WorkerMetadata(task, new HashMap<>(), this.cache.incarnation(local.key)));
+                } else this.metadataWorker.assign(task);
                 return true;
             }
             return false;
@@ -2565,9 +2581,25 @@ public final class ClientSession {
             var task = ready.task();
             var state = this.demands.region(task.region());
             if (state == null) task.cache().forget(task.region());
-            if (task.view() != this.viewRevision || state == null) return;
+            if (task.view() != this.viewRevision || task.cache() != this.cache || state != task.owner()) return;
+            if (task.revision() != state.metadataRevision) {
+                if (!state.localLoaded) { state.localTried = false; this.queueRegion(state.key); }
+                return;
+            }
+            this.refreshLocalIncarnation(state);
+            if (ready.incarnation() != this.cache.incarnation(state.key)) {
+                if (!state.localLoaded) { state.localTried = false; this.queueRegion(state.key); }
+                return;
+            }
+            if (task.revision() != state.metadataRevision) return;
+            if (state.localIncarnation != 0 && state.localIncarnation != ready.incarnation()) state.localCommits.clear();
+            state.localIncarnation = ready.incarnation();
+            ready.sections().putAll(state.localCommits);
+            state.localCommits.clear();
             state.localLoaded = true;
             state.localSections = ready.sections();
+            state.localCoverage.clear();
+            for (var section : state.localSections.values()) updateLocalCoverage(state, section.key(), section.kind() != LocalSection.ABSENT);
             ClientLodDebug.discovered(this, state.localSections);
             // Seed only the highest available cached nodes of branches with no cached
             // ancestors. At most four probes per section; normal GPU refinement takes over
@@ -2658,7 +2690,7 @@ public final class ClientSession {
                 if (outcome != null && worker.resource.matches(outcome.lease())) {
                     if (outcome.committed()) {
                         var demand = this.demands.get(outcome.ticket().key());
-                        if (demand != null && demand.revision == outcome.ticket().demandRevision()) this.recordCommitted(demand, outcome.content());
+                        if (demand != null && demand.revision == outcome.ticket().demandRevision()) this.recordCommitted(outcome.content(), outcome.incarnation());
                     }
                     if (worker.resource.finishSave(outcome.lease())) worker.reusable();
                     if (outcome.failure() instanceof IOException io) this.lastPersistenceFailure = io.toString();
@@ -2688,13 +2720,13 @@ public final class ClientSession {
                         var task = cached.task();
                         boolean committed = task.owner().current(task.job());
                         if (committed) {
-                            task.owner().committed(task.reply().dimensionId(), task.reply().content());
+                            task.owner().committed(task.reply().dimensionId(), task.reply().content(), cached.incarnation());
                             task.owner().complete(task.job(), task.reply().content(), task.reply().compressed().length);
                         }
                         worker.releaseCompletion(lease);
-                        if (committed && task.reply().dimensionId() == this.dimensionId) {
-                            var state = this.demands.region(task.reply().content().region());
-                            if (state != null) { state.localLoaded = false; state.localTried = false; this.queueRegion(state.key); }
+                        if (committed && task.reply().dimensionId() == this.dimensionId
+                                && task.reply().worldIdentity().equals(this.worldIdentity)) {
+                            this.recordLocalCommitted(task.reply().content(), cached.incarnation());
                         }
                     }
                     case WorkerMetadata saved -> {
@@ -2708,13 +2740,25 @@ public final class ClientSession {
                             this.cacheReads++;
                             this.cacheMisses++;
                             var region = this.demands.region(demand.regionKey);
+                            boolean discarded = region != null && Objects.equals(region.localSections.get(demand.key), demand.content);
                             if (region != null) {
-                                if (miss.fallback() == null) region.localSections.remove(demand.key);
-                                else region.localSections.put(demand.key, miss.fallback());
+                                this.refreshLocalIncarnation(region);
+                                var local = region.localSections.get(demand.key);
+                                if (miss.incarnation() == this.cache.incarnation(region.key)
+                                        && (local == null || Objects.equals(local, demand.content))) {
+                                    if (miss.fallback() != null && !region.localLoaded) {
+                                        region.localIncarnation = miss.incarnation();
+                                        region.localCommits.put(demand.key, miss.fallback());
+                                    } else if (region.localLoaded) {
+                                        if (miss.fallback() == null) region.localSections.remove(demand.key);
+                                        else region.localSections.put(demand.key, miss.fallback());
+                                        updateLocalCoverage(region, demand.key, miss.fallback() != null && miss.fallback().kind() != LocalSection.ABSENT);
+                                    }
+                                }
                             }
                             demand.content = null; this.networkWanted(demand, false);
                             demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
-                            if (miss.fallback() == null) this.invalidateCachedCover(demand.key);
+                            if (discarded && miss.fallback() == null) this.invalidateCachedCover(demand.key);
                             if (!this.bindAvailable(demand)) this.waitForNetwork(demand);
                             var top = this.demands.get(topAncestor(demand.key));
                             if (top != null && top.cachedCover) { top.cachedCover = false; this.bindAvailable(top); }
@@ -2833,17 +2877,90 @@ public final class ClientSession {
             if (meshed) this.meshedSections++;
         }
 
-        void recordCommitted(Demand demand, LocalSection content) {
+        void recordCommitted(LocalSection content, long incarnation) {
             if (content == null) return;
-            var region = this.demands.region(demand.regionKey);
-            if (region == null) return;
-            if (region.localSections.isEmpty()) region.localSections = new HashMap<>();
-            region.localSections.put(content.key(), content);
+            this.recordLocalCommitted(content, incarnation);
             if (this.networkOwner != null && this.networkOwner.downloads != null) {
                 var downloads = this.networkOwner.downloads;
-                downloads.committed(this.dimensionId, content);
+                downloads.committed(this.dimensionId, content, incarnation);
                 var job = downloads.pending(this.dimensionId, content.key());
                 if (job != null) downloads.complete(job, content, content.compressedBytes());
+            }
+        }
+
+        private static boolean localCovered(SectionDemandTable.RegionDemand region, long key) {
+            int bits = region.localCoverage.get(key);
+            return (bits & 256) != 0 || (bits & 255) == 255;
+        }
+
+        /** Direct availability plus eight complete-child bits; propagation stops when coverage is unchanged. */
+        private static void updateLocalCoverage(SectionDemandTable.RegionDemand region, long key, boolean available) {
+            int before = region.localCoverage.get(key);
+            int after = (before & 255) | (available ? 256 : 0);
+            while (true) {
+                if (after == 0) region.localCoverage.remove(key); else region.localCoverage.put(key, after);
+                boolean wasCovered = (before & 256) != 0 || (before & 255) == 255;
+                boolean covered = (after & 256) != 0 || (after & 255) == 255;
+                if (wasCovered == covered || SectionKey.level(key) == SectionKey.MAX_LOD_LAYER) return;
+                int childBit = 1 << ((SectionKey.x(key) & 1) | (SectionKey.z(key) & 1) << 1 | (SectionKey.y(key) & 1) << 2);
+                key = parent(key);
+                before = region.localCoverage.get(key);
+                after = covered ? before | childBit : before & ~childBit;
+            }
+        }
+
+        /** Invalidate only the evicted region; installed geometry and worker leases stay owned. */
+        private void refreshLocalIncarnation(SectionDemandTable.RegionDemand region) {
+            if (this.cache == null || region.localIncarnation == 0) return;
+            long incarnation = this.cache.incarnation(region.key);
+            if (incarnation == region.localIncarnation) return;
+            region.localIncarnation = incarnation;
+            region.metadataRevision++;
+            region.localTried = false;
+            region.localLoaded = false;
+            region.localSections = Map.of();
+            region.localCoverage.clear();
+            region.localCommits.clear();
+            for (long key : region.members.keySet()) {
+                var demand = this.demands.get(key);
+                if (!demand.cachedCover) continue;
+                this.forgetDependencies(demand);
+                demand.cachedCover = false;
+                demand.cachedCutPending = null;
+                this.interestChanges.add(demand.key);
+            }
+            this.queueRegion(region.key);
+        }
+
+        private void recordLocalCommitted(LocalSection content, long incarnation) {
+            var region = this.demands.region(content.region());
+            if (region == null) return;
+            this.refreshLocalIncarnation(region);
+            if (this.cache == null || this.cache.incarnation(region.key) != incarnation) return;
+            region.localIncarnation = incarnation;
+            ClientLodDebug.startupEvent(this, "localPatch", 0);
+            if (!region.localLoaded) { region.localCommits.put(content.key(), content); return; }
+            if (region.localSections.isEmpty()) region.localSections = new HashMap<>();
+            region.localSections.put(content.key(), content);
+            boolean available = content.kind() != LocalSection.ABSENT;
+            updateLocalCoverage(region, content.key(), available);
+            if (!available) this.invalidateCachedCover(content.key());
+            if (available && this.demands.get(content.key()) == null && SectionKey.level(content.key()) != SectionKey.MAX_LOD_LAYER
+                    && this.demands.get(topAncestor(content.key())) != null) {
+                long ancestor = content.key(); boolean covered = false;
+                while (SectionKey.level(ancestor) < SectionKey.MAX_LOD_LAYER) {
+                    ancestor = parent(ancestor);
+                    var section = region.localSections.get(ancestor);
+                    if (section != null && section.kind() != LocalSection.ABSENT) { covered = true; break; }
+                }
+                if (!covered) this.addDemand(content.key());
+            }
+            long key = content.key();
+            while (true) {
+                var demand = this.demands.get(key);
+                if (demand != null) this.bindAvailable(demand);
+                if (SectionKey.level(key) == SectionKey.MAX_LOD_LAYER) break;
+                key = parent(key);
             }
         }
 

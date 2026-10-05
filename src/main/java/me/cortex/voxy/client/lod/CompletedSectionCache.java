@@ -14,7 +14,7 @@ final class CompletedSectionCache implements AutoCloseable {
     private final Path root;
     private volatile boolean closed;
     private int operations;
-    private final java.util.Set<Long> retained = new java.util.HashSet<>();
+    private final Map<Long, RegionalDiskBudget.Region> retained = new java.util.HashMap<>();
     CompletedSectionCache(RegionalMetadataStore metadata, RegionalProtocol.Hash32 world, String dimension) {
         this.metadata = metadata; this.budget = metadata.budget; this.world = world; this.dimension = dimension;
         this.root = metadata.namespace(world, dimension); this.budget.retain();
@@ -51,31 +51,41 @@ final class CompletedSectionCache implements AutoCloseable {
         retain(region);
         return directorySnapshot(region);
     }
+    boolean knownAbsent(long region) throws IOException {
+        retain(region);
+        return this.budget.knownAbsent(path(region));
+    }
+    /** No file access; the retained hot path also avoids path allocation. */
+    synchronized long incarnation(long region) {
+        var owner = this.retained.get(region);
+        return owner == null ? this.budget.incarnation(path(region)) : owner.incarnation;
+    }
     /** Retains only the recovered index, including a not-yet-created journal. */
     synchronized void retain(long region) throws IOException {
         if (this.closed) throw new IOException("closed section cache");
-        if (this.retained.add(region)) this.budget.retainDirectory(path(region));
+        if (!this.retained.containsKey(region)) this.retained.put(region, this.budget.retainDirectory(path(region)));
     }
     synchronized void forget(long region) {
-        if (this.retained.remove(region)) this.budget.releaseDirectory(path(region));
+        if (this.retained.remove(region) != null) this.budget.releaseDirectory(path(region));
     }
     Map<Long, LocalSection> directorySnapshot(long region) throws IOException {
         return inspectDirectory(region).sections();
     }
-    record Directory(Map<Long, LocalSection> sections, long namedBytes) {}
+    record Directory(Map<Long, LocalSection> sections, long namedBytes, long incarnation) {}
     Directory inspectDirectory(long region) throws IOException {
         var acquired = acquire(region);
         try (var pin = acquired) {
             var journal = this.budget.journal(path(region), this.world, region, false);
-            if (journal == null) return new Directory(new java.util.HashMap<>(), 0);
-            synchronized (journal) { return new Directory(journal.directory(), journal.currentNamedBytes()); }
+            if (journal == null) return new Directory(new java.util.HashMap<>(), 0, pin.incarnation());
+            synchronized (journal) { return new Directory(journal.directory(), journal.currentNamedBytes(), pin.incarnation()); }
         } finally { released(); }
     }
-    LocalSection previous(LocalSection section) throws IOException {
+    record Fallback(LocalSection section, long incarnation) {}
+    Fallback previous(LocalSection section) throws IOException {
         var acquired = acquire(section.region());
         try (var pin = acquired) {
             var journal = this.budget.journal(path(section.region()), this.world, section.region(), false);
-            return journal == null ? null : journal.previous(section);
+            return new Fallback(journal == null ? null : journal.previous(section), pin.incarnation());
         } finally { released(); }
     }
     RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names) throws IOException {
@@ -83,7 +93,11 @@ final class CompletedSectionCache implements AutoCloseable {
         try (var pin = acquired) {
             var journal = this.budget.journal(path(section.region()), this.world, section.region(), false);
             if (journal == null) return null;
-            return journal.get(section, codec, names);
+            try { return journal.get(section, codec, names); }
+            catch (IOException invalid) {
+                if (!journal.hasPayload(section)) this.budget.invalidateDirectory(path(section.region()));
+                throw invalid;
+            }
         } finally { released(); }
     }
     Save begin(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
@@ -140,7 +154,7 @@ final class CompletedSectionCache implements AutoCloseable {
     }
 
     /** Called by the section's worker after its sole geometry completion was handed off. */
-    void save(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
+    long save(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
               BooleanSupplier current, Object debugWork) throws IOException {
         ClientLodDebug.workerStage(debugWork, "WAIT_REGION_WRITER");
         try (var writer = writer(section.region(), current)) {
@@ -151,7 +165,7 @@ final class CompletedSectionCache implements AutoCloseable {
                 RegionalDiskBudget.checkCurrent(current);
                 try (var save = beginOwned(section, codec, canonical, source, current, writer, false)) {
                     while (!save.step()) RegionalDiskBudget.checkCurrent(current);
-                    return;
+                    return save.pin.incarnation();
                 } catch (RegionalDiskBudget.Capacity full) {
                     if (full.reason != RegionalDiskBudget.Admission.QUOTA || compacted
                             || !writer.owned.compact(this.world, section.region(), current)) throw full;
@@ -220,6 +234,7 @@ final class CompletedSectionCache implements AutoCloseable {
                 if (journal == null || !journal.hasBindings()) return RegionalMetadataStore.Persistence.PERSISTED;
                 writer.owned.expect(CompletedSectionJournal.FRAME_BYTES + 8 + CompletedSectionJournal.FOOTER_BYTES);
                 try (var append = journal.begin(null, null, space(region, writer.owned), current)) { while (!append.step()) {} }
+                this.budget.invalidateDirectory(path(region));
                 writer.owned.completed();
             } finally { released(); }
         }
@@ -228,7 +243,7 @@ final class CompletedSectionCache implements AutoCloseable {
     @Override public synchronized void close() {
         if (this.closed) return;
         this.closed = true;
-        for (long region : this.retained) this.budget.releaseDirectory(path(region));
+        for (long region : this.retained.keySet()) this.budget.releaseDirectory(path(region));
         this.retained.clear();
         if (this.operations == 0) this.budget.release();
     }

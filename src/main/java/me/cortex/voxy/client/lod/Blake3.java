@@ -1,8 +1,6 @@
 package me.cortex.voxy.client.lod;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Objects;
 
 /** Compact unkeyed BLAKE3-256 implementation used to authenticate canonical records. */
@@ -42,10 +40,30 @@ public final class Blake3 {
     /** Incremental, allocation-bounded hasher. Instances are intentionally not thread-safe. */
     public static final class Hasher {
         private final byte[] chunk = new byte[CHUNK_BYTES];
-        private final List<int[]> chainingStack = new ArrayList<>(54);
+        // A long chunk counter needs at most one retained chaining value per bit.
+        private final int[][] chainingStack = new int[Long.SIZE][];
+        private final int[] chainingValue = new int[8];
+        private final int[] message = new int[16];
+        private final int[] state = new int[16];
+        private int stackDepth;
         private int chunkLength;
         private long completeChunks;
+        private long outputCounter;
+        private int outputLength, outputFlags;
         private boolean finalized;
+
+        /** The sole owner may reuse this workspace after its previous operation has ended. */
+        public Hasher reset() {
+            this.chunkLength = 0;
+            this.completeChunks = 0;
+            this.stackDepth = 0;
+            this.outputCounter = 0;
+            this.outputLength = this.outputFlags = 0;
+            this.finalized = false;
+            // Chunk bytes and stack slots beyond their logical extents are never read.
+            // Each message, chaining value and compression state is overwritten before use.
+            return this;
+        }
 
         public Hasher update(byte[] input) {
             Objects.requireNonNull(input, "input");
@@ -72,69 +90,92 @@ public final class Blake3 {
         public byte[] digest() {
             if (this.finalized) throw new IllegalStateException("BLAKE3 hasher is finalized");
             this.finalized = true;
-            Output output = chunkOutput(this.chunk, this.chunkLength, this.completeChunks);
-            for (int index = this.chainingStack.size() - 1; index >= 0; index--) {
-                output = parentOutput(this.chainingStack.get(index), output.chainingValue());
+            chunkOutput(this.chunkLength, this.completeChunks);
+            while (this.stackDepth != 0) {
+                outputChainingValue();
+                parentOutput(this.chainingStack[--this.stackDepth]);
             }
-            return output.rootHash();
+            compress(0, this.outputLength, this.outputFlags | ROOT);
+            byte[] hash = new byte[32];
+            for (int index = 0; index < 8; index++) {
+                int word = this.state[index];
+                hash[index * 4] = (byte) word;
+                hash[index * 4 + 1] = (byte) (word >>> 8);
+                hash[index * 4 + 2] = (byte) (word >>> 16);
+                hash[index * 4 + 3] = (byte) (word >>> 24);
+            }
+            return hash;
         }
 
         private void pushCompleteChunk() {
-            int[] chainingValue = chunkOutput(this.chunk, CHUNK_BYTES, this.completeChunks)
-                    .chainingValue();
+            chunkOutput(CHUNK_BYTES, this.completeChunks);
+            outputChainingValue();
             this.completeChunks = Math.addExact(this.completeChunks, 1);
             long totalChunks = this.completeChunks;
             while ((totalChunks & 1) == 0) {
-                int[] left = this.chainingStack.removeLast();
-                chainingValue = parentOutput(left, chainingValue).chainingValue();
+                parentOutput(this.chainingStack[--this.stackDepth]);
+                outputChainingValue();
                 totalChunks >>>= 1;
             }
-            this.chainingStack.add(chainingValue);
+            int[] slot = this.chainingStack[this.stackDepth];
+            if (slot == null) this.chainingStack[this.stackDepth] = slot = new int[8];
+            System.arraycopy(this.chainingValue, 0, slot, 0, 8);
+            this.stackDepth++;
             this.chunkLength = 0;
         }
-    }
 
-    private static Output chunkOutput(byte[] chunk, int length, long chunkCounter) {
-        int[] chainingValue = IV.clone();
-        int blockCount = Math.max(1, Math.floorDiv(length + BLOCK_BYTES - 1, BLOCK_BYTES));
-        for (int block = 0; block < blockCount - 1; block++) {
-            int flags = block == 0 ? CHUNK_START : 0;
-            chainingValue = firstEight(compress(chainingValue,
-                    words(chunk, block * BLOCK_BYTES, BLOCK_BYTES),
-                    chunkCounter, BLOCK_BYTES, flags));
+        private void chunkOutput(int length, long chunkCounter) {
+            System.arraycopy(IV, 0, this.chainingValue, 0, 8);
+            int blockCount = Math.max(1, Math.floorDiv(length + BLOCK_BYTES - 1, BLOCK_BYTES));
+            for (int block = 0; block < blockCount - 1; block++) {
+                words(block * BLOCK_BYTES, BLOCK_BYTES);
+                compress(chunkCounter, BLOCK_BYTES, block == 0 ? CHUNK_START : 0);
+                System.arraycopy(this.state, 0, this.chainingValue, 0, 8);
+            }
+            int lastOffset = (blockCount - 1) * BLOCK_BYTES;
+            words(lastOffset, length - lastOffset);
+            this.outputCounter = chunkCounter;
+            this.outputLength = length - lastOffset;
+            this.outputFlags = CHUNK_END | (blockCount == 1 ? CHUNK_START : 0);
         }
-        int lastOffset = (blockCount - 1) * BLOCK_BYTES;
-        int lastLength = length - lastOffset;
-        int flags = CHUNK_END | (blockCount == 1 ? CHUNK_START : 0);
-        return new Output(chainingValue, words(chunk, lastOffset, lastLength),
-                chunkCounter, lastLength, flags);
-    }
 
-    private static Output parentOutput(int[] left, int[] right) {
-        int[] block = new int[16];
-        System.arraycopy(left, 0, block, 0, 8);
-        System.arraycopy(right, 0, block, 8, 8);
-        return new Output(IV, block, 0, BLOCK_BYTES, PARENT);
-    }
+        private void parentOutput(int[] left) {
+            System.arraycopy(left, 0, this.message, 0, 8);
+            System.arraycopy(this.chainingValue, 0, this.message, 8, 8);
+            System.arraycopy(IV, 0, this.chainingValue, 0, 8);
+            this.outputCounter = 0;
+            this.outputLength = BLOCK_BYTES;
+            this.outputFlags = PARENT;
+        }
 
-    private static int[] compress(int[] chainingValue, int[] block, long counter,
-                                  int blockLength, int flags) {
-        int[] state = new int[16];
-        System.arraycopy(chainingValue, 0, state, 0, 8);
-        System.arraycopy(IV, 0, state, 8, 4);
-        state[12] = (int) counter;
-        state[13] = (int) (counter >>> 32);
-        state[14] = blockLength;
-        state[15] = flags;
-        for (int round = 0; round < 7; round++) {
-            round(state, block, ROUND_SCHEDULES[round]);
+        private void outputChainingValue() {
+            compress(this.outputCounter, this.outputLength, this.outputFlags);
+            System.arraycopy(this.state, 0, this.chainingValue, 0, 8);
         }
-        for (int index = 0; index < 8; index++) {
-            int upper = state[index + 8];
-            state[index] ^= upper;
-            state[index + 8] = upper ^ chainingValue[index];
+
+        private void compress(long counter, int blockLength, int flags) {
+            System.arraycopy(this.chainingValue, 0, this.state, 0, 8);
+            System.arraycopy(IV, 0, this.state, 8, 4);
+            this.state[12] = (int) counter;
+            this.state[13] = (int) (counter >>> 32);
+            this.state[14] = blockLength;
+            this.state[15] = flags;
+            for (int round = 0; round < 7; round++) {
+                round(this.state, this.message, ROUND_SCHEDULES[round]);
+            }
+            for (int index = 0; index < 8; index++) {
+                int upper = this.state[index + 8];
+                this.state[index] ^= upper;
+                this.state[index + 8] = upper ^ this.chainingValue[index];
+            }
         }
-        return state;
+
+        private void words(int offset, int length) {
+            Arrays.fill(this.message, 0);
+            for (int index = 0; index < length; index++) {
+                this.message[index >>> 2] |= Byte.toUnsignedInt(this.chunk[offset + index]) << ((index & 3) * 8);
+            }
+        }
     }
 
     private static void round(int[] state, int[] message, int[] schedule) {
@@ -157,44 +198,5 @@ public final class Blake3 {
         state[d] = Integer.rotateRight(state[d] ^ state[a], 8);
         state[c] += state[d];
         state[b] = Integer.rotateRight(state[b] ^ state[c], 7);
-    }
-
-    private static int[] words(byte[] input, int offset, int length) {
-        int[] words = new int[16];
-        for (int index = 0; index < length; index++) {
-            words[index >>> 2] |= Byte.toUnsignedInt(input[offset + index]) << ((index & 3) * 8);
-        }
-        return words;
-    }
-
-    private static int[] firstEight(int[] words) {
-        return Arrays.copyOf(words, 8);
-    }
-
-    private record Output(int[] inputChainingValue, int[] blockWords, long counter,
-                          int blockLength, int flags) {
-        private Output {
-            inputChainingValue = inputChainingValue.clone();
-            blockWords = blockWords.clone();
-        }
-
-        private int[] chainingValue() {
-            return firstEight(compress(this.inputChainingValue, this.blockWords, this.counter,
-                    this.blockLength, this.flags));
-        }
-
-        private byte[] rootHash() {
-            int[] words = compress(this.inputChainingValue, this.blockWords, 0,
-                    this.blockLength, this.flags | ROOT);
-            byte[] hash = new byte[32];
-            for (int index = 0; index < 8; index++) {
-                int word = words[index];
-                hash[index * 4] = (byte) word;
-                hash[index * 4 + 1] = (byte) (word >>> 8);
-                hash[index * 4 + 2] = (byte) (word >>> 16);
-                hash[index * 4 + 3] = (byte) (word >>> 24);
-            }
-            return hash;
-        }
     }
 }

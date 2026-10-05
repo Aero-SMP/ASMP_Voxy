@@ -46,6 +46,16 @@ final class LocalSectionCodec implements AutoCloseable {
     private Buffers buffers;
     private long[] decodedCells;
     private byte[] nameBytes;
+    private Blake3.Hasher readHash;
+
+    /** Borrowed by the sole worker for the complete journal read and integrity check.
+     * No reset or next codec operation may occur until that get() returns.
+     */
+    Blake3.Hasher readHash() throws IOException {
+        if (this.closed || this.busy) throw new IOException("local codec is closed or already owned");
+        if (this.readHash == null) this.readHash = new Blake3.Hasher();
+        return this.readHash.reset();
+    }
 
     static long compressedBound(long canonical) {
         if (canonical < 0 || canonical > MAX_CANONICAL_BYTES)
@@ -143,8 +153,6 @@ final class LocalSectionCodec implements AutoCloseable {
                 int[] blockIds = names(input, blocks, false, resolver);
                 int[] biomeIds = names(input, biomes, true, resolver);
                 long[] palette = new long[count];
-                var used = new IntLinkedOpenHashSet(count);
-                boolean[] seenBlocks = new boolean[blocks], seenBiomes = new boolean[biomes];
                 int nextBlock = 0, nextBiome = 0;
                 // Validate remote table identities, not translated aliases (including air).
                 var identities = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(count);
@@ -153,13 +161,14 @@ final class LocalSectionCodec implements AutoCloseable {
                     if (block >= blocks || biome >= biomes || block > nextBlock || biome > nextBiome
                             || !identities.add((long) block << 24 | (long) biome << 8 | light))
                         throw new IOException("invalid local palette reference/order");
-                    if (!seenBlocks[block]) { seenBlocks[block] = true; nextBlock++; }
-                    if (!seenBiomes[biome]) { seenBiomes[biome] = true; nextBiome++; }
+                    if (block == nextBlock) nextBlock++;
+                    if (biome == nextBiome) nextBiome++;
                     int id = blockIds[block];
-                    if (id != 0) used.add(id);
                     palette[i] = CatalogMapper.composeMappingId((byte) light, id, biomeIds[biome]);
                 }
                 if (nextBlock != blocks || nextBiome != biomes) throw new IOException("unused local names");
+                var used = new IntLinkedOpenHashSet(blocks);
+                for (int id : blockIds) if (id != 0) used.add(id);
                 if (this.decodedCells == null) this.decodedCells = new long[CELLS];
                 long[] cells = this.decodedCells;
                 int bits = count == 1 ? 0 : 32 - Integer.numberOfLeadingZeros(count - 1);
@@ -406,6 +415,7 @@ final class LocalSectionCodec implements AutoCloseable {
         if (this.buffers != null) { this.buffers.close(); this.buffers = null; }
         this.decodedCells = null;
         this.nameBytes = null;
+        this.readHash = null;
         this.encoder = this.decoder = 0;
     }
 }
