@@ -35,7 +35,7 @@ final class WorldCacheDownloads implements AutoCloseable {
     private FutureTask<DirectoryResult> directoryTask;
     private DirectoryKey directoryKey;
     private CatalogCodec.SharedNames catalogueNames = new CatalogCodec.SharedNames();
-    private long directoryEpoch, diskStamp, diskRecovery, diskAdmission, sourceSections, sampledSections, sampledNamedBytes;
+    private long diskStamp, diskRecovery, diskAdmission, sourceSections, sampledSections, sampledNamedBytes;
     private int activeDimension = -1;
     private Dimension viewedDimension;
     private Set<Long> viewedVisible;
@@ -144,6 +144,9 @@ final class WorldCacheDownloads implements AutoCloseable {
         final Map<Position, Node> queued = new HashMap<>();
         final Map<Long, Coverage> coverage = new HashMap<>();
         final Map<Long, Map<Long, LocalSection>> pendingBindings = new HashMap<>();
+        final Set<Long> retainedRegions = new HashSet<>();
+        final Long2IntOpenHashMap pendingJobs = new Long2IntOpenHashMap();
+        long directoryEpoch;
         PriorityQueue<Node> frontier = new PriorityQueue<>();
         volatile RegionalProtocol.CatalogMessage catalogue;
         RegionalProtocol.Hash32 persistedCatalogue = RegionalProtocol.Hash32.ZERO;
@@ -222,7 +225,69 @@ final class WorldCacheDownloads implements AutoCloseable {
             if (!inside(node) || !height(node) || !saved(node) || this.queued.putIfAbsent(node.position(), node) != null) return;
             this.frontier.add(node);
         }
-        void trimCoverage() { this.coverage.keySet().removeIf(key -> key != this.probeRegion && !this.visibleRegions.contains(key)); }
+    }
+
+    private void retain(Dimension dimension, long region) throws IOException {
+        if (dimension.retainedRegions.contains(region)) return;
+        dimension.cache.retain(region);
+        dimension.retainedRegions.add(region);
+    }
+    private void releaseUnused(Dimension dimension, long region) {
+        if (dimension.coverage.containsKey(region) || dimension.pendingJobs.get(region) != 0
+                || this.directoryKey != null && this.directoryKey.dimension == dimension && this.directoryKey.region == region) return;
+        if (dimension.retainedRegions.remove(region)) dimension.cache.forget(region);
+    }
+    private void removeCoverage(Dimension dimension, long region) {
+        dimension.coverage.remove(region);
+        releaseUnused(dimension, region);
+    }
+    private void clearCoverage(Dimension dimension) {
+        var iterator = dimension.coverage.keySet().iterator();
+        while (iterator.hasNext()) {
+            long region = iterator.next(); iterator.remove(); releaseUnused(dimension, region);
+        }
+    }
+    private static boolean needsCoverage(Dimension dimension, long region) {
+        return dimension.visibleRegions.contains(region) || dimension.probeRegion == region
+                && !dimension.sourceBlocked.contains(region) && !dimension.admissionBlocked.contains(region)
+                && !dimension.spaceBlocked.containsKey(region) && !dimension.parkedRegions.contains(region);
+    }
+    private void trimCoverage(Dimension dimension) {
+        var iterator = dimension.coverage.keySet().iterator();
+        while (iterator.hasNext()) {
+            long region = iterator.next();
+            if (!needsCoverage(dimension, region)) { iterator.remove(); releaseUnused(dimension, region); }
+        }
+        this.directoryRequests.removeIf(key -> {
+            if (key.dimension != dimension || needsCoverage(dimension, key.region)) return false;
+            dimension.pendingBindings.remove(key.region); return true;
+        });
+        if (this.directoryKey != null && this.directoryKey.dimension == dimension
+                && !needsCoverage(dimension, this.directoryKey.region)) cancelDirectory();
+    }
+    private void cancelDirectory() {
+        var key = this.directoryKey;
+        if (this.directoryTask != null) this.directoryTask.cancel(true);
+        this.directoryTask = null; this.directoryKey = null;
+        if (key != null) {
+            key.dimension.pendingBindings.remove(key.region);
+            releaseUnused(key.dimension, key.region);
+        }
+    }
+    private void invalidateDirectories(Dimension dimension) {
+        ++dimension.directoryEpoch;
+        this.directoryRequests.removeIf(key -> key.dimension == dimension);
+        if (this.directoryKey != null && this.directoryKey.dimension == dimension) cancelDirectory();
+        dimension.pendingBindings.clear();
+    }
+    private void invalidateDirectory(Dimension dimension, long region) {
+        this.directoryRequests.remove(new DirectoryKey(dimension, region));
+        if (this.directoryKey != null && this.directoryKey.dimension == dimension && this.directoryKey.region == region) cancelDirectory();
+        dimension.pendingBindings.remove(region);
+        removeCoverage(dimension, region);
+    }
+    private void discardUnusedCoverage(Dimension dimension, long region) {
+        if (!needsCoverage(dimension, region)) invalidateDirectory(dimension, region);
     }
 
     WorldCacheDownloads(ServerDownloadSettings settings, RegionalMetadataStore store, Runnable wake, ForegroundOwner foreground) throws IOException {
@@ -256,7 +321,8 @@ final class WorldCacheDownloads implements AutoCloseable {
                 if (geometryChanged) {
                     old.sourceSections = 0;
                     for (var region : old.regions.entrySet()) old.sourceSections += countRegion(old, region.getKey(), region.getValue());
-                    old.coverage.clear(); old.admissionBlocked.clear(); old.spaceBlocked.clear(); old.resetFrontier();
+                    invalidateDirectories(old); clearCoverage(old);
+                    old.admissionBlocked.clear(); old.spaceBlocked.clear(); old.resetFrontier();
                 }
             }
             startCatalogue(old);
@@ -268,7 +334,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         this.dimensions.remove(dimension.info.id(), dimension);
         for (var job : List.copyOf(this.jobs.values())) if (job.dimension == dimension) remove(job, true);
         if (dimension.catalogueTask != null) dimension.catalogueTask.cancel(true);
-        this.directoryRequests.removeIf(key -> key.dimension == dimension);
+        invalidateDirectories(dimension); clearCoverage(dimension);
         this.metadata.updateRetention(dimension.info.name(), dimension.x, dimension.z, Set.of());
         dimension.cache.close();
     }
@@ -280,7 +346,9 @@ final class WorldCacheDownloads implements AutoCloseable {
         switch (update.state()) {
             case SNAPSHOT_BEGIN -> {
                 dimension.inventoryReady = false; dimension.inventoryComplete = false; dimension.inventoryFailed = false;
-                dimension.regions.clear(); dimension.occupancy.clear(); dimension.coverage.clear();
+                invalidateDirectories(dimension); clearCoverage(dimension);
+                dimension.probeRegion = Long.MIN_VALUE;
+                dimension.regions.clear(); dimension.occupancy.clear();
                 dimension.regionRevisions.clear();
                 dimension.unreadableRegions.clear();
                 dimension.sourceSections = 0;
@@ -308,6 +376,7 @@ final class WorldCacheDownloads implements AutoCloseable {
                 if (update.state() == RegionalProtocol.InventoryState.REMOVED_REGION || update.state() == RegionalProtocol.InventoryState.UNREADABLE_REGION) {
                     dimension.unpublishedRegions.remove(key); dimension.parkedRegions.remove(key);
                     dimension.regionRevisions.remove(key);
+                    invalidateDirectory(dimension, key);
                     for (var job : List.copyOf(this.jobs.values()))
                         if (job.dimension == dimension && regionFor(job.key) == key) remove(job, true);
                 }
@@ -328,7 +397,7 @@ final class WorldCacheDownloads implements AutoCloseable {
                 Coverage coverage = dimension.coverage.get(key);
                 if (coverage != null) coverage.rebuild(dimension);
                 if (slots == null) {
-                    dimension.coverage.remove(key); dimension.pendingBindings.remove(key); dimension.spaceBlocked.remove(key);
+                    invalidateDirectory(dimension, key); dimension.spaceBlocked.remove(key);
                 }
                 if (dimension.inventoryReady && slots != null) {
                     reoffer(dimension, key);
@@ -366,7 +435,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         Set<Long> added = new HashSet<>(visible); added.removeAll(dimension.visibleRoots);
         dimension.visibleRoots.clear(); dimension.visibleRoots.addAll(visible); dimension.visibleRegions.clear();
         for (long key : visible) dimension.visibleRegions.add(regionFor(key));
-        dimension.reheap(); dimension.trimCoverage();
+        dimension.reheap(); trimCoverage(dimension);
         this.metadata.updateRetention(dimension.info.name(), dimension.x, dimension.z, dimension.visibleRegions);
         for (var job : List.copyOf(this.jobs.values())) if (job.dimension == dimension && job.purpose == 3
                 && !dimension.node(job.key).visible() && !job.processing) {
@@ -489,7 +558,10 @@ final class WorldCacheDownloads implements AutoCloseable {
                 if (this.requested.containsKey(new RegionalProtocol.ScopedKey(dimension.info.id(), key))) continue;
                 if (dimension.sourceBlocked.contains(region) || dimension.admissionBlocked.contains(region)
                         || dimension.spaceBlocked.containsKey(region) || dimension.parkedRegions.contains(region)) continue;
-                if (dimension.probeRegion != region) { dimension.probeRegion = region; dimension.trimCoverage(); }
+                if (dimension.probeRegion != region) {
+                    long previous = dimension.probeRegion; dimension.probeRegion = region;
+                    discardUnusedCoverage(dimension, previous);
+                }
                 var coverage = directory(dimension, region);
                 if (coverage == null) { dimension.offer(node); return null; }
                 LocalSection have = coverage.bindings.get(key);
@@ -506,12 +578,17 @@ final class WorldCacheDownloads implements AutoCloseable {
                 var admission = dimension.cache.canAdmit(key, binding);
                 if (admission == RegionalDiskBudget.Admission.DISK_FULL) {
                     dimension.spaceBlocked.computeIfAbsent(region, ignored -> new HashSet<>()).add(key);
+                    discardUnusedCoverage(dimension, region);
                     return null;
                 }
-                if (admission != RegionalDiskBudget.Admission.READY) { dimension.admissionBlocked.add(region); continue; }
+                if (admission != RegionalDiskBudget.Admission.READY) {
+                    dimension.admissionBlocked.add(region); discardUnusedCoverage(dimension, region); continue;
+                }
                 int purpose = node.visible() ? 3 : 4;
                 var job = new Job(dimension, key, ticket, connection, purpose, this.diskRecovery, this.diskAdmission);
-                this.jobs.put(ticket, job); this.requested.put(job.scope(), job); dimension.expand(node);
+                retain(dimension, region);
+                this.jobs.put(ticket, job); this.requested.put(job.scope(), job);
+                dimension.pendingJobs.addTo(region, 1); dimension.expand(node);
                 return new RegionalProtocol.Desire(dimension.info.id(), dimension.info.worldIdentity(), ticket, key, purpose, null, node.rank());
             }
         }
@@ -529,14 +606,21 @@ final class WorldCacheDownloads implements AutoCloseable {
     private void startDirectory() {
         if (this.closed || this.directoryTask != null || this.directoryRequests.isEmpty()) return;
         var iterator = this.directoryRequests.iterator(); this.directoryKey = iterator.next(); iterator.remove();
-        var key = this.directoryKey; long epoch = this.directoryEpoch, stamp = this.diskStamp;
+        var key = this.directoryKey; long epoch = key.dimension.directoryEpoch, stamp = this.diskStamp;
+        try { retain(key.dimension, key.region); }
+        catch (IOException failure) {
+            this.failures++; this.lastFailure = String.valueOf(failure); key.dimension.sourceBlocked.add(key.region);
+            this.directoryKey = null; releaseUnused(key.dimension, key.region); return;
+        }
         var task = new FutureTask<DirectoryResult>(() -> {
             try {
                 var directory = key.dimension.cache.inspectDirectory(key.region);
                 return new DirectoryResult(key, epoch, stamp, directory.sections(), directory.namedBytes(), null);
             } catch (IOException failure) { return new DirectoryResult(key, epoch, stamp, Map.of(), 0, failure); }
         }) { @Override protected void done() { wake.run(); } };
-        this.directoryTask = task; Thread.startVirtualThread(task);
+        this.directoryTask = task;
+        try { Thread.startVirtualThread(task); }
+        catch (RuntimeException | Error failure) { cancelDirectory(); throw failure; }
     }
     private void drainDirectory() {
         long admission = this.metadata.admissionGeneration();
@@ -582,16 +666,20 @@ final class WorldCacheDownloads implements AutoCloseable {
         long stamp = this.metadata.budget.stamp();
         if (stamp != this.diskStamp) {
             this.diskStamp = stamp;
-            for (var dimension : this.dimensions.values()) { dimension.coverage.clear(); dimension.admissionBlocked.clear(); dimension.seed(); }
+            for (var dimension : this.dimensions.values()) {
+                invalidateDirectories(dimension); clearCoverage(dimension);
+                dimension.admissionBlocked.clear(); dimension.seed();
+            }
         }
         var task = this.directoryTask;
         if (task != null && task.isDone()) {
+            var key = this.directoryKey;
             this.directoryTask = null; this.directoryKey = null;
             try {
                 var result = task.get(); var dimension = result.key.dimension;
-                if (result.epoch == this.directoryEpoch && result.stamp == this.diskStamp && this.dimensions.get(dimension.info.id()) == dimension) {
+                if (result.epoch == dimension.directoryEpoch && result.stamp == this.diskStamp && this.dimensions.get(dimension.info.id()) == dimension) {
                     if (result.failure != null) { this.failures++; this.lastFailure = String.valueOf(result.failure); dimension.sourceBlocked.add(result.key.region); }
-                    else if (dimension.visibleRegions.contains(result.key.region) || dimension.probeRegion == result.key.region) {
+                    else if (needsCoverage(dimension, result.key.region)) {
                         var overlay = dimension.pendingBindings.remove(result.key.region);
                         if (overlay != null) result.sections.putAll(overlay);
                         var coverage = new Coverage(result.sections); coverage.rebuild(dimension); dimension.coverage.put(result.key.region, coverage);
@@ -600,12 +688,22 @@ final class WorldCacheDownloads implements AutoCloseable {
                     }
                 }
             } catch (Exception failure) { if (!task.isCancelled()) { this.failures++; this.lastFailure = String.valueOf(failure); } }
+            finally {
+                key.dimension.pendingBindings.remove(key.region);
+                releaseUnused(key.dimension, key.region);
+            }
         }
         startDirectory();
     }
     private boolean remove(Job job, boolean drop) {
         if (!this.jobs.remove(job.ticket, job)) return false;
-        this.requested.remove(job.scope(), job); if (drop) this.drops.add(job.scope()); return true;
+        this.requested.remove(job.scope(), job); if (drop) this.drops.add(job.scope());
+        long region = regionFor(job.key);
+        int remaining = job.dimension.pendingJobs.addTo(region, -1) - 1;
+        if (remaining < 0) throw new IllegalStateException("cache-only job count underflow");
+        if (remaining == 0) job.dimension.pendingJobs.remove(region);
+        releaseUnused(job.dimension, region);
+        return true;
     }
     List<RegionalProtocol.Desire> changes() {
         var changes = new ArrayList<RegionalProtocol.Desire>();
@@ -649,6 +747,7 @@ final class WorldCacheDownloads implements AutoCloseable {
                 && job.dimension.regionRevisions.getOrDefault(region, 0L) > job.availabilityRevision)
             reoffer(job.dimension, region);
         else job.dimension.parkedRegions.add(region);
+        discardUnusedCoverage(job.dimension, region);
     }
     void failed(Job job, Throwable failure) {
         if (!remove(job, true)) return;
@@ -663,22 +762,21 @@ final class WorldCacheDownloads implements AutoCloseable {
             if (this.metadata.admissionGeneration() != job.admissionGeneration) reoffer(job.dimension, regionFor(job.key));
             else job.dimension.admissionBlocked.add(regionFor(job.key));
         } else job.dimension.sourceBlocked.add(regionFor(job.key));
+        discardUnusedCoverage(job.dimension, regionFor(job.key));
     }
     List<RegionalProtocol.ScopedKey> drops() { return List.copyOf(this.drops); }
     void dropped(List<RegionalProtocol.ScopedKey> keys) { this.drops.removeAll(keys); }
     private void reset(boolean sameConnection) {
         for (var job : List.copyOf(this.jobs.values())) remove(job, sameConnection);
         if (!sameConnection) this.drops.clear();
-        ++this.directoryEpoch;
-        if (this.directoryTask != null) this.directoryTask.cancel(true);
-        this.directoryTask = null; this.directoryKey = null; this.directoryRequests.clear();
+        cancelDirectory(); this.directoryRequests.clear();
         this.activeDimension = -1;
         this.viewedDimension = null; this.viewedVisible = null; this.viewedEpoch = Long.MIN_VALUE;
         for (var dimension : this.dimensions.values()) {
             if (!sameConnection) { dimension.inventoryReady = false; dimension.inventoryComplete = false; }
             dimension.visibleRoots.clear(); dimension.visibleRegions.clear(); dimension.admissionBlocked.clear(); dimension.spaceBlocked.clear();
-            dimension.probeRegion = Long.MIN_VALUE; dimension.coverage.clear(); dimension.resetFrontier();
-            dimension.pendingBindings.clear();
+            dimension.probeRegion = Long.MIN_VALUE;
+            invalidateDirectories(dimension); clearCoverage(dimension); dimension.resetFrontier();
             this.metadata.updateRetention(dimension.info.name(), dimension.x, dimension.z, Set.of());
         }
     }
@@ -725,14 +823,17 @@ final class WorldCacheDownloads implements AutoCloseable {
         return count;
     }
     String snapshot() {
-        int incomplete = 0, unreadable = 0;
+        int incomplete = 0, unreadable = 0, retained = 0, jobRegions = 0;
         for (var dimension : this.dimensions.values()) {
             if (!dimension.inventoryComplete) incomplete++;
             unreadable += dimension.unreadableRegions.size();
+            retained += dimension.retainedRegions.size(); jobRegions += dimension.pendingJobs.size();
         }
         return "prefetchCommitted=" + this.committed + " prefetchPending=" + this.jobs.size()
                 + " prefetchBytes=" + this.receivedBytes + " prefetchFailures=" + this.failures
                 + " prefetchInventoryIncomplete=" + incomplete + " prefetchUnreadableRegions=" + unreadable
+                + " prefetchRetainedIndexes=" + retained + " prefetchJobRegions=" + jobRegions
+                + " prefetchDirectoryOwners=" + (this.directoryKey == null ? 0 : 1)
                 + " prefetchExcludedDimensions=" + this.excludedDimensions
                 + " prefetchSourceSections=" + this.sourceSections + " prefetchFailure=" + this.lastFailure;
     }

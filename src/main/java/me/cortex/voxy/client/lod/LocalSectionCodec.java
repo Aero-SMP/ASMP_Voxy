@@ -44,6 +44,8 @@ final class LocalSectionCodec implements AutoCloseable {
     long decodedBytes() { return this.decodedBytes; }
     private boolean busy, closed;
     private Buffers buffers;
+    private long[] decodedCells;
+    private byte[] nameBytes;
 
     static long compressedBound(long canonical) {
         if (canonical < 0 || canonical > MAX_CANONICAL_BYTES)
@@ -115,6 +117,10 @@ final class LocalSectionCodec implements AutoCloseable {
         }
     }
 
+    /** Returned cells are borrowed until the next decode or codec closure. The owning worker
+     * must finish model waiting and synchronous meshing before then; published geometry and
+     * save inputs must not retain them. The busy guard covers decoding, not that later use.
+     */
     RegionalSectionCodec.SectionData decode(long key, int children, InputStream compressed,
                                             long compressedBytes, long canonicalBytes,
                                             Names resolver) throws IOException {
@@ -154,9 +160,11 @@ final class LocalSectionCodec implements AutoCloseable {
                     palette[i] = CatalogMapper.composeMappingId((byte) light, id, biomeIds[biome]);
                 }
                 if (nextBlock != blocks || nextBiome != biomes) throw new IOException("unused local names");
-                long[] cells = new long[CELLS];
+                if (this.decodedCells == null) this.decodedCells = new long[CELLS];
+                long[] cells = this.decodedCells;
                 int bits = count == 1 ? 0 : 32 - Integer.numberOfLeadingZeros(count - 1);
                 int next = 0, available = 0; long packed = 0;
+                // Every successful decode overwrites all cells; a partial failure never escapes.
                 for (int cell = 0; cell < CELLS; cell++) {
                     while (available < bits) {
                         packed |= (long) required(input) << available;
@@ -175,9 +183,10 @@ final class LocalSectionCodec implements AutoCloseable {
         } finally { this.busy = false; }
     }
 
-    private static int[] names(DecodedInput input, int count, boolean biome, Names resolver) throws IOException {
+    private int[] names(DecodedInput input, int count, boolean biome, Names resolver) throws IOException {
         int[] ids = new int[count];
-        byte[] bytes = new byte[MAX_NAME_BYTES];
+        if (this.nameBytes == null) this.nameBytes = new byte[MAX_NAME_BYTES];
+        byte[] bytes = this.nameBytes;
         var decoder = StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT);
         // Only compact mapped IDs survive each name; resolver owns canonical spelling/epoch checks.
@@ -395,6 +404,8 @@ final class LocalSectionCodec implements AutoCloseable {
         if (this.encoder != 0) ZSTD_freeCCtx(this.encoder);
         if (this.decoder != 0) ZSTD_freeDCtx(this.decoder);
         if (this.buffers != null) { this.buffers.close(); this.buffers = null; }
+        this.decodedCells = null;
+        this.nameBytes = null;
         this.encoder = this.decoder = 0;
     }
 }

@@ -923,7 +923,10 @@ final class RegionalDiskBudget {
         synchronized (this) { owner = this.regions.get(path); }
         if (owner == null) throw new IllegalStateException("journal requires a pin or retained directory");
         synchronized (owner) {
-            if (owner.journal != null && !owner.journal.closed()) return owner.journal;
+            if (owner.journal != null && !owner.journal.closed()) {
+                ClientLodDebug.cacheJournalReused();
+                return owner.journal;
+            }
             owner.journal = null;
             boolean present = Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && Files.size(path) != 0;
             if (!present && !create) return null;

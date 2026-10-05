@@ -18,6 +18,9 @@ public final class ClientLodDebug {
     static boolean cacheDeletionAllowed(java.nio.file.Path path) { return true; }
     static void inventoryDelay(java.nio.file.Path root) throws java.io.IOException {}
     static void cacheCommitted(CompletedSectionCache cache, LocalSection section) {}
+    static void cacheJournalRecovered(RegionalProtocol.Hash32 world, long region, Object journal, long frames, long nanos) {}
+    static void cacheJournalReused() {}
+    static void cacheJournalCommitted(Object journal, long region, LocalSection section, long bytes) {}
     static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) {}
     static java.net.DatagramSocket quicSocket() throws java.net.SocketException { return new java.net.DatagramSocket(); }
     static void streamingDesire(ClientSession.Session session, ClientSession.Demand demand, RegionalProtocol.Desire desire) {}

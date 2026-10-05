@@ -61,9 +61,12 @@ final class CompletedSectionJournal implements AutoCloseable {
                     || header.getInt() != RegionalProtocol.crc32c(Arrays.copyOf(header.array(), 56))
                     || header.getInt() != 0) throw new IOException("invalid local journal identity");
             var journal = new CompletedSectionJournal(path, region);
-            journal.recover(channel);
+            long recoveryStart = System.nanoTime();
+            long frames = journal.recover(channel);
+            long recoveryNanos = System.nanoTime() - recoveryStart;
             if (writable) { channel.truncate(journal.end); journal.writer = channel; }
             else channel.close();
+            ClientLodDebug.cacheJournalRecovered(world, region, journal, frames, recoveryNanos);
             return journal;
         } catch (Throwable failure) {
             try { channel.close(); } catch (IOException close) { failure.addSuppressed(close); }
@@ -72,11 +75,12 @@ final class CompletedSectionJournal implements AutoCloseable {
     }
     private CompletedSectionJournal(Path path, long region) { this.path = path; this.region = region; }
 
-    private void recover(FileChannel file) throws IOException {
+    private long recover(FileChannel file) throws IOException {
         this.end = HEADER_BYTES;
-        long extent = file.size();
+        long extent = file.size(), frames = 0;
         while (this.end + FRAME_BYTES + FOOTER_BYTES <= extent) {
             long at = this.end;
+            frames++;
             var frame = read(file, at, FRAME_BYTES);
             if (frame.getInt() != FRAME_MAGIC) break;
             int kind = frame.getInt(), length = frame.getInt(), crc = frame.getInt();
@@ -114,6 +118,7 @@ final class CompletedSectionJournal implements AutoCloseable {
             } catch (IllegalArgumentException | IOException corrupt) { break; }
             this.end += FRAME_BYTES + (long) length + FOOTER_BYTES;
         }
+        return frames;
     }
     synchronized LocalSection binding(long key) throws IOException {
         checkOpen(); var binding = this.bindings.get(key);
@@ -377,6 +382,7 @@ final class CompletedSectionJournal implements AutoCloseable {
                 }
                 this.committed = true;
             });
+            ClientLodDebug.cacheJournalCommitted(CompletedSectionJournal.this, region, this.section, end);
             return true;
         }
         private void reserve(long bytes) throws IOException {

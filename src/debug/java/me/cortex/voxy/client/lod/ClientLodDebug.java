@@ -41,6 +41,11 @@ public final class ClientLodDebug {
             Thread.ofPlatform().daemon().name("Voxy client debug log writer").factory());
     private static final long SAMPLE_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final int UNLIMITED_FRAMERATE = 260;
+    private static final java.util.concurrent.atomic.AtomicLong JOURNAL_RECOVERIES = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong JOURNAL_FRAMES = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong JOURNAL_RECOVERY_NANOS = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong JOURNAL_REUSES = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong JOURNAL_COMMITS = new java.util.concurrent.atomic.AtomicLong();
 
     private static boolean initialized;
     private static boolean dynamicFpsHandled;
@@ -132,6 +137,19 @@ public final class ClientLodDebug {
     static boolean cacheDeletionAllowed(Path path) { return DebugCacheTestProfile.canDelete(path); }
     static void inventoryDelay(Path root) throws IOException { DebugCacheTestProfile.inventoryDelay(root); }
     static void cacheCommitted(CompletedSectionCache cache, LocalSection section) { DebugCacheTestProfile.verifyChain(cache, section); }
+    static void cacheJournalRecovered(RegionalProtocol.Hash32 world, long region, Object journal, long frames, long nanos) {
+        JOURNAL_RECOVERIES.incrementAndGet(); JOURNAL_FRAMES.addAndGet(frames); JOURNAL_RECOVERY_NANOS.addAndGet(nanos);
+        emit("VOXY_CACHE_JOURNAL_RECOVER world=" + java.util.HexFormat.of().formatHex(world.bytes())
+                + " region=" + region + " journal=" + Integer.toUnsignedString(System.identityHashCode(journal))
+                + " frameVisits=" + frames + " durationNs=" + nanos);
+    }
+    static void cacheJournalReused() { JOURNAL_REUSES.incrementAndGet(); }
+    static void cacheJournalCommitted(Object journal, long region, LocalSection section, long bytes) {
+        JOURNAL_COMMITS.incrementAndGet();
+        emit("VOXY_CACHE_JOURNAL_COMMIT region=" + region
+                + " journal=" + Integer.toUnsignedString(System.identityHashCode(journal))
+                + " key=" + (section == null ? "RESET" : section.key()) + " journalBytes=" + bytes);
+    }
     static void discovered(ClientSession.Session session, java.util.Map<Long, LocalSection> sections) { SessionDebugTelemetry.discovered(session, sections); }
 
     static void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {
@@ -282,7 +300,10 @@ public final class ClientLodDebug {
         long now = System.nanoTime();
         if (now < nextSampleNanos) return;
         nextSampleNanos = now + SAMPLE_INTERVAL_NANOS;
-        emit("VOXY_PIPELINE " + ClientSession.debugSnapshot() + ' ' + renderSnapshot());
+        emit("VOXY_PIPELINE " + ClientSession.debugSnapshot() + ' ' + renderSnapshot()
+                + " journalIndex={recoveries=" + JOURNAL_RECOVERIES.get() + " frameVisits=" + JOURNAL_FRAMES.get()
+                + " recoveryNs=" + JOURNAL_RECOVERY_NANOS.get() + " reuses=" + JOURNAL_REUSES.get()
+                + " commits=" + JOURNAL_COMMITS.get() + '}');
     }
 
     /** Samples existing renderer counters once per second for both HZB passes. */

@@ -48,11 +48,13 @@ final class CompletedSectionCache implements AutoCloseable {
         if (this.closed && this.operations == 0) this.budget.release();
     }
     Map<Long, LocalSection> directory(long region) throws IOException {
-        synchronized (this) {
-            if (this.closed) throw new IOException("closed section cache");
-            if (this.retained.add(region)) this.budget.retainDirectory(path(region));
-        }
+        retain(region);
         return directorySnapshot(region);
+    }
+    /** Retains only the recovered index, including a not-yet-created journal. */
+    synchronized void retain(long region) throws IOException {
+        if (this.closed) throw new IOException("closed section cache");
+        if (this.retained.add(region)) this.budget.retainDirectory(path(region));
     }
     synchronized void forget(long region) {
         if (this.retained.remove(region)) this.budget.releaseDirectory(path(region));
