@@ -1,0 +1,17 @@
+[
+  {
+    "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.256-beta+1.21.1-neoforge-debug.jar",
+    "sha256": "4c974d1fa21ef7ac935b8f6812e97cd0a0ac3a1a50a7cf7d48df77882ac2eb45",
+    "bytes": 4043129
+  },
+  {
+    "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.256-beta+1.21.1-neoforge-debug.jar",
+    "sha256": "de250efa3327d4689e2b88528305230a1db801e9b404c442d9e5ac9de06850ff",
+    "bytes": 1745743
+  },
+  {
+    "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/rust-server/target/release/voxy-rust-server",
+    "sha256": "f5840addd21a7c1aa5df28df4392916b04c7487fb9ae18a1d5cc270d8a32bc29",
+    "bytes": 3418512
+  }
+]

@@ -1,0 +1,133 @@
+{
+  "scope": "Three separately completed saves at one existing FULL Testing block; no pressure load",
+  "target": [
+    -234,
+    115,
+    60
+  ],
+  "original": "minecraft:air",
+  "baseline": {
+    "source": {
+      "path": "/home/aerosmp/Desktop/Voxy_Testing/world/region/r.-1.0.mca",
+      "slot": 113,
+      "location": 220930,
+      "timestamp": 1791212807,
+      "mtimeNs": 1791213380870308755,
+      "fileBytes": 9961472,
+      "sourceMarker": 1791213380861395859,
+      "compression": 2,
+      "external": null,
+      "compressedSha256": "caea3dd11c95ff6bc17c86c2863acfe6d3e409a5a0e3dbfac97c9ef30907f044",
+      "rawNbtSha256": "9aeb4f2f8b02be49992c9a8bca4b070b7fb90b9f8bfb22d62d2bf800a77ded3f",
+      "stableRead": true
+    },
+    "state": {
+      "Name": "minecraft:air"
+    },
+    "status": "minecraft:full"
+  },
+  "events": [
+    {
+      "utcSet": "2026-10-05T15:16:21.405772+00:00",
+      "command": "execute in minecraft:overworld if loaded -234 115 60 if block -234 115 60 minecraft:air run setblock -234 115 60 minecraft:gold_block",
+      "reply": "Changed the block at -234, 115, 60\n",
+      "utcSaved": "2026-10-05T15:16:21.526681+00:00",
+      "saveReply": "Saving the game (this may take a moment!)\nSaved the game\n",
+      "savedProof": {
+        "source": {
+          "path": "/home/aerosmp/Desktop/Voxy_Testing/world/region/r.-1.0.mca",
+          "slot": 113,
+          "location": 258306,
+          "timestamp": 1791213381,
+          "mtimeNs": 1791213381478311907,
+          "fileBytes": 9961472,
+          "sourceMarker": 1791213381469399011,
+          "compression": 2,
+          "external": null,
+          "compressedSha256": "52727c89212406548ca8327e9597473d8a8a34afdf4ee2c5aad38b4e9ca7a5eb",
+          "rawNbtSha256": "9ffbf11c45f1d04488ac2e36d20da78fe96c95f8866b8d0e1e034eb299fbaeb0",
+          "stableRead": true
+        },
+        "state": {
+          "Name": "minecraft:gold_block"
+        },
+        "status": "minecraft:full"
+      }
+    },
+    {
+      "utcSet": "2026-10-05T15:16:21.551890+00:00",
+      "command": "execute in minecraft:overworld if loaded -234 115 60 if block -234 115 60 minecraft:gold_block run setblock -234 115 60 minecraft:diamond_block",
+      "reply": "Changed the block at -234, 115, 60\n",
+      "utcSaved": "2026-10-05T15:16:21.645484+00:00",
+      "saveReply": "Saving the game (this may take a moment!)\nSaved the game\n",
+      "savedProof": {
+        "source": {
+          "path": "/home/aerosmp/Desktop/Voxy_Testing/world/region/r.-1.0.mca",
+          "slot": 113,
+          "location": 89602,
+          "timestamp": 1791213381,
+          "mtimeNs": 1791213381610312590,
+          "fileBytes": 9961472,
+          "sourceMarker": 1791213381602448270,
+          "compression": 2,
+          "external": null,
+          "compressedSha256": "d41cc207809f63a85ec52c20485e2628f7766c2ac223b82485f3fbb34ebc68ac",
+          "rawNbtSha256": "bb297fb2ad2ef9d50fcaf55a6db8405d18733ce627c9790b1820df8d5da247d4",
+          "stableRead": true
+        },
+        "state": {
+          "Name": "minecraft:diamond_block"
+        },
+        "status": "minecraft:full"
+      }
+    },
+    {
+      "utcSet": "2026-10-05T15:16:21.669002+00:00",
+      "command": "execute in minecraft:overworld if loaded -234 115 60 if block -234 115 60 minecraft:diamond_block run setblock -234 115 60 minecraft:stone",
+      "reply": "Changed the block at -234, 115, 60\n",
+      "utcSaved": "2026-10-05T15:16:21.756470+00:00",
+      "saveReply": "Saving the game (this may take a moment!)\nSaved the game\n",
+      "savedProof": {
+        "source": {
+          "path": "/home/aerosmp/Desktop/Voxy_Testing/world/region/r.-1.0.mca",
+          "slot": 113,
+          "location": 258306,
+          "timestamp": 1791213381,
+          "mtimeNs": 1791213381718313151,
+          "fileBytes": 9961472,
+          "sourceMarker": 1791213381725128895,
+          "compression": 2,
+          "external": null,
+          "compressedSha256": "15e78f4d0260085d7fc92b22e9abb40e424dba62bc438d553590d1c0fcefde13",
+          "rawNbtSha256": "bded35b938e08c3ca2f67c653f340e4b58b5a8fffce0792f3fe20b73f8fc7f6b",
+          "stableRead": true
+        },
+        "state": {
+          "Name": "minecraft:stone"
+        },
+        "status": "minecraft:full"
+      }
+    }
+  ],
+  "restorePending": false,
+  "latestSavedState": "minecraft:stone",
+  "burstDurationSeconds": 0.350698,
+  "restoration": {
+    "events": [
+      {
+        "utc": "2026-10-05T15:44:11.824663+00:00",
+        "command": "execute in minecraft:overworld if loaded -234 115 60 if block -234 115 60 minecraft:stone run setblock -234 115 60 minecraft:air",
+        "reply": "Changed the block at -234, 115, 60\n"
+      },
+      {
+        "utc": "2026-10-05T15:44:11.944878+00:00",
+        "command": "save-all flush",
+        "reply": "Saving the game (this may take a moment!)\nSaved the game\n"
+      }
+    ],
+    "savedProof": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/pc256-target-restored-saved-air.json",
+    "state": {
+      "Name": "minecraft:air"
+    }
+  }
+}

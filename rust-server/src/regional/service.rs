@@ -1,14 +1,17 @@
 use super::{
     RegionalRuntime,
-    wire::{ContentBinding, ControlMessage, RecordDescriptor, RecordStatus, encode_control_record},
+    wire::{ContentBinding, ControlMessage, DimensionMetadata, RecordDescriptor, RecordStatus},
 };
 use crate::anvil::AnvilWorld;
 use crate::{catalog::Catalog, read_lock, registry::Registry};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
-    path::Path,
-    sync::{Arc, Mutex, RwLock, Weak},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -80,6 +83,13 @@ pub enum RegionalAnnouncement {
         generation: u64,
         changed_ordinals: Option<Arc<[u32]>>,
     },
+    Discovery {
+        dimension: String,
+        revision: u64,
+        updates: Arc<[((i32, i32), Option<crate::anvil::RegionAvailability>)]>,
+        reset: bool,
+    },
+    Manifest,
     Shutdown(String),
 }
 
@@ -94,12 +104,22 @@ struct SharedCadence {
 
 #[derive(Debug)]
 pub struct RegionalService {
-    runtimes: BTreeMap<String, Arc<RegionalRuntime>>,
+    runtimes: RwLock<BTreeMap<String, DimensionEntry>>,
+    data_root: PathBuf,
+    registry: Arc<RwLock<Registry>>,
+    next_dimension: AtomicU64,
     catalog: Arc<CatalogCache>,
     announcements: broadcast::Sender<RegionalAnnouncement>,
     wake: Arc<Notify>,
     worker: Mutex<Option<JoinHandle<()>>>,
     cadences: Mutex<SharedCadence>,
+    pending_saves: Mutex<BTreeMap<String, BTreeMap<(i32, i32), [u64; 16]>>>,
+}
+
+#[derive(Clone, Debug)]
+struct DimensionEntry {
+    metadata: DimensionMetadata,
+    runtime: Arc<RegionalRuntime>,
 }
 
 impl RegionalService {
@@ -108,40 +128,143 @@ impl RegionalService {
         dimensions: &BTreeMap<String, Arc<AnvilWorld>>,
         registry: Arc<RwLock<Registry>>,
     ) -> Result<Self> {
-        let layout = super::RegionLayout::new(-2, 12, crate::MAX_LOD + 1)?;
-        let runtimes = dimensions
-            .iter()
-            .map(|(dimension, source)| {
-                Ok((
-                    dimension.clone(),
-                    Arc::new(RegionalRuntime::open(
-                        data_root.as_ref(),
-                        dimension.clone(),
-                        source.clone(),
-                        registry.clone(),
-                        layout,
-                    )?),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
+        // Java supplies actual live dimension layouts before a runtime can build terrain.
+        // Saved paths alone cannot establish custom height or an unset world border.
+        let _ = dimensions;
         let (announcements, _) = broadcast::channel(ANNOUNCEMENT_CAPACITY);
         Ok(Self {
-            runtimes,
+            runtimes: RwLock::new(BTreeMap::new()),
+            data_root: data_root.as_ref().to_path_buf(),
+            registry: registry.clone(),
+            next_dimension: AtomicU64::new(1),
             catalog: Arc::new(CatalogCache::new(registry)),
             announcements,
             wake: Arc::new(Notify::new()),
             worker: Mutex::new(None),
             cadences: Mutex::new(SharedCadence::default()),
+            pending_saves: Mutex::new(BTreeMap::new()),
         })
     }
 
+    pub fn define_dimension(
+        &self,
+        name: String,
+        root: PathBuf,
+        min_y: i32,
+        count: u32,
+        custom_border: bool,
+        center_x: f64,
+        center_z: f64,
+        size: f64,
+    ) -> Result<()> {
+        if name.is_empty()
+            || !center_x.is_finite()
+            || !center_z.is_finite()
+            || !size.is_finite()
+            || size <= 0.0
+        {
+            bail!("invalid dimension metadata")
+        }
+        let layout = super::RegionLayout::new(min_y, count.try_into()?, crate::MAX_LOD + 1)?;
+        let existing = read_lock(&self.runtimes)?.get(&name).cloned();
+        let runtime = match &existing {
+            Some(entry) if entry.runtime.layout() == layout => entry.runtime.clone(),
+            _ => Arc::new(RegionalRuntime::open(
+                &self.data_root,
+                name.clone(),
+                Arc::new(AnvilWorld::new(name.clone(), root)),
+                self.registry.clone(),
+                layout,
+            )?),
+        };
+        let id = existing.as_ref().map_or_else(
+            || self.next_dimension.fetch_add(1, Ordering::Relaxed) as u32,
+            |entry| entry.metadata.id,
+        );
+        let catalogue = self.catalog.get()?;
+        let metadata = DimensionMetadata {
+            id,
+            name: name.clone(),
+            world_identity: runtime.world_identity(),
+            min_section_y: min_y,
+            section_count: count,
+            custom_border,
+            center_x,
+            center_z,
+            size,
+            catalog_id: catalogue.catalog_id,
+            catalog_fingerprint: catalogue.definition.fingerprint,
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|entry| entry.metadata == metadata)
+        {
+            return Ok(());
+        }
+        crate::write_lock(&self.runtimes)?.insert(
+            name.clone(),
+            DimensionEntry {
+                metadata,
+                runtime: runtime.clone(),
+            },
+        );
+        // A storage worker can finish a dimension's first save before the next Minecraft tick
+        // advertises its metadata. Retain only coalesced coordinates until that definition arrives.
+        if let Some(regions) = self
+            .pending_saves
+            .lock()
+            .map_err(|_| crate::UnsafeState("pending saves owner poisoned"))?
+            .remove(&name)
+        {
+            for ((x, z), slots) in regions {
+                for (word, mut bits) in slots.into_iter().enumerate() {
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        let slot = word * 64 + bit;
+                        runtime.saved_chunks(&[(
+                            x * 32 + (slot % 32) as i32,
+                            z * 32 + (slot / 32) as i32,
+                        )])?;
+                        bits &= bits - 1;
+                    }
+                }
+            }
+        }
+        let _ = self.announcements.send(RegionalAnnouncement::Manifest);
+        self.wake.notify_one();
+        Ok(())
+    }
+    pub fn manifest(&self) -> Result<Vec<DimensionMetadata>> {
+        let catalogue = self.catalog.get()?;
+        Ok(read_lock(&self.runtimes)?
+            .values()
+            .map(|entry| {
+                let mut metadata = entry.metadata.clone();
+                metadata.catalog_id = catalogue.catalog_id;
+                metadata.catalog_fingerprint = catalogue.definition.fingerprint;
+                metadata
+            })
+            .collect())
+    }
+    pub fn dimension_id(&self, name: &str) -> Result<u32> {
+        read_lock(&self.runtimes)?
+            .get(name)
+            .map(|entry| entry.metadata.id)
+            .with_context(|| format!("unknown live dimension {name}"))
+    }
+    pub fn dimension_name(&self, id: u32) -> Result<String> {
+        read_lock(&self.runtimes)?
+            .values()
+            .find(|entry| entry.metadata.id == id)
+            .map(|entry| entry.metadata.name.clone())
+            .with_context(|| format!("unknown dimension id {id}"))
+    }
     pub fn runtime(&self, dimension: &str) -> Result<Arc<RegionalRuntime>> {
-        self.runtimes
+        read_lock(&self.runtimes)?
             .get(dimension)
-            .cloned()
+            .map(|entry| entry.runtime.clone())
             .with_context(|| format!("unknown regional dimension {dimension}"))
     }
-
     pub fn responder(&self, dimension: &str, server_instance: u64) -> Result<RegionalResponder> {
         RegionalResponder::new(
             self.runtime(dimension)?,
@@ -181,67 +304,37 @@ impl RegionalService {
             .intervals
             .first_key_value()
             .map_or(1000, |(&interval, _)| interval);
-        for runtime in self.runtimes.values() {
-            runtime.set_freshness_interval(shortest);
+        for entry in read_lock(&self.runtimes)?.values() {
+            entry.runtime.set_freshness_interval(shortest);
         }
         self.wake.notify_one();
         Ok(())
     }
 
     pub fn saved_chunks(&self, dimension: &str, chunks: &[(i32, i32)]) -> Result<()> {
-        self.runtime(dimension)?.saved_chunks(chunks)
+        if let Some(runtime) = read_lock(&self.runtimes)?
+            .get(dimension)
+            .map(|entry| entry.runtime.clone())
+        {
+            return runtime.saved_chunks(chunks);
+        }
+        let mut pending = self
+            .pending_saves
+            .lock()
+            .map_err(|_| crate::UnsafeState("pending saves owner poisoned"))?;
+        let regions = pending.entry(dimension.to_owned()).or_default();
+        for &(x, z) in chunks {
+            let bits = regions
+                .entry((x.div_euclid(32), z.div_euclid(32)))
+                .or_default();
+            let slot = (z.rem_euclid(32) * 32 + x.rem_euclid(32)) as usize;
+            bits[slot / 64] |= 1 << (slot % 64);
+        }
+        Ok(())
     }
 
-    /// The Java supervisor owns stdin and sends coalesced completed-save coordinates.
-    pub fn start_save_reader(self: &Arc<Self>) {
-        let service = self.clone();
-        // Tokio's stdin uses an uncancellable blocking task that can hold runtime shutdown open.
-        // This process-owned thread exits at pipe EOF and never participates in Tokio shutdown.
-        let started = std::thread::Builder::new()
-            .name("Voxy completed saves".into())
-            .spawn(move || {
-                use std::io::Read;
-                let stdin = std::io::stdin();
-                let mut input = std::io::BufReader::new(stdin.lock());
-                let result: Result<()> = (|| {
-                    loop {
-                        let mut length = [0; 2];
-                        match input.read_exact(&mut length) {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                return Ok(());
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                        let size = u16::from_le_bytes(length) as usize;
-                        if size == 0 || size > super::wire::MAX_DIMENSION_BYTES {
-                            bail!("invalid save notification dimension");
-                        }
-                        let mut name = vec![0; size];
-                        input.read_exact(&mut name)?;
-                        let runtime = service.runtime(std::str::from_utf8(&name)?)?;
-                        let mut count = [0; 4];
-                        input.read_exact(&mut count)?;
-                        for _ in 0..u32::from_le_bytes(count) {
-                            let mut chunk = [0; 8];
-                            input.read_exact(&mut chunk)?;
-                            let x = i32::from_le_bytes(chunk[..4].try_into().unwrap());
-                            let z = i32::from_le_bytes(chunk[4..].try_into().unwrap());
-                            runtime.saved_chunks(&[(x, z)])?;
-                        }
-                    }
-                })();
-                if let Err(error) = result {
-                    eprintln!(
-                        "Voxy completed-save pipe ended: {error:#}; source reconciliation continues"
-                    );
-                }
-            });
-        if let Err(error) = started {
-            eprintln!(
-                "Voxy completed-save reader unavailable: {error}; source reconciliation continues"
-            );
-        }
+    pub fn wake(&self) {
+        self.wake.notify_one();
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RegionalAnnouncement> {
@@ -250,8 +343,20 @@ impl RegionalService {
 
     pub fn refresh_all(&self, round: u64) -> Result<RefreshStatus> {
         let mut result = RefreshStatus::default();
-        for (dimension, runtime) in &self.runtimes {
+        let runtimes = read_lock(&self.runtimes)?
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.runtime.clone()))
+            .collect::<Vec<_>>();
+        for (dimension, runtime) in runtimes {
             let refresh = runtime.refresh(round)?;
+            if refresh.inventory_changed {
+                let _ = self.announcements.send(RegionalAnnouncement::Discovery {
+                    dimension: dimension.clone(),
+                    revision: runtime.inventory_revision(),
+                    updates: refresh.inventory_updates.clone().into(),
+                    reset: refresh.inventory_reset,
+                });
+            }
             result.more_pending |= refresh.more_pending;
             result.incomplete |= refresh.incomplete;
             if result.failure.is_none() {
@@ -277,23 +382,6 @@ impl RegionalService {
             }
         }
         Ok(result)
-    }
-
-    /// One logical round: finish independent eligible work, then truthfully report failures.
-    pub fn refresh_once(&self) -> Result<()> {
-        let mut failure = None;
-        loop {
-            let status = self.refresh_all(0)?;
-            if failure.is_none() && status.incomplete {
-                failure = status.failure;
-            }
-            if !status.more_pending {
-                if let Some(failure) = failure {
-                    bail!("regional import incomplete: {failure}");
-                }
-                return Ok(());
-            }
-        }
     }
 
     pub fn start(self: &Arc<Self>, poll_interval: Duration) -> Result<()> {
@@ -386,15 +474,19 @@ impl RegionalResponder {
         })
     }
 
-    pub fn hello(&self, background_token: [u8; 32]) -> Result<ControlMessage> {
+    pub fn hello(&self, dimension: u32) -> Result<ControlMessage> {
         let catalog = self.catalog.get()?;
         Ok(ControlMessage::ServerHello {
             server_instance: self.server_instance,
+            active_dimension: dimension,
             world_identity: self.runtime.world_identity(),
             catalog_id: catalog.catalog_id,
             catalog_fingerprint: catalog.definition.fingerprint,
-            background_token,
         })
+    }
+
+    pub fn catalogue(&self) -> Result<Arc<CatalogDefinition>> {
+        Ok(self.catalog.get()?.definition)
     }
 
     pub fn world_identity(&self) -> [u8; 32] {
@@ -432,18 +524,7 @@ impl RegionalResponder {
                     } else {
                         RecordStatus::Data
                     };
-                    descriptor.binding = ContentBinding {
-                        flags: entry.flags,
-                        children: entry.non_empty_children,
-                        catalog_fingerprint: catalog.fingerprint,
-                        fingerprint: entry.fingerprint,
-                        compressed_length: entry.compressed_length,
-                        canonical_length: entry.canonical_length,
-                        compressed_crc: entry.compressed_crc,
-                    };
-                    if !entry.is_present() {
-                        descriptor.binding = ContentBinding::default();
-                    }
+                    descriptor.binding = ContentBinding::from_entry(entry, catalog.fingerprint);
                 }
                 Err(_) => descriptor.status = RecordStatus::Absent,
             }
@@ -518,7 +599,7 @@ pub struct CatalogDefinition {
     pub fingerprint: [u8; 32],
     pub canonical_length: u32,
     pub compressed_length: u32,
-    pub frame: Arc<[u8]>,
+    pub payload: Arc<[u8]>,
 }
 
 #[derive(Debug)]
@@ -533,7 +614,7 @@ impl CatalogCache {
         Self {
             registry,
             current: Mutex::new(None),
-            trace: std::env::var_os("VOXY_BACKGROUND_TRACE").is_some_and(|value| value == "1"),
+            trace: std::env::var_os("VOXY_NETWORK_TRACE").is_some_and(|value| value == "1"),
         }
     }
 
@@ -556,12 +637,12 @@ impl CatalogCache {
         let compressed =
             zstd::bulk::compress(&canonical, 1).context("compress catalogue definition")?;
         let compressed_length = u32::try_from(compressed.len())?;
-        let frame: Arc<[u8]> = encode_control_record(&ControlMessage::Catalog {
-            fingerprint,
-            canonical_length,
-            compressed,
-        })?
-        .into();
+        let mut payload = Vec::with_capacity(40 + compressed.len());
+        payload.extend_from_slice(&fingerprint);
+        payload.extend_from_slice(&canonical_length.to_le_bytes());
+        payload.extend_from_slice(&compressed_length.to_le_bytes());
+        payload.extend_from_slice(&compressed);
+        let payload: Arc<[u8]> = payload.into();
         if self.trace {
             eprintln!(
                 "VOXY_CATALOG_BUILT catalog_id={} generation={} fingerprint={} canonical_bytes={canonical_length} compressed_bytes={compressed_length} build_ns={}",
@@ -578,7 +659,7 @@ impl CatalogCache {
                 fingerprint,
                 canonical_length,
                 compressed_length,
-                frame,
+                payload,
             }),
         };
         *current = Some(cached.clone());

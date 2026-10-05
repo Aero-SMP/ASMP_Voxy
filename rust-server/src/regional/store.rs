@@ -14,7 +14,6 @@ const REGION_MAGIC: &[u8; 8] = b"VXYRGN\0\x01";
 const REGION_HEADER_BYTES: usize = 256;
 pub(crate) const SECTION_ENTRY_BYTES: usize = 48;
 const ZSTD_LEVEL: i32 = 1;
-const MAX_REGION_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SECTION_CANONICAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SECTION_COMPRESSED_BYTES: usize = 4 * 1024 * 1024;
 const REGION_ENTRY_PRESENT: u16 = 1 << 15;
@@ -462,9 +461,6 @@ impl RegionFileBuilder {
             }
         }
         let file_length = next_payload;
-        if file_length > MAX_REGION_FILE_BYTES {
-            bail!("regional file exceeds its {MAX_REGION_FILE_BYTES} byte safety bound");
-        }
 
         let published_sections = self
             .sections
@@ -653,7 +649,6 @@ fn decode_header(bytes: &[u8; REGION_HEADER_BYTES]) -> Result<Header> {
         || header.payload_offset
             != header.directory_offset + header.entry_count as u64 * SECTION_ENTRY_BYTES as u64
         || header.file_length < header.payload_offset
-        || header.file_length > MAX_REGION_FILE_BYTES
     {
         bail!("regional file header extents or identity are invalid");
     }
@@ -675,8 +670,8 @@ impl RegionFile {
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let length = file.metadata()?.len();
-        if length < REGION_HEADER_BYTES as u64 || length > MAX_REGION_FILE_BYTES {
-            bail!("regional file length is outside its safety bounds");
+        if length < REGION_HEADER_BYTES as u64 {
+            bail!("regional file is shorter than its header");
         }
         let mut header_bytes = [0u8; REGION_HEADER_BYTES];
         file.read_exact_at(&mut header_bytes, 0)?;

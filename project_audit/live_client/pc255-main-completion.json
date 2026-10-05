@@ -1,0 +1,32 @@
+{
+  "utc": "2026-10-05T14:55:48.807953+00:00",
+  "scope": "Independent committed Main-copy coarse coverage, normal-projection PC camera sweep",
+  "run": "8f0b1116-4203-428c-8443-5c79c3d42d53",
+  "sourceReceipt": "main_coverage_snapshot_receipt_20261005.json",
+  "sourceExpectedManifest": "live_client/main_snapshot_expected_coarse_sections.json",
+  "expected": 800,
+  "coverage": {
+    "expected": 800,
+    "currentData": 800,
+    "currentEmpty": 0,
+    "currentAbsent": 0,
+    "missing": 0,
+    "compressedIntegrityValidData": 800,
+    "authenticatedFallbackData": 0,
+    "snapshotExactData": 146,
+    "snapshotContentExactData": 800,
+    "sectionsFromChangingFiles": 0
+  },
+  "complete": true,
+  "fullMetadata": "pc255-main-full-final.json",
+  "firstColdCoarseBodyRunBeganUtc": "2026-10-05T13:44:00Z",
+  "completionUtc": "2026-10-05T14:53:19.9389271Z",
+  "timingQualification": "Approximate beginning from live policy/pose receipt; actual typed events retain precise timestamps. Camera rotation and near finer preparation competed with coarse downloads. No guaranteed static-camera deadline or saturation claim.",
+  "projection": "Existing pixel-size and FOV, render distance temporarily512 MC chunks. Cardial/diagonal sweep at0,1000,0; no single-image whole-square claim.",
+  "limits": [
+    "Read-only source copy is stable per pair, not one atomic Main tick.",
+    "Minecraft near chunks still Testing; this case does not establish Main normal/LOD seams.",
+    "Fog and weather limit visible extreme distance.",
+    "Current shared catalogue differs from some historical publication catalogue hashes; all800 section source fingerprints/children match."
+  ]
+}

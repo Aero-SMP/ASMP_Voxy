@@ -12,7 +12,8 @@ import java.util.Locale;
 
 /** Empty endpoint request or the exact QUIC endpoint authenticated by Minecraft. */
 public record QuicEndpointPayload(String host, int udpPort, String alpn,
-                                  byte[] certificateSha256) implements CustomPacketPayload {
+                                  byte[] certificateSha256, int bandwidthKbps,
+                                  byte[] routeToken) implements CustomPacketPayload {
     public static final String REGISTRATION_VERSION = "voxy-cache-start";
     public static final int MAX_HOST_LENGTH = 255;
     public static final int MAX_ALPN_LENGTH = 255;
@@ -29,7 +30,10 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
                     String alpn = input.readUtf(MAX_ALPN_LENGTH);
                     byte[] fingerprint = new byte[CERTIFICATE_SHA256_BYTES];
                     input.readBytes(fingerprint);
-                    return new QuicEndpointPayload(host, udpPort, alpn, fingerprint);
+                    int bandwidth = input.readUnsignedShort();
+                    byte[] token = new byte[32];
+                    input.readBytes(token);
+                    return new QuicEndpointPayload(host, udpPort, alpn, fingerprint, bandwidth, token);
                 }
 
                 @Override
@@ -38,6 +42,8 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
                     output.writeShort(payload.udpPort);
                     output.writeUtf(payload.alpn, MAX_ALPN_LENGTH);
                     output.writeBytes(payload.certificateSha256);
+                    output.writeShort(payload.bandwidthKbps);
+                    output.writeBytes(payload.routeToken);
                 }
             };
 
@@ -53,24 +59,32 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
                 || certificateSha256.length != CERTIFICATE_SHA256_BYTES) {
             throw new IllegalArgumentException("invalid Voxy QUIC certificate fingerprint");
         }
+        routeToken = routeToken == null ? null : routeToken.clone();
+        if (routeToken == null || routeToken.length != 32 || bandwidthKbps < 100 || bandwidthKbps > 10_000)
+            throw new IllegalArgumentException("invalid Voxy QUIC route or download bandwidth");
 
         if (udpPort == 0) {
-            if (!host.isEmpty() || !alpn.isEmpty() || !allZero(certificateSha256)) {
+            if (!host.isEmpty() || !alpn.isEmpty() || !allZero(certificateSha256) || !allZero(routeToken)) {
                 throw new IllegalArgumentException("invalid Voxy QUIC endpoint request");
             }
         } else if (udpPort < 0 || udpPort > 0xffff
-                || !host.equals(canonicalHost(host)) || alpn.isEmpty()) {
+                || !host.equals(canonicalHost(host)) || alpn.isEmpty() || allZero(routeToken)) {
             throw new IllegalArgumentException("invalid Voxy QUIC endpoint");
         }
     }
 
-    public static QuicEndpointPayload request() {
-        return new QuicEndpointPayload("", 0, "", new byte[CERTIFICATE_SHA256_BYTES]);
+    public static QuicEndpointPayload request(int bandwidthKbps) {
+        return new QuicEndpointPayload("", 0, "", new byte[CERTIFICATE_SHA256_BYTES], bandwidthKbps, new byte[32]);
     }
 
     public static QuicEndpointPayload endpoint(String host, int udpPort, String alpn,
-                                               byte[] certificateSha256) {
-        return new QuicEndpointPayload(canonicalHost(host), udpPort, alpn, certificateSha256);
+                                               byte[] certificateSha256, byte[] routeToken) {
+        return endpoint(host, udpPort, alpn, certificateSha256, routeToken, 1000);
+    }
+
+    public static QuicEndpointPayload endpoint(String host, int udpPort, String alpn,
+                                               byte[] certificateSha256, byte[] routeToken, int bandwidthKbps) {
+        return new QuicEndpointPayload(canonicalHost(host), udpPort, alpn, certificateSha256, bandwidthKbps, routeToken);
     }
 
     public boolean isRequest() {
@@ -83,18 +97,25 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
     }
 
     @Override
+    public byte[] routeToken() { return this.routeToken.clone(); }
+
+    @Override
     public boolean equals(Object other) {
         return this == other || other instanceof QuicEndpointPayload endpoint
                 && this.udpPort == endpoint.udpPort && this.host.equals(endpoint.host)
                 && this.alpn.equals(endpoint.alpn)
-                && Arrays.equals(this.certificateSha256, endpoint.certificateSha256);
+                && this.bandwidthKbps == endpoint.bandwidthKbps
+                && Arrays.equals(this.certificateSha256, endpoint.certificateSha256)
+                && Arrays.equals(this.routeToken, endpoint.routeToken);
     }
 
     @Override
     public int hashCode() {
         int hash = 31 * this.host.hashCode() + this.udpPort;
         hash = 31 * hash + this.alpn.hashCode();
-        return 31 * hash + Arrays.hashCode(this.certificateSha256);
+        hash = 31 * hash + Arrays.hashCode(this.certificateSha256);
+        hash = 31 * hash + this.bandwidthKbps;
+        return 31 * hash + Arrays.hashCode(this.routeToken);
     }
 
     /** Empty means reuse the authenticated Minecraft peer address. */

@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.network.QuicEndpointPayload;
+import me.cortex.voxy.client.config.ServerDownloadSettings;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
@@ -47,6 +48,12 @@ final class QuicEndpointDiscovery {
     }
 
     static RegionalQuicClient connect(ClientPacketListener listener) throws IOException {
+        var settings = ServerDownloadSettings.current();
+        if (settings == null) throw new IOException("Voxy QUIC requires a Minecraft server identity");
+        return connect(listener, settings.downloadKbps());
+    }
+
+    static RegionalQuicClient connect(ClientPacketListener listener, int bandwidthKbps) throws IOException {
         if (listener == null || !listener.hasChannel(QuicEndpointPayload.TYPE)) {
             throw new IOException("Minecraft server does not advertise Voxy QUIC");
         }
@@ -61,7 +68,7 @@ final class QuicEndpointDiscovery {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (endpoint == null && System.nanoTime() - deadline < 0) {
                 if (!request.connection().isConnected()) throw new IOException("Minecraft connection ended during endpoint discovery");
-                listener.send(QuicEndpointPayload.request());
+                listener.send(QuicEndpointPayload.request(bandwidthKbps));
                 endpoint = response.poll(250, TimeUnit.MILLISECONDS);
             }
         } catch (InterruptedException exception) {
@@ -80,7 +87,7 @@ final class QuicEndpointDiscovery {
                 ? new InetAddress[]{remoteAddress(listener.getConnection().getRemoteAddress())}
                 : resolve(endpoint.host());
         return RegionalQuicClient.connect(addresses, endpoint.udpPort(), endpoint.alpn(),
-                endpoint.certificateSha256());
+                endpoint.certificateSha256(), endpoint.routeToken());
     }
 
     private static void receiveEndpoint(QuicEndpointPayload payload, net.minecraft.network.Connection connection) {

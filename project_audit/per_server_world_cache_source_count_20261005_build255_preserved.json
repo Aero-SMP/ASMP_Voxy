@@ -1,0 +1,1060 @@
+{
+  "timestamp_utc": "2026-10-05T13:42:01.693960+00:00",
+  "method": "Existing count_cache_first_sources.py: symmetric physical lines including comments/blanks, Java/Rust/shaders; selected main/debug/test/tools trees. Filesystem working-tree count includes tracked and untracked. Shared sources counted separately because excluded from historical helper scope. Generated/audit trees excluded. Every selected descendant directory counted, including empty directories.",
+  "helper_sha256": "84f38e2882ade0e02e883b07076e9ab0b694d837b09432777ea68ef09d26932d",
+  "baseline_commit": "745084e90abcb577fa37b39d68c9d4d5a1ce83ec",
+  "baseline_snapshot": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/source-count-baseline-745084e",
+  "baseline_limitations": "Committed Git trees cannot represent historical untracked files or empty directories; baseline is exactly the committed tree reconstructed into the feature audit directory. No original worktree changed.",
+  "working_head": "a3364a0ad774b8dcbc751092e49ce5d6ecf03b7e",
+  "working_tree_source_digest_sha256": "ac9f29a7f781998712afac4a2b1867c449460676a53f1df714e92dcb7cd89f44",
+  "source_digest_scope": "All selected main/debug/java-test/tool/shared sources, sorted relative paths plus bytes; tracked and untracked included; generated directories excluded. Source bytes may change concurrently, this is a timestamped read snapshot.",
+  "baseline": {
+    "plan_main_paths": {
+      "files": 188,
+      "lines": 37362,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "client_main": {
+      "files": 155,
+      "lines": 24354,
+      "directories": 45,
+      "empty_directories": 0
+    },
+    "server_main": {
+      "files": 6,
+      "lines": 788,
+      "directories": 9,
+      "empty_directories": 0
+    },
+    "rust_main_paths": {
+      "files": 27,
+      "lines": 12220,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "debug": {
+      "files": 22,
+      "lines": 4590,
+      "directories": 17,
+      "empty_directories": 0
+    },
+    "java_tests": {
+      "files": 15,
+      "lines": 1922,
+      "directories": 18,
+      "empty_directories": 0
+    },
+    "rust_test_files": {
+      "files": 6,
+      "lines": 1935,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "native_pressure": {
+      "files": 1,
+      "lines": 1270,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "main_without_standalone_tests_pressure": {
+      "files": 181,
+      "lines": 34157,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "embedded_rust_tests": {
+      "lines": 1135,
+      "ranges": {
+        "rust-server/src/config.rs": [
+          {
+            "first": 102,
+            "last": 162,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/anvil.rs": [
+          {
+            "first": 905,
+            "last": 907,
+            "item": "mod array_tests;"
+          },
+          {
+            "first": 909,
+            "last": 1011,
+            "item": "mod region_boundary_tests {"
+          }
+        ],
+        "rust-server/src/lod.rs": [
+          {
+            "first": 162,
+            "last": 182,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/service.rs": [
+          {
+            "first": 52,
+            "last": 72,
+            "item": "mod round_tests {"
+          }
+        ],
+        "rust-server/src/regional/store.rs": [
+          {
+            "first": 541,
+            "last": 542,
+            "item": "super::faults::hit(                       , path)?;"
+          },
+          {
+            "first": 544,
+            "last": 545,
+            "item": "super::faults::hit(                      , path)?;"
+          },
+          {
+            "first": 553,
+            "last": 554,
+            "item": "super::faults::hit(                , path)?;"
+          },
+          {
+            "first": 842,
+            "last": 1325,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/source.rs": [
+          {
+            "first": 156,
+            "last": 157,
+            "item": "super::faults::hit(                      , path)?;"
+          },
+          {
+            "first": 159,
+            "last": 160,
+            "item": "super::faults::hit(                     , path)?;"
+          },
+          {
+            "first": 223,
+            "last": 254,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/builder.rs": [
+          {
+            "first": 71,
+            "last": 72,
+            "item": "super::faults::hit(             , output.as_ref())?;"
+          },
+          {
+            "first": 265,
+            "last": 266,
+            "item": "super::faults::hit(      , output.as_ref())?;"
+          },
+          {
+            "first": 484,
+            "last": 485,
+            "item": "super::faults::hit(               , &source.root)?;"
+          },
+          {
+            "first": 502,
+            "last": 527,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/runtime.rs": [
+          {
+            "first": 131,
+            "last": 217,
+            "item": "mod order_tests {"
+          },
+          {
+            "first": 488,
+            "last": 491,
+            "item": "pub(crate) fn test_subscription_count(&self) -> usize {"
+          },
+          {
+            "first": 599,
+            "last": 600,
+            "item": "super::faults::hit(           , &self.source.root)?;"
+          },
+          {
+            "first": 769,
+            "last": 770,
+            "item": "super::faults::hit(         , &self.terrain_path(coordinate))?;"
+          },
+          {
+            "first": 783,
+            "last": 784,
+            "item": "super::faults::hit(           , &self.terrain_path(coordinate))?;"
+          },
+          {
+            "first": 1207,
+            "last": 1208,
+            "item": "super::faults::hit(             , path)?;"
+          },
+          {
+            "first": 1217,
+            "last": 1218,
+            "item": "super::faults::hit(                , path)?;"
+          },
+          {
+            "first": 1223,
+            "last": 1225,
+            "item": "mod refresh_tests;"
+          }
+        ],
+        "rust-server/src/regional/section.rs": [
+          {
+            "first": 215,
+            "last": 428,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/mod.rs": [
+          {
+            "first": 14,
+            "last": 15,
+            "item": "mod air_lighting_tests;"
+          },
+          {
+            "first": 16,
+            "last": 17,
+            "item": "mod faults;"
+          },
+          {
+            "first": 18,
+            "last": 19,
+            "item": "mod payload_prototype_tests;"
+          },
+          {
+            "first": 20,
+            "last": 21,
+            "item": "mod refresh_measurements;"
+          }
+        ],
+        "rust-server/src/regional/index.rs": [
+          {
+            "first": 141,
+            "last": 182,
+            "item": "mod tests {"
+          }
+        ]
+      }
+    },
+    "release_source": {
+      "files": 181,
+      "lines": 33022,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "tools_runtime": {
+      "files": 9,
+      "lines": 1889,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "tools_tests": {
+      "files": 3,
+      "lines": 381,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "tools_all": {
+      "files": 12,
+      "lines": 2270,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "maintained_all_sources": {
+      "files": 237,
+      "lines": 46144,
+      "directories": 101,
+      "empty_directories": 0
+    },
+    "resources": {
+      "files": 12,
+      "text_lines": 1022,
+      "bytes": 95643
+    },
+    "shared_sources": {
+      "files": 11,
+      "lines": 901,
+      "directories": 21,
+      "empty_directories": 0
+    },
+    "maintained_plus_shared": {
+      "files": 248,
+      "lines": 47045,
+      "directories": 122,
+      "empty_directories": 0
+    }
+  },
+  "working": {
+    "plan_main_paths": {
+      "files": 190,
+      "lines": 40075,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "client_main": {
+      "files": 157,
+      "lines": 26409,
+      "directories": 45,
+      "empty_directories": 0
+    },
+    "server_main": {
+      "files": 6,
+      "lines": 983,
+      "directories": 9,
+      "empty_directories": 0
+    },
+    "rust_main_paths": {
+      "files": 27,
+      "lines": 12683,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "debug": {
+      "files": 22,
+      "lines": 4694,
+      "directories": 17,
+      "empty_directories": 0
+    },
+    "java_tests": {
+      "files": 15,
+      "lines": 1922,
+      "directories": 18,
+      "empty_directories": 0
+    },
+    "rust_test_files": {
+      "files": 6,
+      "lines": 1935,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "native_pressure": {
+      "files": 1,
+      "lines": 693,
+      "directories": 2,
+      "empty_directories": 0
+    },
+    "main_without_standalone_tests_pressure": {
+      "files": 183,
+      "lines": 37447,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "embedded_rust_tests": {
+      "lines": 1181,
+      "ranges": {
+        "rust-server/src/config.rs": [
+          {
+            "first": 96,
+            "last": 156,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/anvil.rs": [
+          {
+            "first": 993,
+            "last": 995,
+            "item": "mod array_tests;"
+          },
+          {
+            "first": 997,
+            "last": 1099,
+            "item": "mod region_boundary_tests {"
+          }
+        ],
+        "rust-server/src/lod.rs": [
+          {
+            "first": 162,
+            "last": 182,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/service.rs": [
+          {
+            "first": 55,
+            "last": 75,
+            "item": "mod round_tests {"
+          }
+        ],
+        "rust-server/src/regional/store.rs": [
+          {
+            "first": 537,
+            "last": 538,
+            "item": "super::faults::hit(                       , path)?;"
+          },
+          {
+            "first": 540,
+            "last": 541,
+            "item": "super::faults::hit(                      , path)?;"
+          },
+          {
+            "first": 549,
+            "last": 550,
+            "item": "super::faults::hit(                , path)?;"
+          },
+          {
+            "first": 837,
+            "last": 1320,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/source.rs": [
+          {
+            "first": 165,
+            "last": 166,
+            "item": "super::faults::hit(                      , path)?;"
+          },
+          {
+            "first": 168,
+            "last": 169,
+            "item": "super::faults::hit(                     , path)?;"
+          },
+          {
+            "first": 232,
+            "last": 263,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/builder.rs": [
+          {
+            "first": 71,
+            "last": 72,
+            "item": "super::faults::hit(             , output.as_ref())?;"
+          },
+          {
+            "first": 265,
+            "last": 266,
+            "item": "super::faults::hit(      , output.as_ref())?;"
+          },
+          {
+            "first": 484,
+            "last": 485,
+            "item": "super::faults::hit(               , &source.root)?;"
+          },
+          {
+            "first": 502,
+            "last": 527,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/runtime.rs": [
+          {
+            "first": 108,
+            "last": 155,
+            "item": "fn refresh_order<T>("
+          },
+          {
+            "first": 157,
+            "last": 243,
+            "item": "mod order_tests {"
+          },
+          {
+            "first": 534,
+            "last": 537,
+            "item": "pub(crate) fn test_subscription_count(&self) -> usize {"
+          },
+          {
+            "first": 924,
+            "last": 925,
+            "item": "super::faults::hit(         , &self.terrain_path(coordinate))?;"
+          },
+          {
+            "first": 938,
+            "last": 939,
+            "item": "super::faults::hit(           , &self.terrain_path(coordinate))?;"
+          },
+          {
+            "first": 1344,
+            "last": 1345,
+            "item": "super::faults::hit(             , path)?;"
+          },
+          {
+            "first": 1354,
+            "last": 1355,
+            "item": "super::faults::hit(                , path)?;"
+          },
+          {
+            "first": 1360,
+            "last": 1362,
+            "item": "mod refresh_tests;"
+          }
+        ],
+        "rust-server/src/regional/section.rs": [
+          {
+            "first": 215,
+            "last": 428,
+            "item": "mod tests {"
+          }
+        ],
+        "rust-server/src/regional/mod.rs": [
+          {
+            "first": 14,
+            "last": 15,
+            "item": "mod air_lighting_tests;"
+          },
+          {
+            "first": 16,
+            "last": 17,
+            "item": "mod faults;"
+          },
+          {
+            "first": 18,
+            "last": 19,
+            "item": "mod payload_prototype_tests;"
+          },
+          {
+            "first": 20,
+            "last": 21,
+            "item": "mod refresh_measurements;"
+          }
+        ],
+        "rust-server/src/regional/index.rs": [
+          {
+            "first": 141,
+            "last": 182,
+            "item": "mod tests {"
+          }
+        ]
+      }
+    },
+    "release_source": {
+      "files": 183,
+      "lines": 36266,
+      "directories": 56,
+      "empty_directories": 0
+    },
+    "tools_runtime": {
+      "files": 8,
+      "lines": 1211,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "tools_tests": {
+      "files": 3,
+      "lines": 381,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "tools_all": {
+      "files": 11,
+      "lines": 1592,
+      "directories": 10,
+      "empty_directories": 0
+    },
+    "maintained_all_sources": {
+      "files": 238,
+      "lines": 48283,
+      "directories": 101,
+      "empty_directories": 0
+    },
+    "resources": {
+      "files": 12,
+      "text_lines": 1025,
+      "bytes": 96161
+    },
+    "shared_sources": {
+      "files": 11,
+      "lines": 947,
+      "directories": 21,
+      "empty_directories": 0
+    },
+    "maintained_plus_shared": {
+      "files": 249,
+      "lines": 49230,
+      "directories": 122,
+      "empty_directories": 0
+    }
+  },
+  "deltas": {
+    "plan_main_paths": {
+      "files": 2,
+      "lines": 2713,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "release_source": {
+      "files": 2,
+      "lines": 3244,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "debug": {
+      "files": 0,
+      "lines": 104,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "java_tests": {
+      "files": 0,
+      "lines": 0,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "tools_all": {
+      "files": -1,
+      "lines": -678,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "maintained_all_sources": {
+      "files": 1,
+      "lines": 2139,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "shared_sources": {
+      "files": 0,
+      "lines": 46,
+      "directories": 0,
+      "empty_directories": 0
+    },
+    "maintained_plus_shared": {
+      "files": 1,
+      "lines": 2185,
+      "directories": 0,
+      "empty_directories": 0
+    }
+  },
+  "source_digest_encoding": "SHA256 of sorted UTF-8 POSIX relative path, NUL, complete file bytes, NUL for each selected source.",
+  "included_untracked_production_sources": [
+    "src/main/java/me/cortex/voxy/client/config/ServerDownloadSettings.java",
+    "src/main/java/me/cortex/voxy/client/lod/RoutedDatagramSocket.java",
+    "src/main/java/me/cortex/voxy/client/lod/WorldCacheDownloads.java"
+  ],
+  "scope_notes": [
+    "The release_source count excludes standalone Rust test fixtures, the separate authenticated live_pressure CLI, and lexically gated cfg(test) ranges. Shared sources remain a separate historically excluded scope.",
+    "Existing pure unit/fixture source files are counted without executing them; no tests were run for this receipt.",
+    "Obsolete tools/live_pressure.py is removed. The remaining Rust CLI is counted as native_pressure; 100-client pressure verification remains suspended.",
+    "Main/debug/tool/shared trees include tracked and untracked files. Generated and project_audit trees are excluded; selected directories include empty directories."
+  ],
+  "matched_253_artifacts": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.253-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "bf3a51aad5bbbdb6a8d6a8dc1c0ef6c09c342aabf4ed25efb7a9e862a320a59b",
+      "bytes": 4041266
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.253-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "22f627bb13228d853ac305936da3143f2a7ce0fa55233e09293fd6016e5362b1",
+      "bytes": 1745550
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/rust-server/target/release/voxy-rust-server",
+      "sha256": "b1877ab27f10b8f4db4ad72bcb52203bd6dd6aad8cc65faf608daa86d1e488bf",
+      "bytes": 3418320
+    }
+  ],
+  "matched_254_artifacts": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.254-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "fea7e0aa8086a176d890822abe50363fe22fd7bf85e2ea2b271da0d5fac961af",
+      "bytes": 4041266
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.254-beta+1.21.1-neoforge.jar",
+      "sha256": "642e17fe3e8bb55880c44f32bd22e87d34302760eec7f4b161db093affaa4689",
+      "bytes": 3886518
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/rust-server/target/release/voxy-rust-server",
+      "sha256": "f5840addd21a7c1aa5df28df4392916b04c7487fb9ae18a1d5cc270d8a32bc29",
+      "bytes": 3418512
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.254-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "cec71e8e17228304e45e2664befaee8b8dc3d5d94e6cebca55877f73aebbe985",
+      "bytes": 1745743
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.254-beta+1.21.1-neoforge.jar",
+      "sha256": "7b4c58ef7727126b008628c89d6d543a78abd3ab5336e724e409c00043813e3d",
+      "bytes": 1679734
+    }
+  ],
+  "final_254_read_only_source_review": {
+    "baseline": "745084e90abcb577fa37b39d68c9d4d5a1ce83ec",
+    "scope": [
+      "VoxyConfigMenu/VoxyConfig/ServerDownloadSettings",
+      "VoxyRenderSystem/HierarchicalOcclusionTraverser/traversal.comp",
+      "ClientSession local decoding, catalogue/bootstrap, network gating and publication",
+      "CompletedSectionCache/CompletedSectionJournal/RegionalMetadataStore/RegionalSectionCodec"
+    ],
+    "findings": [
+      "No new draw selection, meshing or GPU eviction algorithm changes in reviewed renderer diff; visibility observation records only actual normal-camera final-pass enqueue and leaves detail actions intact.",
+      "Added observation has an actual cost:16bytes per renderlistcapacity GPU allocation (3200000bytes for200000 entries), occupied-prefix O(visible cut) readback and arrays, plus24float frustum snapshots per normal frame. Source review does not establish unchanged FPS or allocation rate.",
+      "Per-current-server Sodium bandwidth/storage policy bindings resolve dynamically; normal STREAMING_SETTINGS hooks signal owner without renderer reconstruction. Existing enable/render-distance/VRAM settings behavior remains.",
+      "Named local payload decoding remains server-independent. Publication-before-network gate remains local to an actual covering cached parent or cached cut; partial cached siblings do not globally block missing coverage. Same-format previous-valid-binding corruption recovery remains.",
+      "Native254 distinguishes geometry-empty sections retaining lighting/biome payloads from payloadless wireEMPTY; retained payload is sent asDATA and existing Java scanner continues decoding it."
+    ],
+    "limitations": "Read-only static review only. No new tests, builds, PC actions or pressure verification performed for this audit."
+  },
+  "source_count_history": [
+    {
+      "build": 254,
+      "timestamp_utc": "2026-10-05T13:26:24.040838+00:00",
+      "working_head": "a3364a0ad774b8dcbc751092e49ce5d6ecf03b7e",
+      "working_tree_source_digest_sha256": "5617a8444d56deec200f4fe0f4bc9308522f8861073ac76b2dbae03a1868dccf",
+      "working": {
+        "plan_main_paths": {
+          "files": 190,
+          "lines": 40035,
+          "directories": 56,
+          "empty_directories": 0
+        },
+        "client_main": {
+          "files": 157,
+          "lines": 26369,
+          "directories": 45,
+          "empty_directories": 0
+        },
+        "server_main": {
+          "files": 6,
+          "lines": 983,
+          "directories": 9,
+          "empty_directories": 0
+        },
+        "rust_main_paths": {
+          "files": 27,
+          "lines": 12683,
+          "directories": 2,
+          "empty_directories": 0
+        },
+        "debug": {
+          "files": 22,
+          "lines": 4694,
+          "directories": 17,
+          "empty_directories": 0
+        },
+        "java_tests": {
+          "files": 15,
+          "lines": 1922,
+          "directories": 18,
+          "empty_directories": 0
+        },
+        "rust_test_files": {
+          "files": 6,
+          "lines": 1935,
+          "directories": 2,
+          "empty_directories": 0
+        },
+        "native_pressure": {
+          "files": 1,
+          "lines": 693,
+          "directories": 2,
+          "empty_directories": 0
+        },
+        "main_without_standalone_tests_pressure": {
+          "files": 183,
+          "lines": 37407,
+          "directories": 56,
+          "empty_directories": 0
+        },
+        "embedded_rust_tests": {
+          "lines": 1181,
+          "ranges": {
+            "rust-server/src/config.rs": [
+              {
+                "first": 96,
+                "last": 156,
+                "item": "mod tests {"
+              }
+            ],
+            "rust-server/src/anvil.rs": [
+              {
+                "first": 993,
+                "last": 995,
+                "item": "mod array_tests;"
+              },
+              {
+                "first": 997,
+                "last": 1099,
+                "item": "mod region_boundary_tests {"
+              }
+            ],
+            "rust-server/src/lod.rs": [
+              {
+                "first": 162,
+                "last": 182,
+                "item": "mod tests {"
+              }
+            ],
+            "rust-server/src/regional/service.rs": [
+              {
+                "first": 55,
+                "last": 75,
+                "item": "mod round_tests {"
+              }
+            ],
+            "rust-server/src/regional/store.rs": [
+              {
+                "first": 537,
+                "last": 538,
+                "item": "super::faults::hit(                       , path)?;"
+              },
+              {
+                "first": 540,
+                "last": 541,
+                "item": "super::faults::hit(                      , path)?;"
+              },
+              {
+                "first": 549,
+                "last": 550,
+                "item": "super::faults::hit(                , path)?;"
+              },
+              {
+                "first": 837,
+                "last": 1320,
+                "item": "mod tests {"
+              }
+            ],
+            "rust-server/src/regional/source.rs": [
+              {
+                "first": 165,
+                "last": 166,
+                "item": "super::faults::hit(                      , path)?;"
+              },
+              {
+                "first": 168,
+                "last": 169,
+                "item": "super::faults::hit(                     , path)?;"
+              },
+              {
+                "first": 232,
+                "last": 263,
+                "item": "mod tests {"
+              }
+            ],
+            "rust-server/src/regional/builder.rs": [
+              {
+                "first": 71,
+                "last": 72,
+                "item": "super::faults::hit(             , output.as_ref())?;"
+              },
+              {
+                "first": 265,
+                "last": 266,
+                "item": "super::faults::hit(      , output.as_ref())?;"
+              },
+              {
+                "first": 484,
+                "last": 485,
+                "item": "super::faults::hit(               , &source.root)?;"
+              },
+              {
+                "first": 502,
+                "last": 527,
+                "item": "mod tests {"
+              }
+            ],
+            "rust-server/src/regional/runtime.rs": [
+              {
+                "first": 108,
+                "last": 155,
+                "item": "fn refresh_order<T>("
+              },
+              {
+                "first": 157,
+                "last": 243,
+                "item": "mod order_tests {"
+              },
+              {
+                "first": 534,
+                "last": 537,
+                "item": "pub(crate) fn test_subscription_count(&self) -> usize {"
+              },
+              {
+                "first": 924,
+                "last": 925,
+                "item": "super::faults::hit(         , &self.terrain_path(coordinate))?;"
+              },
+              {
+                "first": 938,
+                "last": 939,
+                "item": "super::faults::hit(           , &self.terrain_path(coordinate))?;"
+              },
+              {
+                "first": 1344,
+                "last": 1345,
+                "item": "super::faults::hit(             , path)?;"
+              },
+              {
+                "first": 1354,
+                "last": 1355,
+                "item": "super::faults::hit(                , path)?;"
+              },
+              {
+                "first": 1360,
+                "last": 1362,
+                "item": "mod refresh_tests;"
+              }
+            ],
+            "rust-server/src/regional/section.rs": [
+              {
+                "first": 215,
+                "last": 428,
+                "item": "mod tests {"
+              }
+            ],
+            "rust-server/src/regional/mod.rs": [
+              {
+                "first": 14,
+                "last": 15,
+                "item": "mod air_lighting_tests;"
+              },
+              {
+                "first": 16,
+                "last": 17,
+                "item": "mod faults;"
+              },
+              {
+                "first": 18,
+                "last": 19,
+                "item": "mod payload_prototype_tests;"
+              },
+              {
+                "first": 20,
+                "last": 21,
+                "item": "mod refresh_measurements;"
+              }
+            ],
+            "rust-server/src/regional/index.rs": [
+              {
+                "first": 141,
+                "last": 182,
+                "item": "mod tests {"
+              }
+            ]
+          }
+        },
+        "release_source": {
+          "files": 183,
+          "lines": 36226,
+          "directories": 56,
+          "empty_directories": 0
+        },
+        "tools_runtime": {
+          "files": 8,
+          "lines": 1211,
+          "directories": 10,
+          "empty_directories": 0
+        },
+        "tools_tests": {
+          "files": 3,
+          "lines": 381,
+          "directories": 10,
+          "empty_directories": 0
+        },
+        "tools_all": {
+          "files": 11,
+          "lines": 1592,
+          "directories": 10,
+          "empty_directories": 0
+        },
+        "maintained_all_sources": {
+          "files": 238,
+          "lines": 48243,
+          "directories": 101,
+          "empty_directories": 0
+        },
+        "resources": {
+          "files": 12,
+          "text_lines": 1025,
+          "bytes": 96161
+        },
+        "shared_sources": {
+          "files": 11,
+          "lines": 947,
+          "directories": 21,
+          "empty_directories": 0
+        },
+        "maintained_plus_shared": {
+          "files": 249,
+          "lines": 49190,
+          "directories": 122,
+          "empty_directories": 0
+        }
+      },
+      "deltas": {
+        "plan_main_paths": {
+          "files": 2,
+          "lines": 2673,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "release_source": {
+          "files": 2,
+          "lines": 3204,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "debug": {
+          "files": 0,
+          "lines": 104,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "java_tests": {
+          "files": 0,
+          "lines": 0,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "tools_all": {
+          "files": -1,
+          "lines": -678,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "maintained_all_sources": {
+          "files": 1,
+          "lines": 2099,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "shared_sources": {
+          "files": 0,
+          "lines": 46,
+          "directories": 0,
+          "empty_directories": 0
+        },
+        "maintained_plus_shared": {
+          "files": 1,
+          "lines": 2145,
+          "directories": 0,
+          "empty_directories": 0
+        }
+      }
+    }
+  ],
+  "current_build": 255,
+  "matched_255_artifacts": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.255-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "c2b8340d6591907277b55c872203de47b7b47d53b8d6ef8eb745a91ab4125c6e",
+      "bytes": 4042183
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.255-beta+1.21.1-neoforge.jar",
+      "sha256": "a55456c47ed2bfeacca3915800f406273f20287a20d16dedbdd991f12f3de3a1",
+      "bytes": 3887435
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/rust-server/target/release/voxy-rust-server",
+      "sha256": "f5840addd21a7c1aa5df28df4392916b04c7487fb9ae18a1d5cc270d8a32bc29",
+      "bytes": 3418512
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.255-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "64140525aeb6534463fec485922fc1cb49c4bd7ff460140f8e474dd891953b78",
+      "bytes": 1745743
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.255-beta+1.21.1-neoforge.jar",
+      "sha256": "56347e9e4af7217be72b2eb0ea1c06f11b533d511b73294537743ff63b70f825",
+      "bytes": 1679733
+    }
+  ]
+}

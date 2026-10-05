@@ -45,6 +45,44 @@ pub struct RegionHeader {
     pub file_marker: u64,
 }
 
+/// Compact discovery metadata. Full headers and semantic source tables belong to one build.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegionAvailability {
+    pub file_marker: u64,
+    pub header_fingerprint: [u8; 16],
+    pub saved: [u64; 16],
+    pub readable: bool,
+}
+impl RegionAvailability {
+    pub fn same_inventory(&self, other: &Self) -> bool {
+        self.readable == other.readable && self.saved == other.saved
+    }
+
+    pub fn from_header(header: &RegionHeader) -> Self {
+        let mut saved = [0; 16];
+        for (slot, entry) in header.entries.iter().enumerate() {
+            if entry.location >> 8 != 0 && entry.location & 0xff != 0 {
+                saved[slot / 64] |= 1 << (slot % 64);
+            }
+        }
+        Self {
+            file_marker: header.file_marker,
+            header_fingerprint: header_fingerprint(&header.entries),
+            saved,
+            readable: true,
+        }
+    }
+}
+
+pub fn header_fingerprint(entries: &[RegionEntry]) -> [u8; 16] {
+    let mut hash = blake3::Hasher::new();
+    for entry in entries {
+        hash.update(&entry.location.to_le_bytes());
+        hash.update(&entry.timestamp.to_le_bytes());
+    }
+    hash.finalize().as_bytes()[..16].try_into().unwrap()
+}
+
 #[derive(Clone, Debug)]
 pub struct FailedRegion {
     pub path: PathBuf,
@@ -211,6 +249,56 @@ impl AnvilWorld {
         out.failed
             .sort_unstable_by_key(|header| (header.region_x, header.region_z));
         Ok(out)
+    }
+
+    /// Reconcile directory metadata once, reading a changed header only. Never retain all 8 KiB
+    /// headers or reread the entire directory after each individual regional publication.
+    pub fn region_inventory(
+        &self,
+        previous: &BTreeMap<(i32, i32), RegionAvailability>,
+    ) -> Result<BTreeMap<(i32, i32), RegionAvailability>> {
+        let directory = self.region_dir();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.root.is_dir() => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(error).context("enumerate saved Anvil regions"),
+        };
+        let mut inventory = BTreeMap::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(coordinate) = parse_region_filename(&path) else {
+                continue;
+            };
+            if !region_is_representable(coordinate.0, coordinate.1) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if metadata.len() == 0 {
+                continue;
+            }
+            let marker = region_file_marker(&metadata);
+            let availability = if let Some(old) = previous
+                .get(&coordinate)
+                .filter(|old| old.file_marker == marker && old.readable)
+            {
+                old.clone()
+            } else {
+                match read_region_header(&path, coordinate.0, coordinate.1) {
+                    Ok(header) => RegionAvailability::from_header(&header),
+                    Err(_) => RegionAvailability {
+                        file_marker: marker,
+                        header_fingerprint: [0; 16],
+                        saved: [0; 16],
+                        readable: false,
+                    },
+                }
+            };
+            inventory.insert(coordinate, availability);
+        }
+        Ok(inventory)
     }
 
     /// Captures one region immediately before an incremental build. This avoids coupling a

@@ -1,4 +1,4 @@
-//! Shared-port UDP routing and admission for each session's background IP downloads.
+//! Authenticated shared-port routing and IP download pacing before the QUIC handshake.
 use quinn::{AsyncUdpSocket, UdpPoller};
 use std::{
     collections::{HashMap, VecDeque},
@@ -56,40 +56,24 @@ impl Inbox {
     }
 }
 
-/// One physical listener carries plain foreground QUIC and token-framed background QUIC.
-/// Each background endpoint keeps its own transport, handshake and pacing clock.
+/// Only Java-registered, token-framed routes reach QUIC. Unknown UDP receives no response.
 #[derive(Debug)]
 pub struct UdpMux {
     physical: Arc<dyn AsyncUdpSocket>,
-    foreground: Arc<Inbox>,
     routes: Routes,
     receiver: tokio::task::AbortHandle,
 }
 impl UdpMux {
     pub fn new(physical: Arc<dyn AsyncUdpSocket>) -> Arc<Self> {
-        let foreground = Arc::new(Inbox::default());
         let routes = Arc::new(Mutex::new(HashMap::new()));
-        let receiver = tokio::spawn(receive(
-            physical.clone(),
-            foreground.clone(),
-            routes.clone(),
-        ));
+        let receiver = tokio::spawn(receive(physical.clone(), routes.clone()));
         Arc::new(Self {
             physical,
-            foreground,
             routes,
             receiver: receiver.abort_handle(),
         })
     }
-    pub fn foreground(self: &Arc<Self>) -> Arc<dyn AsyncUdpSocket> {
-        Arc::new(RoutedSocket {
-            mux: self.clone(),
-            inbox: self.foreground.clone(),
-            route: None,
-            transmit: Mutex::new(Vec::new()),
-        })
-    }
-    pub fn background(self: &Arc<Self>, token: &[u8; 32]) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+    pub fn route(self: &Arc<Self>, token: &[u8; 32]) -> io::Result<Arc<dyn AsyncUdpSocket>> {
         let route: Route = token[..ENVELOPE_BYTES - 1].try_into().unwrap();
         let inbox = Arc::new(Inbox::default());
         let mut routes = self.routes.lock().expect("UDP route owner poisoned");
@@ -103,7 +87,7 @@ impl UdpMux {
         Ok(Arc::new(RoutedSocket {
             mux: self.clone(),
             inbox,
-            route: Some(route),
+            route,
             transmit: Mutex::new(Vec::new()),
         }))
     }
@@ -114,7 +98,7 @@ impl Drop for UdpMux {
     }
 }
 
-async fn receive(physical: Arc<dyn AsyncUdpSocket>, foreground: Arc<Inbox>, routes: Routes) {
+async fn receive(physical: Arc<dyn AsyncUdpSocket>, routes: Routes) {
     // Sized from the UDP wire limit and the physical socket's GRO capability, not workload.
     let mut bytes = vec![0u8; u16::MAX as usize * physical.max_receive_segments().max(1)];
     let error = loop {
@@ -129,9 +113,7 @@ async fn receive(physical: Arc<dyn AsyncUdpSocket>, foreground: Arc<Inbox>, rout
         }
         let meta = metadata[0];
         for packet in bytes[..meta.len].chunks(meta.stride.max(1)) {
-            // QUIC bit greasing allows plain short headers to start with zero too.
-            // A registered session token, not the marker alone, identifies our envelope.
-            let background = if packet.first() == Some(&0) && packet.len() > ENVELOPE_BYTES {
+            let destination = if packet.first() == Some(&0) && packet.len() > ENVELOPE_BYTES {
                 let route: Route = packet[1..ENVELOPE_BYTES].try_into().unwrap();
                 routes
                     .lock()
@@ -141,10 +123,8 @@ async fn receive(physical: Arc<dyn AsyncUdpSocket>, foreground: Arc<Inbox>, rout
             } else {
                 None
             };
-            let (inbox, payload) = match background {
-                Some(inbox) => (inbox, &packet[ENVELOPE_BYTES..]),
-                None => (foreground.clone(), packet),
-            };
+            let Some(inbox) = destination else { continue };
+            let payload = &packet[ENVELOPE_BYTES..];
             inbox.deliver(Packet {
                 bytes: payload.into(),
                 meta: quinn::udp::RecvMeta {
@@ -156,7 +136,6 @@ async fn receive(physical: Arc<dyn AsyncUdpSocket>, foreground: Arc<Inbox>, rout
         }
     };
     eprintln!("Voxy UDP listener failed: {error}");
-    foreground.fail(error.kind());
     for inbox in routes
         .lock()
         .expect("UDP route owner poisoned")
@@ -171,18 +150,16 @@ async fn receive(physical: Arc<dyn AsyncUdpSocket>, foreground: Arc<Inbox>, rout
 struct RoutedSocket {
     mux: Arc<UdpMux>,
     inbox: Arc<Inbox>,
-    route: Option<Route>,
+    route: Route,
     transmit: Mutex<Vec<u8>>,
 }
 impl Drop for RoutedSocket {
     fn drop(&mut self) {
-        if let Some(route) = self.route {
-            self.mux
-                .routes
-                .lock()
-                .expect("UDP route owner poisoned")
-                .remove(&route);
-        }
+        self.mux
+            .routes
+            .lock()
+            .expect("UDP route owner poisoned")
+            .remove(&self.route);
     }
 }
 impl AsyncUdpSocket for RoutedSocket {
@@ -190,9 +167,6 @@ impl AsyncUdpSocket for RoutedSocket {
         self.mux.physical.clone().create_io_poller()
     }
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
-        let Some(route) = self.route else {
-            return self.mux.physical.try_send(transmit);
-        };
         if transmit
             .segment_size
             .is_some_and(|size| size < transmit.contents.len())
@@ -205,7 +179,7 @@ impl AsyncUdpSocket for RoutedSocket {
         let mut bytes = self.transmit.lock().expect("UDP transmit owner poisoned");
         bytes.clear();
         bytes.push(0);
-        bytes.extend_from_slice(&route);
+        bytes.extend_from_slice(&self.route);
         bytes.extend_from_slice(transmit.contents);
         self.mux.physical.try_send(&quinn::udp::Transmit {
             contents: &bytes,
@@ -246,11 +220,7 @@ impl AsyncUdpSocket for RoutedSocket {
         self.mux.physical.local_addr()
     }
     fn max_transmit_segments(&self) -> usize {
-        if self.route.is_some() {
-            1
-        } else {
-            self.mux.physical.max_transmit_segments()
-        }
+        1
     }
     fn max_receive_segments(&self) -> usize {
         1
@@ -285,23 +255,19 @@ impl RateLedger {
         })
     }
     pub fn update(&self, kbps: u64) {
-        let mut clock = self.clock.lock().expect("background rate owner poisoned");
+        let mut clock = self.clock.lock().expect("download rate owner poisoned");
         let now = Instant::now();
         let rate = kbps * 125;
         // Retain existing pacing debt when changing a live finite rate; never grant idle credit.
         let remaining = clock.next.saturating_duration_since(now).as_nanos();
-        let debt = if rate != 0 && clock.rate != 0 {
-            remaining * clock.rate as u128 / rate as u128
-        } else {
-            0
-        };
+        let debt = remaining * clock.rate as u128 / rate as u128;
         clock.rate = rate;
         clock.next = now + Duration::from_nanos(debt.min(u64::MAX as u128) as u64);
         drop(clock);
         self.changed.notify_waiters();
     }
     pub fn counters(&self) -> (u64, u64) {
-        let clock = self.clock.lock().expect("background rate owner poisoned");
+        let clock = self.clock.lock().expect("download rate owner poisoned");
         (clock.bytes, clock.datagrams)
     }
 }
@@ -330,9 +296,9 @@ impl AsyncUdpSocket for PacedSocket {
             .ledger
             .clock
             .lock()
-            .expect("background rate owner poisoned");
+            .expect("download rate owner poisoned");
         let now = Instant::now();
-        if clock.rate != 0 && now < clock.next {
+        if now < clock.next {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         // max_transmit_segments=1: exactly one unfragmented IP/UDP datagram per submission.
@@ -345,10 +311,8 @@ impl AsyncUdpSocket for PacedSocket {
         self.inner.try_send(transmit)?;
         clock.bytes = clock.bytes.saturating_add(cost);
         clock.datagrams = clock.datagrams.saturating_add(1);
-        if clock.rate != 0 {
-            let nanos = (cost as u128 * 1_000_000_000).div_ceil(clock.rate as u128);
-            clock.next = now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
-        }
+        let nanos = (cost as u128 * 1_000_000_000).div_ceil(clock.rate as u128);
+        clock.next = now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
         Ok(())
     }
     fn poll_recv(
@@ -388,16 +352,16 @@ impl UdpPoller for PacedPoller {
                 self.changed = Box::pin(self.socket.ledger.changed.clone().notified_owned());
                 continue;
             }
-            let (rate, next) = {
+            let next = {
                 let clock = self
                     .socket
                     .ledger
                     .clock
                     .lock()
-                    .expect("background rate owner poisoned");
-                (clock.rate, clock.next)
+                    .expect("download rate owner poisoned");
+                clock.next
             };
-            if rate == 0 || Instant::now() >= next {
+            if Instant::now() >= next {
                 return self.inner.as_mut().poll_writable(cx);
             }
             self.timer.as_mut().reset(next);

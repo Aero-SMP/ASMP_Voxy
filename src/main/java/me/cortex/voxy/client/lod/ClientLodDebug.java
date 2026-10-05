@@ -13,6 +13,7 @@ public final class ClientLodDebug {
     static void init(IEventBus modBus) {}
     static void tick() {}
     static boolean connectionAllowed() { return true; }
+    static java.nio.file.Path cacheRoot(java.nio.file.Path normal) { return normal; }
     static java.nio.file.Path cacheNamespace(java.nio.file.Path normal) { return normal; }
     static boolean cacheDeletionAllowed(java.nio.file.Path path) { return true; }
     static void inventoryDelay(java.nio.file.Path root) throws java.io.IOException {}

@@ -1,0 +1,16 @@
+[
+  {
+    "repository": "ASMP_Voxy",
+    "statusSha256": "13750d2cef065e86b02882791662a025efc093b87c7c8136d2ec67e9313882ac",
+    "statusLines": 3,
+    "scope": "git status --porcelain=v1 --untracked-files=all",
+    "taskMutation": "No source or worktree file changes; shared Git objects/ref updated only for feature-branch work"
+  },
+  {
+    "repository": "ASMP_Voxy_Restart",
+    "statusSha256": "18b49fb412591bd6b6b023e37eb4b496136819c76c5c83c9d9cf6bae8a3348be",
+    "statusLines": 1130,
+    "scope": "git status --porcelain=v1 --untracked-files=all",
+    "taskMutation": "No source or worktree file changes; shared Git objects/ref updated only for feature-branch work"
+  }
+]

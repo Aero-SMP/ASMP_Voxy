@@ -20,6 +20,25 @@ final class CompletedSectionCache implements AutoCloseable {
         this.root = metadata.namespace(world, dimension); this.budget.retain();
     }
     Path path(long region) { return this.root.resolve("r." + (int) region + "." + (int) (region >>> 32) + ".vxlocal"); }
+    RegionalDiskBudget.Admission canAdmit(long key, long estimatedBytes) {
+        long binding = CompletedSectionJournal.FRAME_BYTES + CompletedSectionJournal.BINDING_BYTES + CompletedSectionJournal.FOOTER_BYTES;
+        return this.budget.admission(path(region(key)), Math.max(binding, estimatedBytes));
+    }
+    boolean canDownload() { return this.metadata.canDownload(); }
+    private static long region(long key) {
+        int shift = me.cortex.voxy.client.core.rendering.SectionKey.MAX_LOD_LAYER
+                - me.cortex.voxy.client.core.rendering.SectionKey.level(key);
+        return Integer.toUnsignedLong(me.cortex.voxy.client.core.rendering.SectionKey.x(key) >> shift)
+                | (long) (me.cortex.voxy.client.core.rendering.SectionKey.z(key) >> shift) << 32;
+    }
+    LocalSection binding(long key) throws IOException {
+        long region = region(key);
+        var acquired = acquire(region);
+        try (var pin = acquired) {
+            var journal = this.budget.journal(path(region), this.world, region, false);
+            return journal == null ? null : journal.binding(key);
+        } finally { released(); }
+    }
     private synchronized RegionalDiskBudget.Pin acquire(long region) throws IOException {
         if (this.closed) throw new IOException("closed section cache");
         var pin = this.budget.pin(path(region)); this.operations++; return pin;
@@ -39,10 +58,15 @@ final class CompletedSectionCache implements AutoCloseable {
         if (this.retained.remove(region)) this.budget.releaseDirectory(path(region));
     }
     Map<Long, LocalSection> directorySnapshot(long region) throws IOException {
+        return inspectDirectory(region).sections();
+    }
+    record Directory(Map<Long, LocalSection> sections, long namedBytes) {}
+    Directory inspectDirectory(long region) throws IOException {
         var acquired = acquire(region);
         try (var pin = acquired) {
             var journal = this.budget.journal(path(region), this.world, region, false);
-            return journal == null ? Map.of() : journal.directory();
+            if (journal == null) return new Directory(new java.util.HashMap<>(), 0);
+            synchronized (journal) { return new Directory(journal.directory(), journal.currentNamedBytes()); }
         } finally { released(); }
     }
     LocalSection previous(LocalSection section) throws IOException {
@@ -88,8 +112,6 @@ final class CompletedSectionCache implements AutoCloseable {
         try {
             if (section.kind() == LocalSection.DATA) encoder = codec.encode(canonical, source);
             var journal = this.budget.journal(path(region), this.world, region, true);
-            // A full shard is rotated only when its actual next record cannot fit, never using
-            // the maximum possible extent for every small record. Save retries own conversion.
             return new Save(section, encoder, journal.begin(section, encoder, space(region), current), pin, releaseWriter);
         } catch (Throwable failure) {
             if (encoder != null) encoder.close();
@@ -104,17 +126,20 @@ final class CompletedSectionCache implements AutoCloseable {
         try (var writer = writer(section.region(), current)) {
             this.budget.awaitReady(current);
             ClientLodDebug.workerStage(debugWork, "SAVE_ENCODE_WRITE");
+            boolean compacted = false;
             while (true) {
                 RegionalDiskBudget.checkCurrent(current);
                 try (var save = beginOwned(section, codec, canonical, source, current, null)) {
                     while (!save.step()) RegionalDiskBudget.checkCurrent(current);
-                    RegionalDiskBudget.checkCurrent(current);
                     return;
-                } catch (CompletedSectionJournal.RotationRequired full) {
-                    // beginOwned/Save have released this writer's old-file pin and partial tail.
-                    writer.owned.rotate(current);
+                } catch (RegionalDiskBudget.Capacity full) {
+                    if (full.reason != RegionalDiskBudget.Admission.QUOTA || compacted
+                            || !writer.owned.compact(this.world, section.region(), current)) throw full;
+                    compacted = true;
                 }
             }
+        } catch (IOException failure) {
+            this.budget.writeFailure(path(section.region()), failure); throw failure;
         }
     }
     private CompletedSectionJournal.Space space(long region) {
@@ -171,9 +196,6 @@ final class CompletedSectionCache implements AutoCloseable {
                 var journal = this.budget.journal(path(region), this.world, region, false);
                 if (journal == null || !journal.hasBindings()) return RegionalMetadataStore.Persistence.PERSISTED;
                 try (var append = journal.begin(null, null, space(region), current)) { while (!append.step()) {} }
-            } catch (CompletedSectionJournal.RotationRequired full) {
-                // The try-with-resources pin has drained before exact-incarnation retirement.
-                writer.owned.rotate(current);
             } finally { released(); }
         }
         return RegionalMetadataStore.Persistence.PERSISTED;

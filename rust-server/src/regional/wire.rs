@@ -6,12 +6,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"voxy-region-cache-start";
 pub const STREAM_CONTROL: u8 = 0;
 pub const STREAM_SECTION_LANE: u8 = 1;
-pub const STREAM_BACKGROUND: u8 = 2;
+pub const STREAM_DISCOVERY: u8 = 2;
 pub const MAX_DIMENSION_BYTES: usize = 1024;
 pub const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SECTION_COMPRESSED_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SECTION_REQUESTS: usize = u16::MAX as usize;
 pub const RECORD_DESCRIPTOR_BYTES: usize = 88;
+pub const RECORD_SCOPE_BYTES: usize = 36;
 pub const S_RECORD: u8 = 0x85;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,15 +36,16 @@ impl TryFrom<u8> for PriorityLane {
 pub struct StreamingSettings {
     pub interval_millis: u64,
     pub bandwidth_kbps: u64,
+    pub refresh_allowed: bool,
 }
 impl StreamingSettings {
     pub fn validate(self) -> Result<()> {
         if self.interval_millis < 1000 {
             bail!("terrain update interval must be at least one second");
         }
-        self.bandwidth_kbps
-            .checked_mul(125)
-            .ok_or_else(|| anyhow::anyhow!("background rate overflow"))?;
+        if !(100..=10_000).contains(&self.bandwidth_kbps) {
+            bail!("total download rate must be 100 through 10000 kbps");
+        }
         if self.interval_millis > u64::MAX / 1_000_000 {
             bail!("terrain interval overflow");
         }
@@ -62,6 +64,39 @@ pub struct ContentBinding {
     pub compressed_crc: u32,
 }
 impl ContentBinding {
+    pub fn from_entry(entry: super::RegionSectionEntry, catalog_fingerprint: [u8; 32]) -> Self {
+        if !entry.is_present() {
+            return Self::default();
+        }
+        Self {
+            // Storage EMPTY describes geometry. Wire EMPTY means there is no payload;
+            // air with lighting or biomes must retain its full DATA body.
+            flags: Self::wire_flags(true, entry.has_payload()),
+            children: entry.non_empty_children,
+            catalog_fingerprint,
+            fingerprint: entry.fingerprint,
+            compressed_length: entry.compressed_length,
+            canonical_length: entry.canonical_length,
+            compressed_crc: entry.compressed_crc,
+        }
+    }
+    fn wire_flags(present: bool, body: bool) -> u16 {
+        if !present {
+            0
+        } else if body {
+            0x8000
+        } else {
+            0x8001
+        }
+    }
+    fn validate_flags(self) -> Result<()> {
+        let present = self.flags & 0x8000 != 0;
+        if self.flags != Self::wire_flags(present, self.has_body()) || (!present && self.has_body())
+        {
+            bail!("terrain binding flags disagree with payload");
+        }
+        Ok(())
+    }
     pub fn has_body(self) -> bool {
         self.compressed_length != 0
     }
@@ -80,15 +115,17 @@ pub struct Desire {
     pub key: u64,
     /// Coverage/refinement are misses; interest-only keeps adequate cached terrain current.
     pub purpose: u8,
+    pub rank: u64,
     pub have: Option<ContentBinding>,
 }
 impl Desire {
     fn validate(self) -> Result<()> {
-        if self.ticket == 0 || self.purpose > 2 {
+        if self.ticket == 0 || self.purpose > 4 || self.rank == 0 {
             bail!("invalid terrain desire");
         }
         SectionKey::unpack(self.key)?;
         if let Some(have) = self.have {
+            have.validate_flags()?;
             if have.flags & !0x8001 != 0
                 || have.compressed_length as usize > MAX_SECTION_COMPRESSED_BYTES
             {
@@ -99,31 +136,84 @@ impl Desire {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopedDesire {
+    pub dimension: u32,
+    pub expected_world: [u8; 32],
+    pub desire: Desire,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ScopedKey {
+    pub dimension: u32,
+    pub key: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DimensionAnchor {
+    pub dimension: u32,
+    pub x: i32,
+    pub z: i32,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct DimensionMetadata {
+    pub id: u32,
+    pub name: String,
+    pub world_identity: [u8; 32],
+    pub min_section_y: i32,
+    pub section_count: u32,
+    pub custom_border: bool,
+    pub center_x: f64,
+    pub center_z: f64,
+    pub size: f64,
+    pub catalog_id: u64,
+    pub catalog_fingerprint: [u8; 32],
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InventoryRecord {
+    pub dimension: u32,
+    pub revision: u64,
+    /// 0 begin, 1 saved, 2 unreadable, 3 removed, 4 complete, 5 inventory failure.
+    pub state: u8,
+    pub x: i32,
+    pub z: i32,
+    pub saved: [u64; 16],
+}
+#[derive(Clone, Debug, PartialEq)]
 pub enum ControlMessage {
     Open {
         dimension: String,
         expected_world: [u8; 32],
         held_catalog: [u8; 32],
         settings: StreamingSettings,
+        anchor_x: i32,
+        anchor_z: i32,
         desires: Vec<Desire>,
     },
-    Desires(Vec<Desire>),
-    Drop(Vec<u64>),
-    Settings(StreamingSettings),
+    Desires(Vec<ScopedDesire>),
+    Drop(Vec<ScopedKey>),
+    Settings {
+        settings: StreamingSettings,
+        active_dimension: u32,
+        anchors: Vec<DimensionAnchor>,
+    },
     ServerHello {
         server_instance: u64,
+        active_dimension: u32,
         world_identity: [u8; 32],
         catalog_id: u64,
         catalog_fingerprint: [u8; 32],
-        background_token: [u8; 32],
     },
+    Manifest(Vec<DimensionMetadata>),
+    Inventory(InventoryRecord),
     Catalog {
+        dimension: u32,
+        world_identity: [u8; 32],
         fingerprint: [u8; 32],
         canonical_length: u32,
         compressed: Vec<u8>,
     },
     Record {
+        dimension: u32,
+        world_identity: [u8; 32],
         descriptor: RecordDescriptor,
         compressed: Vec<u8>,
     },
@@ -172,6 +262,7 @@ impl RecordDescriptor {
             bail!("zero terrain ownership ticket");
         }
         SectionKey::unpack(self.key)?;
+        self.binding.validate_flags()?;
         if self.binding.compressed_length as usize > MAX_SECTION_COMPRESSED_BYTES {
             bail!("oversized terrain record");
         }
@@ -208,54 +299,104 @@ pub fn encode_control_record(message: &ControlMessage) -> Result<Vec<u8>> {
             expected_world,
             held_catalog,
             settings,
+            anchor_x,
+            anchor_z,
             desires,
         } => {
             put_string(&mut payload, dimension, MAX_DIMENSION_BYTES)?;
             payload.extend_from_slice(expected_world);
             payload.extend_from_slice(held_catalog);
             put_settings(&mut payload, *settings)?;
+            payload.extend_from_slice(&anchor_x.to_le_bytes());
+            payload.extend_from_slice(&anchor_z.to_le_bytes());
             put_desires(&mut payload, desires)?;
             0x01
         }
         ControlMessage::Desires(desires) => {
-            put_desires(&mut payload, desires)?;
+            put_count(&mut payload, desires.len())?;
+            for scoped in desires {
+                payload.extend_from_slice(&scoped.dimension.to_le_bytes());
+                payload.extend_from_slice(&scoped.expected_world);
+                put_desire(&mut payload, scoped.desire)?;
+            }
             0x02
         }
         ControlMessage::Drop(keys) => {
             put_count(&mut payload, keys.len())?;
-            for key in keys {
-                SectionKey::unpack(*key)?;
-                payload.extend_from_slice(&key.to_le_bytes());
+            for scoped in keys {
+                SectionKey::unpack(scoped.key)?;
+                payload.extend_from_slice(&scoped.dimension.to_le_bytes());
+                payload.extend_from_slice(&scoped.key.to_le_bytes());
             }
             0x04
         }
-        ControlMessage::Settings(settings) => {
+        ControlMessage::Settings {
+            settings,
+            active_dimension,
+            anchors,
+        } => {
             put_settings(&mut payload, *settings)?;
+            payload.extend_from_slice(&active_dimension.to_le_bytes());
+            put_count(&mut payload, anchors.len())?;
+            for anchor in anchors {
+                payload.extend_from_slice(&anchor.dimension.to_le_bytes());
+                payload.extend_from_slice(&anchor.x.to_le_bytes());
+                payload.extend_from_slice(&anchor.z.to_le_bytes());
+            }
             0x05
         }
         ControlMessage::ServerHello {
             server_instance,
+            active_dimension,
             world_identity,
             catalog_id,
             catalog_fingerprint,
-            background_token,
         } => {
-            if *server_instance == 0 || *catalog_id == 0 || *world_identity == [0; 32] {
-                bail!("invalid server identity");
-            }
             payload.extend_from_slice(&server_instance.to_le_bytes());
+            payload.extend_from_slice(&active_dimension.to_le_bytes());
             payload.extend_from_slice(world_identity);
             payload.extend_from_slice(&catalog_id.to_le_bytes());
             payload.extend_from_slice(catalog_fingerprint);
-            payload.extend_from_slice(background_token);
             0x81
         }
+        ControlMessage::Manifest(dimensions) => {
+            put_count(&mut payload, dimensions.len())?;
+            for d in dimensions {
+                payload.extend_from_slice(&d.id.to_le_bytes());
+                put_string(&mut payload, &d.name, MAX_DIMENSION_BYTES)?;
+                payload.extend_from_slice(&d.world_identity);
+                payload.extend_from_slice(&d.min_section_y.to_le_bytes());
+                payload.extend_from_slice(&d.section_count.to_le_bytes());
+                payload.push(u8::from(d.custom_border));
+                payload.extend_from_slice(&d.center_x.to_le_bytes());
+                payload.extend_from_slice(&d.center_z.to_le_bytes());
+                payload.extend_from_slice(&d.size.to_le_bytes());
+                payload.extend_from_slice(&d.catalog_id.to_le_bytes());
+                payload.extend_from_slice(&d.catalog_fingerprint);
+            }
+            0x82
+        }
+        ControlMessage::Inventory(record) => {
+            payload.extend_from_slice(&record.dimension.to_le_bytes());
+            payload.extend_from_slice(&record.revision.to_le_bytes());
+            payload.push(record.state);
+            payload.extend_from_slice(&record.x.to_le_bytes());
+            payload.extend_from_slice(&record.z.to_le_bytes());
+            for bits in record.saved {
+                payload.extend_from_slice(&bits.to_le_bytes());
+            }
+            0x84
+        }
         ControlMessage::Catalog {
+            dimension,
+            world_identity,
             fingerprint,
             canonical_length,
             compressed,
         } => {
             validate_catalog(*fingerprint, *canonical_length, compressed.len())?;
+            payload.extend_from_slice(&dimension.to_le_bytes());
+            payload.extend_from_slice(world_identity);
             payload.extend_from_slice(fingerprint);
             payload.extend_from_slice(&canonical_length.to_le_bytes());
             payload.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
@@ -263,9 +404,13 @@ pub fn encode_control_record(message: &ControlMessage) -> Result<Vec<u8>> {
             0x83
         }
         ControlMessage::Record {
+            dimension,
+            world_identity,
             descriptor,
             compressed,
         } => {
+            payload.extend_from_slice(&dimension.to_le_bytes());
+            payload.extend_from_slice(world_identity);
             payload.extend_from_slice(&descriptor.encode()?);
             if descriptor.status == RecordStatus::Data {
                 if compressed.len() != descriptor.binding.compressed_length as usize {
@@ -301,6 +446,21 @@ pub fn encode_control_record(message: &ControlMessage) -> Result<Vec<u8>> {
 }
 
 pub async fn read_control<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<ControlMessage>> {
+    read_control_frame(input, None).await
+}
+
+pub async fn read_control_traced<R: AsyncRead + Unpin>(
+    input: &mut R,
+    session: u64,
+    public_route: &str,
+) -> Result<Option<ControlMessage>> {
+    read_control_frame(input, Some((session, public_route))).await
+}
+
+async fn read_control_frame<R: AsyncRead + Unpin>(
+    input: &mut R,
+    trace: Option<(u64, &str)>,
+) -> Result<Option<ControlMessage>> {
     let kind = match input.read_u8().await {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -310,22 +470,41 @@ pub async fn read_control<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<
     if length > maximum_payload(kind)? {
         bail!("control length exceeds its structural frame shape");
     }
+    if let Some((session, route)) = trace {
+        eprintln!(
+            "VOXY_BOOTSTRAP stage=OPEN_HEADER session={session} route={route} kind={kind} frame_bytes={length}"
+        );
+    }
     let mut bytes = vec![0; length];
-    input.read_exact(&mut bytes).await?;
+    let mut received = 0;
+    while received < length {
+        let count = input.read(&mut bytes[received..]).await?;
+        if count == 0 {
+            bail!("control frame ended after {received} of {length} bytes")
+        }
+        received += count;
+        if let Some((session, route)) = trace {
+            eprintln!(
+                "VOXY_BOOTSTRAP stage=OPEN_BODY session={session} route={route} received_bytes={received} frame_bytes={length}"
+            );
+        }
+    }
     decode_control_payload(kind, &bytes).map(Some)
 }
 
 fn maximum_payload(kind: u8) -> Result<usize> {
     Ok(match kind {
-        0x01 => 2 + MAX_DIMENSION_BYTES + 64 + 16 + 2 + MAX_SECTION_REQUESTS * 81,
-        0x02 => 2 + MAX_SECTION_REQUESTS * 81,
-        0x04 => 2 + MAX_SECTION_REQUESTS * 8,
-        0x05 => 16,
-        0x81 => 112,
+        0x01 => 2 + MAX_DIMENSION_BYTES + 64 + 25 + 2 + MAX_SECTION_REQUESTS * 89,
+        0x02 => 2 + MAX_SECTION_REQUESTS * 125,
+        0x04 => 2 + MAX_SECTION_REQUESTS * 12,
+        0x05 => 23 + MAX_SECTION_REQUESTS * 12,
+        0x81 => 84,
+        0x82 => 2 + MAX_SECTION_REQUESTS * (2 + MAX_DIMENSION_BYTES + 109),
+        0x84 => 149,
         0x83 => zstd::zstd_safe::compress_bound(MAX_CATALOG_BYTES)
-            .checked_add(40)
+            .checked_add(76)
             .context("catalog frame extent overflow")?,
-        S_RECORD => RECORD_DESCRIPTOR_BYTES + MAX_SECTION_COMPRESSED_BYTES,
+        S_RECORD => RECORD_SCOPE_BYTES + RECORD_DESCRIPTOR_BYTES + MAX_SECTION_COMPRESSED_BYTES,
         0xfe => 4100,
         0xff => 4098,
         _ => bail!("unknown control record {kind:#04x}"),
@@ -352,42 +531,120 @@ pub fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> 
             expected_world: take(&mut input, 32)?.try_into().unwrap(),
             held_catalog: take(&mut input, 32)?.try_into().unwrap(),
             settings: take_settings(&mut input)?,
+            anchor_x: take_i32(&mut input)?,
+            anchor_z: take_i32(&mut input)?,
             desires: take_desires(&mut input)?,
         },
-        0x02 => ControlMessage::Desires(take_desires(&mut input)?),
-        0x04 => {
-            let count = take_u16(&mut input)? as usize;
-            if count > input.len() / 8 {
-                bail!("truncated releases");
-            }
-            let mut keys = Vec::with_capacity(count);
+        0x02 => {
+            let count = take_u16(&mut input)?;
+            let mut desires = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                let key = take_u64(&mut input)?;
-                SectionKey::unpack(key)?;
-                keys.push(key);
+                desires.push(ScopedDesire {
+                    dimension: take_u32(&mut input)?,
+                    expected_world: take(&mut input, 32)?.try_into().unwrap(),
+                    desire: take_desire(&mut input)?,
+                });
+            }
+            ControlMessage::Desires(desires)
+        }
+        0x04 => {
+            let count = take_u16(&mut input)?;
+            let mut keys = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let scoped = ScopedKey {
+                    dimension: take_u32(&mut input)?,
+                    key: take_u64(&mut input)?,
+                };
+                SectionKey::unpack(scoped.key)?;
+                keys.push(scoped);
             }
             ControlMessage::Drop(keys)
         }
-        0x05 => ControlMessage::Settings(take_settings(&mut input)?),
+        0x05 => {
+            let settings = take_settings(&mut input)?;
+            let active_dimension = take_u32(&mut input)?;
+            let count = take_u16(&mut input)?;
+            let mut anchors = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                anchors.push(DimensionAnchor {
+                    dimension: take_u32(&mut input)?,
+                    x: take_i32(&mut input)?,
+                    z: take_i32(&mut input)?,
+                });
+            }
+            ControlMessage::Settings {
+                settings,
+                active_dimension,
+                anchors,
+            }
+        }
         0x81 => ControlMessage::ServerHello {
             server_instance: take_u64(&mut input)?,
+            active_dimension: take_u32(&mut input)?,
             world_identity: take(&mut input, 32)?.try_into().unwrap(),
             catalog_id: take_u64(&mut input)?,
             catalog_fingerprint: take(&mut input, 32)?.try_into().unwrap(),
-            background_token: take(&mut input, 32)?.try_into().unwrap(),
         },
+        0x82 => {
+            let count = take_u16(&mut input)?;
+            let mut dimensions = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                dimensions.push(DimensionMetadata {
+                    id: take_u32(&mut input)?,
+                    name: take_string(&mut input, MAX_DIMENSION_BYTES)?,
+                    world_identity: take(&mut input, 32)?.try_into().unwrap(),
+                    min_section_y: take_i32(&mut input)?,
+                    section_count: take_u32(&mut input)?,
+                    custom_border: take_bool(&mut input)?,
+                    center_x: take_f64(&mut input)?,
+                    center_z: take_f64(&mut input)?,
+                    size: take_f64(&mut input)?,
+                    catalog_id: take_u64(&mut input)?,
+                    catalog_fingerprint: take(&mut input, 32)?.try_into().unwrap(),
+                });
+            }
+            ControlMessage::Manifest(dimensions)
+        }
+        0x84 => {
+            let dimension = take_u32(&mut input)?;
+            let revision = take_u64(&mut input)?;
+            let state = take_u8(&mut input)?;
+            if state > 5 {
+                bail!("invalid inventory state");
+            }
+            let x = take_i32(&mut input)?;
+            let z = take_i32(&mut input)?;
+            let mut saved = [0; 16];
+            for bits in &mut saved {
+                *bits = take_u64(&mut input)?;
+            }
+            ControlMessage::Inventory(InventoryRecord {
+                dimension,
+                revision,
+                state,
+                x,
+                z,
+                saved,
+            })
+        }
         0x83 => {
+            let dimension = take_u32(&mut input)?;
+            let world_identity = take(&mut input, 32)?.try_into().unwrap();
             let fingerprint = take(&mut input, 32)?.try_into().unwrap();
             let canonical_length = take_u32(&mut input)?;
             let size = take_u32(&mut input)? as usize;
             validate_catalog(fingerprint, canonical_length, size)?;
             ControlMessage::Catalog {
+                dimension,
+                world_identity,
                 fingerprint,
                 canonical_length,
                 compressed: take(&mut input, size)?.to_vec(),
             }
         }
         S_RECORD => {
+            let dimension = take_u32(&mut input)?;
+            let world_identity = take(&mut input, 32)?.try_into().unwrap();
             let descriptor = RecordDescriptor::decode(take(&mut input, RECORD_DESCRIPTOR_BYTES)?)?;
             let compressed = if descriptor.status == RecordStatus::Data {
                 take(&mut input, descriptor.binding.compressed_length as usize)?.to_vec()
@@ -395,6 +652,8 @@ pub fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> 
                 Vec::new()
             };
             ControlMessage::Record {
+                dimension,
+                world_identity,
                 descriptor,
                 compressed,
             }
@@ -416,6 +675,8 @@ pub fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> 
 
 pub async fn write_record<W: AsyncWrite + Unpin>(
     out: &mut W,
+    dimension: u32,
+    world_identity: [u8; 32],
     descriptor: RecordDescriptor,
     body: &[u8],
 ) -> Result<()> {
@@ -429,7 +690,10 @@ pub async fn write_record<W: AsyncWrite + Unpin>(
         bail!("terrain body size mismatch");
     }
     out.write_u8(S_RECORD).await?;
-    out.write_u32_le((header.len() + body.len()) as u32).await?;
+    out.write_u32_le((RECORD_SCOPE_BYTES + header.len() + body.len()) as u32)
+        .await?;
+    out.write_u32_le(dimension).await?;
+    out.write_all(&world_identity).await?;
     out.write_all(&header).await?;
     out.write_all(body).await?;
     Ok(())
@@ -472,12 +736,14 @@ fn put_settings(out: &mut Vec<u8>, settings: StreamingSettings) -> Result<()> {
     settings.validate()?;
     out.extend_from_slice(&settings.interval_millis.to_le_bytes());
     out.extend_from_slice(&settings.bandwidth_kbps.to_le_bytes());
+    out.push(u8::from(settings.refresh_allowed));
     Ok(())
 }
 fn take_settings(input: &mut &[u8]) -> Result<StreamingSettings> {
     let settings = StreamingSettings {
         interval_millis: take_u64(input)?,
         bandwidth_kbps: take_u64(input)?,
+        refresh_allowed: take_bool(input)?,
     };
     settings.validate()?;
     Ok(settings)
@@ -505,40 +771,59 @@ fn take_binding(input: &mut &[u8]) -> Result<ContentBinding> {
 fn put_desires(out: &mut Vec<u8>, desires: &[Desire]) -> Result<()> {
     put_count(out, desires.len())?;
     for desire in desires {
-        desire.validate()?;
-        out.extend_from_slice(&desire.ticket.to_le_bytes());
-        out.extend_from_slice(&desire.key.to_le_bytes());
-        out.push(desire.purpose);
-        out.push(u8::from(desire.have.is_some()));
-        if let Some(have) = desire.have {
-            put_binding(out, have);
-        }
+        put_desire(out, *desire)?;
     }
+    Ok(())
+}
+fn put_desire(out: &mut Vec<u8>, desire: Desire) -> Result<()> {
+    desire.validate()?;
+    out.extend_from_slice(&desire.ticket.to_le_bytes());
+    out.extend_from_slice(&desire.key.to_le_bytes());
+    out.push(desire.purpose);
+    out.push(u8::from(desire.have.is_some()));
+    if let Some(have) = desire.have {
+        put_binding(out, have);
+    }
+    out.extend_from_slice(&desire.rank.to_le_bytes());
     Ok(())
 }
 fn take_desires(input: &mut &[u8]) -> Result<Vec<Desire>> {
     let count = take_u16(input)? as usize;
-    if count > input.len() / 18 {
+    if count > input.len() / 26 {
         bail!("truncated desires");
     }
-    let mut desires = Vec::with_capacity(count);
-    for _ in 0..count {
-        let ticket = take_u64(input)?;
-        let key = take_u64(input)?;
-        let purpose = take_u8(input)?;
-        let have = match take_u8(input)? {
-            0 => None,
-            1 => Some(take_binding(input)?),
-            _ => bail!("invalid holding marker"),
-        };
-        let desire = Desire {
-            ticket,
-            key,
-            purpose,
-            have,
-        };
-        desire.validate()?;
-        desires.push(desire);
+    (0..count).map(|_| take_desire(input)).collect()
+}
+fn take_desire(input: &mut &[u8]) -> Result<Desire> {
+    let ticket = take_u64(input)?;
+    let key = take_u64(input)?;
+    let purpose = take_u8(input)?;
+    let have = if take_bool(input)? {
+        Some(take_binding(input)?)
+    } else {
+        None
+    };
+    let rank = take_u64(input)?;
+    let desire = Desire {
+        ticket,
+        key,
+        purpose,
+        rank,
+        have,
+    };
+    desire.validate()?;
+    Ok(desire)
+}
+fn take_i32(input: &mut &[u8]) -> Result<i32> {
+    Ok(i32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
+}
+fn take_f64(input: &mut &[u8]) -> Result<f64> {
+    Ok(f64::from_le_bytes(take(input, 8)?.try_into().unwrap()))
+}
+fn take_bool(input: &mut &[u8]) -> Result<bool> {
+    match take_u8(input)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => bail!("invalid boolean"),
     }
-    Ok(desires)
 }

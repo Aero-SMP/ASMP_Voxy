@@ -49,6 +49,15 @@ public class HierarchicalOcclusionTraverser {
         void accept(long key, int action, int bucket, int epoch);
     }
     private DetailActionListener detailActionListener = (key, action, bucket, epoch) -> {};
+    @FunctionalInterface
+    public interface VisibleSectionListener {
+        void accept(long epoch, long[] keys, float[] areas, int[] buckets);
+    }
+    private VisibleSectionListener visibleSectionListener = (epoch, keys, areas, buckets) -> {};
+    private GlBuffer visibleSectionBuffer;
+    private int visibleSectionCapacity;
+    private boolean observeVisibleSections, visibleReadbackPending;
+    private long visibleEpoch, visibleGeneration;
 
     private final GlBuffer detailActionBuffer;
 
@@ -74,6 +83,7 @@ public class HierarchicalOcclusionTraverser {
     private static final int NODE_QUEUE_SOURCE_BINDING = BINDING_COUNTER++;
     private static final int NODE_QUEUE_SINK_BINDING = BINDING_COUNTER++;
     private static final int RENDER_TRACKER_BINDING = BINDING_COUNTER++;
+    private static final int VISIBLE_SECTIONS_BINDING = BINDING_COUNTER++;
 
     private final int hizSampler = glGenSamplers();
 
@@ -129,6 +139,7 @@ public class HierarchicalOcclusionTraverser {
             .define("NODE_QUEUE_SINK_BINDING", NODE_QUEUE_SINK_BINDING)
 
             .define("RENDER_TRACKER_BINDING", RENDER_TRACKER_BINDING)
+            .define("VISIBLE_SECTIONS_BINDING", VISIBLE_SECTIONS_BINDING)
 
             .defineIf("TAA", taa != null)
 
@@ -154,10 +165,13 @@ public class HierarchicalOcclusionTraverser {
         this.traversal = program;
         this.pipeline = program != null && pipeline.hasTAA() ? pipeline : null;
         this.previousFrameNanos = 0;
+        this.visibleGeneration++;
     }
 
     public void clearProgram(AutoBindingShader expected) {
-        if (this.traversal == expected) { this.traversal = null; this.pipeline = null; }
+        if (this.traversal == expected) {
+            this.traversal = null; this.pipeline = null; this.visibleGeneration++;
+        }
     }
 
     private void addTLN(int id) {
@@ -210,7 +224,7 @@ public class HierarchicalOcclusionTraverser {
         }
     }
 
-    private void uploadUniform(Viewport viewport, HiZBuffer hiZBuffer, boolean finalPass) {
+    private void uploadUniform(Viewport viewport, HiZBuffer hiZBuffer, boolean finalPass, boolean observeCut) {
         long ptr = UploadStream.INSTANCE.upload(this.uniformBuffer, 0, 1024);
 
         viewport.MVP.getToAddress(ptr); ptr += 4*4*4;
@@ -243,6 +257,7 @@ public class HierarchicalOcclusionTraverser {
         // std140 offset 216; the block rounds to 224 bytes. Both passes use
         // the target captured by doTraversal(), not a second config read.
         MemoryUtil.memPutFloat(ptr, this.detailThresholdScale);
+        MemoryUtil.memPutInt(ptr + 4, observeCut ? 1 : 0);
 
     }
 
@@ -253,6 +268,8 @@ public class HierarchicalOcclusionTraverser {
         glBindTextureUnit(0, hiZBuffer.getHizTextureId());
         glBindSampler(0, this.hizSampler);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, RENDER_QUEUE_BINDING, viewport.getRenderList().id);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, VISIBLE_SECTIONS_BINDING,
+                this.visibleSectionBuffer == null ? 0 : this.visibleSectionBuffer.id);
     }
 
     public void doTraversal(Viewport viewport) {
@@ -276,7 +293,9 @@ public class HierarchicalOcclusionTraverser {
 
     private void doTraversal(Viewport viewport, HiZBuffer hiZBuffer, boolean finalPass) {
         if (finalPass) this.actionEpoch++;
-        this.uploadUniform(viewport, hiZBuffer, finalPass);
+        boolean observeCut = finalPass && this.observeVisibleSections && !this.visibleReadbackPending
+                && this.visibleSectionBuffer != null;
+        this.uploadUniform(viewport, hiZBuffer, finalPass, observeCut);
 
         this.traversal.bind();
         this.bindings(viewport, hiZBuffer);
@@ -291,7 +310,10 @@ public class HierarchicalOcclusionTraverser {
         this.traverseInternal();
 
         // Only the refined HZB pass may influence residency. The first pass is draw-only.
-        if (finalPass) this.downloadResetDetailActions();
+        if (finalPass) {
+            this.downloadResetDetailActions();
+            if (observeCut) this.downloadVisibleSections(viewport.getRenderList());
+        }
 
         //Bind the hiz buffer
         glBindSampler(0, 0);
@@ -300,6 +322,55 @@ public class HierarchicalOcclusionTraverser {
 
     public void setDetailActionListener(DetailActionListener listener) {
         this.detailActionListener = Objects.requireNonNull(listener, "listener");
+    }
+
+    public void setVisibleSectionListener(VisibleSectionListener listener, GlBuffer renderList) {
+        this.visibleSectionListener = Objects.requireNonNull(listener, "listener");
+        int capacity = Math.toIntExact(renderList.size() / 4 - 1);
+        if (capacity < 1) throw new IllegalArgumentException("empty render list");
+        if (this.visibleSectionBuffer == null) {
+            this.visibleSectionCapacity = capacity;
+            this.visibleSectionBuffer = new GlBuffer(capacity * 16L);
+        } else if (capacity != this.visibleSectionCapacity) throw new IllegalArgumentException("render-list capacity changed");
+        this.visibleGeneration++;
+    }
+
+    public void observeVisibleSections(boolean enabled) { this.observeVisibleSections = enabled; }
+
+    public void stopVisibleObservations() {
+        this.observeVisibleSections = false;
+        this.visibleGeneration++;
+        this.visibleSectionListener = (epoch, keys, areas, buckets) -> {};
+    }
+
+    /** Freeze only the drawn cut until its count and occupied prefix have crossed GPU fences. */
+    private void downloadVisibleSections(GlBuffer renderList) {
+        this.visibleReadbackPending = true;
+        long generation = this.visibleGeneration, epoch = ++this.visibleEpoch;
+        DownloadStream.INSTANCE.download(renderList, 0, 4, (ptr, size) -> {
+            if (generation != this.visibleGeneration) { this.visibleReadbackPending = false; return; }
+            int count = (int) Math.min(Integer.toUnsignedLong(MemoryUtil.memGetInt(ptr)), this.visibleSectionCapacity);
+            if (count == 0) {
+                this.visibleReadbackPending = false;
+                this.visibleSectionListener.accept(epoch, new long[0], new float[0], new int[0]);
+                return;
+            }
+            DownloadStream.INSTANCE.download(this.visibleSectionBuffer, 0, count * 16L, (records, bytes) -> {
+                try {
+                    if (generation != this.visibleGeneration) return;
+                    long[] keys = new long[count]; float[] areas = new float[count]; int[] buckets = new int[count];
+                    for (int i = 0; i < count; i++) {
+                        long address = records + i * 16L;
+                        keys[i] = (long) MemoryUtil.memGetInt(address) << 32
+                                | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
+                        float area = MemoryUtil.memGetFloat(address + 8);
+                        areas[i] = Float.isFinite(area) ? Math.max(0, Math.min(1, area)) : 0;
+                        buckets[i] = MemoryUtil.memGetInt(address + 12);
+                    }
+                    this.visibleSectionListener.accept(epoch, keys, areas, buckets);
+                } finally { this.visibleReadbackPending = false; }
+            });
+        });
     }
 
     private void traverseInternal() {
@@ -390,9 +461,11 @@ public class HierarchicalOcclusionTraverser {
     }
 
     public void free() {
+        this.stopVisibleObservations();
         this.traversal = null;
         this.pipeline = null;
         this.detailActionBuffer.free();
+        if (this.visibleSectionBuffer != null) this.visibleSectionBuffer.free();
         this.nodeBuffer.free();
         this.uniformBuffer.free();
         this.queueMetaBuffer.free();

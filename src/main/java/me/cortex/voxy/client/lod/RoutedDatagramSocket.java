@@ -4,8 +4,8 @@ import java.io.IOException;
 import java.net.*;
 import java.util.Arrays;
 
-/** Routes a separately paced QUIC connection through the primary server's UDP port. */
-final class BackgroundDatagramSocket extends DatagramSocket {
+/** Every QUIC packet uses its authenticated Minecraft-session route, including the first handshake. */
+final class RoutedDatagramSocket extends DatagramSocket {
     private static final int HEADER = 17;
     private final DatagramSocket socket;
     private final byte[] token;
@@ -13,8 +13,9 @@ final class BackgroundDatagramSocket extends DatagramSocket {
     private final DatagramPacket incoming = new DatagramPacket(this.receiving, this.receiving.length);
     private final DatagramPacket outgoing = new DatagramPacket(this.sending, this.sending.length);
 
-    BackgroundDatagramSocket(DatagramSocket socket, byte[] token) throws SocketException {
+    RoutedDatagramSocket(DatagramSocket socket, byte[] token) throws SocketException {
         super((SocketAddress) null);
+        if (token == null || token.length != 32) throw new SocketException("invalid Voxy route token");
         this.socket = socket;
         this.token = Arrays.copyOf(token, 16);
         System.arraycopy(this.token, 0, this.sending, 1, this.token.length);
@@ -23,7 +24,7 @@ final class BackgroundDatagramSocket extends DatagramSocket {
     @Override public void send(DatagramPacket packet) throws IOException {
         synchronized (this.sending) {
             int length = packet.getLength();
-            if (length > 65507 - HEADER) throw new IOException("background datagram exceeds UDP payload size");
+            if (length > 65507 - HEADER) throw new IOException("routed datagram exceeds UDP payload size");
             System.arraycopy(packet.getData(), packet.getOffset(), this.sending, HEADER, length);
             this.outgoing.setLength(HEADER + length);
             this.outgoing.setSocketAddress(packet.getSocketAddress());

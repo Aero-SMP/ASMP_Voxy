@@ -1,0 +1,74 @@
+{
+  "observedUtc": "2026-10-05T15:44:44.470539+00:00",
+  "scope": "Saved Testing publication only; runtime attachment is not inferred. No chunk loads or world writes.",
+  "worldIdentity": "4ad3384a36c191b98fbe8232b357767552ae8d451a06a25affca865928dbbeb7",
+  "dimension": "minecraft:overworld",
+  "key": "003000001fffff80",
+  "lod": 0,
+  "coordinates": [
+    -8,
+    3,
+    1
+  ],
+  "region": [
+    -1,
+    0
+  ],
+  "path": "/home/aerosmp/Desktop/Voxy_Testing/voxy-data/regional/minecraft_3aoverworld/r.-1.0.vxregion",
+  "generation": 16829,
+  "entryOrdinal": 1304,
+  "sourceFingerprint": "71dfd8cd59a1dabcb56ddccc57a1bb19",
+  "children": 0,
+  "storageFlags": 32769,
+  "storageGeometryEmpty": true,
+  "wireStatus": "DATA",
+  "wireFlags": 32768,
+  "payloadOffset": 5619268,
+  "compressedLength": 20,
+  "canonicalLength": 11,
+  "compressedCrc32c": 4052269800,
+  "compressedBodyCrc32cValid": true,
+  "compressedBodySha256": "a0b574cf7ff1eddd217935e6fb3be3830ebe868b50b377d19a82325ebe829c49",
+  "sourceCanonicalBlake3IndependentlyVerified": false,
+  "storedCatalogueFingerprint": "dd9d633e3da37dee2d4dc2df8b5817cf4d77550402ef80812b9b0289a904bf16",
+  "servedCatalogueNote": "Server binds the current shared catalogue; its fingerprint is not derived from this historical publication header.",
+  "headerCrc32cValid": true,
+  "directoryCrc32cValid": true,
+  "stableCurrentPublication": true,
+  "headerSha256": "53394478cb11a6d99b216ebe82b02a5717e791085eb093d8a0cb435ef041d3fa",
+  "entrySha256": "f021761c035414f34480ad3e06a00cdfe383018caa0cef6ebd3e962ea527ba07",
+  "sourceTable": {
+    "path": "/home/aerosmp/Desktop/Voxy_Testing/voxy-data/regional/minecraft_3aoverworld/r.-1.0.vxsource",
+    "terrainGeneration": 16829,
+    "anvilFileMarker": 1791215082694797071,
+    "pairedGeneration": true,
+    "stableRead": true,
+    "mtimeNs": 1791215083932855812,
+    "fileSha256": "a77bf6139d5db29a4967aa44ffab30acfe875ad1485de5cfb9d3aa4b6b0de90e",
+    "headerCrc32cValid": true,
+    "fullBlake3ChecksumVerified": false,
+    "storedBlake3Checksum": "afb2f696651c5297c8b3cef47f81ed350fe1333e8e68e9daf4b586d87fc1571c",
+    "targetChunk": {
+      "chunk": [
+        -15,
+        3
+      ],
+      "slot": 113,
+      "generated": true,
+      "location": 152834,
+      "timestamp": 1791215051,
+      "semanticFingerprintBytes": "2b0ed106955e84c6d3d26e9241997ca2"
+    }
+  },
+  "anvilSource": {
+    "path": "/home/aerosmp/Desktop/Voxy_Testing/world/region/r.-1.0.mca",
+    "stableRead": true,
+    "currentMarker": 1791215082694797071,
+    "mtimeNs": 1791215082701612815,
+    "fileBytes": 9961472,
+    "targetLocation": 152834,
+    "targetTimestamp": 1791215051,
+    "markerMatchesPairedTable": true
+  },
+  "limitation": "Anvil marker belongs to the generation-paired source sidecar, not the immutable region header. Header/directory/body CRCs are checked; canonical decode and source-table full BLAKE3 are not. Match a separately saved final block-state proof."
+}

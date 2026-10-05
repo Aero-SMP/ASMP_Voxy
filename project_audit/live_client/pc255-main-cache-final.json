@@ -1,0 +1,5 @@
+{
+  "exit": 0,
+  "stdout": "{\"receipt\":\"C:\\\\Users\\\\USER\\\\Desktop\\\\VoxyNetworkCapture\\\\journal-observation-main-20261005T145319.json\",\"errors\":0,\"completeCompressedMainDataObserved\":true,\"coverage\":{\"expected\":800,\"currentData\":800,\"currentEmpty\":0,\"currentAbsent\":0,\"missing\":0,\"compressedIntegrityValidData\":800,\"authenticatedFallbackData\":0,\"snapshotExactData\":146,\"snapshotContentExactData\":800,\"sectionsFromChangingFiles\":0},\"utc\":\"2026-10-05T14:53:19.9389271Z\",\"files\":855,\"completeSnapshotContent\":true,\"bytes\":135532711}\n",
+  "stderr": ""
+}

@@ -26,8 +26,11 @@
   "voxy.config.general.skyFogDistance": "Sky fog distance",
   "voxy.config.general.skyFogDistance.tooltip": "Distance at which sky fog starts to render in chunks",
   "voxy.config.streaming.update_interval": "Terrain Update Interval",
-  "voxy.config.streaming.update_interval.tooltip": "Minimum time between background terrain update batches. Cached terrain stays visible; missing terrain and zoom detail load immediately.",
-  "voxy.config.streaming.background_bandwidth": "Background Download Bandwidth",
-  "voxy.config.streaming.background_bandwidth.tooltip": "Maximum background Voxy download traffic, including QUIC retransmissions and IP/UDP overhead. Missing terrain and zoom detail use your available connection.",
-  "voxy.config.streaming.unlimited": "Unlimited"
+  "voxy.config.streaming.update_interval.tooltip": "Minimum time between background terrain update batches. Cached terrain stays visible; missing terrain and zoom detail bypass this interval.",
+  "voxy.config.streaming.bandwidth": "Download Bandwidth",
+  "voxy.config.streaming.bandwidth.tooltip": "Maximum total Voxy download traffic for %s across all dimensions, including handshakes, terrain, QUIC retransmissions and IP/UDP overhead. Decimal kbps/Mbps. The cap applies to missing terrain, detail preparation and updates.",
+  "voxy.config.streaming.storage": "Cache Storage",
+  "voxy.config.streaming.storage.tooltip": "Terrain cache allowance for %s across all dimensions, including complete cache files and metadata. Decimal MB/GB. Entire world keeps all existing saved terrain when disk space permits. At a full disk, new downloads pause and cached terrain remains available.",
+  "voxy.config.streaming.entire_world": "Entire world",
+  "voxy.config.streaming.no_server": "Join a multiplayer server to set its download bandwidth and cache storage."
 }

@@ -56,16 +56,17 @@ final class DebugCacheTestProfile {
         return loaded;
     }
 
-    static Path namespace(Path normal) {
+    static Path root(Path normal) {
         var p = profile();
         // Stable for this JVM: lease expiry releases holds, never redirects an open cache.
-        return p == null || p.namespace().equals("off") ? normal : normal.resolve("test-" + p.namespace());
+        return p == null || p.namespace().equals("off") ? normal : normal.resolveSibling("test-" + p.namespace());
     }
 
     static boolean canDelete(Path path) {
         var p = profile();
         if (p == null || p.namespace().equals("off")) return true;
-        for (Path component : path) if (component.toString().equals("test-" + p.namespace())) return true;
+        for (Path component : path) if (component.toString().equals("test-" + p.namespace())
+                || component.toString().equals("test-" + p.namespace() + "-current")) return true;
         return false;
     }
 

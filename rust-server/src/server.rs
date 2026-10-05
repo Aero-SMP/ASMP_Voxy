@@ -1,4 +1,4 @@
-//! Session-owned foreground desires and independently paced background terrain.
+//! One authenticated Minecraft-session route, paced before TLS, across all dimensions.
 use crate::{
     anvil::AnvilWorld,
     crc::crc32c,
@@ -8,9 +8,10 @@ use crate::{
         CatalogDefinition, PreparedSection, RegionalAnnouncement, RegionalResponder,
         RegionalService,
         wire::{
-            self, ALPN, ContentBinding, ControlMessage, Desire, PriorityLane, RecordStatus,
-            STREAM_BACKGROUND, STREAM_CONTROL, STREAM_SECTION_LANE, StreamingSettings,
-            encode_control_record, read_control, read_lane, read_stream_role,
+            self, ALPN, ContentBinding, ControlMessage, Desire, DimensionAnchor, InventoryRecord,
+            RecordStatus, STREAM_CONTROL, STREAM_DISCOVERY, STREAM_SECTION_LANE, ScopedDesire,
+            ScopedKey, StreamingSettings, encode_control_record, read_control, read_lane,
+            read_stream_role,
         },
     },
     replace_synced, sync_parent,
@@ -20,7 +21,7 @@ use quinn::{Endpoint, IdleTimeout, Runtime, VarInt, crypto::rustls::QuicServerCo
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     future::Future,
     io::Write,
@@ -28,33 +29,49 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use tokio::{sync::Notify, time::Instant};
 
-const SERVICE_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
-const CONTROL_STREAM_PRIORITY: i32 = 3;
-const CONTROL_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_PENDING_HANDSHAKES: usize = 128;
-const MAX_LIVE_CONNECTIONS: usize = 1_024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_IDENTITY_BYTES: usize = 64 * 1024;
 const CERTIFICATE_FILE: &str = "certificate.der";
 const PRIVATE_KEY_FILE: &str = "private-key.der";
+type Region = (u32, i32, i32);
+type Subscribers = HashMap<Region, HashMap<usize, Weak<Session>>>;
 
-type Region = (i32, i32);
-type Subscribers = HashMap<(String, i32, i32), HashMap<usize, Weak<Session>>>;
+#[derive(Debug)]
+struct Network {
+    mux: Arc<UdpMux>,
+    config: quinn::ServerConfig,
+}
+#[derive(Debug)]
+struct RouteOwner {
+    token: [u8; 32],
+    ledger: Arc<RateLedger>,
+    endpoint: Endpoint,
+    connection: Mutex<Option<quinn::Connection>>,
+    closed: AtomicBool,
+}
+impl RouteOwner {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.endpoint
+            .close(VarInt::from_u32(0), b"Minecraft session ended");
+    }
+}
 #[derive(Debug)]
 pub struct ServerState {
     server_instance: u64,
     regional: Arc<RegionalService>,
     subscribers: Mutex<Subscribers>,
-    started: Instant,
+    network: OnceLock<Network>,
+    routes: Mutex<HashMap<[u8; 32], Arc<RouteOwner>>>,
+    bridge_stopped: Notify,
     trace: bool,
 }
 impl ServerState {
@@ -65,25 +82,85 @@ impl ServerState {
     ) -> Self {
         let server_instance = dimensions
             .iter()
-            .fold(catalog_id, |identity, (name, world)| {
-                identity.rotate_left(11)
+            .fold(catalog_id, |id, (name, world)| {
+                id.rotate_left(11)
                     ^ u64::from(crc32c(name.as_bytes()))
                     ^ u64::from(crc32c(world.root.as_os_str().as_encoded_bytes()))
-            });
+            })
+            .max(1);
         Self {
             server_instance,
             regional,
             subscribers: Mutex::new(HashMap::new()),
-            started: Instant::now(),
-            trace: std::env::var("VOXY_BACKGROUND_TRACE").as_deref() == Ok("1"),
+            network: OnceLock::new(),
+            routes: Mutex::new(HashMap::new()),
+            bridge_stopped: Notify::new(),
+            trace: std::env::var("VOXY_NETWORK_TRACE").as_deref() == Ok("1"),
         }
     }
-
+    fn register_route(self: &Arc<Self>, token: [u8; 32], kbps: u64) -> Result<()> {
+        if token == [0; 32] || !(100..=10_000).contains(&kbps) {
+            bail!("invalid authenticated route policy")
+        }
+        let mut routes = self.routes.lock().expect("Minecraft route owner poisoned");
+        if let Some(route) = routes.get(&token) {
+            route.ledger.update(kbps);
+            return Ok(());
+        }
+        let network = self.network.get().context("UDP listener not ready")?;
+        let ledger = RateLedger::new(kbps);
+        let socket = PacedSocket::new(network.mux.route(&token)?, ledger.clone());
+        let endpoint = Endpoint::new_with_abstract_socket(
+            Default::default(),
+            Some(network.config.clone()),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        let route = Arc::new(RouteOwner {
+            token,
+            ledger,
+            endpoint,
+            connection: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        });
+        routes.insert(token, route.clone());
+        let state = self.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = route.endpoint.accept().await {
+                let state = state.clone();
+                let route = route.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_connection(state, route, incoming).await {
+                        eprintln!("Voxy QUIC session ended: {error:#}");
+                    }
+                });
+            }
+            route.endpoint.wait_idle().await;
+            if state.trace {
+                let (bytes, packets) = route.ledger.counters();
+                eprintln!(
+                    "VOXY_ROUTE_STATS route={} ip_bytes={bytes} datagrams={packets}",
+                    hex(&route.token[..16])
+                );
+            }
+        });
+        Ok(())
+    }
+    fn revoke_route(&self, token: [u8; 32]) {
+        if let Some(route) = self
+            .routes
+            .lock()
+            .expect("Minecraft route owner poisoned")
+            .remove(&token)
+        {
+            route.close();
+        }
+    }
     fn register(&self, session: &Arc<Session>, coordinate: Region) {
         self.subscribers
             .lock()
             .expect("terrain subscriber owner poisoned")
-            .entry((session.dimension.clone(), coordinate.0, coordinate.1))
+            .entry(coordinate)
             .or_default()
             .insert(session.id, Arc::downgrade(session));
     }
@@ -92,11 +169,10 @@ impl ServerState {
             .subscribers
             .lock()
             .expect("terrain subscriber owner poisoned");
-        let key = (session.dimension.clone(), coordinate.0, coordinate.1);
-        if let Some(region) = subscribers.get_mut(&key) {
+        if let Some(region) = subscribers.get_mut(&coordinate) {
             region.remove(&session.id);
             if region.is_empty() {
-                subscribers.remove(&key);
+                subscribers.remove(&coordinate);
             }
         }
     }
@@ -113,24 +189,26 @@ impl ServerState {
                         changed_ordinals,
                         ..
                     }) => {
+                        let Ok(id) = state.regional.dimension_id(&dimension) else {
+                            continue;
+                        };
                         let recipients = state
                             .subscribers
                             .lock()
                             .expect("terrain subscriber owner poisoned")
-                            .get(&(dimension, region_x, region_z))
-                            .map(|entries| {
-                                entries
+                            .get(&(id, region_x, region_z))
+                            .map(|region| {
+                                region
                                     .values()
                                     .filter_map(Weak::upgrade)
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
                         for session in recipients {
-                            session.changed((region_x, region_z), changed_ordinals.as_deref());
+                            session.changed((id, region_x, region_z), changed_ordinals.as_deref());
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Recover current state; a slow receiver never needs lost event history.
                         let mut recipients = HashMap::new();
                         for region in state
                             .subscribers
@@ -150,41 +228,246 @@ impl ServerState {
                     }
                     Ok(RegionalAnnouncement::Shutdown(_))
                     | Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    _ => {}
                 }
             }
         });
     }
+    /// Exactly one stdin reader consumes the Java-owned pipe. All writes are completed saves or
+    /// authenticated registrations; EOF exits without keeping Tokio's runtime alive.
+    fn start_bridge(self: &Arc<Self>) -> Result<()> {
+        let state = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::Builder::new()
+            .name("Voxy server bridge".into())
+            .spawn(move || {
+                use std::io::Read;
+                let stdin = std::io::stdin();
+                let mut input = std::io::BufReader::new(stdin.lock());
+                let result: Result<()> = (|| {
+                    loop {
+                        let mut opcode = [0; 1];
+                        match input.read_exact(&mut opcode) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        match opcode[0] {
+                            1 => {
+                                let name = read_string(&mut input)?;
+                                let count = read_u32(&mut input)?;
+                                for _ in 0..count {
+                                    let x = read_u32(&mut input)? as i32;
+                                    let z = read_u32(&mut input)? as i32;
+                                    state.regional.saved_chunks(&name, &[(x, z)])?;
+                                }
+                                state.regional.wake();
+                            }
+                            2 => {
+                                let mut token = [0; 32];
+                                input.read_exact(&mut token)?;
+                                let rate = read_u64(&mut input)?;
+                                let _entered = runtime.enter();
+                                state.register_route(token, rate)?;
+                                eprintln!("VOXY_ROUTE_READY {} {}", hex(&token), rate);
+                            }
+                            3 => {
+                                let mut token = [0; 32];
+                                input.read_exact(&mut token)?;
+                                state.revoke_route(token);
+                            }
+                            4 => {
+                                let name = read_string(&mut input)?;
+                                let root = PathBuf::from(read_string(&mut input)?);
+                                let min_y = read_u32(&mut input)? as i32;
+                                let count = read_u32(&mut input)?;
+                                let mut flag = [0; 1];
+                                input.read_exact(&mut flag)?;
+                                let x = read_f64(&mut input)?;
+                                let z = read_f64(&mut input)?;
+                                let size = read_f64(&mut input)?;
+                                state.regional.define_dimension(
+                                    name,
+                                    root,
+                                    min_y,
+                                    count,
+                                    flag[0] != 0,
+                                    x,
+                                    z,
+                                    size,
+                                )?;
+                            }
+                            _ => bail!("unknown owned IPC opcode"),
+                        }
+                    }
+                })();
+                if let Err(error) = result {
+                    eprintln!("Voxy owned bridge stopped: {error:#}");
+                }
+                // Pipe EOF ends Java's ownership, even when no read error occurred.
+                state.bridge_stopped.notify_one();
+            })?;
+        Ok(())
+    }
+}
+fn read_u32(input: &mut impl std::io::Read) -> Result<u32> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+fn read_u64(input: &mut impl std::io::Read) -> Result<u64> {
+    let mut bytes = [0; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn read_f64(input: &mut impl std::io::Read) -> Result<f64> {
+    Ok(f64::from_bits(read_u64(input)?))
+}
+fn read_string(input: &mut impl std::io::Read) -> Result<String> {
+    let mut bytes = [0; 2];
+    input.read_exact(&mut bytes)?;
+    let size = u16::from_le_bytes(bytes) as usize;
+    if size == 0 {
+        bail!("empty IPC string")
+    };
+    let mut bytes = vec![0; size];
+    input.read_exact(&mut bytes)?;
+    Ok(String::from_utf8(bytes)?)
+}
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").unwrap();
+    }
+    out
 }
 
+#[derive(Clone, Debug)]
+struct Scope {
+    responder: RegionalResponder,
+    world: [u8; 32],
+}
 #[derive(Debug)]
 struct Interest {
     desire: Desire,
     known: Option<ContentBinding>,
-    primary_known: Option<ContentBinding>,
-    active: Option<(u64, u64, bool)>,
+    active: Option<(u64, u64)>,
+    revision: u64,
+    dirty: bool,
+    queued: Option<QueueEntry>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct QueueEntry {
+    class: u8,
+    rank: u128,
+    coarse: u8,
+    dimension: u32,
+    key: u64,
     revision: u64,
 }
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Wants {
-    interests: HashMap<u64, Interest>,
-    regions: HashMap<Region, HashMap<u32, u64>>,
-    foreground: [VecDeque<u64>; 2],
-    queued: [HashSet<u64>; 2],
-    background: HashSet<u64>,
+    interests: HashMap<ScopedKey, Interest>,
+    regions: HashMap<Region, HashMap<u32, ScopedKey>>,
+    visible: [BTreeSet<QueueEntry>; 2],
+    prefetch: BTreeMap<u32, BTreeSet<QueueEntry>>,
+    refresh: BTreeSet<QueueEntry>,
+    changed: HashSet<ScopedKey>,
+    next_refresh: Instant,
+    refresh_inflight: usize,
+}
+impl Default for Wants {
+    fn default() -> Self {
+        Self {
+            interests: HashMap::new(),
+            regions: HashMap::new(),
+            visible: Default::default(),
+            prefetch: BTreeMap::new(),
+            refresh: BTreeSet::new(),
+            changed: HashSet::new(),
+            next_refresh: Instant::now(),
+            refresh_inflight: 0,
+        }
+    }
 }
 impl Wants {
-    fn queue(&mut self, key: u64) {
+    fn remove_queue(&mut self, key: ScopedKey) {
+        let Some(entry) = self
+            .interests
+            .get_mut(&key)
+            .and_then(|interest| interest.queued.take())
+        else {
+            return;
+        };
+        match entry.class {
+            0 => {
+                self.visible[0].remove(&entry);
+            }
+            1 | 2 => {
+                self.visible[1].remove(&entry);
+            }
+            3 => {
+                if let Some(queue) = self.prefetch.get_mut(&key.dimension) {
+                    queue.remove(&entry);
+                    if queue.is_empty() {
+                        self.prefetch.remove(&key.dimension);
+                    }
+                }
+            }
+            4 => {
+                self.refresh.remove(&entry);
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn enqueue(&mut self, key: ScopedKey) {
+        self.remove_queue(key);
         let Some(interest) = self.interests.get(&key) else {
             return;
         };
-        if interest.desire.purpose == 2 {
-            self.background.insert(key);
-        } else if interest.active.is_none() {
-            let lane = interest.desire.purpose as usize;
-            if self.queued[lane].insert(key) {
-                self.foreground[lane].push_back(key);
-            }
+        if interest.active.is_some() {
+            return;
         }
+        if (interest.known.is_some() && interest.dirty) || interest.desire.purpose == 2 {
+            if interest.dirty {
+                self.changed.insert(key);
+            }
+            return;
+        }
+        let class = match interest.desire.purpose {
+            0 => 0,
+            1 => 1,
+            3 => 2,
+            4 => 3,
+            _ => return,
+        };
+        let entry = QueueEntry {
+            class,
+            rank: interest.desire.rank as u128,
+            coarse: 4 - ((key.key >> 60) as u8),
+            dimension: key.dimension,
+            key: key.key,
+            revision: interest.revision,
+        };
+        match class {
+            0 => {
+                self.visible[0].insert(entry);
+            }
+            1 | 2 => {
+                self.visible[1].insert(entry);
+            }
+            3 => {
+                self.prefetch
+                    .entry(key.dimension)
+                    .or_default()
+                    .insert(entry);
+            }
+            _ => unreachable!(),
+        }
+        self.interests.get_mut(&key).unwrap().queued = Some(entry);
     }
 }
 #[derive(Debug)]
@@ -192,87 +475,33 @@ struct PrimaryWriter {
     send: quinn::SendStream,
     failed: bool,
 }
-
 #[derive(Debug)]
 struct Session {
     id: usize,
-    peer: SocketAddr,
-    dimension: String,
     state: Arc<ServerState>,
-    responder: RegionalResponder,
+    route: Arc<RouteOwner>,
+    scopes: Mutex<HashMap<u32, Scope>>,
     wants: Mutex<Wants>,
-    foreground: [Notify; 2],
-    background: Notify,
+    available: Notify,
     stopped: Notify,
     closed: AtomicBool,
     settings: Mutex<StreamingSettings>,
-    ledger: Arc<RateLedger>,
+    active_dimension: Mutex<u32>,
+    anchors: Mutex<HashMap<u32, (i32, i32)>>,
     metadata: tokio::sync::Mutex<PrimaryWriter>,
     catalogues: Mutex<HashSet<[u8; 32]>>,
 }
 #[derive(Clone, Copy)]
 struct Claim {
+    scope: ScopedKey,
     desire: Desire,
     revision: u64,
     known: Option<ContentBinding>,
+    refresh: bool,
 }
 impl Session {
-    fn has_catalogue(&self, fingerprint: [u8; 32]) -> bool {
-        self.catalogues
-            .lock()
-            .expect("catalogue announcement owner poisoned")
-            .contains(&fingerprint)
-    }
-    async fn announce_catalogue(&self, catalogue: &CatalogDefinition) -> Result<()> {
-        let mut writer = self.metadata.lock().await;
-        if writer.failed || self.closed.load(Ordering::Acquire) {
-            bail!("primary catalogue writer is closed");
-        }
-        if self.has_catalogue(catalogue.fingerprint) {
-            return Ok(());
-        }
-        let started = Instant::now();
-        self.trace_catalogue_start("foreground", catalogue);
-        if let Err(error) = writer.send.write_all(&catalogue.frame).await {
-            // A partial frame cannot be retried on this cursor. The lane error closes primary.
-            writer.failed = true;
-            return Err(error).context("primary catalogue frame failed");
-        }
-        self.catalogues
-            .lock()
-            .expect("catalogue announcement owner poisoned")
-            .insert(catalogue.fingerprint);
-        self.trace_catalogue("foreground", catalogue, started);
-        Ok(())
-    }
-    fn trace_catalogue(&self, channel: &str, catalogue: &CatalogDefinition, started: Instant) {
-        if self.state.trace {
-            eprintln!(
-                "VOXY_CATALOG_SENT session={} channel={channel} fingerprint={} canonical_bytes={} compressed_bytes={} frame_bytes={} write_ns={}",
-                self.id,
-                blake3::Hash::from(catalogue.fingerprint),
-                catalogue.canonical_length,
-                catalogue.compressed_length,
-                catalogue.frame.len(),
-                started.elapsed().as_nanos()
-            );
-        }
-    }
-    fn trace_catalogue_start(&self, channel: &str, catalogue: &CatalogDefinition) {
-        if self.state.trace {
-            eprintln!(
-                "VOXY_CATALOG_WRITE session={} channel={channel} fingerprint={} frame_bytes={}",
-                self.id,
-                blake3::Hash::from(catalogue.fingerprint),
-                catalogue.frame.len()
-            );
-        }
-    }
     fn wake(&self) {
-        for lane in &self.foreground {
-            lane.notify_waiters();
-        }
-        self.background.notify_waiters();
+        self.available.notify_waiters();
     }
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
@@ -281,148 +510,161 @@ impl Session {
     }
     async fn ended(&self) {
         loop {
-            let notified = self.stopped.notified();
+            let wait = self.stopped.notified();
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
-            notified.await;
+            wait.await;
         }
     }
-    fn apply(self: &Arc<Self>, desires: Vec<Desire>) -> Result<()> {
+    fn scope(&self, id: u32) -> Result<Scope> {
+        let mut scopes = self.scopes.lock().expect("dimension scope owner poisoned");
+        if let Some(scope) = scopes.get(&id) {
+            return Ok(scope.clone());
+        }
+        let name = self.state.regional.dimension_name(id)?;
+        let responder = self
+            .state
+            .regional
+            .responder(&name, self.state.server_instance)?;
+        let scope = Scope {
+            world: responder.world_identity(),
+            responder,
+        };
+        scopes.insert(id, scope.clone());
+        Ok(scope)
+    }
+    fn coordinate(&self, scoped: ScopedKey) -> Result<(Region, u32)> {
+        let key = crate::key::SectionKey::unpack(scoped.key)?;
+        let side = 16i32 >> key.level;
+        let region = (
+            scoped.dimension,
+            key.x.div_euclid(side),
+            key.z.div_euclid(side),
+        );
+        let ordinal = self
+            .scope(scoped.dimension)?
+            .responder
+            .layout()
+            .index(region.1, region.2, key.into())
+            .map(|n| n as u32)
+            .unwrap_or(u32::MAX);
+        Ok((region, ordinal))
+    }
+    fn apply(self: &Arc<Self>, desires: Vec<ScopedDesire>) -> Result<()> {
+        let settings = *self
+            .settings
+            .lock()
+            .expect("streaming policy owner poisoned");
         let mut additions = Vec::new();
-        {
-            let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-            for desire in desires {
-                let key = crate::key::SectionKey::unpack(desire.key)?;
-                let side = 16i32 >> key.level;
-                let coordinate = (key.x.div_euclid(side), key.z.div_euclid(side));
-                let ordinal = self
-                    .responder
-                    .layout()
-                    .index(coordinate.0, coordinate.1, key.into())
-                    .map(|index| index as u32)
-                    .unwrap_or(u32::MAX);
-                let first = !wants.regions.contains_key(&coordinate);
-                wants
-                    .regions
-                    .entry(coordinate)
-                    .or_default()
-                    .insert(ordinal, desire.key);
-                if first {
-                    additions.push(coordinate);
-                }
-                let (active, revision) = wants
-                    .interests
-                    .get(&desire.key)
-                    .map_or((None, 0), |old| (old.active, old.revision.wrapping_add(1)));
-                wants.interests.insert(
-                    desire.key,
-                    Interest {
-                        desire,
-                        known: desire.have,
-                        primary_known: desire.have,
-                        active,
-                        revision,
-                    },
-                );
-                if desire.purpose != 2 {
-                    wants.queue(desire.key);
-                } else if desire.have.is_some() {
-                    wants.background.insert(desire.key);
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        for mut scoped in desires {
+            let scope = self.scope(scoped.dimension)?;
+            if scoped.expected_world != [0; 32] && scoped.expected_world != scope.world {
+                bail!("request world identity changed")
+            }
+            let key = ScopedKey {
+                dimension: scoped.dimension,
+                key: scoped.desire.key,
+            };
+            if let Some(anchor) = self
+                .anchors
+                .lock()
+                .expect("spatial anchor owner poisoned")
+                .get(&scoped.dimension)
+                .copied()
+            {
+                scoped.desire.rank = geometric_rank(key.key, anchor)?;
+            }
+            let (region, ordinal) = self.coordinate(key)?;
+            if !wants.regions.contains_key(&region) {
+                additions.push(region);
+            }
+            wants
+                .regions
+                .entry(region)
+                .or_default()
+                .insert(ordinal, key);
+            wants.remove_queue(key);
+            let old = wants.interests.remove(&key);
+            let revision = old.as_ref().map_or(0, |old| old.revision.wrapping_add(1));
+            let known = scoped.desire.have;
+            wants.interests.insert(
+                key,
+                Interest {
+                    desire: scoped.desire,
+                    known,
+                    active: old.as_ref().and_then(|old| old.active),
+                    revision,
+                    dirty: old.as_ref().is_some_and(|old| old.dirty)
+                        || (scoped.desire.purpose == 2 && known.is_some()),
+                    queued: None,
+                },
+            );
+            wants.enqueue(key);
+        }
+        drop(wants);
+        for region in additions {
+            self.scope(region.0)?
+                .responder
+                .subscribe_region(region.1, region.2)?;
+            self.state.register(self, region);
+        }
+        self.state
+            .regional
+            .set_cadence(self.id, Some(settings.interval_millis))?;
+        self.wake();
+        Ok(())
+    }
+    fn drop_keys(&self, keys: Vec<ScopedKey>) -> Result<()> {
+        let mut releases = Vec::new();
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        for key in keys {
+            wants.remove_queue(key);
+            wants.changed.remove(&key);
+            if wants.interests.remove(&key).is_none() {
+                continue;
+            }
+            let (region, ordinal) = self.coordinate(key)?;
+            if let Some(entries) = wants.regions.get_mut(&region) {
+                entries.remove(&ordinal);
+                if entries.is_empty() {
+                    wants.regions.remove(&region);
+                    releases.push(region);
                 }
             }
         }
-        for coordinate in additions {
-            self.responder
-                .subscribe_region(coordinate.0, coordinate.1)?;
-            self.state.register(self, coordinate);
+        let empty = wants.interests.is_empty();
+        drop(wants);
+        for region in releases {
+            self.state.release(self, region);
+            self.scope(region.0)?
+                .responder
+                .unsubscribe_region(region.1, region.2)?;
         }
-        let interval = self
-            .settings
-            .lock()
-            .expect("streaming settings owner poisoned")
-            .interval_millis;
-        if !self
-            .wants
-            .lock()
-            .expect("terrain desire owner poisoned")
-            .interests
-            .is_empty()
-        {
-            self.state.regional.set_cadence(self.id, Some(interval))?;
+        if empty {
+            self.state.regional.set_cadence(self.id, None)?;
         }
         self.wake();
         Ok(())
     }
-    fn drop_keys(&self, keys: Vec<u64>) -> Result<()> {
-        let mut releases = Vec::new();
-        {
-            let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-            for key in keys {
-                if wants.interests.remove(&key).is_none() {
-                    continue;
-                }
-                let spatial = crate::key::SectionKey::unpack(key)?;
-                let side = 16i32 >> spatial.level;
-                let coordinate = (spatial.x.div_euclid(side), spatial.z.div_euclid(side));
-                if let Some(region) = wants.regions.get_mut(&coordinate) {
-                    let ordinal = self
-                        .responder
-                        .layout()
-                        .index(coordinate.0, coordinate.1, spatial.into())
-                        .map(|index| index as u32)
-                        .unwrap_or(u32::MAX);
-                    if region.get(&ordinal) == Some(&key) {
-                        region.remove(&ordinal);
-                    }
-                    if region.is_empty() {
-                        wants.regions.remove(&coordinate);
-                        releases.push(coordinate);
-                    }
-                }
-                wants.background.remove(&key);
-                for queued in &mut wants.queued {
-                    queued.remove(&key);
-                }
-            }
-        }
-        if self
-            .wants
-            .lock()
-            .expect("terrain desire owner poisoned")
-            .interests
-            .is_empty()
-        {
-            self.state.regional.set_cadence(self.id, None)?;
-        }
-        for coordinate in releases {
-            self.state.release(self, coordinate);
-            self.responder
-                .unsubscribe_region(coordinate.0, coordinate.1)?;
-        }
-        Ok(())
-    }
-    fn changed(&self, coordinate: Region, ordinals: Option<&[u32]>) {
+    fn changed(&self, region: Region, ordinals: Option<&[u32]>) {
         let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-        let Some(region) = wants.regions.get(&coordinate) else {
+        let Some(entries) = wants.regions.get(&region) else {
             return;
         };
         let keys = match ordinals {
             Some(ordinals) => ordinals
                 .iter()
-                .filter_map(|ordinal| region.get(ordinal).copied())
+                .filter_map(|ordinal| entries.get(ordinal).copied())
                 .collect::<Vec<_>>(),
-            None => region.values().copied().collect(),
+            None => entries.values().copied().collect(),
         };
         for key in keys {
-            let Some(interest) = wants.interests.get_mut(&key) else {
-                continue;
-            };
-            interest.revision = interest.revision.wrapping_add(1);
-            if interest.known.is_none() && interest.desire.purpose != 2 {
-                wants.queue(key);
-            } else {
-                wants.background.insert(key);
+            if let Some(interest) = wants.interests.get_mut(&key) {
+                interest.revision = interest.revision.wrapping_add(1);
+                interest.dirty = true;
+                wants.enqueue(key);
             }
         }
         drop(wants);
@@ -441,134 +683,257 @@ impl Session {
             self.changed(coordinate, None);
         }
     }
-    fn reconcile_background(&self) {
-        // Reliable writes are not durable receipt. An abandoned background connection may
-        // have buffered records; only peer holdings and the still-live primary are a safe base.
-        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-        for interest in wants.interests.values_mut() {
-            interest.known = interest.primary_known;
-            if interest.active.is_some_and(|(_, _, background)| background) {
-                interest.active = None;
-            }
-        }
-        drop(wants);
-        self.reconcile();
-    }
-
-    fn claim(&self, lane: usize) -> Option<Claim> {
-        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-        while let Some(key) = wants.foreground[lane].pop_front() {
-            if !wants.queued[lane].remove(&key) {
-                continue;
-            }
-            let Some(interest) = wants.interests.get_mut(&key) else {
-                continue;
-            };
-            if interest
-                .active
-                .is_some_and(|(_, _, background)| !background)
-                || interest.desire.purpose as usize != lane
-            {
-                continue;
-            }
-            // Urgent misses may supersede a slow background owner; its frame is not cancelled.
-            interest.active = Some((interest.desire.ticket, interest.revision, false));
-            return Some(Claim {
-                desire: interest.desire,
-                revision: interest.revision,
-                known: interest.known,
-            });
-        }
-        None
-    }
-    fn background_keys(&self) -> Vec<u64> {
-        self.wants
-            .lock()
-            .expect("terrain desire owner poisoned")
-            .background
-            .iter()
-            .copied()
-            .collect()
-    }
-    fn claim_background(&self, key: u64) -> Option<Claim> {
-        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-        let interest = wants.interests.get_mut(&key)?;
-        if interest.active.is_some() {
-            return None;
-        }
-        interest.active = Some((interest.desire.ticket, interest.revision, true));
-        let claim = Claim {
-            desire: interest.desire,
-            revision: interest.revision,
-            known: interest.known,
-        };
-        wants.background.remove(&key);
-        Some(claim)
-    }
-    fn finish(&self, claim: Claim, binding: Option<ContentBinding>, background: bool) {
-        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-        let Some(interest) = wants.interests.get_mut(&claim.desire.key) else {
-            return;
-        };
-        if interest.active != Some((claim.desire.ticket, claim.revision, background)) {
-            return;
-        }
-        interest.active = None;
-        if interest.desire.ticket == claim.desire.ticket {
-            if let Some(binding) = binding {
-                interest.known = Some(binding);
-                if !background {
-                    interest.primary_known = Some(binding);
-                }
-            }
-        }
-        if interest.desire.ticket != claim.desire.ticket || interest.revision != claim.revision {
-            if interest.desire.purpose != 2
-                && (interest.desire.ticket != claim.desire.ticket || interest.known.is_none())
-            {
-                wants.queue(claim.desire.key);
-            } else {
-                wants.background.insert(claim.desire.key);
-            }
-        }
-        drop(wants);
-        self.wake();
-    }
-    fn policy(&self, settings: StreamingSettings) -> Result<()> {
+    fn policy(
+        &self,
+        settings: StreamingSettings,
+        active: u32,
+        anchors: Vec<DimensionAnchor>,
+    ) -> Result<()> {
         settings.validate()?;
+        self.scope(active)?;
         *self
             .settings
             .lock()
-            .expect("streaming settings owner poisoned") = settings;
-        self.ledger.update(settings.bandwidth_kbps);
-        let interested = !self
-            .wants
+            .expect("streaming policy owner poisoned") = settings;
+        *self
+            .active_dimension
             .lock()
-            .expect("terrain desire owner poisoned")
-            .interests
-            .is_empty();
+            .expect("active dimension owner poisoned") = active;
+        self.route.ledger.update(settings.bandwidth_kbps);
+        if self.state.trace {
+            let (bytes, datagrams) = self.route.ledger.counters();
+            eprintln!(
+                "VOXY_TOTAL_POLICY session={} route={} total_kbps={} interval_ms={} refresh_allowed={} active_dimension={} ip_bytes={} datagrams={}",
+                self.id,
+                hex(&self.route.token[..16]),
+                settings.bandwidth_kbps,
+                settings.interval_millis,
+                settings.refresh_allowed,
+                active,
+                bytes,
+                datagrams
+            );
+        }
+        {
+            let mut current = self.anchors.lock().expect("spatial anchor owner poisoned");
+            for anchor in anchors {
+                current.insert(anchor.dimension, (anchor.x, anchor.z));
+            }
+        }
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        wants.visible = Default::default();
+        wants.prefetch.clear();
+        wants.refresh.clear();
+        let anchors = self.anchors.lock().expect("spatial anchor owner poisoned");
+        let keys = wants.interests.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            if let Some(interest) = wants.interests.get_mut(&key) {
+                interest.queued = None;
+                if let Some(anchor) = anchors.get(&key.dimension) {
+                    interest.desire.rank = geometric_rank(key.key, *anchor)?;
+                }
+            }
+            wants.enqueue(key);
+        }
+        let interested = !wants.interests.is_empty();
+        drop(wants);
         self.state
             .regional
             .set_cadence(self.id, interested.then_some(settings.interval_millis))?;
         self.wake();
         Ok(())
     }
-    fn trace(&self, phase: &str, sequence: u64, keys: usize, port: u16) {
-        if !self.state.trace {
-            return;
-        }
+    fn claim(&self, lane: usize) -> (Option<Claim>, Option<Instant>) {
         let settings = *self
             .settings
             .lock()
-            .expect("streaming settings owner poisoned");
-        let (bytes, datagrams) = self.ledger.counters();
-        eprintln!(
-            "VOXY_BACKGROUND_BATCH phase={phase} session={} peer={} port={port} seq={sequence} monotonic_ns={} interval_ms={} keys={keys} ip_bytes={bytes} datagrams={datagrams}",
-            self.id,
-            self.peer,
-            self.state.started.elapsed().as_nanos(),
-            settings.interval_millis
-        );
+            .expect("streaming policy owner poisoned");
+        let active = *self
+            .active_dimension
+            .lock()
+            .expect("active dimension owner poisoned");
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        let mut deadline = None;
+        if lane != 0
+            && settings.refresh_allowed
+            && wants.refresh.is_empty()
+            && wants.refresh_inflight == 0
+            && !wants.changed.is_empty()
+        {
+            if Instant::now() >= wants.next_refresh {
+                let changed = std::mem::take(&mut wants.changed);
+                for key in changed {
+                    let Some(interest) = wants.interests.get(&key) else {
+                        continue;
+                    };
+                    if !interest.dirty || interest.active.is_some() {
+                        wants.changed.insert(key);
+                        continue;
+                    }
+                    let entry = QueueEntry {
+                        class: 4,
+                        rank: interest.desire.rank as u128 * 256,
+                        coarse: 4 - ((key.key >> 60) as u8),
+                        dimension: key.dimension,
+                        key: key.key,
+                        revision: interest.revision,
+                    };
+                    wants.refresh.insert(entry);
+                    wants.interests.get_mut(&key).unwrap().queued = Some(entry);
+                }
+                wants.next_refresh =
+                    Instant::now() + Duration::from_millis(settings.interval_millis);
+            } else {
+                deadline = Some(wants.next_refresh);
+            }
+        }
+        let entry = if let Some(entry) = wants.visible[lane].first().copied() {
+            Some(entry)
+        } else if lane == 0 {
+            None
+        } else {
+            let pool = if wants.prefetch.contains_key(&active) {
+                Some(active)
+            } else {
+                wants.prefetch.first_key_value().map(|(&id, _)| id)
+            };
+            let missing = pool.and_then(|id| wants.prefetch[&id].first().copied());
+            let refresh = if settings.refresh_allowed {
+                wants.refresh.first().copied()
+            } else {
+                None
+            };
+            match (missing, refresh) {
+                (Some(missing), Some(refresh)) => Some(
+                    if (missing.rank, missing.coarse, missing.dimension, missing.key)
+                        <= (refresh.rank, refresh.coarse, refresh.dimension, refresh.key)
+                    {
+                        missing
+                    } else {
+                        refresh
+                    },
+                ),
+                (missing, refresh) => missing.or(refresh),
+            }
+        };
+        let Some(entry) = entry else {
+            return (None, deadline);
+        };
+        let key = ScopedKey {
+            dimension: entry.dimension,
+            key: entry.key,
+        };
+        wants.remove_queue(key);
+        let interest = wants
+            .interests
+            .get_mut(&key)
+            .expect("queued terrain has an owner");
+        interest.active = Some((interest.desire.ticket, interest.revision));
+        let claim = Claim {
+            scope: key,
+            desire: interest.desire,
+            revision: interest.revision,
+            known: interest.known,
+            refresh: entry.class == 4,
+        };
+        if claim.refresh {
+            wants.refresh_inflight += 1;
+        }
+        (Some(claim), deadline)
+    }
+    fn finish(&self, claim: Claim, binding: Option<ContentBinding>) {
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        if claim.refresh {
+            wants.refresh_inflight -= 1;
+        }
+        let Some(interest) = wants.interests.get_mut(&claim.scope) else {
+            drop(wants);
+            self.wake();
+            return;
+        };
+        if interest.active != Some((claim.desire.ticket, claim.revision)) {
+            return;
+        }
+        interest.active = None;
+        if interest.desire.ticket == claim.desire.ticket {
+            if let Some(binding) = binding {
+                interest.known = Some(binding);
+            }
+            // NotReady retains the subscription and waits for publication, without polling.
+            if interest.revision == claim.revision {
+                interest.dirty = false;
+            }
+        }
+        if interest.desire.ticket != claim.desire.ticket || interest.revision != claim.revision {
+            wants.enqueue(claim.scope);
+        }
+        drop(wants);
+        self.wake();
+    }
+    async fn metadata(&self, message: &ControlMessage) -> Result<()> {
+        let mut writer = self.metadata.lock().await;
+        if writer.failed {
+            bail!("metadata writer closed")
+        }
+        let result = writer
+            .send
+            .write_all(&encode_control_record(message)?)
+            .await;
+        if result.is_err() {
+            writer.failed = true;
+        }
+        result.context("shared metadata frame failed")
+    }
+    async fn announce_catalogue(
+        &self,
+        dimension: u32,
+        world: [u8; 32],
+        catalogue: &CatalogDefinition,
+    ) -> Result<()> {
+        let mut writer = self.metadata.lock().await;
+        if writer.failed {
+            bail!("metadata writer closed")
+        }
+        if self
+            .catalogues
+            .lock()
+            .expect("catalogue owner poisoned")
+            .contains(&catalogue.fingerprint)
+        {
+            return Ok(());
+        }
+        use tokio::io::AsyncWriteExt;
+        let result = async {
+            writer.send.write_u8(0x83).await?;
+            writer
+                .send
+                .write_u32_le((36 + catalogue.payload.len()) as u32)
+                .await?;
+            writer.send.write_u32_le(dimension).await?;
+            writer.send.write_all(&world).await?;
+            writer.send.write_all(&catalogue.payload).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            writer.failed = true;
+            return Err(error);
+        }
+        self.catalogues
+            .lock()
+            .expect("catalogue owner poisoned")
+            .insert(catalogue.fingerprint);
+        if self.state.trace {
+            eprintln!(
+                "VOXY_CATALOG_SENT session={} dimension={} fingerprint={} canonical_bytes={} compressed_bytes={}",
+                self.id,
+                dimension,
+                blake3::Hash::from(catalogue.fingerprint),
+                catalogue.canonical_length,
+                catalogue.compressed_length
+            );
+        }
+        Ok(())
     }
 }
 
@@ -579,94 +944,159 @@ pub async fn serve(
     shutdown: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let identity = load_or_create_identity(identity_directory)?;
-    let server_config = make_server_config(&identity)?;
+    let config = make_server_config(&identity)?;
     let runtime = Arc::new(quinn::TokioRuntime);
     let socket = std::net::UdpSocket::bind(listen)
-        .with_context(|| format!("bind Voxy QUIC UDP endpoint {listen}"))?;
-    let multiplex = UdpMux::new(runtime.wrap_udp_socket(socket)?);
-    let endpoint = Endpoint::new_with_abstract_socket(
-        Default::default(),
-        Some(server_config.clone()),
-        multiplex.foreground(),
-        runtime,
-    )?;
-    let mut background_config = server_config.clone();
-    background_config.transport_config(make_transport_config(true)?);
-    let actual = endpoint.local_addr()?;
+        .with_context(|| format!("bind Voxy QUIC UDP {listen}"))?;
+    let actual = socket.local_addr()?;
+    let mux = UdpMux::new(runtime.wrap_udp_socket(socket)?);
+    state
+        .network
+        .set(Network { mux, config })
+        .map_err(|_| anyhow::anyhow!("UDP listener already initialized"))?;
+    state.start_bridge()?;
+    state.publication_loop();
     eprintln!(
         "VOXY_READY udp_port={} alpn={} cert_sha256={}",
         actual.port(),
-        std::str::from_utf8(ALPN).expect("static ALPN"),
+        std::str::from_utf8(ALPN)?,
         identity.fingerprint
     );
-    state.publication_loop();
-    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
-    let live = Arc::new(tokio::sync::Semaphore::new(MAX_LIVE_CONNECTIONS));
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            incoming=endpoint.accept()=> {
-                let Some(incoming)=incoming else { return Ok(()); };
-                let Ok(live_permit)=live.clone().try_acquire_owned() else {incoming.refuse();continue;};
-                let Ok(handshake_permit)=pending.clone().try_acquire_owned() else {incoming.refuse();continue;};
-                let state=state.clone();let config=background_config.clone();let multiplex=multiplex.clone();
-                tokio::spawn(async move {
-                    if let Err(error)=serve_connection(state,incoming,config,multiplex,handshake_permit,live_permit).await {
-                        eprintln!("Voxy QUIC session ended: {error:#}");
-                    }
-                });
-            }
-            result=&mut shutdown=> {
-                result?; state.regional.shutdown("Voxy server shutting down");
-                tokio::time::sleep(SERVICE_SHUTDOWN_GRACE).await;
-                endpoint.close(VarInt::from_u32(0),b"Voxy server shutting down");
-                let _=tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT,endpoint.wait_idle()).await;
-                return Ok(());
-            }
-        }
+    tokio::select! { result = shutdown => result?, _ = state.bridge_stopped.notified() => {} }
+    state.regional.shutdown("Voxy server shutting down");
+    let routes = state
+        .routes
+        .lock()
+        .expect("Minecraft route owner poisoned")
+        .drain()
+        .map(|(_, route)| route)
+        .collect::<Vec<_>>();
+    for route in &routes {
+        route.close();
     }
+    for route in routes {
+        route.endpoint.wait_idle().await;
+    }
+    Ok(())
 }
-
 async fn serve_connection(
     state: Arc<ServerState>,
+    route: Arc<RouteOwner>,
     incoming: quinn::Incoming,
-    config: quinn::ServerConfig,
-    multiplex: Arc<UdpMux>,
-    handshake_permit: tokio::sync::OwnedSemaphorePermit,
-    _live_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
-    // Quinn's idle timeout owns handshake loss recovery; a second five-second timer rejected impaired clients.
     let connection = incoming.await?;
-    let (send, mut recv) = connection.accept_bi().await?;
-    send.set_priority(CONTROL_STREAM_PRIORITY)?;
-    if read_stream_role(&mut recv).await? != Some(STREAM_CONTROL) {
-        bail!("first stream must be control");
+    if state.trace {
+        eprintln!(
+            "VOXY_BOOTSTRAP stage=TLS_ESTABLISHED session={} route={} peer={}",
+            connection.stable_id(),
+            hex(&route.token[..16]),
+            connection.remote_address()
+        );
     }
-    let (dimension, expected_world, held_catalog, settings, desires) =
-        match read_control(&mut recv).await? {
+    if route.closed.load(Ordering::Acquire) {
+        connection.close(VarInt::from_u32(0), b"Minecraft session revoked");
+        return Ok(());
+    }
+    let result = serve_established(state.clone(), route.clone(), &connection).await;
+    connection.close(VarInt::from_u32(0), b"Voxy session ended");
+    if state.trace {
+        let (bytes, packets) = route.ledger.counters();
+        eprintln!(
+            "VOXY_QUIC_ENDED session={} route={} route_ip_bytes={bytes} route_datagrams={packets} success={}",
+            connection.stable_id(),
+            hex(&route.token[..16]),
+            result.is_ok()
+        );
+    }
+    result
+}
+async fn serve_established(
+    state: Arc<ServerState>,
+    route: Arc<RouteOwner>,
+    connection: &quinn::Connection,
+) -> Result<()> {
+    let (send, mut recv) = connection.accept_bi().await?;
+    send.set_priority(3)?;
+    if read_stream_role(&mut recv).await? != Some(STREAM_CONTROL) {
+        bail!("first stream must be control")
+    }
+    if state.trace {
+        eprintln!(
+            "VOXY_BOOTSTRAP stage=FIRST_CONTROL session={} route={}",
+            connection.stable_id(),
+            hex(&route.token[..16])
+        );
+    }
+    let mut supplied = [0; 32];
+    recv.read_exact(&mut supplied).await?;
+    if supplied != route.token {
+        bail!("authenticated route token mismatch")
+    }
+    if state.trace {
+        eprintln!(
+            "VOXY_BOOTSTRAP stage=TOKEN_VALID session={} route={}",
+            connection.stable_id(),
+            hex(&route.token[..16])
+        );
+    }
+    // Routing carries only the public first half of the token. Do not let an unauthenticated
+    // TLS handshake using that prefix displace the player's authenticated connection.
+    {
+        let mut current = route
+            .connection
+            .lock()
+            .expect("QUIC connection owner poisoned");
+        if let Some(old) = current.replace(connection.clone()) {
+            old.close(VarInt::from_u32(0), b"QUIC reconnect");
+        }
+    }
+    let open = if state.trace {
+        wire::read_control_traced(
+            &mut recv,
+            connection.stable_id() as u64,
+            &hex(&route.token[..16]),
+        )
+        .await?
+    } else {
+        read_control(&mut recv).await?
+    };
+    let (dimension, expected_world, held_catalog, settings, anchor_x, anchor_z, desires) =
+        match open {
             Some(ControlMessage::Open {
                 dimension,
                 expected_world,
                 held_catalog,
                 settings,
+                anchor_x,
+                anchor_z,
                 desires,
-            }) => (dimension, expected_world, held_catalog, settings, desires),
-            _ => bail!("OPEN must be the first control message"),
+            }) => (
+                dimension,
+                expected_world,
+                held_catalog,
+                settings,
+                anchor_x,
+                anchor_z,
+                desires,
+            ),
+            _ => bail!("OPEN must be first"),
         };
-    drop(handshake_permit);
+    if state.trace {
+        eprintln!(
+            "VOXY_BOOTSTRAP stage=OPEN_READ session={} route={} dimension={} total_kbps={} initial_desires={} expected_world={} held_catalog={}",
+            connection.stable_id(),
+            hex(&route.token[..16]),
+            dimension,
+            settings.bandwidth_kbps,
+            desires.len(),
+            blake3::Hash::from(expected_world),
+            blake3::Hash::from(held_catalog)
+        );
+    }
+    let active = state.regional.dimension_id(&dimension)?;
     let responder = state
         .regional
         .responder(&dimension, state.server_instance)?;
-    let mut token = [0; 32];
-    connection
-        .export_keying_material(&mut token, b"voxy-background-session", b"")
-        .map_err(|_| anyhow::anyhow!("session token export failed"))?;
-    let ledger = RateLedger::new(settings.bandwidth_kbps);
-    let runtime = Arc::new(quinn::TokioRuntime);
-    let socket = PacedSocket::new(multiplex.background(&token)?, ledger.clone());
-    let background_endpoint =
-        Endpoint::new_with_abstract_socket(Default::default(), Some(config), socket, runtime)?;
-    let port = background_endpoint.local_addr()?.port();
     let matched = expected_world == [0; 32] || expected_world == responder.world_identity();
     let mut catalogues = HashSet::new();
     if matched && held_catalog != [0; 32] {
@@ -674,94 +1104,76 @@ async fn serve_connection(
     }
     let session = Arc::new(Session {
         id: connection.stable_id(),
-        peer: connection.remote_address(),
-        dimension,
         state: state.clone(),
-        responder,
-        wants: Mutex::new(Wants::default()),
-        foreground: [Notify::new(), Notify::new()],
-        background: Notify::new(),
+        route,
+        scopes: Mutex::new(HashMap::new()),
+        wants: Mutex::new(Wants {
+            next_refresh: Instant::now() + Duration::from_millis(settings.interval_millis),
+            ..Default::default()
+        }),
+        available: Notify::new(),
         stopped: Notify::new(),
         closed: AtomicBool::new(false),
         settings: Mutex::new(settings),
-        ledger,
+        active_dimension: Mutex::new(active),
+        anchors: Mutex::new(HashMap::from([(active, (anchor_x, anchor_z))])),
         metadata: tokio::sync::Mutex::new(PrimaryWriter {
             send,
             failed: false,
         }),
         catalogues: Mutex::new(catalogues),
     });
-    session.policy(settings)?;
-    if state.trace {
-        let misses = desires.iter().filter(|desire| desire.purpose != 2).count();
-        eprintln!(
-            "VOXY_STREAM_SESSION session={} peer={} port={} interval_ms={} bandwidth_kbps={} initial_misses={} initial_interests={} held_catalog={}",
-            session.id,
-            session.peer,
-            port,
-            settings.interval_millis,
-            settings.bandwidth_kbps,
-            misses,
-            desires.len(),
-            blake3::Hash::from(held_catalog)
-        );
-    }
-    if matched {
-        session.apply(desires)?;
-    }
-    let result=async {
-        {
-            let mut writer=session.metadata.lock().await;
-            write_control(&mut writer.send,&session.responder.hello(token)?,CONTROL_WRITE_PROGRESS_TIMEOUT).await?;
+    let result = async {
+        session.policy(settings, active, vec![DimensionAnchor { dimension:active, x:anchor_x, z:anchor_z }])?;
+        session.metadata(&responder.hello(active)?).await?;
+        if state.trace {
+            eprintln!("VOXY_BOOTSTRAP stage=HELLO_SENT session={} route={}", session.id, hex(&session.route.token[..16]));
         }
-        let background_session=session.clone();let background=background_endpoint.clone();
-        let mut background_task=Some(tokio::spawn(async move {serve_background(background_session,background,token).await}));
-        let mut lanes=tokio::task::JoinSet::new();
-        // One reader owns the byte cursor. Cancelling read_control after accepting another lane
-        // would discard an already-read frame prefix and corrupt the next control message.
-        let control_session=session.clone();
-        let mut controls=tokio::spawn(async move {
+        session.metadata(&ControlMessage::Manifest(state.regional.manifest()?)).await?;
+        if state.trace {
+            eprintln!("VOXY_BOOTSTRAP stage=MANIFEST_SENT session={} route={}", session.id, hex(&session.route.token[..16]));
+        }
+        let definition = responder.catalogue()?;
+        session.announce_catalogue(active, responder.world_identity(), &definition).await?;
+        if matched {
+            session.apply(desires.into_iter().map(|desire| ScopedDesire { dimension:active, expected_world, desire }).collect())?;
+        }
+        if state.trace {
+            eprintln!("VOXY_STREAM_SESSION session={} peer={} dimension={} total_kbps={} held_catalog={}", session.id, connection.remote_address(), active, settings.bandwidth_kbps, blake3::Hash::from(held_catalog));
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        let owner = session.clone();
+        tasks.spawn(async move {
             loop {
                 match read_control(&mut recv).await? {
-                    Some(ControlMessage::Desires(desires))=>control_session.apply(desires)?,
-                    Some(ControlMessage::Drop(keys))=>control_session.drop_keys(keys)?,
-                    Some(ControlMessage::Settings(settings))=>control_session.policy(settings)?,
-                    None=>return Ok::<(),anyhow::Error>(()),
-                    Some(_)=>bail!("unexpected primary control record"),
+                    Some(ControlMessage::Desires(desires)) => owner.apply(desires)?,
+                    Some(ControlMessage::Drop(keys)) => owner.drop_keys(keys)?,
+                    Some(ControlMessage::Settings { settings, active_dimension, anchors }) => owner.policy(settings, active_dimension, anchors)?,
+                    None => return Ok(()),
+                    _ => bail!("unexpected client control record"),
                 }
             }
         });
-        let mut controls_finished=false;
-        let result=loop {
+        let result = loop {
             tokio::select! {
-                incoming=connection.accept_bi()=> {
-                    let (send,recv)=match incoming {Ok(pair)=>pair,Err(error)=>break Err(error.into())};
-                    let owner=session.clone();lanes.spawn(async move {serve_lane(owner,send,recv).await});
+                incoming = connection.accept_bi() => {
+                    let (send,recv) = match incoming { Ok(streams)=>streams, Err(error)=>break Err(error.into()) };
+                    let owner=session.clone();
+                    tasks.spawn(async move { serve_lane(owner,send,recv).await });
                 }
-                message=&mut controls=> {
-                    controls_finished=true;
-                    break match message { Ok(result)=>result,Err(error)=>Err(error.into()) };
+                result = tasks.join_next() => {
+                    break match result { Some(Ok(result))=>result, Some(Err(error))=>Err(error.into()), None=>Ok(()) };
                 }
-                lane=lanes.join_next(),if !lanes.is_empty()=> {
-                    match lane {Some(Ok(Ok(())))=>{},Some(Ok(Err(error)))=>break Err(error),Some(Err(error))=>break Err(error.into()),None=>{}}
-                }
-                background=async { background_task.as_mut().unwrap().await },if background_task.is_some()=> {
-                    if let Ok(Err(error))=background {eprintln!("Voxy background connection failed: {error:#}; foreground remains available");}
-                    background_task=None;
-                }
+                error = connection.closed() => break Err(error.into()),
             }
         };
-        session.close();connection.close(VarInt::from_u32(0),b"session ended");
-        while lanes.join_next().await.is_some() {}
-        if !controls_finished { let _=controls.await; }
-        if let Some(background_task)=background_task { let _=background_task.await; }
+        session.close();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
         result
     }.await;
     session.close();
-    connection.close(VarInt::from_u32(0), b"primary session ended");
-    background_endpoint.close(VarInt::from_u32(0), b"primary session ended");
-    background_endpoint.wait_idle().await;
-    let coordinates = session
+    let regions = session
         .wants
         .lock()
         .expect("terrain desire owner poisoned")
@@ -769,83 +1181,85 @@ async fn serve_connection(
         .keys()
         .copied()
         .collect::<Vec<_>>();
-    for coordinate in coordinates {
-        state.release(&session, coordinate);
+    for region in regions {
+        state.release(&session, region);
         session
+            .scope(region.0)?
             .responder
-            .unsubscribe_region(coordinate.0, coordinate.1)?;
+            .unsubscribe_region(region.1, region.2)?;
     }
     state.regional.set_cadence(session.id, None)?;
-    if state.trace {
-        let (bytes, datagrams) = session.ledger.counters();
-        eprintln!(
-            "VOXY_BACKGROUND_STATS session={} peer={} port={} ip_bytes={} datagrams={}",
-            session.id, session.peer, port, bytes, datagrams
-        );
-    }
     result
 }
-
 async fn serve_lane(
     session: Arc<Session>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> Result<()> {
-    if read_stream_role(&mut recv).await? != Some(STREAM_SECTION_LANE) {
-        bail!("invalid foreground stream role");
+    match read_stream_role(&mut recv).await? {
+        Some(STREAM_DISCOVERY) => {
+            send.set_priority(1)?;
+            return discovery_loop(session, &mut send).await;
+        }
+        Some(STREAM_SECTION_LANE) => {}
+        _ => bail!("invalid section stream role"),
     }
-    let lane = read_lane(&mut recv).await?;
-    send.set_priority(match lane {
-        PriorityLane::Coverage => 2,
-        PriorityLane::Refinement => 1,
-    })?;
-    let lane = lane as usize;
+    let lane = read_lane(&mut recv).await? as usize;
+    send.set_priority(if lane == 0 { 2 } else { 1 })?;
     loop {
-        let notified = session.foreground[lane].notified();
+        let notified = session.available.notified();
         if session.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        if let Some(claim) = session.claim(lane) {
-            let sent = tokio::select! {result=send_claim(&session,&mut send,claim,None)=>result?,_=session.ended()=>return Ok(())};
-            session.finish(claim, sent, false);
+        let (claim, deadline) = session.claim(lane);
+        if let Some(claim) = claim {
+            let binding = tokio::select! {result=send_claim(&session,&mut send,claim)=>result?,_=session.ended()=>return Ok(())};
+            session.finish(claim, binding);
         } else {
-            tokio::select! {_=notified=>{},_=session.ended()=>return Ok(())}
+            tokio::select! {_=notified=>{},_=async{if let Some(deadline)=deadline{tokio::time::sleep_until(deadline).await}else{std::future::pending::<()>().await}}=>{},_=session.ended()=>return Ok(())}
         }
     }
 }
-
+fn geometric_rank(packed: u64, anchor: (i32, i32)) -> Result<u64> {
+    let key = crate::key::SectionKey::unpack(packed)?;
+    let side = 32i64 << key.level;
+    let x = key.x as i64 * side;
+    let z = key.z as i64 * side;
+    let distance = |position: i32, origin: i64| {
+        if (position as i64) < origin {
+            origin - position as i64
+        } else if position as i64 > origin + side {
+            position as i64 - origin - side
+        } else {
+            0
+        }
+    };
+    let dx = distance(anchor.0, x) as i128;
+    let dz = distance(anchor.1, z) as i128;
+    let rank = 512i128 * 512 + ((dx * dx + dz * dz) << (2 * (4 - key.level)));
+    u64::try_from(rank).context("spatial rank overflow")
+}
 async fn send_claim(
     session: &Session,
     send: &mut quinn::SendStream,
     claim: Claim,
-    background_catalogues: Option<&mut HashSet<[u8; 32]>>,
 ) -> Result<Option<ContentBinding>> {
-    let background = background_catalogues.is_some();
-    let responder = session.responder.clone();
+    let scope = session.scope(claim.scope.dimension)?;
+    let responder = scope.responder.clone();
     let desire = claim.desire;
     let mut prepared: PreparedSection =
         tokio::task::spawn_blocking(move || responder.prepare(desire.ticket, desire.key)).await??;
     let descriptor = prepared.descriptor;
-    if background
+    if claim.refresh
         && claim.known == Some(descriptor.binding)
         && descriptor.status != RecordStatus::NotReady
     {
         return Ok(Some(descriptor.binding));
     }
     if descriptor.binding.catalog_fingerprint != [0; 32] {
-        if let Some(announced) = background_catalogues {
-            if !announced.contains(&descriptor.binding.catalog_fingerprint)
-                && !session.has_catalogue(descriptor.binding.catalog_fingerprint)
-            {
-                let started = Instant::now();
-                session.trace_catalogue_start("background", &prepared.catalog);
-                send.write_all(&prepared.catalog.frame).await?;
-                announced.insert(descriptor.binding.catalog_fingerprint);
-                session.trace_catalogue("background", &prepared.catalog, started);
-            }
-        } else {
-            session.announce_catalogue(&prepared.catalog).await?;
-        }
+        session
+            .announce_catalogue(claim.scope.dimension, scope.world, &prepared.catalog)
+            .await?;
     }
     if descriptor.status == RecordStatus::Data
         && claim
@@ -856,150 +1270,245 @@ async fn send_claim(
     }
     let descriptor = prepared.descriptor;
     let body = tokio::task::spawn_blocking(move || prepared.body()).await??;
-    wire::write_record(send, descriptor, &body).await?;
+    wire::write_record(send, claim.scope.dimension, scope.world, descriptor, &body).await?;
     Ok((descriptor.status != RecordStatus::NotReady).then_some(descriptor.binding))
 }
-
-async fn serve_background(
-    session: Arc<Session>,
-    endpoint: Endpoint,
-    token: [u8; 32],
-) -> Result<()> {
-    let mut last_start = Instant::now();
-    let mut sequence = 0u64;
-    loop {
-        let incoming = tokio::select! {
-            incoming = endpoint.accept() => incoming,
-            _ = session.ended() => return Ok(()),
-        };
-        let Some(incoming) = incoming else {
-            return Ok(());
-        };
-        let connection = tokio::select! {
-            result = incoming => match result {
-                Ok(connection) => connection,
-                Err(error) => {
-                    eprintln!("background handshake failed: {error}");
-                    continue;
-                }
-            },
-            _ = session.ended() => return Ok(()),
-        };
-        let transfer = async {
-            let (mut send, mut recv) = connection.accept_bi().await?;
-            if read_stream_role(&mut recv).await? != Some(STREAM_BACKGROUND) {
-                bail!("invalid background stream role");
-            }
-            let mut supplied = [0; 32];
-            recv.read_exact(&mut supplied).await?;
-            if supplied != token {
-                bail!("background session token mismatch");
-            }
-            let mut held_catalog = [0; 32];
-            recv.read_exact(&mut held_catalog).await?;
-            if session.state.trace {
-                let (bytes, datagrams) = session.ledger.counters();
-                eprintln!(
-                    "VOXY_BACKGROUND_CONNECTED session={} peer={} port={} ip_bytes={} datagrams={}",
-                    session.id,
-                    connection.remote_address(),
-                    endpoint.local_addr()?.port(),
-                    bytes,
-                    datagrams
-                );
-            }
-            session.reconcile_background();
-            let mut catalogues = HashSet::new();
-            if held_catalog != [0; 32] {
-                catalogues.insert(held_catalog);
-            }
-            loop {
-                let settings = *session
-                    .settings
-                    .lock()
-                    .expect("streaming settings owner poisoned");
-                let deadline = last_start + Duration::from_millis(settings.interval_millis);
-                if Instant::now() < deadline {
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => {},
-                        _ = session.background.notified() => continue,
-                        _ = session.ended() => return Ok::<(), anyhow::Error>(()),
-                    }
-                }
-                // Observe wakeups before the predicate: notify_waiters retains changes
-                // for an existing future, but not for one created after the last key arrives.
-                let notified = session.background.notified();
-                let keys = session.background_keys();
-                if keys.is_empty() {
-                    tokio::select! {
-                        _ = notified => {},
-                        _ = session.ended() => return Ok(()),
-                    }
-                    continue;
-                }
-                last_start = Instant::now();
-                sequence = sequence
-                    .checked_add(1)
-                    .context("background batch counter exhausted")?;
-                session.trace("start", sequence, keys.len(), endpoint.local_addr()?.port());
-                for &key in &keys {
-                    let Some(claim) = session.claim_background(key) else {
-                        continue;
-                    };
-                    let sent = tokio::select! {
-                        result = send_claim(&session, &mut send, claim, Some(&mut catalogues)) => match result {
-                            Ok(binding) => binding,
-                            Err(error) => {
-                                session.finish(claim, None, true);
-                                return Err(error);
-                            }
-                        },
-                        _ = session.ended() => return Ok(()),
-                    };
-                    session.finish(claim, sent, true);
-                }
-                session.trace(
-                    "finish",
-                    sequence,
-                    keys.len(),
-                    endpoint.local_addr()?.port(),
-                );
-            }
-        };
-        let result = tokio::select! {
-            result = transfer => result,
-            error = connection.closed() => Err(error.into()),
-            _ = session.ended() => Ok(()),
-        };
-        connection.close(VarInt::from_u32(0), b"background stream ended");
-        if let Err(error) = result {
-            eprintln!("Voxy background reconnect required: {error:#}");
-        }
-        if session.closed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-    }
+async fn write_discovery(send: &mut quinn::SendStream, message: &ControlMessage) -> Result<()> {
+    send.write_all(&encode_control_record(message)?)
+        .await
+        .context("discovery stream frame failed")
 }
-
-async fn write_control(
-    send: &mut quinn::SendStream,
-    message: &ControlMessage,
-    progress_timeout: Duration,
-) -> Result<()> {
-    let record = encode_control_record(message)?;
-    let mut remaining = record.as_slice();
-    while !remaining.is_empty() {
-        // Quinn's inherent write is cancellation-safe and reports the accepted prefix.
-        // The next deadline starts only after bytes were accepted, not after a wakeup.
-        let written = tokio::time::timeout(progress_timeout, send.write(remaining))
-            .await
-            .context("regional control write made no progress")??;
-        if written == 0 {
-            bail!("regional control write accepted zero bytes");
-        }
-        remaining = &remaining[written..];
-    }
+fn discovery_priority(session: &Session, send: &quinn::SendStream, dimension: u32) -> Result<()> {
+    let active = *session
+        .active_dimension
+        .lock()
+        .expect("active dimension owner poisoned");
+    // Equal-priority streams share transport service. Keep inactive discovery at the
+    // refinement priority so pending active COMPLETE bytes cannot be stranded behind
+    // continuous refresh traffic when this shared stream moves to another dimension.
+    send.set_priority(if dimension == active { 2 } else { 1 })?;
     Ok(())
+}
+async fn snapshot_inventory(
+    session: &Session,
+    send: &mut quinn::SendStream,
+    dimension: u32,
+) -> Result<Option<u64>> {
+    discovery_priority(session, send, dimension)?;
+    let name = session.state.regional.dimension_name(dimension)?;
+    let runtime = session.state.regional.runtime(&name)?;
+    let revision = runtime.inventory_revision();
+    let known = runtime.inventory_known()?;
+    let record = |state, x, z, saved| {
+        ControlMessage::Inventory(InventoryRecord {
+            dimension,
+            revision,
+            state,
+            x,
+            z,
+            saved,
+        })
+    };
+    write_discovery(send, &record(if known { 0 } else { 5 }, 0, 0, [0; 16])).await?;
+    if !known {
+        if session.state.trace {
+            eprintln!(
+                "VOXY_INVENTORY_SNAPSHOT session={} dimension={dimension} revision={revision} known=false rows=0",
+                session.id
+            );
+        }
+        return Ok(None);
+    }
+    let mut after = None;
+    let mut rows = 0u64;
+    while let Some((coordinate, availability)) = runtime.inventory_after(after)? {
+        write_discovery(
+            send,
+            &record(
+                if availability.readable { 1 } else { 2 },
+                coordinate.0,
+                coordinate.1,
+                availability.saved,
+            ),
+        )
+        .await?;
+        after = Some(coordinate);
+        rows += 1;
+    }
+    if session.state.trace {
+        eprintln!(
+            "VOXY_INVENTORY_SNAPSHOT session={} dimension={dimension} revision={revision} known=true rows={rows}",
+            session.id
+        );
+    }
+    // Complete only after queued changes since the cursor began have caught up. The map can
+    // change while a capped stream writes; declaring this mixed cursor a finished snapshot
+    // would incorrectly turn a just-saved or removed region into authoritative absence.
+    Ok(Some(revision))
+}
+async fn discovery_loop(session: Arc<Session>, send: &mut quinn::SendStream) -> Result<()> {
+    let mut events = session.state.regional.subscribe();
+    let manifest = session.state.regional.manifest()?;
+    let mut known_dimensions = manifest
+        .iter()
+        .map(|dimension| dimension.id)
+        .collect::<HashSet<_>>();
+    let mut revisions = HashMap::new();
+    let mut pending_complete = HashSet::new();
+    let mut initialized = HashSet::new();
+    let mut pending_snapshots = manifest
+        .iter()
+        .map(|dimension| dimension.id)
+        .collect::<VecDeque<_>>();
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => Some(Ok(event)),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(lost)) => {
+                Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)))
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Ok(()),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => None,
+        };
+        let event = match event {
+            Some(event) => event,
+            None => {
+                let pending = pending_complete.iter().copied().collect::<Vec<_>>();
+                for dimension in pending {
+                    let name = session.state.regional.dimension_name(dimension)?;
+                    let runtime = session.state.regional.runtime(&name)?;
+                    let revision = revisions[&dimension];
+                    if runtime.inventory_known()? && runtime.inventory_revision() == revision {
+                        discovery_priority(&session, send, dimension)?;
+                        write_discovery(
+                            send,
+                            &ControlMessage::Inventory(InventoryRecord {
+                                dimension,
+                                revision,
+                                state: 4,
+                                x: 0,
+                                z: 0,
+                                saved: [0; 16],
+                            }),
+                        )
+                        .await?;
+                        pending_complete.remove(&dimension);
+                        if session.state.trace {
+                            eprintln!(
+                                "VOXY_INVENTORY_COMPLETE session={} dimension={dimension} revision={revision}",
+                                session.id
+                            );
+                        }
+                    }
+                }
+                if pending_complete.is_empty() && !pending_snapshots.is_empty() {
+                    let active = *session
+                        .active_dimension
+                        .lock()
+                        .expect("active dimension owner poisoned");
+                    let position = pending_snapshots
+                        .iter()
+                        .position(|id| *id == active)
+                        .unwrap_or(0);
+                    let dimension = pending_snapshots
+                        .remove(position)
+                        .expect("pending snapshot exists");
+                    initialized.insert(dimension);
+                    if let Some(revision) = snapshot_inventory(&session, send, dimension).await? {
+                        revisions.insert(dimension, revision);
+                        pending_complete.insert(dimension);
+                    }
+                    continue;
+                }
+                events.recv().await
+            }
+        };
+        match event {
+            Ok(RegionalAnnouncement::Manifest) => {
+                let manifest = session.state.regional.manifest()?;
+                write_discovery(send, &ControlMessage::Manifest(manifest.clone())).await?;
+                for dimension in manifest {
+                    if known_dimensions.insert(dimension.id) {
+                        pending_snapshots.push_back(dimension.id);
+                    }
+                }
+            }
+            Ok(RegionalAnnouncement::Discovery {
+                dimension,
+                revision,
+                updates,
+                reset,
+            }) => {
+                let id = session.state.regional.dimension_id(&dimension)?;
+                // A later full snapshot already includes changes before that dimension starts.
+                if !initialized.contains(&id) {
+                    continue;
+                }
+                if revisions
+                    .get(&id)
+                    .is_some_and(|previous| *previous > revision)
+                {
+                    continue;
+                }
+                let runtime = session.state.regional.runtime(&dimension)?;
+                discovery_priority(&session, send, id)?;
+                if reset {
+                    if let Some(revision) = snapshot_inventory(&session, send, id).await? {
+                        revisions.insert(id, revision);
+                        pending_complete.insert(id);
+                    }
+                    continue;
+                }
+                revisions.insert(id, revision);
+                if !runtime.inventory_known()? {
+                    pending_complete.remove(&id);
+                    write_discovery(
+                        send,
+                        &ControlMessage::Inventory(InventoryRecord {
+                            dimension: id,
+                            revision,
+                            state: 5,
+                            x: 0,
+                            z: 0,
+                            saved: [0; 16],
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
+                for (coordinate, availability) in updates.iter() {
+                    write_discovery(
+                        send,
+                        &ControlMessage::Inventory(InventoryRecord {
+                            dimension: id,
+                            revision,
+                            state: availability
+                                .as_ref()
+                                .map_or(3, |entry| if entry.readable { 1 } else { 2 }),
+                            x: coordinate.0,
+                            z: coordinate.1,
+                            saved: availability.as_ref().map_or([0; 16], |entry| entry.saved),
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let manifest = session.state.regional.manifest()?;
+                write_discovery(send, &ControlMessage::Manifest(manifest.clone())).await?;
+                known_dimensions = manifest.iter().map(|dimension| dimension.id).collect();
+                pending_snapshots = manifest.iter().map(|dimension| dimension.id).collect();
+                initialized.clear();
+                revisions.clear();
+                pending_complete.clear();
+            }
+            Ok(RegionalAnnouncement::Shutdown(message)) => {
+                write_discovery(send, &ControlMessage::Shutdown { message }).await?;
+                return Ok(());
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            _ => {}
+        }
+    }
 }
 
 struct PersistentIdentity {
@@ -1075,14 +1584,14 @@ fn make_server_config(identity: &PersistentIdentity) -> Result<quinn::ServerConf
     tls.max_early_data_size = 0;
     let crypto = QuicServerConfig::try_from(tls).context("configure QUIC TLS")?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    server.transport_config(make_transport_config(false)?);
+    server.transport_config(make_transport_config()?);
     Ok(server)
 }
 
-fn make_transport_config(background: bool) -> Result<Arc<quinn::TransportConfig>> {
+fn make_transport_config() -> Result<Arc<quinn::TransportConfig>> {
     let mut transport = quinn::TransportConfig::default();
-    // One permanent control stream plus eight persistent client-opened section lanes.
-    transport.max_concurrent_bidi_streams(VarInt::from_u32(9));
+    // Control, eight section lanes, and one low-priority discovery lane share this connection.
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(10));
     transport.max_concurrent_uni_streams(VarInt::from_u32(0));
     transport.stream_receive_window(VarInt::from_u32(32 * 1024));
     transport.receive_window(VarInt::from_u32(1024 * 1024));
@@ -1091,12 +1600,9 @@ fn make_transport_config(background: bool) -> Result<Arc<quinn::TransportConfig>
     transport.datagram_send_buffer_size(0);
     transport.max_idle_timeout(Some(IdleTimeout::try_from(IDLE_TIMEOUT)?));
     transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
-    if background {
-        // Reserve the framing bytes within Quinn's existing IPv6-safe 1452-byte ceiling.
-        let mut discovery = quinn::MtuDiscoveryConfig::default();
-        discovery.upper_bound(1452 - ENVELOPE_BYTES as u16);
-        transport.mtu_discovery_config(Some(discovery));
-    }
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(1452 - ENVELOPE_BYTES as u16);
+    transport.mtu_discovery_config(Some(discovery));
     Ok(Arc::new(transport))
 }
 

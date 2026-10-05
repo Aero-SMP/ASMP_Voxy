@@ -122,6 +122,15 @@ impl RegionSourceTable {
                 })
     }
 
+    pub fn header_fingerprint(&self) -> [u8; 16] {
+        let mut hash = blake3::Hasher::new();
+        for record in self.records.iter() {
+            hash.update(&record.anvil_location.to_le_bytes());
+            hash.update(&record.anvil_timestamp.to_le_bytes());
+        }
+        hash.finalize().as_bytes()[..16].try_into().unwrap()
+    }
+
     pub fn write_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let parent = path

@@ -3,7 +3,7 @@ use super::{
     rebuild_region_incremental,
 };
 use crate::{
-    anvil::{AnvilWorld, RegionHeader},
+    anvil::{AnvilWorld, RegionAvailability, RegionHeader},
     read_lock,
     registry::Registry,
     safe_dimension_name, write_lock,
@@ -29,6 +29,9 @@ pub struct RegionalRefresh {
     pub more_pending: bool,
     pub incomplete: bool,
     pub failure: Option<String>,
+    pub inventory_changed: bool,
+    pub inventory_reset: bool,
+    pub inventory_updates: Vec<((i32, i32), Option<RegionAvailability>)>,
 }
 
 #[derive(Debug)]
@@ -42,21 +45,43 @@ pub struct RegionalRuntime {
     // Keep only generation metadata resident. Region indexes and file handles are opened for the
     // one request or rebuild that owns them, so world size cannot multiply the full directory.
     regions: RwLock<BTreeMap<(i32, i32), u64>>,
-    sources: RwLock<BTreeMap<(i32, i32), RegionSourceTable>>,
+    sources: RwLock<BTreeMap<(i32, i32), SourceStamp>>,
     // Successful Anvil inventory, including unreadable regions. Missing generated LOD data
     // alone never proves terrain deletion; a failed directory scan revokes absence evidence.
-    inventory: RwLock<Option<BTreeSet<(i32, i32)>>>,
+    inventory: RwLock<Option<BTreeMap<(i32, i32), RegionAvailability>>>,
+    inventory_revision: AtomicU64,
     maintenance: Mutex<Maintenance>,
     priority: Mutex<PriorityRequests>,
     dirty: Mutex<BTreeMap<(i32, i32), [u64; 16]>>,
+    dirty_discovery: Mutex<BTreeSet<(i32, i32)>>,
     freshness_attempts: Mutex<BTreeMap<(i32, i32), Instant>>,
     freshness_millis: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceStamp {
+    generation: u64,
+    marker: u64,
+    header: [u8; 16],
+    reconciled: bool,
+}
+impl SourceStamp {
+    fn from_table(table: &RegionSourceTable) -> Self {
+        Self {
+            generation: table.terrain_generation,
+            marker: table.anvil_file_marker,
+            header: table.header_fingerprint(),
+            reconciled: table.reconciled,
+        }
+    }
+}
 #[derive(Debug, Default)]
 struct Maintenance {
     retry: BTreeMap<(i32, i32), Retry>,
     inventory_failed_round: Option<u64>,
+    inventory_round: Option<u64>,
+    pending: VecDeque<(i32, i32)>,
+    pending_set: BTreeSet<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +105,7 @@ struct PriorityRequests {
     active: BTreeMap<(i32, i32), Arc<RegionFile>>,
 }
 
+#[cfg(test)]
 fn refresh_order<T>(
     headers: &BTreeMap<(i32, i32), T>,
     priority: &Mutex<PriorityRequests>,
@@ -239,21 +265,12 @@ impl RegionalRuntime {
         identity.update(dimension.as_bytes());
         let world_identity = *identity.finalize().as_bytes();
 
-        let source_snapshot = source.region_headers().ok();
-        let inventory_known = source_snapshot.is_some();
-        let source_snapshot = source_snapshot.unwrap_or_default();
-        let source_coordinates = source_snapshot
-            .valid
-            .iter()
-            .map(|header| (header.region_x, header.region_z))
-            .chain(
-                source_snapshot
-                    .failed
-                    .iter()
-                    .map(|failed| (failed.region_x, failed.region_z)),
-            )
-            .collect::<BTreeSet<_>>();
-        drop(source_snapshot);
+        let inventory = source.region_inventory(&BTreeMap::new()).ok();
+        let inventory_known = inventory.is_some();
+        let source_coordinates = inventory
+            .as_ref()
+            .map(|entries| entries.keys().copied().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
 
         let mut maintenance = Maintenance::default();
         let mut regions = BTreeMap::new();
@@ -296,12 +313,30 @@ impl RegionalRuntime {
                             );
                         }
                     }
-                    Ok(_) | Err(_) => crate::quarantine(&path),
+                    Ok(region) => {
+                        // A changed authoritative height replaces the layout, not the world.
+                        // Preserve its generation high-water mark so clients cannot reject the
+                        // rebuilt data as an older revision of their already cached terrain.
+                        if region.world_identity() == world_identity
+                            && region.catalog_id() == catalog_id
+                        {
+                            maintenance.retry.insert(
+                                coordinate,
+                                Retry {
+                                    kind: RetryKind::Refresh,
+                                    generation: region.generation(),
+                                    round: None,
+                                },
+                            );
+                        }
+                        crate::quarantine(&path);
+                    }
+                    Err(_) => crate::quarantine(&path),
                 },
                 RegionalFileKind::Source => match RegionSourceTable::open(&path) {
                     Ok(table) if (table.region_x, table.region_z) == coordinate => {
                         if durable_file(&path).is_ok() {
-                            sources.insert(coordinate, table);
+                            sources.insert(coordinate, SourceStamp::from_table(&table));
                         } else {
                             maintenance.retry.entry(coordinate).or_insert(Retry {
                                 kind: RetryKind::Refresh,
@@ -317,7 +352,7 @@ impl RegionalRuntime {
         sources.retain(|coordinate, table| {
             regions
                 .get(coordinate)
-                .is_some_and(|generation| *generation == table.terrain_generation)
+                .is_some_and(|generation| *generation == table.generation)
         });
         Ok(Self {
             dimension,
@@ -328,10 +363,12 @@ impl RegionalRuntime {
             layout,
             regions: RwLock::new(regions),
             sources: RwLock::new(sources),
-            inventory: RwLock::new(inventory_known.then_some(source_coordinates)),
+            inventory: RwLock::new(inventory),
+            inventory_revision: AtomicU64::new(1),
             maintenance: Mutex::new(maintenance),
             priority: Mutex::new(PriorityRequests::default()),
             dirty: Mutex::new(BTreeMap::new()),
+            dirty_discovery: Mutex::new(BTreeSet::new()),
             freshness_attempts: Mutex::new(BTreeMap::new()),
             freshness_millis: AtomicU64::new(1000),
         })
@@ -348,7 +385,7 @@ impl RegionalRuntime {
     pub fn confirmed_absent(&self, x: i32, z: i32) -> Result<bool> {
         Ok(read_lock(&self.inventory)?
             .as_ref()
-            .is_some_and(|coordinates| !coordinates.contains(&(x, z))))
+            .is_some_and(|coordinates| !coordinates.contains_key(&(x, z))))
     }
 
     pub fn region(&self, x: i32, z: i32) -> Result<Option<Arc<RegionFile>>> {
@@ -413,6 +450,15 @@ impl RegionalRuntime {
             let slot = (z.rem_euclid(32) * 32 + x.rem_euclid(32)) as usize;
             bits[slot / 64] |= 1 << (slot % 64);
         }
+        let mut discovery = self
+            .dirty_discovery
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty discovery owner poisoned"))?;
+        discovery.extend(
+            chunks
+                .iter()
+                .map(|&(x, z)| (x.div_euclid(32), z.div_euclid(32))),
+        );
         Ok(())
     }
 
@@ -570,124 +616,222 @@ impl RegionalRuntime {
         Ok(true)
     }
 
-    /// Publishes at most one terrain region per invocation. That makes initial coverage visible
-    /// immediately and bounds build memory without throttling parsing, compression, or serving
-    /// inside the selected region.
+    pub fn inventory_revision(&self) -> u64 {
+        self.inventory_revision.load(Ordering::Acquire)
+    }
+    pub fn inventory_known(&self) -> Result<bool> {
+        Ok(read_lock(&self.inventory)?.is_some())
+    }
+    pub fn inventory_after(
+        &self,
+        after: Option<(i32, i32)>,
+    ) -> Result<Option<((i32, i32), RegionAvailability)>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let inventory = read_lock(&self.inventory)?;
+        let Some(inventory) = inventory.as_ref() else {
+            return Ok(None);
+        };
+        let next = match after {
+            Some(after) => inventory.range((Excluded(after), Unbounded)).next(),
+            None => inventory.first_key_value(),
+        };
+        Ok(next.map(|(coordinate, availability)| (*coordinate, availability.clone())))
+    }
+
+    /// A shared compact snapshot/cursor survives individual publications. Full source records
+    /// are opened only by the regional transaction that needs them.
     pub fn refresh(&self, round: u64) -> Result<RegionalRefresh> {
         let mut maintenance = self
             .maintenance
             .lock()
             .map_err(|_| crate::UnsafeState("regional maintenance lock poisoned"))?;
         let mut result = RegionalRefresh::default();
-        if maintenance.inventory_failed_round == Some(round) {
-            result.incomplete = true;
-            result.failure = Some(format!("{}: inventory deferred this round", self.dimension));
-            return Ok(result);
-        }
-        let snapshot = match self.source.region_headers() {
-            Ok(headers) => headers,
-            Err(error) => {
-                *write_lock(&self.inventory)? = None;
-                maintenance.inventory_failed_round = Some(round);
-                result.incomplete = true;
-                result.failure = Some(format!("{}: inventory: {error:#}", self.dimension));
-                eprintln!("{}", result.failure.as_ref().unwrap());
-                return Ok(result);
+        // Finish the current sweep before reconciling the entire directory again. Completed-save
+        // hints below still discover changed/new sources immediately during a long import.
+        if maintenance.inventory_round.is_none()
+            || (maintenance.pending.is_empty() && maintenance.inventory_round != Some(round))
+        {
+            let (previous_known, previous) = {
+                let inventory = read_lock(&self.inventory)?;
+                (inventory.is_some(), inventory.clone().unwrap_or_default())
+            };
+            match self.source.region_inventory(&previous) {
+                Ok(next) => {
+                    let mut updates = Vec::new();
+                    for (&coordinate, availability) in &next {
+                        if !previous
+                            .get(&coordinate)
+                            .is_some_and(|old| old.same_inventory(availability))
+                        {
+                            updates.push((coordinate, Some(availability.clone())));
+                        }
+                        if availability.readable
+                            && !self.availability_is_current(
+                                coordinate,
+                                availability,
+                                &maintenance,
+                            )?
+                        {
+                            if maintenance.pending_set.insert(coordinate) {
+                                maintenance.pending.push_back(coordinate);
+                            }
+                        } else if !availability.readable {
+                            result.incomplete = true;
+                            result.failure.get_or_insert_with(|| {
+                                format!("{}: unreadable source {:?}", self.dimension, coordinate)
+                            });
+                        }
+                    }
+                    for coordinate in previous
+                        .keys()
+                        .filter(|coordinate| !next.contains_key(coordinate))
+                        .copied()
+                        .collect::<Vec<_>>()
+                    {
+                        updates.push((coordinate, None));
+                    }
+                    // Stored files absent from a successful inventory are removals, including
+                    // deletions that happened while Java/native was offline.
+                    let stale = read_lock(&self.regions)?
+                        .keys()
+                        .copied()
+                        .chain(maintenance.retry.keys().copied())
+                        .filter(|coordinate| !next.contains_key(coordinate))
+                        .collect::<BTreeSet<_>>();
+                    for coordinate in stale {
+                        self.take_dirty(coordinate)?;
+                        self.freshness_attempts
+                            .lock()
+                            .map_err(|_| crate::UnsafeState("freshness owner poisoned"))?
+                            .remove(&coordinate);
+                        if let Some(generation) = write_lock(&self.regions)?.remove(&coordinate) {
+                            result.removed.push(coordinate);
+                            maintenance.retry.insert(
+                                coordinate,
+                                Retry {
+                                    kind: RetryKind::Cleanup,
+                                    generation,
+                                    round: None,
+                                },
+                            );
+                        }
+                        write_lock(&self.sources)?.remove(&coordinate);
+                        self.priority
+                            .lock()
+                            .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?
+                            .active
+                            .remove(&coordinate);
+                        if let Err(error) = self.cleanup(coordinate) {
+                            self.failed(&mut maintenance, &mut result, coordinate, round, error)?;
+                        } else {
+                            maintenance.retry.remove(&coordinate);
+                        }
+                    }
+                    result.inventory_reset =
+                        !previous_known || maintenance.inventory_failed_round.is_some();
+                    let mut inventory = write_lock(&self.inventory)?;
+                    *inventory = Some(next);
+                    if !updates.is_empty() || result.inventory_reset {
+                        result.inventory_changed = true;
+                        result.inventory_updates = updates;
+                        self.inventory_revision.fetch_add(1, Ordering::Release);
+                    }
+                    drop(inventory);
+                    maintenance.inventory_failed_round = None;
+                    maintenance.inventory_round = Some(round);
+                }
+                Err(error) => {
+                    if maintenance.inventory_failed_round != Some(round) {
+                        let mut inventory = write_lock(&self.inventory)?;
+                        *inventory = None;
+                        self.inventory_revision.fetch_add(1, Ordering::Release);
+                        drop(inventory);
+                        result.inventory_changed = true;
+                        maintenance.inventory_failed_round = Some(round);
+                        maintenance.inventory_round = Some(round);
+                    }
+                    result.incomplete = true;
+                    result.failure = Some(format!("{}: inventory: {error:#}", self.dimension));
+                }
             }
+        }
+        let dirty = std::mem::take(
+            &mut *self
+                .dirty_discovery
+                .lock()
+                .map_err(|_| crate::UnsafeState("dirty discovery owner poisoned"))?,
+        );
+        for coordinate in dirty {
+            // A save can create a region after the last directory snapshot. Read that one header.
+            match self.source.region_header(coordinate.0, coordinate.1) {
+                Ok(Some(header)) => {
+                    let availability = RegionAvailability::from_header(&header);
+                    if let Some(inventory) = write_lock(&self.inventory)?.as_mut() {
+                        let changed = !inventory
+                            .get(&coordinate)
+                            .is_some_and(|old| old.same_inventory(&availability));
+                        // Keep current file/header stamps even when the saved footprint is unchanged.
+                        inventory.insert(coordinate, availability.clone());
+                        if changed {
+                            result
+                                .inventory_updates
+                                .push((coordinate, Some(availability)));
+                            result.inventory_changed = true;
+                            self.inventory_revision.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                    if maintenance.pending_set.insert(coordinate) {
+                        maintenance.pending.push_back(coordinate);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.failed(&mut maintenance, &mut result, coordinate, round, error)?;
+                }
+            }
+        }
+        // Requested coverage wins over the shared import cursor without sorting the world.
+        let preferred = {
+            let mut priority = self
+                .priority
+                .lock()
+                .map_err(|_| crate::UnsafeState("regional priority owner poisoned"))?;
+            let mut chosen = None;
+            while let Some(coordinate) = priority.order.pop_front() {
+                if priority.membership.remove(&coordinate) {
+                    chosen = Some(coordinate);
+                    break;
+                }
+            }
+            chosen
         };
-        maintenance.inventory_failed_round = None;
-        #[cfg(test)]
-        super::faults::hit("inventory", &self.source.root)?;
-        let inventory = snapshot
-            .valid
-            .iter()
-            .map(|h| (h.region_x, h.region_z))
-            .chain(snapshot.failed.iter().map(|h| (h.region_x, h.region_z)))
-            .collect::<BTreeSet<_>>();
-        *write_lock(&self.inventory)? = Some(inventory.clone());
-        for failed in snapshot.failed {
-            let coordinate = (failed.region_x, failed.region_z);
-            if !Self::deferred(&maintenance, coordinate, round) {
-                self.failed(
-                    &mut maintenance,
-                    &mut result,
-                    coordinate,
-                    round,
-                    anyhow::anyhow!("header snapshot: {}", failed.error),
-                )?;
-            }
-        }
-        let headers = snapshot
-            .valid
-            .into_iter()
-            .map(|h| ((h.region_x, h.region_z), h))
-            .collect::<BTreeMap<_, _>>();
-        let stored = read_lock(&self.regions)?
-            .keys()
-            .copied()
-            .chain(maintenance.retry.keys().copied())
-            .collect::<BTreeSet<_>>();
-        for coordinate in stored.difference(&inventory).copied() {
-            self.take_dirty(coordinate)?;
-            self.freshness_attempts
-                .lock()
-                .map_err(|_| crate::UnsafeState("freshness owner poisoned"))?
-                .remove(&coordinate);
-            // Logical removal precedes fallible physical cleanup and is never rolled back.
-            let removed_generation = write_lock(&self.regions)?.remove(&coordinate);
-            if removed_generation.is_some() {
-                result.removed.push(coordinate);
-            }
-            write_lock(&self.sources)?.remove(&coordinate);
-            self.priority
-                .lock()
-                .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?
-                .active
-                .remove(&coordinate);
-            let retry = maintenance.retry.entry(coordinate).or_insert(Retry {
-                kind: RetryKind::Cleanup,
-                generation: removed_generation.unwrap_or(0),
-                round: None,
-            });
-            if retry.kind != RetryKind::Cleanup {
-                retry.kind = RetryKind::Cleanup;
-                retry.round = None;
-            }
-            if Self::deferred(&maintenance, coordinate, round) {
-                continue;
-            }
-            if let Err(error) = self.cleanup(coordinate) {
-                self.failed(
-                    &mut maintenance,
-                    &mut result,
-                    coordinate,
-                    round,
-                    error.context("removal cleanup"),
-                )?;
-            } else {
-                maintenance.retry.remove(&coordinate);
-            }
-        }
-        let order = refresh_order(
-            &headers,
-            &self.priority,
-            |coordinate, header| self.header_is_current(coordinate, header, &maintenance),
-            |coordinate| Self::deferred(&maintenance, coordinate, round),
-        )?;
-        for coordinate in order {
+        let mut candidates = preferred.into_iter().collect::<VecDeque<_>>();
+        while let Some(coordinate) = candidates
+            .pop_front()
+            .or_else(|| maintenance.pending.pop_front())
+        {
+            maintenance.pending_set.remove(&coordinate);
             if Self::deferred(&maintenance, coordinate, round)
                 || self.freshness_deferred(coordinate)?
-                || self.header_is_current(coordinate, &headers[&coordinate], &maintenance)?
             {
                 continue;
             }
-            // A reappeared source cancels cleanup. Only a complete inventory proves deletion.
-            if let Some(retry) = maintenance.retry.get_mut(&coordinate)
-                && retry.kind == RetryKind::Cleanup
+            let current = read_lock(&self.inventory)?
+                .as_ref()
+                .and_then(|inventory| inventory.get(&coordinate))
+                .cloned();
+            if current.as_ref().is_some_and(|entry| entry.readable)
+                && self.availability_is_current(
+                    coordinate,
+                    current.as_ref().unwrap(),
+                    &maintenance,
+                )?
             {
-                retry.kind = RetryKind::Refresh;
+                continue;
             }
-            let before = result.changed.len();
+            if current.is_none() {
+                continue;
+            }
             let captured = self.take_dirty(coordinate)?;
             self.freshness_attempts
                 .lock()
@@ -701,28 +845,39 @@ impl RegionalRuntime {
             } else {
                 maintenance.retry.remove(&coordinate);
             }
-            if result.changed.len() > before {
+            if !result.changed.is_empty() {
                 break;
             }
         }
-        for (coordinate, header) in &headers {
-            if !Self::deferred(&maintenance, *coordinate, round)
-                && !self.freshness_deferred(*coordinate)?
-                && !self.header_is_current(*coordinate, header, &maintenance)?
-            {
-                result.more_pending = true;
-                break;
-            }
-        }
+        result.more_pending = !maintenance.pending.is_empty();
         result.incomplete |= !maintenance.retry.is_empty();
-        if result.incomplete && result.failure.is_none() {
-            result.failure = Some(format!(
-                "{}: {} unresolved regional operations",
-                self.dimension,
-                maintenance.retry.len()
-            ));
-        }
         Ok(result)
+    }
+
+    fn availability_is_current(
+        &self,
+        coordinate: (i32, i32),
+        header: &RegionAvailability,
+        maintenance: &Maintenance,
+    ) -> Result<bool> {
+        if self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?
+            .contains_key(&coordinate)
+            || maintenance.retry.contains_key(&coordinate)
+        {
+            return Ok(false);
+        }
+        let regions = read_lock(&self.regions)?;
+        let sources = read_lock(&self.sources)?;
+        Ok(regions.get(&coordinate).is_some_and(|generation| {
+            sources.get(&coordinate).is_some_and(|source| {
+                source.generation == *generation
+                    && source.marker == header.file_marker
+                    && source.header == header.header_fingerprint
+            })
+        }))
     }
 
     fn deferred(maintenance: &Maintenance, coordinate: (i32, i32), round: u64) -> bool {
@@ -858,7 +1013,16 @@ impl RegionalRuntime {
         } else {
             None
         };
-        let stored = read_lock(&self.sources)?.get(&coordinate).cloned();
+        let stamp = read_lock(&self.sources)?.get(&coordinate).copied();
+        let stored = stamp.and_then(|stamp| {
+            RegionSourceTable::open(self.source_path(coordinate))
+                .ok()
+                .filter(|table| table.terrain_generation == stamp.generation)
+                .map(|mut table| {
+                    table.reconciled = stamp.reconciled;
+                    table
+                })
+        });
         if let (Some(region), Some(source)) = (&region, &stored)
             && source.terrain_generation == region.generation()
             && source.header_matches(&header.entries, header.file_marker)
@@ -889,7 +1053,8 @@ impl RegionalRuntime {
                     .table
                     .write_atomic(self.source_path(coordinate))
                     .context("metadata-only sidecar")?;
-                write_lock(&self.sources)?.insert(coordinate, probe.table);
+                write_lock(&self.sources)?
+                    .insert(coordinate, SourceStamp::from_table(&probe.table));
                 result.metadata_only += 1;
                 if !was_authoritative {
                     self.install(region.clone(), result)?;
@@ -983,7 +1148,7 @@ impl RegionalRuntime {
             .source
             .write_atomic(self.source_path(coordinate))
             .context("source-table publication")?;
-        write_lock(&self.sources)?.insert(coordinate, built.source);
+        write_lock(&self.sources)?.insert(coordinate, SourceStamp::from_table(&built.source));
         Ok(())
     }
 
@@ -1054,7 +1219,7 @@ impl RegionalRuntime {
             let mut sources = write_lock(&self.sources)?;
             if sources
                 .get(&coordinate)
-                .is_some_and(|table| table.terrain_generation != generation)
+                .is_some_and(|table| table.generation != generation)
             {
                 sources.remove(&coordinate);
             }
@@ -1073,37 +1238,9 @@ impl RegionalRuntime {
         {
             // A sidecar found after a failed sync must cross its durability barriers again.
             durable_file(&self.source_path(coordinate))?;
-            write_lock(&self.sources)?.insert(coordinate, table);
+            write_lock(&self.sources)?.insert(coordinate, SourceStamp::from_table(&table));
         }
         Ok(())
-    }
-
-    fn header_is_current(
-        &self,
-        coordinate: (i32, i32),
-        header: &RegionHeader,
-        maintenance: &Maintenance,
-    ) -> Result<bool> {
-        if self
-            .dirty
-            .lock()
-            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?
-            .contains_key(&coordinate)
-        {
-            return Ok(false);
-        }
-
-        if maintenance.retry.contains_key(&coordinate) {
-            return Ok(false);
-        }
-        let regions = read_lock(&self.regions)?;
-        let sources = read_lock(&self.sources)?;
-        Ok(regions.get(&coordinate).is_some_and(|generation| {
-            sources.get(&coordinate).is_some_and(|source| {
-                source.terrain_generation == *generation
-                    && source.header_matches(&header.entries, header.file_marker)
-            })
-        }))
     }
 
     fn open_generation(&self, coordinate: (i32, i32), generation: u64) -> Result<RegionFile> {

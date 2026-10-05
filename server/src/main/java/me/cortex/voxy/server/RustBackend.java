@@ -154,7 +154,8 @@ final class RustBackend {
                 .directory(owned.config.toAbsolutePath().getParent().toFile())
                 .redirectErrorStream(true);
         builder.environment().put("MALLOC_ARENA_MAX", "2");
-        builder.environment().put("VOXY_BACKGROUND_TRACE", System.getProperty("voxy.background.trace", "0"));
+        builder.environment().put("VOXY_NETWORK_TRACE",
+                ServerDebug.networkTrace() || Boolean.getBoolean("voxy.network.trace") ? "1" : "0");
         return builder.start();
     }
 
@@ -186,8 +187,14 @@ final class RustBackend {
                                 }
                             }
                         }
+                        if (line.startsWith("VOXY_ROUTE_READY ")) {
+                            String[] fields = line.split(" ");
+                            if (fields.length != 3 || fields[1].length() != 64) throw new IOException("malformed route readiness");
+                            owned.saves.routeReady(child, fields[1], Integer.parseInt(fields[2]));
+                        }
                         // Control processing precedes presentation; degraded logging still drains.
-                        String message = line;
+                        String message = line.startsWith("VOXY_ROUTE_READY ")
+                                ? "VOXY_ROUTE_READY authenticated route registered" : line;
                         if (owned.loggerEnabled) report(owned, false, () -> LOGGER.info("[Rust] {}", message));
                         if (announced && owned.wanted) reportState(owned);
                     }
@@ -366,6 +373,23 @@ final class RustBackend {
     static void savedChunk(ResourceKey<Level> dimension, int x, int z) {
         Owner current = owner;
         if (current != null && current.wanted) current.saves.saved(dimension, x, z);
+    }
+
+    static void dimension(ChunkSaveNotifications.Dimension dimension) {
+        Owner current = owner;
+        if (current != null && current.wanted) current.saves.dimension(dimension);
+    }
+
+    static java.util.concurrent.CompletableFuture<Void> register(byte[] token, int rate) {
+        Owner current = owner;
+        return current == null || !current.wanted
+                ? java.util.concurrent.CompletableFuture.failedFuture(new IOException("native owner unavailable"))
+                : current.saves.register(token, rate);
+    }
+
+    static void revoke(byte[] token) {
+        Owner current = owner;
+        if (current != null && current.wanted) current.saves.revoke(token);
     }
 
     static ReadyRecord ready() {

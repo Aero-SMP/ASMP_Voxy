@@ -1,0 +1,39 @@
+{
+  "utc": "2026-10-05T15:44:12.105630+00:00",
+  "target": [
+    -234,
+    115,
+    60
+  ],
+  "restoredOriginal": "minecraft:air",
+  "savedStableRead": true,
+  "savedProof": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/pc256-target-restored-saved-air.json",
+  "ownedForceLoadRemoved": true,
+  "events": [
+    {
+      "utc": "2026-10-05T15:44:11.824663+00:00",
+      "command": "execute in minecraft:overworld if loaded -234 115 60 if block -234 115 60 minecraft:stone run setblock -234 115 60 minecraft:air",
+      "reply": "Changed the block at -234, 115, 60\n"
+    },
+    {
+      "utc": "2026-10-05T15:44:11.944878+00:00",
+      "command": "save-all flush",
+      "reply": "Saving the game (this may take a moment!)\nSaved the game\n"
+    },
+    {
+      "utc": "2026-10-05T15:44:11.992724+00:00",
+      "command": "execute in minecraft:overworld run forceload remove -234 60",
+      "reply": "Unmarked chunk [-15, 3] in Overworld for force loading\n"
+    },
+    {
+      "utc": "2026-10-05T15:44:12.013772+00:00",
+      "command": "execute in minecraft:overworld run forceload query -234 60",
+      "reply": "Chunk at [-15, 3] in Overworld is not marked for force loading\n"
+    },
+    {
+      "utc": "2026-10-05T15:44:12.105503+00:00",
+      "command": "save-all flush",
+      "reply": "Saving the game (this may take a moment!)\nSaved the game\n"
+    }
+  ]
+}

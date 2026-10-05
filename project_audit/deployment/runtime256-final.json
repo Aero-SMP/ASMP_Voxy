@@ -1,0 +1,39 @@
+{
+  "utc": "2026-10-05T15:56:48.635958+00:00",
+  "processes": [
+    {
+      "pid": 3887739,
+      "comm": "java",
+      "cwd": "/home/aerosmp/Desktop/Voxy_Testing",
+      "heapBytes": {
+        "InitialHeapSize": 1073741824,
+        "MaxHeapSize": 4294967296
+      }
+    },
+    {
+      "pid": 3888664,
+      "comm": "voxy-rust-serve",
+      "cwd": "/home/aerosmp/Desktop/Voxy_Testing",
+      "sha256": "f5840addd21a7c1aa5df28df4392916b04c7487fb9ae18a1d5cc270d8a32bc29",
+      "cgroup": "/sys/fs/cgroup/user.slice/user-1007.slice/user@1007.service/app.slice/voxy-testing-rust-3888660.service",
+      "limits": {
+        "memory.max": "999997440",
+        "memory.swap.max": "0",
+        "memory.current": "165978112",
+        "memory.peak": "608399360",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+      }
+    }
+  ],
+  "mods": [
+    {
+      "name": "voxy-server-0.2.256-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "de250efa3327d4689e2b88528305230a1db801e9b404c442d9e5ac9de06850ff"
+    }
+  ],
+  "wrapperSha256": "b0ce47e005e49c82dc7af6376094325083f5a541f2891e4dc1a206d6321c6e39",
+  "configPath": "/home/aerosmp/Desktop/Voxy_Testing/voxy-rust.toml",
+  "configSha256": "7c59b14d5bb3a5f3f481511401ffa8469b3efa54720578e82e0f00a3a57e16b6",
+  "endpoint": "95.164.127.81:25787",
+  "minecraft": "play.aerosmp.com:25587"
+}

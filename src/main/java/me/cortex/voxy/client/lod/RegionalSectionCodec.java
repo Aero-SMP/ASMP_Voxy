@@ -121,6 +121,18 @@ public final class RegionalSectionCodec implements AutoCloseable {
     SectionData decode(long key, int childMask, byte[] canonical,
                        RegionalProtocol.Fingerprint expected, Mappings mappings,
                        LocalSectionCodec.Names names) throws IOException {
+        return parse(key, childMask, canonical, expected, mappings, names, true);
+    }
+
+    /** Same structural/integrity scanner as rendering, without registry resolution or cells. */
+    void validate(long key, int childMask, byte[] canonical,
+                  RegionalProtocol.Fingerprint expected, Mappings mappings) throws IOException {
+        parse(key, childMask, canonical, expected, mappings, null, false);
+    }
+
+    private SectionData parse(long key, int childMask, byte[] canonical,
+                              RegionalProtocol.Fingerprint expected, Mappings mappings,
+                              LocalSectionCodec.Names names, boolean render) throws IOException {
         Objects.requireNonNull(canonical, "canonical");
         Objects.requireNonNull(expected, "fingerprint");
         Objects.requireNonNull(mappings, "mappings");
@@ -140,9 +152,9 @@ public final class RegionalSectionCodec implements AutoCloseable {
         if (expectedLength != canonical.length) {
             throw new IOException("regional section palette or word extent is invalid");
         }
-        long[] palette = new long[paletteCount];
+        long[] palette = render ? new long[paletteCount] : null;
         // The validated palette bounds unique IDs; reserve once instead of rehashing during translation.
-        var usedBlocks = new IntLinkedOpenHashSet(paletteCount);
+        var usedBlocks = render ? new IntLinkedOpenHashSet(paletteCount) : null;
         java.util.HashSet<RemotePaletteEntry> remotePalette =
                 new java.util.HashSet<>(paletteCount * 2);
         for (int index = 0; index < paletteCount; index++) {
@@ -156,13 +168,14 @@ public final class RegionalSectionCodec implements AutoCloseable {
                     || remoteBiome >= (source == null ? mappings.biomes.length : source.biomes().size())) {
                 throw new IOException("invalid regional section palette entry");
             }
-            int localBlock = source == null ? mappings.blocks[(int) remoteBlock]
-                    : names.resolve(source.blocks().get((int) remoteBlock).canonical(), false);
-            int localBiome = source == null ? mappings.biomes[(int) remoteBiome]
-                    : names.resolve(source.biomes().get((int) remoteBiome), true);
-            if (localBlock != 0) usedBlocks.add(localBlock);
-            palette[index] = CatalogMapper.composeMappingId(light,
-                    localBlock, localBiome);
+            if (render) {
+                int localBlock = source == null ? mappings.blocks[(int) remoteBlock]
+                        : names.resolve(source.blocks().get((int) remoteBlock).canonical(), false);
+                int localBiome = source == null ? mappings.biomes[(int) remoteBiome]
+                        : names.resolve(source.biomes().get((int) remoteBiome), true);
+                if (localBlock != 0) usedBlocks.add(localBlock);
+                palette[index] = CatalogMapper.composeMappingId(light, localBlock, localBiome);
+            }
         }
         int wordsOffset = input.position();
         if (bits != 0 && (SECTION_CELLS * bits & 63) != 0) {
@@ -170,10 +183,10 @@ public final class RegionalSectionCodec implements AutoCloseable {
             long finalWord = input.getLong(wordsOffset + ((int) expectedWords - 1) * 8);
             if (finalWord >>> used != 0) throw new IOException("nonzero section index padding");
         }
-        long[] cells = new long[SECTION_CELLS];
+        long[] cells = render ? new long[SECTION_CELLS] : null;
         int next = 0;
         if (bits == 0) {
-            Arrays.fill(cells, palette[0]);
+            if (render) Arrays.fill(cells, palette[0]);
             next = 1;
         } else {
             long mask = (1L << bits) - 1;
@@ -188,11 +201,11 @@ public final class RegionalSectionCodec implements AutoCloseable {
                 if (selected >= paletteCount) throw new IOException("section palette index overflow");
                 if (selected > next) throw new IOException("noncanonical section palette order");
                 if (selected == next) next++;
-                cells[index] = palette[selected];
+                if (render) cells[index] = palette[selected];
             }
         }
         if (next != paletteCount) throw new IOException("unused regional section palette entry");
-        return new SectionData(key, childMask, cells, usedBlocks.toIntArray());
+        return render ? new SectionData(key, childMask, cells, usedBlocks.toIntArray()) : null;
     }
 
     private static int minimumBits(int paletteCount) {

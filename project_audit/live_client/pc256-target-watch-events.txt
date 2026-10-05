@@ -1,0 +1,5 @@
+2026-10-05T15:36:55.209799700Z VOXY_CACHE_ACTIVATED session=1 key=13510799418982272 frame=256 kind=2 children=0
+2026-10-05T15:38:00.746372800Z VOXY_DESIRE session=1 ticket=391166 key=13510799418982272 purpose=2 have=true localProbed=true frame=29536 cacheActivatedFrame=256 coveringKey=0 coveringActivatedFrame=-1 cachedCut=false cachedCutActivatedFrame=-1
+2026-10-05T15:39:13.301569400Z VOXY_DESIRE session=1 ticket=491508 key=13510799418982272 purpose=2 have=true localProbed=true frame=68942 cacheActivatedFrame=-1 coveringKey=0 coveringActivatedFrame=-1 cachedCut=false cachedCutActivatedFrame=-1
+2026-10-05T15:44:14.347540100Z VOXY_DESIRE session=1 ticket=526542 key=13510799418982272 purpose=2 have=true localProbed=true frame=265033 cacheActivatedFrame=-1 coveringKey=0 coveringActivatedFrame=-1 cachedCut=false cachedCutActivatedFrame=-1
+2026-10-05T15:44:14.352548200Z VOXY_DESIRE session=1 ticket=526543 key=13510799418982272 purpose=2 have=true localProbed=true frame=265036 cacheActivatedFrame=-1 coveringKey=0 coveringActivatedFrame=-1 cachedCut=false cachedCutActivatedFrame=-1

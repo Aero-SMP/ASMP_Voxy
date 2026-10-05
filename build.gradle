@@ -153,6 +153,7 @@ dependencies {
     }
 
     compileOnly "tech.kwik:kwik:${kwikVersion}"
+    compileOnly 'tech.kwik:agent15:3.2'
     clientEmbedded "tech.kwik:kwik:${kwikVersion}"
     clientEmbedded 'tech.kwik:agent15:3.2'
     clientEmbedded 'at.favre.lib:hkdf:2.0.0'

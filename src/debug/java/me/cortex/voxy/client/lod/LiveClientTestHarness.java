@@ -6,6 +6,8 @@ import me.cortex.voxy.client.iris.IrisUtil;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.api.v0.IrisApi;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
+import me.cortex.voxy.client.config.ServerDownloadSettings;
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.debugtest.DebugTestCommandPayload;
 import me.cortex.voxy.debugtest.DebugLatestMailbox;
 import me.cortex.voxy.debugtest.DebugPoseStabilizer;
@@ -13,12 +15,17 @@ import me.cortex.voxy.debugtest.DebugPoseMath;
 import me.cortex.voxy.debugtest.DebugTestProtocol;
 import me.cortex.voxy.debugtest.DebugTestResultPayload;
 import me.cortex.voxy.debugtest.DebugTestSnapshot;
+import net.caffeinemc.mods.sodium.client.config.ConfigManager;
+import net.caffeinemc.mods.sodium.client.config.structure.OptionPage;
+import net.caffeinemc.mods.sodium.client.gui.VideoSettingsScreen;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.PacketSendListener;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.client.event.RenderFrameEvent;
@@ -131,6 +138,13 @@ final class LiveClientTestHarness {
         observedPose = observePose();
         Run active = run;
         if (active == null) return;
+        if (active.settingsAwaitFrame >= 0 && renderedFrame > active.settingsAwaitFrame) {
+            Screen expected = active.command == DebugTestProtocol.CommandKind.OPEN_SETTINGS ? active.settingsScreen : null;
+            if (Minecraft.getInstance().screen != expected) { failRun(DebugTestProtocol.Failure.PRECONDITION); return; }
+            active.settingsAwaitFrame = -1;
+            requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
+                    active.stepId, DebugTestProtocol.Failure.NONE, false);
+        }
         if (active.zoomPending && active.zoomControl.observed()) {
             active.zoomPending = false;
             requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
@@ -209,6 +223,64 @@ final class LiveClientTestHarness {
         active.stepId = command.stepId();
         active.command = command.kind();
         switch (command.kind()) {
+            case OPEN_SETTINGS -> {
+                var minecraft = Minecraft.getInstance();
+                if (minecraft.screen != null) { sendFailure(command, DebugTestProtocol.Failure.PRECONDITION); break; }
+                try {
+                    var page = ConfigManager.CONFIG.getModOptions().stream().filter(mod -> mod.configId().equals("voxy"))
+                            .flatMap(mod -> mod.pages().stream()).filter(pageEntry -> pageEntry instanceof OptionPage
+                                    && pageEntry.name().getString().equals(Component.translatable("voxy.config.rendering").getString()))
+                            .map(pageEntry -> (OptionPage) pageEntry).findFirst().orElseThrow();
+                    Screen settings = VideoSettingsScreen.createScreen(null, page);
+                    if (!(settings instanceof VideoSettingsScreen)) throw new IllegalStateException("Sodium settings unavailable");
+                    active.settingsScreen = settings;
+                    minecraft.setScreen(settings);
+                    active.settingsAwaitFrame = renderedFrame;
+                    ClientLodDebug.updaterEvent("state=SETTINGS_OPENED run=" + active.runId + " step=" + active.stepId
+                            + " page=voxy.config.rendering server=" + ServerDownloadSettings.current().serverId());
+                } catch (RuntimeException failure) {
+                    me.cortex.voxy.common.Logger.error("Could not open actual Sodium Voxy settings", failure);
+                    failRun(DebugTestProtocol.Failure.PRECONDITION);
+                }
+            }
+            case CLOSE_SETTINGS -> {
+                if (active.settingsScreen == null || Minecraft.getInstance().screen != active.settingsScreen) {
+                    sendFailure(command, DebugTestProtocol.Failure.PRECONDITION); break;
+                }
+                closeSettings(active);
+                active.settingsAwaitFrame = renderedFrame;
+            }
+            case DOWNLOAD_POLICY -> {
+                var policy = ServerDownloadSettings.current();
+                if (policy == null || active.renderer == null) {
+                    sendFailure(command, DebugTestProtocol.Failure.PRECONDITION); break;
+                }
+                try {
+                    long value = DebugTestCommandPayload.downloadPolicyValue(command.option(), command.value());
+                    switch (command.option()) {
+                        case "bandwidth" -> policy.setDownloadKbps((int) value);
+                        case "storage" -> policy.setStorageBytes(value);
+                        case "interval" -> VoxyConfig.CONFIG.backgroundUpdateIntervalSeconds = (int) value;
+                        case "render_distance" -> {
+                            VoxyConfig.CONFIG.sectionRenderDistance = value / 32.0f;
+                            active.renderer.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
+                        }
+                        default -> throw new IllegalArgumentException("invalid download policy option");
+                    }
+                    policy.save(); VoxyConfig.CONFIG.save(); ClientSession.streamingSettingsChanged();
+                    ClientLodDebug.updaterEvent("state=DOWNLOAD_POLICY_APPLIED run=" + active.runId + " step=" + active.stepId
+                            + " server=" + policy.serverId() + " option=" + command.option() + " value=" + command.value()
+                            + " bandwidthKbps=" + policy.downloadKbps() + " storageBytes=" + policy.storageBytes()
+                            + " intervalSeconds=" + VoxyConfig.CONFIG.getBackgroundUpdateIntervalSeconds()
+                            + " renderDistanceChunks=" + Math.round(VoxyConfig.CONFIG.sectionRenderDistance * 32)
+                            + " renderer=" + active.renderer.rendererIdentity());
+                    requestResult(DebugTestProtocol.ResultKind.CHECKPOINT_RESULT, active.runId,
+                            active.stepId, DebugTestProtocol.Failure.NONE, false);
+                } catch (RuntimeException failure) {
+                    me.cortex.voxy.common.Logger.error("Debug download policy change failed", failure);
+                    failRun(DebugTestProtocol.Failure.INTERNAL);
+                }
+            }
             case ZOOM_IN, ZOOM_OUT, ZOOM_MAX -> {
                 if (!DebugZoomControl.available() || DebugZoomControl.worldFov() <= 0) {
                     sendFailure(command, DebugTestProtocol.Failure.PRECONDITION);
@@ -235,7 +307,7 @@ final class LiveClientTestHarness {
                 try {
                     if (active.shaderSettings == null) active.shaderSettings = new DebugShaderSettings();
                     if (command.kind() == DebugTestProtocol.CommandKind.SHADER_OPTION) {
-                        active.shaderSettings.option(command.shaderOption(), command.shaderValue());
+                        active.shaderSettings.option(command.option(), command.value());
                     } else if (command.kind() == DebugTestProtocol.CommandKind.SHADERS_ON
                             || command.kind() == DebugTestProtocol.CommandKind.SHADERS_OFF) {
                         IrisApi.getInstance().getConfig().setShadersEnabledAndApply(
@@ -267,11 +339,7 @@ final class LiveClientTestHarness {
                         ClientLodDebug.holdTransport(command.kind() == DebugTestProtocol.CommandKind.HOLD_QUIC);
                     }
                     if (command.kind() != DebugTestProtocol.CommandKind.RESUME_QUIC) {
-                        if (session.connectionAttempt != null) {
-                            session.connectionAttempt.close();
-                            session.connectionAttempt = null;
-                        }
-                        if (session.quic != null) session.quic.close();
+                        session.interruptTransport();
                     }
                     session.signal();
                     Minecraft.getInstance().execute(() -> {
@@ -297,6 +365,7 @@ final class LiveClientTestHarness {
             case CAPTURE_SCREENSHOT -> active.screenshot = new ScreenshotRequest(
                     "voxy-test-" + active.runId + '-' + active.stepId + ".png", renderedFrame);
             case END_RUN -> {
+                closeSettings(active);
                 releaseZoom(active);
                 active.shaderDrawMarker = active.renderer == null ? 0 : active.renderer.shaderResumedDraws();
                 try {
@@ -671,6 +740,7 @@ final class LiveClientTestHarness {
     }
 
     private static void restoreSettings(Run previous) {
+        closeSettings(previous);
         releaseZoom(previous);
         if (previous != null && previous.shaderSettings != null && IrisUtil.IRIS_INSTALLED) {
             var settings = previous.shaderSettings;
@@ -681,6 +751,14 @@ final class LiveClientTestHarness {
                 me.cortex.voxy.common.Logger.error("Could not restore original shader enable state", failure);
             }
         }
+    }
+
+    private static void closeSettings(Run active) {
+        if (active == null || active.settingsScreen == null) return;
+        var minecraft = Minecraft.getInstance();
+        if (minecraft.screen == active.settingsScreen) minecraft.setScreen(null);
+        active.settingsScreen = null;
+        active.settingsAwaitFrame = -1;
     }
 
     private static void releaseZoom(Run previous) {
@@ -708,6 +786,8 @@ final class LiveClientTestHarness {
         long zoomDeadline;
         long shaderAwaitFrame = -1, shaderDrawMarker;
         boolean endingShaderRestore;
+        Screen settingsScreen;
+        long settingsAwaitFrame = -1;
         PoseExpectation pose;
         Trace trace;
         ScreenshotRequest screenshot;
@@ -715,7 +795,7 @@ final class LiveClientTestHarness {
             this.runId = runId; this.stepId = stepId; this.renderer = renderer;
         }
         boolean hasOutstandingOperation() {
-            return this.zoomPending || this.shaderAwaitFrame >= 0 || this.pose != null || this.trace != null || this.screenshot != null
+            return this.zoomPending || this.shaderAwaitFrame >= 0 || this.settingsAwaitFrame >= 0 || this.pose != null || this.trace != null || this.screenshot != null
                     || snapshotPending;
         }
     }

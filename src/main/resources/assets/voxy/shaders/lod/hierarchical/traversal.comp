@@ -27,6 +27,7 @@ layout(binding = SCENE_UNIFORM_BINDING, std140) uniform SceneUniform {
     uint finalPass;
     uint coarsenGraceFrames;
     float detailThresholdScale;
+    uint observeVisibleSections;
 };
 
 #import <voxy:lod/hierarchical/queue.glsl>
@@ -45,6 +46,10 @@ layout(binding = RENDER_QUEUE_BINDING, std430) restrict buffer renderQueueStruct
 
 layout(binding = RENDER_TRACKER_BINDING, std430) restrict buffer renderTrackerArray {
     uint[] lastRenderFrame;
+};
+
+layout(binding = VISIBLE_SECTIONS_BINDING, std430) restrict writeonly buffer visibleSectionArray {
+    uvec4[] visibleSections;
 };
 
 uint actionHash(uint value) {
@@ -81,7 +86,16 @@ void enqueueChildren(in UnpackedNode node) {
 void enqueueSelfForRender(in UnpackedNode node) {
     if (renderQueueIndex < renderQueueMaxSize && !isEmptyMesh(node)) {
         uint renderIndex = atomicAdd(renderQueueIndex, 1);
-        if (renderIndex < renderQueueMaxSize) renderQueue[renderIndex] = getMesh(node);
+        if (renderIndex < renderQueueMaxSize) {
+            renderQueue[renderIndex] = getMesh(node);
+            if (finalPass != 0u && observeVisibleSections != 0u) {
+                vec2 extent = max(_maxBB.xy - _minBB.xy, vec2(0.0f));
+                float area = min(extent.x * extent.y, 1.0f);
+                uvec2 position = getRawPos(node);
+                visibleSections[renderIndex] = uvec4(position, floatBitsToUint(area),
+                        detailScoreBucket(projectedDetailScore()));
+            }
+        }
     }
 }
 

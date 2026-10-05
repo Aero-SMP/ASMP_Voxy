@@ -14,7 +14,6 @@ import java.util.zip.CRC32C;
  * Every reader owns its channel so interruption cannot close another reader's channel.
  */
 final class CompletedSectionJournal implements AutoCloseable {
-    static final long MAX_BYTES = 256L * 1024 * 1024;
     static final int HEADER_BYTES = 64, FRAME_BYTES = 16, FOOTER_BYTES = 8;
     static final int BINDING_BYTES = 96, PAYLOAD_METADATA_BYTES = 76;
     private static final long MAGIC = 0x314d414e595856L; // VXYNAM1
@@ -37,9 +36,6 @@ final class CompletedSectionJournal implements AutoCloseable {
         long canonicalBytes();
         @Override void close() throws IOException;
     }
-    static final class RotationRequired extends IOException {
-        RotationRequired() { super("local journal rotation required"); }
-    }
 
     static CompletedSectionJournal open(Path path, RegionalProtocol.Hash32 world, long region, boolean writable) throws IOException {
         LocalCacheOwnership.rejectLinks(path);
@@ -52,7 +48,7 @@ final class CompletedSectionJournal implements AutoCloseable {
                 header.putInt(RegionalProtocol.crc32c(Arrays.copyOf(header.array(), 56))).putInt(0).flip();
                 write(channel, 0, header);
             }
-            if (channel.size() < HEADER_BYTES || channel.size() > MAX_BYTES) throw new IOException("invalid local journal extent");
+            if (channel.size() < HEADER_BYTES) throw new IOException("invalid local journal extent");
             var header = read(channel, 0, HEADER_BYTES);
             if (header.getLong() != MAGIC || !RegionalProtocol.Hash32.read(header).equals(world)
                     || header.getLong() != region || header.getLong() != 0
@@ -113,12 +109,108 @@ final class CompletedSectionJournal implements AutoCloseable {
             this.end += FRAME_BYTES + (long) length + FOOTER_BYTES;
         }
     }
+    synchronized LocalSection binding(long key) throws IOException {
+        checkOpen(); var binding = this.bindings.get(key);
+        if (binding == null) return null;
+        var section = binding.section();
+        return section.kind() == LocalSection.DATA && !this.payloads.containsKey(token(section)) ? null : section;
+    }
+    synchronized long compactedBytes() throws IOException {
+        checkOpen();
+        long bytes = HEADER_BYTES;
+        var used = new HashSet<Token>();
+        for (var binding : this.bindings.values()) {
+            LocalSection section = binding.section();
+            bytes = Math.addExact(bytes, FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES);
+            if (section.kind() == LocalSection.DATA && used.add(token(section))) {
+                Payload payload = this.payloads.get(token(section));
+                if (payload == null) throw new IOException("cannot compact quarantined local payload");
+                bytes = Math.addExact(bytes, FRAME_BYTES + PAYLOAD_METADATA_BYTES + (long) payload.compressed() + FOOTER_BYTES);
+            }
+        }
+        return bytes;
+    }
+    synchronized long currentNamedBytes() throws IOException {
+        checkOpen();
+        long bytes = HEADER_BYTES;
+        var used = new HashSet<Token>();
+        for (var binding : this.bindings.values()) {
+            var section = binding.section();
+            if (section.kind() == LocalSection.ABSENT) continue;
+            var payload = section.kind() == LocalSection.DATA ? this.payloads.get(token(section)) : null;
+            if (section.kind() == LocalSection.DATA && payload == null) continue;
+            bytes += FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES;
+            if (payload != null && used.add(token(section)))
+                bytes += FRAME_BYTES + PAYLOAD_METADATA_BYTES + payload.compressed() + FOOTER_BYTES;
+        }
+        return bytes;
+    }
+    /** Copy validated committed compressed bodies; offsets/predecessors are rebuilt, encoding is unchanged. */
+    void compactTo(Path destination, BooleanSupplier current) throws IOException {
+        Map<Long, Binding> latest; Map<Token, Payload> bodies;
+        synchronized (this) {
+            checkOpen(); if (busy()) throw new IOException("compaction requires drained journal");
+            latest = Map.copyOf(this.bindings); bodies = new HashMap<>();
+            for (var binding : latest.values()) if (binding.section().kind() == LocalSection.DATA) {
+                Token token = token(binding.section()); Payload payload = this.payloads.get(token);
+                if (payload == null) throw new IOException("missing current compaction payload");
+                bodies.put(token, payload);
+            }
+        }
+        LocalCacheOwnership.rejectLinks(destination);
+        try (var source = FileChannel.open(this.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+             var output = FileChannel.open(destination, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
+            write(output, 0, read(source, 0, HEADER_BYTES));
+            long at = HEADER_BYTES;
+            var copied = new HashMap<Token, Long>();
+            byte[] transfer = new byte[8192];
+            for (var binding : latest.values()) {
+                RegionalDiskBudget.checkCurrent(current);
+                LocalSection section = binding.section(); long bodyAt = 0;
+                if (section.kind() == LocalSection.DATA) {
+                    Token token = token(section);
+                    Long oldCopy = copied.get(token);
+                    if (oldCopy != null) bodyAt = oldCopy;
+                    else {
+                        Payload body = bodies.get(token);
+                        if (body == null) throw new IOException("missing current compaction payload");
+                        byte[] metadata = buffer(PAYLOAD_METADATA_BYTES).put(token.catalog().bytes()).put(token.source().bytes())
+                                .putInt(body.compressed()).putInt(body.canonical()).putInt(body.crc()).put(body.local().bytes()).array();
+                        bodyAt = at + FRAME_BYTES + PAYLOAD_METADATA_BYTES;
+                        var crc = new CRC32C(); var hash = new Blake3.Hasher();
+                        for (int done = 0; done < body.compressed();) {
+                            RegionalDiskBudget.checkCurrent(current);
+                            int count = Math.min(transfer.length, body.compressed() - done);
+                            var chunk = ByteBuffer.wrap(transfer, 0, count);
+                            long position = body.offset() + done;
+                            while (chunk.hasRemaining()) { int n = source.read(chunk, position); if (n <= 0) throw new IOException("truncated compaction payload"); position += n; }
+                            crc.update(transfer, 0, count); hash.update(transfer, 0, count);
+                            write(output, bodyAt + done, ByteBuffer.wrap(transfer, 0, count)); done += count;
+                        }
+                        if ((int) crc.getValue() != body.crc() || !fingerprint(hash).equals(body.local()))
+                            throw new IOException("corrupt compaction payload; preserving source journal");
+                        finishFrame(output, at, PAYLOAD, metadata, body.compressed());
+                        at += FRAME_BYTES + PAYLOAD_METADATA_BYTES + (long) body.compressed() + FOOTER_BYTES;
+                        copied.put(token, bodyAt);
+                    }
+                }
+                byte[] metadata = buffer(BINDING_BYTES).putLong(section.key()).putInt(section.kind()).putInt(section.children())
+                        .putInt(section.compressedBytes()).putInt(section.canonicalBytes()).putInt(section.crc()).putInt(0)
+                        .put(section.fingerprint().bytes()).put(section.catalog().bytes()).putLong(0).putLong(bodyAt).array();
+                finishFrame(output, at, BINDING, metadata, 0); at += FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES;
+            }
+            output.force(true);
+        }
+    }
     synchronized boolean hasBindings() { return !this.bindings.isEmpty(); }
     synchronized boolean closed() { return this.closed; }
     synchronized Map<Long, LocalSection> directory() throws IOException {
         checkOpen();
         var result = new HashMap<Long, LocalSection>(this.bindings.size());
-        this.bindings.forEach((key, value) -> result.put(key, value.section()));
+        this.bindings.forEach((key, value) -> {
+            var section = value.section();
+            if (section.kind() != LocalSection.DATA || this.payloads.containsKey(token(section))) result.put(key, section);
+        });
         return result;
     }
     synchronized long bytes() { return this.end; }
@@ -174,7 +266,9 @@ final class CompletedSectionJournal implements AutoCloseable {
                 throw new IOException("local payload integrity mismatch");
             return decoded; // Journal integrity AND format validation before publication.
         } catch (IOException invalid) {
-            synchronized (this) { this.payloads.remove(token(section), payload); }
+            if (!(invalid instanceof java.nio.channels.AsynchronousCloseException)
+                    && !(invalid instanceof InterruptedIOException) && !Thread.currentThread().isInterrupted())
+                synchronized (this) { this.payloads.remove(token(section), payload); }
             throw invalid; // A late reader cannot quarantine a concurrently repaired payload.
         } finally { synchronized (this) { this.readers--; } }
     }
@@ -264,7 +358,7 @@ final class CompletedSectionJournal implements AutoCloseable {
             return true;
         }
         private void reserve(long bytes) throws IOException {
-            if (this.start + this.charged + bytes > MAX_BYTES) throw new RotationRequired();
+            Math.addExact(Math.addExact(this.start, this.charged), bytes);
             this.space.reserve(bytes); this.charged += bytes;
         }
         @Override public void write(int value) throws IOException { throw new IOException("buffered local write required"); }
@@ -298,10 +392,13 @@ final class CompletedSectionJournal implements AutoCloseable {
         }
     }
     private void finishFrame(long at, int kind, byte[] metadata, int payloadBytes) throws IOException {
+        finishFrame(this.writer, at, kind, metadata, payloadBytes);
+    }
+    private static void finishFrame(FileChannel output, long at, int kind, byte[] metadata, int payloadBytes) throws IOException {
         int length = metadata.length + payloadBytes, crc = RegionalProtocol.crc32c(metadata);
-        write(this.writer, at + FRAME_BYTES, ByteBuffer.wrap(metadata));
-        write(this.writer, at, buffer(FRAME_BYTES).putInt(FRAME_MAGIC).putInt(kind).putInt(length).putInt(crc).flip());
-        write(this.writer, at + FRAME_BYTES + length, buffer(FOOTER_BYTES).putLong(commit(kind, length, crc)).flip());
+        write(output, at + FRAME_BYTES, ByteBuffer.wrap(metadata));
+        write(output, at, buffer(FRAME_BYTES).putInt(FRAME_MAGIC).putInt(kind).putInt(length).putInt(crc).flip());
+        write(output, at + FRAME_BYTES + length, buffer(FOOTER_BYTES).putLong(commit(kind, length, crc)).flip());
     }
     private static Binding readBinding(FileChannel file, long at) throws IOException {
         if (at < HEADER_BYTES || at + FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES > file.size()) throw new IOException("invalid binding offset");

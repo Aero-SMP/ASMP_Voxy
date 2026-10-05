@@ -9,7 +9,7 @@ import java.util.function.Consumer;
 final class WorkerDebugTelemetry {
     enum Stage { IDLE, TASK, METADATA, INDEX_DECODE, CACHE_READ, DECOMPRESS, DECODE_VALIDATE,
         REQUEST_MODELS, CACHE_WRITE, CHECK_MODELS, MESH, CACHE_QUARANTINE, RESULT_READY, WAIT_MODELS,
-        SAVE_ENCODE_WRITE, WAIT_REGION_WRITER }
+        SAVE_ENCODE_WRITE, WAIT_REGION_WRITER, CACHE_ONLY_VALIDATE, CACHE_ONLY_COMMIT }
     enum Outcome { CACHE_HIT, CACHE_MISS, CACHE_CORRUPT, MODEL_WAIT, FAILURE, COMPRESSED_BYTES, CANONICAL_BYTES, MESH_BYTES, MODEL_RECLAIM,
         SAVE_SUCCESS, SAVE_FAILURE, SAVE_CANCELLED }
     private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
@@ -94,6 +94,9 @@ final class WorkerDebugTelemetry {
         if (task instanceof ClientSession.Session.SectionWorkerTask section) {
             key = section.ticket().key(); revision = section.ticket().demandRevision();
             version = section.ticket().regionGeneration(); source = section.source().name();
+        } else if (task instanceof ClientSession.Session.CacheOnlyTask cache) {
+            key = cache.job().key; revision = cache.job().ticket;
+            version = cache.reply().generation(); source = "CACHE_ONLY_NETWORK";
         } else if (task instanceof ClientSession.Session.EmptyWorkerTask empty) {
             key = empty.ticket().key(); revision = empty.ticket().demandRevision(); source = "EMPTY";
 

@@ -1,0 +1,42 @@
+{
+  "observedUtc": "2026-10-05T15:31:25.978955+00:00",
+  "scope": "Read-only review of existing saved state receipts, native publication logs and authenticated PC cache observations; no runtime actions.",
+  "savedChangesReceipt": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/pc255-three-saved-changes.json",
+  "savedChangesReceiptSha256": "fe09d2ee0d3fc263eb8e4d902536e2949a6c1d44ce6316072b6eb8918efdb143",
+  "states": [
+    "minecraft:gold_block",
+    "minecraft:diamond_block",
+    "minecraft:stone"
+  ],
+  "allThreeSavedChunkReadsFullAndStable": true,
+  "distinctSavedNbtHashes": 3,
+  "firstMutationUtc": "2026-10-05T15:16:21.405772+00:00",
+  "finalCompletedSaveUtc": "2026-10-05T15:16:21.756470+00:00",
+  "mutationAndSaveSpanSeconds": 0.350698,
+  "priorRegionPublication": {
+    "utc": "2026-10-05T15:16:20.592000+00:00",
+    "generation": 16495,
+    "lineSha256": "b24187261e017585238bf1bb4674d1009182a410c2eab9d00bb548e5baf0a442"
+  },
+  "firstLoggedPublicationAfterBurst": {
+    "utc": "2026-10-05T15:16:22.623000+00:00",
+    "generation": 16496,
+    "lineSha256": "3f4c0da7594e90a31b4d8cf0bfea60ab116c29191dfa6e5cd1e9dcffb1450305"
+  },
+  "loggedRegionPublicationsInsideBurst": [],
+  "firstLoggedPublicationDelayAfterFinalSaveSeconds": 0.86653,
+  "pcObservationUtc": "2026-10-05T15:18:25.9753540Z",
+  "pcJournalStable": true,
+  "pcJournalUncommittedTailBytes": 0,
+  "verifiedUpdatedAncestors": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "fineLod0DeliveryVerified": false,
+  "bindingComparisonReceipt": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/project_audit/live_client/pc255-target-chain-native-comparison-20261005T152818Z.json",
+  "nativeExactVoxelProof": "project_audit/live_client/pc255-stone-native-voxel-proof-20261005T152124Z.json",
+  "conclusion": "Three distinct completed saved states collapsed within the interval before the next logged regional publication; current native target is decoded stone and PC stable authenticated LOD1-4 bindings match that final native chain. LOD0 remains old in this saved PC receipt.",
+  "notProved": "The first post-burst regional generation was not retained with per-target body data; its exact target fingerprint cannot be read back from logs. The PC observer does not expose per-target committed history, so absence of earlier gold/diamond target commits or an exact transmission count/cadence is not proved."
+}

@@ -17,8 +17,23 @@ final class RegionalMetadataStore implements AutoCloseable {
     private static final int BYTES = 44;
     final RegionalDiskBudget budget;
     private volatile boolean closed;
+    private volatile RegionalDiskBudget.Account account;
+    private volatile String rawAddress;
     RegionalMetadataStore(Path root) throws IOException { this.budget = RegionalDiskBudget.acquire(root); }
     RegionalMetadataStore(RegionalDiskBudget budget) { this.budget = budget; budget.retain(); }
+    void bindServer(String normalizedPolicyKey, String rawAssociationAddress, long allowanceBytes) throws IOException {
+        this.account = this.budget.configure(normalizedPolicyKey, allowanceBytes);
+        this.rawAddress = rawAssociationAddress;
+    }
+    void updateRetention(String dimension, long blockX, long blockZ, java.util.Set<Long> protectedVisibleRegions) {
+        this.budget.retention(this.account, dimension, blockX, blockZ, protectedVisibleRegions);
+    }
+    RegionalDiskBudget.StorageState namespaceBudget() { return this.budget.storage(this.account); }
+    boolean canDownload() { return !namespaceBudget().downloadPaused(); }
+    void remember(String dimension, RegionalProtocol.Hash32 world) throws IOException {
+        this.budget.claim(this.account, namespace(world, dimension), dimension,
+                this.rawAddress == null ? null : association(this.rawAddress, dimension));
+    }
     Path namespace(RegionalProtocol.Hash32 world, String dimension) {
         return ClientLodDebug.cacheNamespace(this.budget.root.resolve(hex(world)).resolve(identifier(dimension)));
     }
@@ -39,7 +54,9 @@ final class RegionalMetadataStore implements AutoCloseable {
             }
             var input = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
             if (input.getLong() != MAGIC || input.getInt(40) != RegionalProtocol.crc32c(java.util.Arrays.copyOf(bytes, 40))) return null;
-            return RegionalProtocol.Hash32.read(input);
+            var world = RegionalProtocol.Hash32.read(input);
+            if (this.account != null) this.budget.claim(this.account, namespace(world, dimension), dimension, path);
+            return world;
         }
     }
     RegionalProtocol.CatalogMessage readCatalogue(RegionalProtocol.Hash32 world, String dimension) throws IOException {
@@ -52,7 +69,7 @@ final class RegionalMetadataStore implements AutoCloseable {
                 if (file.size() < 46 || file.size() > 5L + RegionalProtocol.MAX_CATALOG_FRAME_BYTES)
                     throw new IOException("cached catalogue extent is invalid");
                 var input = Channels.newInputStream(file);
-                var message = RegionalProtocol.readControl(input);
+                var message = RegionalProtocol.readStoredCatalogue(input, world);
                 if (!(message instanceof RegionalProtocol.CatalogMessage catalog) || input.read() != -1)
                     throw new IOException("cached catalogue contains an invalid frame");
                 return catalog;
@@ -66,6 +83,7 @@ final class RegionalMetadataStore implements AutoCloseable {
         try {
             var unavailable = this.budget.persistenceUnavailable();
             if (unavailable != null) return unavailable;
+            remember(dimension, world);
             Path path = namespace(world, dimension).resolve("catalogue.vxcat");
             Path temporary = path.resolveSibling(path.getFileName() + ".pending");
             try (var writer = this.budget.writer(path, current);
@@ -80,6 +98,7 @@ final class RegionalMetadataStore implements AutoCloseable {
         if (server == null || this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
         var unavailable = this.budget.persistenceUnavailable();
         if (unavailable != null) return unavailable;
+        remember(dimension, world);
         Path path = association(server, dimension), temporary = path.resolveSibling(path.getFileName() + ".pending");
         try (var writer = this.budget.writer(path, current);
              var pin = this.budget.pin(path); var pending = this.budget.pin(temporary)) {
@@ -114,6 +133,8 @@ final class RegionalMetadataStore implements AutoCloseable {
             this.budget.resized(path, length - before);
             installed = true;
             return Persistence.PERSISTED;
+        } catch (IOException failure) {
+            this.budget.writeFailure(temporary, failure); throw failure;
         } finally {
             if (!installed) {
                 long reserved = Math.max(length, oldTemporary);
@@ -127,5 +148,7 @@ final class RegionalMetadataStore implements AutoCloseable {
     }
     static String identifier(String value) { return hex(hash(value.getBytes(StandardCharsets.UTF_8))); }
     private static String hex(RegionalProtocol.Hash32 hash) { return HexFormat.of().formatHex(hash.bytes()); }
-    @Override public synchronized void close() { if (!this.closed) { this.closed = true; this.budget.release(); } }
+    @Override public synchronized void close() {
+        if (!this.closed) { this.closed = true; this.budget.flushAnchors(this.account); this.budget.release(); }
+    }
 }

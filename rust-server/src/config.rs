@@ -6,7 +6,6 @@ use std::{env, net::SocketAddr, path::PathBuf};
 pub struct Config {
     pub listen: SocketAddr,
     pub rayon_threads: usize,
-    pub once: bool,
 }
 
 #[derive(Deserialize)]
@@ -14,8 +13,6 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     rayon_threads: usize,
-    #[serde(default)]
-    once: bool,
     #[serde(default)]
     quic: QuicConfig,
 }
@@ -41,13 +38,11 @@ impl Default for QuicConfig {
 impl Config {
     pub fn load() -> Result<Self> {
         let mut path = PathBuf::from("voxy-rust.toml");
-        let mut once = false;
         let mut minecraft_port = 25565;
         let mut args = env::args_os().skip(1);
         while let Some(argument) = args.next() {
             match argument.to_string_lossy().as_ref() {
                 "--config" => path = args.next().context("--config requires a path")?.into(),
-                "--once" => once = true,
                 "--minecraft-port" => {
                     minecraft_port = args
                         .next()
@@ -68,10 +63,10 @@ impl Config {
             .with_context(|| format!("read configuration {}", path.display()))?;
         let file: FileConfig = toml::from_str(&text)
             .with_context(|| format!("parse configuration {}", path.display()))?;
-        Self::from_file(file, once, minecraft_port)
+        Self::from_file(file, minecraft_port)
     }
 
-    fn from_file(file: FileConfig, once: bool, minecraft_port: u16) -> Result<Self> {
+    fn from_file(file: FileConfig, minecraft_port: u16) -> Result<Self> {
         // Only Java uses/validates the public endpoint; Rust binds `listen` independently.
         let _advertise = file.quic.advertise;
         if file.rayon_threads > 256 {
@@ -80,12 +75,11 @@ impl Config {
         Ok(Self {
             listen: resolve_listen(&file.quic.listen, minecraft_port)?,
             rayon_threads: file.rayon_threads,
-            once: once || file.once,
         })
     }
 
     pub fn usage() -> &'static str {
-        "voxy-rust-server [--config voxy-rust.toml] [--minecraft-port 25565] [--once]"
+        "voxy-rust-server [--config voxy-rust.toml] [--minecraft-port 25565]"
     }
 }
 
@@ -110,7 +104,7 @@ mod tests {
             let file: FileConfig = toml::from_str(text).unwrap();
             assert_eq!(file.quic.listen, "");
             assert_eq!(file.quic.advertise, "");
-            let config = Config::from_file(file, false, minecraft).unwrap();
+            let config = Config::from_file(file, minecraft).unwrap();
             assert_eq!(config.listen, SocketAddr::from(([0, 0, 0, 0], expected)));
         }
         assert!(resolve_listen("", 65336).is_err());

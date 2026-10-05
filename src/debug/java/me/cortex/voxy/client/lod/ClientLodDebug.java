@@ -127,7 +127,8 @@ public final class ClientLodDebug {
         SessionDebugTelemetry.event(session, event, bytes);
     }
 
-    static Path cacheNamespace(Path normal) { return DebugCacheTestProfile.namespace(normal); }
+    static Path cacheRoot(Path normal) { return DebugCacheTestProfile.root(normal); }
+    static Path cacheNamespace(Path normal) { return normal; }
     static boolean cacheDeletionAllowed(Path path) { return DebugCacheTestProfile.canDelete(path); }
     static void inventoryDelay(Path root) throws IOException { DebugCacheTestProfile.inventoryDelay(root); }
     static void cacheCommitted(CompletedSectionCache cache, LocalSection section) { DebugCacheTestProfile.verifyChain(cache, section); }

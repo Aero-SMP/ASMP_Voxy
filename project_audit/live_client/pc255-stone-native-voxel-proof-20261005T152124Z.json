@@ -1,0 +1,57 @@
+{
+  "observedUtc": "2026-10-05T15:21:24.256455+00:00",
+  "scope": "Read-only exact Testing LOD0 selected voxel decode from current immutable publication, no server/PC commands or world writes.",
+  "publication": {
+    "path": "/home/aerosmp/Desktop/Voxy_Testing/voxy-data/regional/minecraft_3aoverworld/r.-1.0.vxregion",
+    "worldIdentity": "4ad3384a36c191b98fbe8232b357767552ae8d451a06a25affca865928dbbeb7",
+    "generation": 16552,
+    "key": "003000001fffff80",
+    "ordinal": 1304,
+    "sourceFingerprint": "97f10e057be6bd9a14b3f12a42eda4b7",
+    "children": 0,
+    "compressedLength": 117,
+    "canonicalLength": 8221,
+    "compressedCrc32cValid": true,
+    "compressedSha256": "d7170db876e67e557969720445a99bc6e71b1dd9616488fc5103a346825e3cc0",
+    "canonicalSha256": "3e38f5dcc2e12a30ec468934c9f5071823c417a7c1a7bf4e452d927eef38201b",
+    "stableCurrentPathRead": true
+  },
+  "canonicalValidation": {
+    "paletteCount": 3,
+    "paletteBits": 2,
+    "all32768IndicesValidated": true,
+    "uniquePaletteCanonicalOrderAndPaddingValid": true,
+    "zstdLibraryVersion": "1.5.7"
+  },
+  "voxel": {
+    "block": [
+      -234,
+      115,
+      60
+    ],
+    "sectionCell": [
+      22,
+      19,
+      28
+    ],
+    "cellIndex": 20374,
+    "paletteIndex": 2,
+    "blockId": 42,
+    "canonicalBlockState": "minecraft:stone",
+    "biomeId": 5,
+    "canonicalBiome": "minecraft:river",
+    "light": 0
+  },
+  "registry": {
+    "path": "/home/aerosmp/Desktop/Voxy_Testing/voxy-data/catalog/catalog.a",
+    "catalogId": 4321790471725524038,
+    "generation": 457,
+    "mipGeneration": 0,
+    "blockCount": 4759,
+    "biomeCount": 56,
+    "crc32cValid": true,
+    "stableRead": true,
+    "sha256": "e29f21a94223bee866c7a9b9227b2619bb2bae2e21bc85c4426702641f048427"
+  },
+  "independentCanonicalBlake3Verified": false
+}

@@ -641,6 +641,8 @@ public class VoxyRenderSystem {
             }
 
             this.viewport = new Viewport(this.geometryData.getMaxSectionCount());
+            this.traversal.setVisibleSectionListener((epoch, keys, areas, buckets) ->
+                    ClientLodClient.visibleSections(this, epoch, keys, areas, buckets), this.viewport.getRenderList());
             this.chunkBoundRenderer = new ChunkBoundRenderer();
             this.initializeShaders();
 
@@ -733,7 +735,7 @@ public class VoxyRenderSystem {
         }
 
         //TODO: optimize
-        int[] oldBufferBindings = new int[10];
+        int[] oldBufferBindings = new int[11];
         for (int i = 0; i < oldBufferBindings.length; i++) {
             oldBufferBindings[i] = glGetIntegeri(GL_SHADER_STORAGE_BUFFER_BINDING, i);
         }
@@ -751,6 +753,7 @@ public class VoxyRenderSystem {
             throw new IllegalStateException("Cannot use the default framebuffer as cannot source from it");
         }
 
+        this.traversal.observeVisibleSections(!IrisUtil.irisShadowActive());
         this.pipeline.preSetup(viewport);
 
         if (!IrisUtil.irisShadowActive()) {
@@ -761,7 +764,16 @@ public class VoxyRenderSystem {
 
         //The entire rendering pipeline (excluding the chunkbound thing)
         this.pipeline.runPipeline(viewport, boundFB, dims[2], dims[3]);
-        if (!IrisUtil.irisShadowActive()) me.cortex.voxy.client.lod.ClientSession.frameRendered(this);
+        if (!IrisUtil.irisShadowActive()) {
+            float[] planes = new float[24];
+            for (int i = 0; i < 6; i++) {
+                var plane = viewport.frustumPlanes[i];
+                planes[i * 4] = plane.x; planes[i * 4 + 1] = plane.y;
+                planes[i * 4 + 2] = plane.z; planes[i * 4 + 3] = plane.w;
+            }
+            ClientLodClient.downloadFrustum(this, planes);
+            me.cortex.voxy.client.lod.ClientSession.frameRendered(this);
+        }
         this.resumedDraws++;
 
         //As much dynamic runtime stuff here
@@ -851,7 +863,10 @@ public class VoxyRenderSystem {
         me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "begin", "BEGIN", 0);
         if (this.nodeManager != null) this.nodeManager.beginStopping();
         if (this.modelService != null) this.modelService.beginStopping();
-        if (this.traversal != null) this.traversal.setDetailActionListener((key, action, bucket, epoch) -> {});
+        if (this.traversal != null) {
+            this.traversal.setDetailActionListener((key, action, bucket, epoch) -> {});
+            this.traversal.stopVisibleObservations();
+        }
         ClientLodClient.stopRenderer(this);
         me.cortex.voxy.client.lod.ClientLodDebug.shutdownPhase(this, "begin", "END", 0);
     }

@@ -10,21 +10,23 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Objects;
 import java.util.zip.CRC32C;
 
 /** Current spatial-key protocol. Storage indexes stay on the server; local journals stay independent. */
 final class RegionalProtocol {
     static final String ALPN = "voxy-region-cache-start";
-    static final int STREAM_CONTROL = 0, STREAM_SECTION_LANE = 1, STREAM_BACKGROUND = 2;
+    static final int STREAM_CONTROL = 0, STREAM_SECTION_LANE = 1, STREAM_DISCOVERY = 2;
     static final int MAX_DIMENSION_BYTES = 1024, MAX_CATALOG_BYTES = 64 * 1024 * 1024;
     static final int MAX_CATALOG_COMPRESSED_BYTES = Math.toIntExact(org.lwjgl.util.zstd.Zstd.ZSTD_compressBound(MAX_CATALOG_BYTES));
-    static final int MAX_CATALOG_FRAME_BYTES = Math.addExact(40, MAX_CATALOG_COMPRESSED_BYTES);
-    static final int MAX_CONTROL_BYTES = MAX_CATALOG_FRAME_BYTES, MAX_SECTION_REQUESTS = 512;
+    static final int MAX_CATALOG_FRAME_BYTES = Math.addExact(76, MAX_CATALOG_COMPRESSED_BYTES);
+    static final int MAX_CONTROL_BYTES = MAX_CATALOG_FRAME_BYTES, MAX_SECTION_REQUESTS = 0xffff;
+    static final int CONTROL_LIST_HEADER_BYTES = 7, SCOPED_DROP_BYTES = 12;
     static final int MAX_SECTION_BYTES = 4 * 1024 * 1024;
     static final int SECTION_FLAG_EMPTY = 1, SECTION_FLAG_PRESENT = 1 << 15;
     static final int C_OPEN = 0x01, C_DESIRE = 0x02, C_DROP = 0x04, C_SETTINGS = 0x05;
-    static final int S_HELLO = 0x81, S_CATALOG = 0x83, S_RECORD = 0x85;
+    static final int S_HELLO = 0x81, S_MANIFEST = 0x82, S_CATALOG = 0x83, S_INVENTORY = 0x84, S_RECORD = 0x85;
     static final int S_ERROR = 0xfe, S_SHUTDOWN = 0xff;
     private static final int RECORD_BYTES = 88;
     private RegionalProtocol() {}
@@ -69,50 +71,93 @@ final class RegionalProtocol {
     }
 
 
-    record Desire(long ticket, long key, int purpose, LocalSection have) {}
-    sealed interface Control permits ServerHello, CatalogMessage, SectionReply, ServerError, ServerShutdown {}
-    record ServerHello(long serverInstance, Hash32 worldIdentity, long catalogId,
-                       Hash32 catalogFingerprint, byte[] backgroundToken) implements Control {}
-    record CatalogMessage(Hash32 fingerprint, int canonicalLength, byte[] compressed) implements Control {}
-    record SectionReply(long ticket, long key, long generation, Status status,
+    record Desire(int dimensionId, Hash32 worldIdentity, long ticket, long key, int purpose,
+                  LocalSection have, long rank) {}
+    record ScopedKey(int dimensionId, long key) {}
+    record DimensionAnchor(int dimensionId, int x, int z) {}
+    record DimensionInfo(int id, String name, Hash32 worldIdentity, int minSectionY, int sectionCount,
+                         boolean customBorder, double centerX, double centerZ, double borderSize,
+                         long catalogId, Hash32 catalogFingerprint) {}
+    enum InventoryState { SNAPSHOT_BEGIN, SAVED_REGION, UNREADABLE_REGION, REMOVED_REGION, SNAPSHOT_COMPLETE, FAILURE }
+    record Manifest(List<DimensionInfo> dimensions) implements Control {
+        Manifest { dimensions = List.copyOf(dimensions); }
+    }
+    record RegionInventory(int dimensionId, long revision, InventoryState state,
+                           int regionX, int regionZ, long[] savedSlots) implements Control {
+        RegionInventory { savedSlots = savedSlots.clone(); }
+        @Override public long[] savedSlots() { return this.savedSlots.clone(); }
+        boolean savedChunk(int slot) { return (this.savedSlots[slot >>> 6] & 1L << (slot & 63)) != 0; }
+    }
+    sealed interface Control permits ServerHello, Manifest, RegionInventory, CatalogMessage,
+            SectionReply, ServerError, ServerShutdown {}
+    record ServerHello(long serverInstance, int activeDimensionId, Hash32 worldIdentity, long catalogId,
+                       Hash32 catalogFingerprint) implements Control {}
+    record CatalogMessage(int dimensionId, Hash32 worldIdentity, Hash32 fingerprint,
+                          int canonicalLength, byte[] compressed) implements Control {}
+    record SectionReply(int dimensionId, Hash32 worldIdentity, long ticket, long key, long generation, Status status,
                         LocalSection content, byte[] compressed) implements Control {}
     record ServerError(int code, String message) implements Control {}
     record ServerShutdown(String message) implements Control {}
 
     static byte[] open(String dimension, Hash32 expectedWorld, Hash32 heldCatalogue, long intervalMillis,
-                       long bandwidthKbps, List<Desire> desires) throws IOException {
+                       long bandwidthKbps, boolean refreshAllowed, int anchorX, int anchorZ,
+                       List<Desire> desires) throws IOException {
+        for (var desire : desires) if (desire.have() != null || desire.purpose() > 1)
+            throw new IOException("initial terrain request must contain only visible missing coverage or detail");
         var payload = new ByteArrayOutputStream();
         putString(payload, dimension, MAX_DIMENSION_BYTES);
         (expectedWorld == null ? Hash32.ZERO : expectedWorld).write(payload);
         (heldCatalogue == null ? Hash32.ZERO : heldCatalogue).write(payload);
-        settings(payload, intervalMillis, bandwidthKbps); desires(payload, desires);
+        settings(payload, intervalMillis, bandwidthKbps); payload.write(refreshAllowed ? 1 : 0);
+        anchor(payload, anchorX, anchorZ); desires(payload, desires, false);
         return control(C_OPEN, payload.toByteArray());
     }
+    static int openHeaderBytes(String dimension) { return 98 + dimension.getBytes(StandardCharsets.UTF_8).length; }
+    static int desireBytes(Desire desire, boolean scoped) { return 26 + (scoped ? 36 : 0) + (desire.have() == null ? 0 : 63); }
     static byte[] desire(List<Desire> desires) throws IOException {
-        var payload = new ByteArrayOutputStream(); desires(payload, desires);
+        var payload = new ByteArrayOutputStream(); desires(payload, desires, true);
         return control(C_DESIRE, payload.toByteArray());
     }
-    static byte[] drop(List<Long> keys) throws IOException {
+    static byte[] drop(List<ScopedKey> keys) throws IOException {
         if (keys.isEmpty() || keys.size() > MAX_SECTION_REQUESTS) throw new IOException("invalid drop count");
         var payload = new ByteArrayOutputStream(); putShort(payload, keys.size());
-        for (long key : keys) putLong(payload, key);
+        for (var key : keys) {
+            if (key.dimensionId() < 0 || (key.key() & 15) != 0) throw new IOException("invalid scoped drop");
+            putInt(payload, key.dimensionId()); putLong(payload, key.key());
+        }
         return control(C_DROP, payload.toByteArray());
     }
-    static byte[] settings(long intervalMillis, long bandwidthKbps) throws IOException {
+    static byte[] settings(long intervalMillis, long bandwidthKbps, boolean refreshAllowed,
+                           int activeDimensionId, List<DimensionAnchor> anchors) throws IOException {
+        if (activeDimensionId < 0 || anchors.size() > 0xffff) throw new IOException("invalid dimension settings");
         var payload = new ByteArrayOutputStream(); settings(payload, intervalMillis, bandwidthKbps);
+        payload.write(refreshAllowed ? 1 : 0); putInt(payload, activeDimensionId); putShort(payload, anchors.size());
+        for (var entry : anchors) {
+            if (entry.dimensionId() < 0) throw new IOException("invalid dimension anchor");
+            putInt(payload, entry.dimensionId()); anchor(payload, entry.x(), entry.z());
+        }
         return control(C_SETTINGS, payload.toByteArray());
     }
     private static void settings(ByteArrayOutputStream payload, long intervalMillis, long bandwidthKbps) throws IOException {
-        if (intervalMillis < 1000 || bandwidthKbps < 0) throw new IOException("invalid background settings");
+        if (intervalMillis < 1000 || bandwidthKbps < 100 || bandwidthKbps > 10_000) throw new IOException("invalid download settings");
         Math.multiplyExact(bandwidthKbps, 125L);
         putLong(payload, intervalMillis); putLong(payload, bandwidthKbps);
     }
-    private static void desires(ByteArrayOutputStream payload, List<Desire> desires) throws IOException {
+    private static void anchor(ByteArrayOutputStream payload, int x, int z) throws IOException {
+        if (Math.abs((long) x) > 30_000_000 || Math.abs((long) z) > 30_000_000) throw new IOException("invalid player anchor");
+        putInt(payload, x); putInt(payload, z);
+    }
+    private static void desires(ByteArrayOutputStream payload, List<Desire> desires, boolean scoped) throws IOException {
         if (desires.size() > MAX_SECTION_REQUESTS) throw new IOException("oversized desire frame");
         putShort(payload, desires.size());
         for (var desire : desires) {
-            if (desire.ticket() == 0 || (desire.key() & 15) != 0 || desire.purpose() < 0 || desire.purpose() > 2)
+            if (desire.dimensionId() < 0 || desire.ticket() == 0 || (desire.key() & 15) != 0
+                    || desire.purpose() < 0 || desire.purpose() > 4 || desire.rank() < 512L * 512)
                 throw new IOException("invalid desire entry");
+            if (scoped) {
+                putInt(payload, desire.dimensionId());
+                Objects.requireNonNull(desire.worldIdentity(), "desire world").write(payload);
+            }
             putLong(payload, desire.ticket()); putLong(payload, desire.key()); payload.write(desire.purpose());
             var have = desire.have(); payload.write(have == null ? 0 : 1);
             if (have != null) {
@@ -121,6 +166,7 @@ final class RegionalProtocol {
                 payload.write(have.children()); have.catalog().write(payload); have.fingerprint().write(payload);
                 putInt(payload, have.compressedBytes()); putInt(payload, have.canonicalBytes()); putInt(payload, have.crc());
             }
+            putLong(payload, desire.rank());
         }
     }
 
@@ -131,7 +177,10 @@ final class RegionalProtocol {
         if (length > MAX_CONTROL_BYTES) throw new IOException("oversized regional frame");
         try {
             if (kind == S_RECORD) {
-                if (length < RECORD_BYTES) throw new IOException("truncated section descriptor");
+                if (length < RECORD_BYTES + 36) throw new IOException("truncated section descriptor");
+                var scope = ByteBuffer.wrap(readExact(input, 36)).order(ByteOrder.LITTLE_ENDIAN);
+                int dimensionId = scope.getInt(); Hash32 world = Hash32.read(scope);
+                if (dimensionId < 0 || world.isZero()) throw new IOException("invalid section scope");
                 var descriptor = ByteBuffer.wrap(readExact(input, RECORD_BYTES)).order(ByteOrder.LITTLE_ENDIAN);
                 long ticket = descriptor.getLong(), key = descriptor.getLong(), generation = descriptor.getLong();
                 Status status = Status.from(Byte.toUnsignedInt(descriptor.get()));
@@ -140,7 +189,7 @@ final class RegionalProtocol {
                 int compressed = descriptor.getInt(), canonical = descriptor.getInt(), crc = descriptor.getInt();
                 int body = status == Status.DATA ? compressed : 0;
                 if (ticket == 0 || (key & 15) != 0 || body < 0 || body > MAX_SECTION_BYTES
-                        || length != RECORD_BYTES + (long) body || (flags & ~(SECTION_FLAG_PRESENT | SECTION_FLAG_EMPTY)) != 0
+                        || length != RECORD_BYTES + 36L + body || (flags & ~(SECTION_FLAG_PRESENT | SECTION_FLAG_EMPTY)) != 0
                         || status != Status.NOT_READY && status != Status.ABSENT && generation == 0)
                     throw new IOException("invalid section descriptor");
                 int localKind = (flags & SECTION_FLAG_PRESENT) == 0 ? LocalSection.ABSENT
@@ -152,28 +201,27 @@ final class RegionalProtocol {
                 var content = new LocalSection(key, localKind, children, compressed, canonical, crc, fingerprint, catalog);
                 byte[] bytes = readExact(input, body);
                 if (body != 0 && crc32c(bytes) != crc) throw new IOException("section body CRC mismatch");
-                return new SectionReply(ticket, key, generation, status, content, bytes);
+                return new SectionReply(dimensionId, world, ticket, key, generation, status, content, bytes);
             }
             if (kind == S_CATALOG) {
-                if (length < 40) throw new IOException("truncated catalog descriptor");
-                var descriptor = ByteBuffer.wrap(readExact(input, 40)).order(ByteOrder.LITTLE_ENDIAN);
-                Hash32 fingerprint = Hash32.read(descriptor);
-                int canonical = descriptor.getInt(), bytes = descriptor.getInt();
-                if (fingerprint.isZero() || canonical < 40 || canonical > MAX_CATALOG_BYTES
-                        || bytes < 1 || bytes > MAX_CATALOG_COMPRESSED_BYTES || length != 40L + bytes)
-                    throw new IOException("invalid catalog frame");
-                return new CatalogMessage(fingerprint, canonical, readExact(input, bytes));
+                if (length < 76) throw new IOException("truncated catalog scope");
+                var scope = ByteBuffer.wrap(readExact(input, 36)).order(ByteOrder.LITTLE_ENDIAN);
+                int dimensionId = scope.getInt(); Hash32 world = Hash32.read(scope);
+                if (dimensionId < 0 || world.isZero()) throw new IOException("invalid catalogue scope");
+                return readCatalogueBody(input, length - 36, dimensionId, world);
             }
             var payload = ByteBuffer.wrap(readExact(input, (int) length)).order(ByteOrder.LITTLE_ENDIAN);
             Control result = switch (kind) {
-                case S_HELLO -> new ServerHello(payload.getLong(), Hash32.read(payload), payload.getLong(),
-                        Hash32.read(payload), take(payload, 32));
+                case S_HELLO -> new ServerHello(payload.getLong(), payload.getInt(), Hash32.read(payload),
+                        payload.getLong(), Hash32.read(payload));
+                case S_MANIFEST -> readManifest(payload);
+                case S_INVENTORY -> readInventory(payload);
                 case S_ERROR -> new ServerError(Short.toUnsignedInt(payload.getShort()), readString(payload, 4096));
                 case S_SHUTDOWN -> new ServerShutdown(readString(payload, 4096));
                 default -> throw new IOException("unknown regional frame " + kind);
             };
             if (payload.hasRemaining()) throw new IOException("trailing regional control bytes");
-            if (result instanceof ServerHello hello && (hello.serverInstance() == 0 || hello.worldIdentity().isZero()
+            if (result instanceof ServerHello hello && (hello.serverInstance() == 0 || hello.activeDimensionId() < 0 || hello.worldIdentity().isZero()
                     || hello.catalogId() == 0 || hello.catalogFingerprint().isZero()))
                 throw new IOException("invalid regional server identity");
             return result;
@@ -181,7 +229,56 @@ final class RegionalProtocol {
             throw new IOException("malformed regional frame", failure);
         }
     }
-    private static byte[] take(ByteBuffer input, int length) { byte[] bytes = new byte[length]; input.get(bytes); return bytes; }
+    private static Manifest readManifest(ByteBuffer payload) throws IOException {
+        int count = Short.toUnsignedInt(payload.getShort());
+        var dimensions = new ArrayList<DimensionInfo>(count);
+        var ids = new java.util.HashSet<Integer>();
+        var names = new java.util.HashSet<String>();
+        for (int i = 0; i < count; i++) {
+            int id = payload.getInt(); String name = readString(payload, MAX_DIMENSION_BYTES);
+            Hash32 world = Hash32.read(payload); int minY = payload.getInt(), height = payload.getInt();
+            int custom = Byte.toUnsignedInt(payload.get());
+            double x = payload.getDouble(), z = payload.getDouble(), size = payload.getDouble();
+            long catalogId = payload.getLong(); Hash32 catalog = Hash32.read(payload);
+            if (id < 0 || !ids.add(id) || !names.add(name) || world.isZero() || height < 1
+                    || minY < -128 || (long) minY + height - 1 > 127 || custom > 1
+                    || !Double.isFinite(x) || !Double.isFinite(z) || Math.abs(x) > 30_000_000 || Math.abs(z) > 30_000_000
+                    || !Double.isFinite(size) || size <= 0 || size > 60_000_000 || catalogId == 0 || catalog.isZero())
+                throw new IOException("invalid dimension manifest");
+            dimensions.add(new DimensionInfo(id, name, world, minY, height, custom != 0, x, z, size, catalogId, catalog));
+        }
+        return new Manifest(dimensions);
+    }
+
+    private static RegionInventory readInventory(ByteBuffer payload) throws IOException {
+        if (payload.remaining() != 149) throw new IOException("invalid inventory extent");
+        int id = payload.getInt(); long revision = payload.getLong(); int state = Byte.toUnsignedInt(payload.get());
+        int x = payload.getInt(), z = payload.getInt(); long[] slots = new long[16];
+        for (int i = 0; i < slots.length; i++) slots[i] = payload.getLong();
+        if (id < 0 || revision == 0 || state >= InventoryState.values().length
+                || Math.abs((long) x) > 58_594 || Math.abs((long) z) > 58_594)
+            throw new IOException("invalid region inventory");
+        return new RegionInventory(id, revision, InventoryState.values()[state], x, z, slots);
+    }
+
+    /** The persisted catalogue has one unchanged local format; network scope comes from its owning namespace. */
+    static CatalogMessage readStoredCatalogue(InputStream input, Hash32 world) throws IOException {
+        if (input.read() != S_CATALOG) throw new IOException("invalid stored catalogue record");
+        long length = readU32(input);
+        if (length > MAX_CATALOG_FRAME_BYTES - 36L) throw new IOException("oversized stored catalogue");
+        return readCatalogueBody(input, length, 0, world);
+    }
+
+    private static CatalogMessage readCatalogueBody(InputStream input, long length, int dimensionId, Hash32 world) throws IOException {
+        if (length < 40) throw new IOException("truncated catalog descriptor");
+        var descriptor = ByteBuffer.wrap(readExact(input, 40)).order(ByteOrder.LITTLE_ENDIAN);
+        Hash32 fingerprint = Hash32.read(descriptor);
+        int canonical = descriptor.getInt(), bytes = descriptor.getInt();
+        if (fingerprint.isZero() || canonical < 40 || canonical > MAX_CATALOG_BYTES
+                || bytes < 1 || bytes > MAX_CATALOG_COMPRESSED_BYTES || length != 40L + bytes)
+            throw new IOException("invalid catalog frame");
+        return new CatalogMessage(dimensionId, world, fingerprint, canonical, readExact(input, bytes));
+    }
     static int crc32c(byte[] bytes) { var crc = new CRC32C(); crc.update(bytes, 0, bytes.length); return (int) crc.getValue(); }
 
     static byte[] catalogFrame(CatalogMessage catalog) throws IOException {

@@ -4,6 +4,8 @@ import tech.kwik.core.ConnectionListener;
 import tech.kwik.core.ConnectionTerminatedEvent;
 import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicStream;
+import tech.kwik.core.frame.StreamFrame;
+import tech.kwik.core.impl.QuicClientConnectionImpl;
 import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,8 +29,8 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Pinned current-only transport. Reader ownership and QUIC flow control carry backpressure. */
 final class RegionalQuicClient implements AutoCloseable {
     interface RecordReceiver {
-        void record(RegionalProtocol.SectionReply reply, boolean background, RegionalSectionCodec.BoundCatalog catalog) throws Exception;
-        RegionalSectionCodec.BoundCatalog catalog(RegionalProtocol.CatalogMessage catalog, boolean background) throws Exception;
+        void record(RegionalProtocol.SectionReply reply, RegionalSectionCodec.BoundCatalog catalog) throws Exception;
+        RegionalSectionCodec.BoundCatalog catalog(RegionalProtocol.CatalogMessage catalog) throws Exception;
     }
     private static final String TLS_SERVER_NAME = "voxy.local";
     private static final long STREAM_ERROR_CANCELLED = 0x10, STREAM_RECEIVE_BYTES = 5L * 1024 * 1024;
@@ -41,47 +43,34 @@ final class RegionalQuicClient implements AutoCloseable {
             Thread.ofVirtual().name("Voxy regional QUIC-", 0).factory());
     private final Object controlHandoffLock = new Object();
     private RegionalProtocol.Control controlHandoff;
+    private final CompletableFuture<Void> discoveryReady = new CompletableFuture<>();
     private final List<LaneWorker> lanes = new ArrayList<>();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final AtomicReference<Runnable> activity = new AtomicReference<>(() -> {});
     private final AtomicBoolean closed = new AtomicBoolean(), listening = new AtomicBoolean();
-    private final String description, alpn;
-    private final InetAddress address;
-    private final int port;
-    private final byte[] certificateSha256;
-    private final boolean background;
+    private final String description;
     private final ConcurrentHashMap<RegionalProtocol.Hash32, CompletableFuture<RegionalSectionCodec.BoundCatalog>> catalogues;
     private volatile RecordReceiver receiver;
 
     static RegionalQuicClient connect(InetAddress[] addresses, int port, String alpn,
-                                      byte[] certificateSha256) throws IOException {
+                                      byte[] certificateSha256, byte[] routeToken) throws IOException {
         Throwable last = null;
         for (InetAddress address : Objects.requireNonNull(addresses)) {
-            try { return connectEndpoint(address, port, alpn, certificateSha256, null, null, null); }
+            try { return connectEndpoint(address, port, alpn, certificateSha256, routeToken); }
             catch (IOException failure) { last = failure; }
         }
         throw new IOException("could not connect to the Voxy regional endpoint", last);
     }
-    static RegionalQuicClient connectBackground(RegionalQuicClient primary,
-                                                byte[] token, RegionalSectionCodec.BoundCatalog held,
-                                                RecordReceiver receiver) throws IOException {
-        if (token == null || token.length != 32) throw new IOException("invalid background token");
-        var result = connectEndpoint(primary.address, primary.port, primary.alpn, primary.certificateSha256,
-                token, primary.catalogues, held);
-        result.listen(receiver); return result;
-    }
     private static RegionalQuicClient connectEndpoint(InetAddress address, int port, String alpn,
-                                                       byte[] pin, byte[] token,
-                                                       ConcurrentHashMap<RegionalProtocol.Hash32, CompletableFuture<RegionalSectionCodec.BoundCatalog>> catalogues,
-                                                       RegionalSectionCodec.BoundCatalog held) throws IOException {
-        if (address == null || port < 1 || port > 65535 || alpn == null || alpn.isEmpty() || pin == null || pin.length != 32)
+                                                       byte[] pin, byte[] token) throws IOException {
+        if (address == null || port < 1 || port > 65535 || alpn == null || alpn.isEmpty()
+                || pin == null || pin.length != 32 || token == null || token.length != 32)
             throw new IOException("invalid Voxy QUIC endpoint");
         QuicClientConnection connection = null;
         try {
             var owner = new ConnectionOwner();
             connection = QuicClientConnection.newBuilder()
-                    .socketFactory(ignored -> token == null ? ClientLodDebug.quicSocket()
-                            : new BackgroundDatagramSocket(ClientLodDebug.quicSocket(), token))
+                    .socketFactory(ignored -> new RoutedDatagramSocket(ClientLodDebug.quicSocket(), token))
                     .host(TLS_SERVER_NAME).proxy(address.getHostAddress()).port(port)
                     .applicationProtocol(alpn).connectTimeout(Duration.ofSeconds(5))
                     .maxIdleTimeout(Duration.ofSeconds(60)).defaultStreamReceiveBufferSize(STREAM_RECEIVE_BYTES)
@@ -90,35 +79,30 @@ final class RegionalQuicClient implements AutoCloseable {
             connection.setPeerInitiatedStreamCallback(RegionalQuicClient::rejectRemoteStream);
             connection.setConnectionListener(owner); connection.connect();
             var stream = connection.createStream(true); var output = stream.getOutputStream();
-            output.write(token == null ? RegionalProtocol.STREAM_CONTROL : RegionalProtocol.STREAM_BACKGROUND);
-            if (token != null) { output.write(token); output.write(held == null ? RegionalProtocol.Hash32.ZERO.bytes() : held.fingerprint().bytes()); }
+            output.write(RegionalProtocol.STREAM_CONTROL); output.write(token);
             output.flush();
             String host = address instanceof Inet6Address ? '[' + address.getHostAddress() + "]:" + port
                     : address.getHostAddress() + ':' + port;
-            var result = new RegionalQuicClient(connection, stream, host, address, port, alpn, pin, token != null, catalogues);
-            if (held != null) result.remember(held);
+            var result = new RegionalQuicClient(connection, stream, host);
             owner.publish(result);
-            if (token == null) { result.workers.submit(result::readControls); result.workers.submit(result.controlWriter); }
+            result.workers.submit(result::readControls); result.workers.submit(result.controlWriter);
             return result;
         } catch (Throwable failure) {
             if (connection != null) connection.close();
             throw new IOException("could not connect to the Voxy endpoint", failure);
         }
     }
-    private RegionalQuicClient(QuicClientConnection connection, QuicStream control, String description,
-                                InetAddress address, int port, String alpn, byte[] pin, boolean background,
-                                ConcurrentHashMap<RegionalProtocol.Hash32, CompletableFuture<RegionalSectionCodec.BoundCatalog>> catalogues) {
+    private RegionalQuicClient(QuicClientConnection connection, QuicStream control, String description) {
         this.connection = connection; this.control = control; this.controlInput = control.getInputStream();
-        this.description = description; this.address = address; this.port = port; this.alpn = alpn;
-        this.certificateSha256 = pin.clone(); this.background = background;
-        this.catalogues = catalogues == null ? new ConcurrentHashMap<>() : catalogues;
-        this.controlWriter = background ? null : new ControlWriter(control.getOutputStream(), this::signalActivity, this::fail);
+        this.description = description;
+        this.catalogues = new ConcurrentHashMap<>();
+        this.controlWriter = new ControlWriter(control.getOutputStream(), this::signalActivity, this::fail);
     }
     void listen(RecordReceiver receiver) {
         Objects.requireNonNull(receiver);
         if (!this.listening.compareAndSet(false, true)) throw new IllegalStateException("record receiver already installed");
         this.receiver = receiver;
-        if (this.background) { this.workers.submit(() -> readRecords(this.controlInput, receiver, null)); return; }
+        this.workers.submit(this::readDiscovery);
         for (var priority : RegionalProtocol.Lane.values()) for (int i = 0; i < LANE_COUNTS[priority.ordinal()]; i++) {
             var lane = new LaneWorker(priority, receiver); this.lanes.add(lane); this.workers.submit(lane::run);
         }
@@ -132,10 +116,20 @@ final class RegionalQuicClient implements AutoCloseable {
     }
     boolean isOpen() { return !this.closed.get() && this.failure.get() == null && this.connection.isConnected(); }
     Throwable failure() { return this.failure.get(); }
+    /** One minimum-sized QUIC packet's stream capacity, independent of request counts or rates. */
+    int controlBatchBytes() {
+        var endpoint = (QuicClientConnectionImpl) this.connection;
+        int datagram = Math.min(QuicClientConnectionImpl.MIN_MAX_UDP_PAYLOAD_SIZE,
+                Math.min(endpoint.getTransportParameters().getMaxUdpPayloadSize(), endpoint.getPeerTransportParameters().getMaxUdpPayloadSize()));
+        return datagram - endpoint.getMaxShortHeaderPacketOverhead() - StreamFrame.maxOverhead();
+    }
     RegionalProtocol.Control pollControl() {
         synchronized (this.controlHandoffLock) {
             var result = this.controlHandoff;
-            if (result != null) { this.controlHandoff = null; this.controlHandoffLock.notifyAll(); }
+            if (result != null) {
+                this.controlHandoff = null; this.controlHandoffLock.notifyAll();
+                if (result instanceof RegionalProtocol.Manifest) this.discoveryReady.complete(null);
+            }
             return result;
         }
     }
@@ -144,20 +138,26 @@ final class RegionalQuicClient implements AutoCloseable {
         synchronized (this.controlHandoffLock) { if (this.controlHandoff != null || !isOpen()) signalActivity(); }
     }
     boolean open(String dimension, RegionalProtocol.Hash32 expectedWorld, RegionalSectionCodec.BoundCatalog held, long intervalMillis,
-                 long bandwidthKbps, List<RegionalProtocol.Desire> desires) throws IOException {
+                 long bandwidthKbps, boolean refreshAllowed, int anchorX, int anchorZ,
+                 List<RegionalProtocol.Desire> desires) throws IOException {
         if (held != null) remember(held);
-        return sendControl(RegionalProtocol.open(dimension, expectedWorld, held == null ? null : held.fingerprint(), intervalMillis, bandwidthKbps, desires));
+        return sendControl(RegionalProtocol.open(dimension, expectedWorld, held == null ? null : held.fingerprint(),
+                intervalMillis, bandwidthKbps, refreshAllowed, anchorX, anchorZ, desires));
     }
     void remember(RegionalSectionCodec.BoundCatalog catalog) {
         this.catalogues.computeIfAbsent(catalog.fingerprint(), ignored -> new CompletableFuture<>()).complete(catalog);
     }
     boolean desire(List<RegionalProtocol.Desire> desires) throws IOException { return sendControl(RegionalProtocol.desire(desires)); }
-    boolean drop(List<Long> keys) throws IOException { return sendControl(RegionalProtocol.drop(keys)); }
-    boolean settings(long intervalMillis, long bandwidthKbps) throws IOException {
-        return sendControl(RegionalProtocol.settings(intervalMillis, bandwidthKbps));
+    boolean drop(List<RegionalProtocol.ScopedKey> keys) throws IOException { return sendControl(RegionalProtocol.drop(keys)); }
+    boolean settings(long intervalMillis, long bandwidthKbps, boolean refreshAllowed,
+                     int activeDimensionId, List<RegionalProtocol.DimensionAnchor> anchors) throws IOException {
+        return sendControl(RegionalProtocol.settings(intervalMillis, bandwidthKbps, refreshAllowed, activeDimensionId, anchors));
     }
     private boolean sendControl(byte[] record) throws IOException {
-        if (!isOpen() || this.controlWriter == null) throw closedFailure();
+        if (!isOpen()) throw closedFailure();
+        int kind = Byte.toUnsignedInt(record[0]);
+        if ((kind == RegionalProtocol.C_OPEN || kind == RegionalProtocol.C_DESIRE || kind == RegionalProtocol.C_DROP)
+                && record.length > controlBatchBytes()) throw new IOException("control record exceeds QUIC packet-derived batch size");
         return this.controlWriter.offer(record);
     }
     /** One writer-owned record, no backlog. The owner must stay free to drain responses even
@@ -218,17 +218,39 @@ final class RegionalQuicClient implements AutoCloseable {
             while (!this.closed.get()) {
                 var incoming = RegionalProtocol.readControl(this.controlInput);
                 if (incoming instanceof RegionalProtocol.CatalogMessage catalog) {
-                    remember(this.receiver.catalog(catalog, false));
+                    remember(this.receiver.catalog(catalog));
                     continue;
                 }
-                synchronized (this.controlHandoffLock) {
-                    while (this.controlHandoff != null && !this.closed.get()) this.controlHandoffLock.wait();
-                    if (this.closed.get()) return;
-                    this.controlHandoff = incoming;
-                }
-                signalActivity();
+                handoff(incoming);
             }
         } catch (Throwable failure) { if (!this.closed.get()) fail(failure); }
+    }
+
+    private void readDiscovery() {
+        QuicStream stream = null;
+        try {
+            stream = this.connection.createStream(true);
+            stream.getOutputStream().write(RegionalProtocol.STREAM_DISCOVERY);
+            stream.getOutputStream().flush();
+            this.discoveryReady.get();
+            while (!this.closed.get()) {
+                var incoming = RegionalProtocol.readControl(stream.getInputStream());
+                if (!(incoming instanceof RegionalProtocol.Manifest || incoming instanceof RegionalProtocol.RegionInventory
+                        || incoming instanceof RegionalProtocol.ServerError || incoming instanceof RegionalProtocol.ServerShutdown))
+                    throw new IOException("unexpected discovery stream frame");
+                handoff(incoming);
+            }
+        } catch (Throwable failure) { if (!this.closed.get()) fail(failure); }
+        finally { if (stream != null) rejectRemoteStream(stream); }
+    }
+
+    private void handoff(RegionalProtocol.Control incoming) throws InterruptedException {
+        synchronized (this.controlHandoffLock) {
+            while (this.controlHandoff != null && !this.closed.get()) this.controlHandoffLock.wait();
+            if (this.closed.get()) return;
+            this.controlHandoff = incoming;
+        }
+        signalActivity();
     }
     private void readRecords(InputStream input, RecordReceiver receiver, LaneWorker lane) {
         try {
@@ -241,11 +263,10 @@ final class RegionalQuicClient implements AutoCloseable {
                             RegionalSectionCodec.BoundCatalog binding = null;
                             if (reply.content().kind() == LocalSection.DATA)
                                 binding = this.catalogues.computeIfAbsent(reply.content().catalog(), ignored -> new CompletableFuture<>()).get();
-                            receiver.record(reply, this.background, binding);
+                            receiver.record(reply, binding);
                         }
                         case RegionalProtocol.CatalogMessage catalog -> {
-                            if (!this.background) throw new IOException("catalogue on a foreground terrain lane");
-                            remember(receiver.catalog(catalog, true));
+                            remember(receiver.catalog(catalog));
                         }
                         case RegionalProtocol.ServerError error -> throw new IOException("Voxy server error " + error.code() + ": " + error.message());
                         case RegionalProtocol.ServerShutdown shutdown -> throw new IOException(shutdown.message());
@@ -278,10 +299,11 @@ final class RegionalQuicClient implements AutoCloseable {
     private IOException closedFailure() { return new IOException("Voxy regional QUIC connection is closed", this.failure.get()); }
     @Override public void close() {
         if (!this.closed.compareAndSet(false, true)) return;
-        if (this.controlWriter != null) this.controlWriter.close();
+        this.controlWriter.close();
+        this.discoveryReady.completeExceptionally(closedFailure());
         for (var lane : this.lanes) lane.stop();
         synchronized (this.controlHandoffLock) { this.controlHandoffLock.notifyAll(); }
-        if (!this.background) this.catalogues.values().forEach(waiter -> waiter.completeExceptionally(closedFailure()));
+        this.catalogues.values().forEach(waiter -> waiter.completeExceptionally(closedFailure()));
         rejectRemoteStream(this.control); this.connection.close(); this.workers.shutdownNow(); signalActivity();
     }
     private static void rejectRemoteStream(QuicStream stream) {

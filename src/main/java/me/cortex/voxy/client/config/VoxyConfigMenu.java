@@ -13,6 +13,7 @@ import net.caffeinemc.mods.sodium.api.config.ConfigState;
 import net.caffeinemc.mods.sodium.api.config.option.OptionFlag;
 import net.caffeinemc.mods.sodium.api.config.option.OptionImpact;
 import net.caffeinemc.mods.sodium.api.config.option.Range;
+import net.caffeinemc.mods.sodium.api.config.option.SteppedValidator;
 import net.caffeinemc.mods.sodium.api.config.structure.ConfigBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.IntegerOptionBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.ModOptionsBuilder;
@@ -77,14 +78,6 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setRange(new Range(1, 60, 1))
                 .setValueFormatter(value -> Component.literal(value + " s"))
                 .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
-        var backgroundBandwidth = option(builder.createIntegerOption(id("background_download_bandwidth")),
-                "voxy.config.streaming.background_bandwidth", CFG::getBackgroundDownloadKbps,
-                value -> CFG.backgroundDownloadKbps = value, STREAMING_SETTINGS)
-                .setRange(new Range(0, 100_000, 100))
-                .setValueFormatter(value -> value == 0
-                        ? Component.translatable("voxy.config.streaming.unlimited")
-                        : Component.literal(String.format(java.util.Locale.ROOT, "%.1f Mbps", value / 1000.0)))
-                .setEnabledProvider(VoxyConfigMenu::voxyEnabled, ENABLED);
 
         int[] geometryMemoryChoices = GeometryMemoryOptions.available(
                 RenderResourceReuse.getSafeGeometryMemoryLimitBytes());
@@ -146,14 +139,17 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setEnabledProvider(VoxyConfigMenu::fogOptionsEnabled,
                         ENABLED, RENDERING, ConfigState.UPDATE_ON_REBUILD);
 
-        options.addPage(builder.createOptionPage()
+        var renderingPage = builder.createOptionPage()
                 .setName(Component.translatable("voxy.config.rendering"))
                 .addOptionGroup(group(builder, rendering))
                 .addOptionGroup(group(builder, renderDistance, pixelSize, geometryMemory))
-                .addOptionGroup(group(builder, updateInterval, backgroundBandwidth))
+                .addOptionGroup(group(builder, updateInterval));
+        renderingPage.addOptionGroup(serverDownloadOptions(builder));
+        renderingPage
                 .addOptionGroup(group(builder, environmentalFog, ssao))
                 .addOptionGroup(group(builder, adaptCloudDistance, cloudDistance))
-                .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance)));
+                .addOptionGroup(group(builder, fogIntensity, fogDensity, skyFogDistance));
+        options.addPage(renderingPage);
 
         registerApplyHooks(options);
     }
@@ -190,6 +186,111 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 }
             }
         }, IRIS_RELOAD, ENABLED, RENDERING, RENDER_DISTANCE, STREAMING_SETTINGS);
+    }
+
+    private static OptionGroupBuilder serverDownloadOptions(ConfigBuilder builder) {
+        var group = builder.createOptionGroup();
+        var bandwidth = option(builder.createIntegerOption(id("download_bandwidth")),
+                "voxy.config.streaming.bandwidth", () -> {
+                    var policy = ServerDownloadSettings.current();
+                    return policy == null ? ServerDownloadSettings.DEFAULT_KBPS : policy.downloadKbps();
+                }, value -> { var policy = ServerDownloadSettings.current(); if (policy != null) policy.setDownloadKbps(value); }, STREAMING_SETTINGS)
+                .setRange(new Range(ServerDownloadSettings.MIN_KBPS, ServerDownloadSettings.MAX_KBPS, 100))
+                .setValueFormatter(value -> Component.literal(value < 1000 ? value + " kbps"
+                        : String.format(java.util.Locale.ROOT, "%.1f Mbps", value / 1000.0)))
+                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && voxyEnabled(state),
+                        ENABLED, ConfigState.UPDATE_ON_REBUILD);
+        bandwidth.setTooltip(value -> {
+            var policy = ServerDownloadSettings.current();
+            return policy == null ? Component.translatable("voxy.config.streaming.no_server")
+                    : Component.translatable("voxy.config.streaming.bandwidth.tooltip", policy.serverId());
+        });
+        bandwidth.setDefaultValue(ServerDownloadSettings.DEFAULT_KBPS);
+        bandwidth.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
+
+        var values = new CacheStorageOptions();
+        var storage = option(builder.createIntegerOption(id("cache_storage")),
+                "voxy.config.streaming.storage", values::index, values::apply, STREAMING_SETTINGS)
+                .setValidator(values)
+                .setValueFormatter(values::label)
+                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && voxyEnabled(state),
+                        ENABLED, ConfigState.UPDATE_ON_REBUILD);
+        storage.setTooltip(value -> {
+            var policy = ServerDownloadSettings.current();
+            return policy == null ? Component.translatable("voxy.config.streaming.no_server")
+                    : Component.translatable("voxy.config.streaming.storage.tooltip", policy.serverId())
+                    .append(Component.literal("\n" + ClientSession.storageStatus(policy.serverId())));
+        });
+        storage.setDefaultProvider(state -> values.defaultIndex(), ConfigState.UPDATE_ON_REBUILD);
+        storage.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
+        group.addOption(bandwidth);
+        group.addOption(storage);
+        return group;
+    }
+
+    private static void saveCurrentServerPolicy() {
+        var policy = ServerDownloadSettings.current();
+        if (policy != null) policy.save();
+    }
+
+    /** Refresh choices with binding resets when a menu opens, keeping slider indices stable while editing. */
+    private static final class CacheStorageOptions implements SteppedValidator {
+        private String serverId;
+        private long[] choices;
+
+        private ServerDownloadSettings select(boolean rebuild) {
+            var policy = ServerDownloadSettings.current();
+            String selected = policy == null ? null : policy.serverId();
+            long bytes = policy == null ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
+            if (rebuild || this.choices == null || !java.util.Objects.equals(this.serverId, selected)
+                    || bytes != Long.MAX_VALUE && java.util.Arrays.binarySearch(this.choices, bytes) < 0) {
+                this.serverId = selected;
+                this.choices = storageChoices(policy);
+            }
+            return policy;
+        }
+
+        int index() {
+            var policy = select(true);
+            return policy != null && policy.entireWorld() ? this.choices.length : java.util.Arrays.binarySearch(this.choices,
+                    policy == null ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes());
+        }
+
+        void apply(int value) {
+            var policy = select(false);
+            if (policy != null) policy.setStorageBytes(value == this.choices.length ? Long.MAX_VALUE : this.choices[value]);
+        }
+
+        @Override public int min() { return 0; }
+        @Override public int max() { select(false); return this.choices.length; }
+        @Override public int step() { return 1; }
+        int defaultIndex() { select(false); return java.util.Arrays.binarySearch(this.choices, ServerDownloadSettings.DEFAULT_STORAGE_BYTES); }
+        Component label(int value) {
+            select(false);
+            return value == this.choices.length ? Component.translatable("voxy.config.streaming.entire_world")
+                    : Component.literal(storageLabel(this.choices[value]));
+        }
+    }
+
+    private static long[] storageChoices(ServerDownloadSettings policy) {
+        var choices = new java.util.TreeSet<Long>();
+        choices.add(ServerDownloadSettings.DEFAULT_STORAGE_BYTES);
+        long current = policy == null || policy.entireWorld() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
+        choices.add(current);
+        long maximum = Math.min(Long.MAX_VALUE - 1, Math.max(current,
+                Math.max(ServerDownloadSettings.DEFAULT_STORAGE_BYTES, policy == null ? 0 : policy.estimatedWorldBytes())));
+        for (long bytes = ServerDownloadSettings.MIN_STORAGE_BYTES; bytes < maximum;) {
+            choices.add(bytes);
+            if (bytes > maximum / 2) break;
+            bytes *= 2;
+        }
+        choices.add(maximum);
+        return choices.stream().mapToLong(Long::longValue).toArray();
+    }
+
+    private static String storageLabel(long bytes) {
+        double unit = bytes < 1_000_000_000 ? 1_000_000.0 : 1_000_000_000.0;
+        return String.format(java.util.Locale.ROOT, "%.1f %s", bytes / unit, bytes < 1_000_000_000 ? "MB" : "GB");
     }
 
     static IntegerOptionBuilder pixelSizeOption(ConfigBuilder builder) {

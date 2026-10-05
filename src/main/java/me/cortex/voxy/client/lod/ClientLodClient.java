@@ -67,6 +67,15 @@ public final class ClientLodClient {
         ClientSession.detailAction(key, action, bucket, epoch);
     }
 
+    public static void visibleSections(me.cortex.voxy.client.core.VoxyRenderSystem renderer,
+                                       long epoch, long[] keys, float[] areas, int[] buckets) {
+        ClientSession.visibleSections(renderer, epoch, keys, areas, buckets);
+    }
+
+    public static void downloadFrustum(me.cortex.voxy.client.core.VoxyRenderSystem renderer, float[] planes) {
+        ClientSession.downloadFrustum(renderer, planes);
+    }
+
     public static void resetDemand() {
         ClientSession.resetDemand();
     }
