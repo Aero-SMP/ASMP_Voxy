@@ -1,7 +1,8 @@
 # Simplify Voxy streaming settings
 
-Status: implementation plan; written 2026-10-05. No implementation, build,
-deployment or testing is performed by writing this document.
+Status: implemented 2026-10-05 in `caf1d876`, with matched debug 260 deployment.
+Live verification is partial; see
+[the implementation report](streaming_settings_simplification_implementation_260.md).
 
 Repository: `/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates`.
 Branch: `feature/cache-first-background-updates`.
