@@ -1,0 +1,47 @@
+[
+  {
+    "path": "project_audit/live_client/repair257-capture/screenshots.json",
+    "bytes": 483,
+    "sha256": "1ac1c38ad2ef3d0e47bec018098ecf04f238b56125f97142d9f6e4c4b8b13772"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/voxy-test-0eaa3caf-fbf5-462f-8d7d-1900bcaf63f3-2.png",
+    "bytes": 3159289,
+    "sha256": "b4d609fb596bf76f466375dc61b5fcfc6e96ae6d580d3fd397562b06bcc982fa"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/restart.log",
+    "bytes": 11174,
+    "sha256": "d2f13605a847e07a0f90b03880b618d03a695e35a02a79778e797fa7880870a3"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/metadata.json",
+    "bytes": 2296,
+    "sha256": "9ccd5d007fa0cb2c9c923c966cb1cccdf5fce468e8ae80751a8f37571f865663"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/voxy-test-0eaa3caf-fbf5-462f-8d7d-1900bcaf63f3-8.png",
+    "bytes": 1312379,
+    "sha256": "60021a1f6428e5d2fe778ca01daecf1d9978044267b7bdbd24e9b80c581359a9"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/result.json",
+    "bytes": 149,
+    "sha256": "16b587b6ff242a913e69f4c68bc37e0105b54b0e98fc2d600af68c840f0d4708"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/events.jsonl",
+    "bytes": 34841,
+    "sha256": "226a05fc10a017a6ec54b281eae1e03256cd6022d0d74eb79575b37d6a27157c"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/voxy-client-debug.log",
+    "bytes": 6446818,
+    "sha256": "26afc9979ced76d98e8b25f5a7f8532c36242464980356ec940f4e5b4509d9fb"
+  },
+  {
+    "path": "project_audit/live_client/repair257-capture/voxy-test-0eaa3caf-fbf5-462f-8d7d-1900bcaf63f3-5.png",
+    "bytes": 4921787,
+    "sha256": "73e606aadc0bdedbebb4d1fba152389bbcc11de6e6c4e028c3fcb5c3b45f7edb"
+  }
+]

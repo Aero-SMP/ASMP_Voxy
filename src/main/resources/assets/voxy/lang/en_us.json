@@ -25,6 +25,7 @@
   "voxy.config.general.fogDensity.tooltip": "Density of the fog, higher values make the fog thicker",
   "voxy.config.general.skyFogDistance": "Sky fog distance",
   "voxy.config.general.skyFogDistance.tooltip": "Distance at which sky fog starts to render in chunks",
+  "voxy.config.streaming.policy_unavailable": "Unavailable",
   "voxy.config.streaming.update_interval": "Terrain Update Interval",
   "voxy.config.streaming.update_interval.tooltip": "Minimum time between background terrain update batches. Cached terrain stays visible; missing terrain and zoom detail bypass this interval.",
   "voxy.config.streaming.bandwidth": "Download Bandwidth",

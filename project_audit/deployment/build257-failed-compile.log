@@ -1,0 +1,133 @@
+To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/9.4.1/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+> Task :createMinecraftArtifacts UP-TO-DATE
+> Task :server:createMinecraftArtifacts UP-TO-DATE
+> Task :server:compileJava
+> Task :server:processDebugResources UP-TO-DATE
+> Task :server:debugJarJar NO-SOURCE
+> Task :server:jarJar NO-SOURCE
+
+> Task :compileJava FAILED
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1300: error: cannot find symbol
+                        if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                                   ^
+  symbol:   variable installed
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1300: error: cannot find symbol
+                        if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                                                                      ^
+  symbol:   variable content
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1300: error: cannot find symbol
+                        if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                                                                                                 ^
+  symbol:   variable cachedCover
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1302: error: cannot find symbol
+                            if (demand.content == null && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
+                                      ^
+  symbol:   variable content
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1302: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                            if (demand.content == null && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
+                                                                              ^
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1316: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                this.dropInterest(demand); demand.regionGeneration = 0;
+                                  ^
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1317: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                this.invalidateNetworkCandidate(demand);
+                                                ^
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1319: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                    this.networkWanted(demand, false); this.unactivatedRequired.remove(demand.key);
+                                       ^
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: cannot find symbol
+                    if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                               ^
+  symbol:   variable installed
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: cannot find symbol
+                    if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                                   ^
+  symbol:   variable content
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: cannot find symbol
+                    if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                                                             ^
+  symbol:   variable preservedPublication
+  location: variable demand of type Demand
+/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                    if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                                                                                                               ^
+Note: /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/core/model/ModelFactory.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+Note: Some messages have been simplified; recompile with -Xdiags:verbose to get full output
+12 errors
+
+[Incubating] Problems report is available at: file:///home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/reports/problems/problems-report.html
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':compileJava'.
+> Compilation failed; see the compiler output below.
+  Note: /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/core/model/ModelFactory.java uses or overrides a deprecated API.
+  Note: Recompile with -Xlint:deprecation for details.
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1302: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                              if (demand.content == null && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
+                                                                                ^
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1316: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                  this.dropInterest(demand); demand.regionGeneration = 0;
+                                    ^
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1317: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                  this.invalidateNetworkCandidate(demand);
+                                                  ^
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1319: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                      this.networkWanted(demand, false); this.unactivatedRequired.remove(demand.key);
+                                         ^
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: incompatible types: me.cortex.voxy.client.lod.SectionDemandTable.Demand cannot be converted to me.cortex.voxy.client.lod.ClientSession.Demand
+                      if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                                                                                                                 ^
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1300: error: cannot find symbol
+                          if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                                     ^
+    symbol:   variable installed
+    location: variable demand of type Demand
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1300: error: cannot find symbol
+                          if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                                                                        ^
+    symbol:   variable content
+    location: variable demand of type Demand
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1300: error: cannot find symbol
+                          if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                                                                                                   ^
+    symbol:   variable cachedCover
+    location: variable demand of type Demand
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1302: error: cannot find symbol
+                              if (demand.content == null && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
+                                        ^
+    symbol:   variable content
+    location: variable demand of type Demand
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: cannot find symbol
+                      if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                 ^
+    symbol:   variable installed
+    location: variable demand of type Demand
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: cannot find symbol
+                      if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                                     ^
+    symbol:   variable content
+    location: variable demand of type Demand
+  /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/lod/ClientSession.java:1321: error: cannot find symbol
+                      if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                                                                               ^
+    symbol:   variable preservedPublication
+    location: variable demand of type Demand
+  Note: Some messages have been simplified; recompile with -Xdiags:verbose to get full output
+  12 errors
+
+* Try:
+> Check your code and dependencies to fix the compilation error(s)
+> Run with --scan to get full insights from a Build Scan (powered by Develocity).
+
+BUILD FAILED in 4s
+5 actionable tasks: 2 executed, 3 up-to-date

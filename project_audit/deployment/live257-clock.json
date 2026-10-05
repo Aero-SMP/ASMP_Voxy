@@ -1,0 +1,11 @@
+{
+  "utc_start": "2026-10-05T17:52:46.249996+00:00",
+  "monotonic_start": 445915.142328518,
+  "limit_seconds": 600,
+  "status": "ended",
+  "utc_end": "2026-10-05T18:03:49.265907+00:00",
+  "monotonic_end": 446578.158235259,
+  "elapsed_seconds": 663.0159069310175,
+  "observations_deadline_seconds": 600,
+  "overrun_reason": "Restoration confirmation harness step sequencing failed; final screenshot and run-close retry crossed600 seconds. The postdeadline screenshot is excluded from acceptance. No additional scenarios or pressure tests were run."
+}

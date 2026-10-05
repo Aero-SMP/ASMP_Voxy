@@ -131,6 +131,7 @@ public final class ClientSession {
         void connect(Session view) throws IOException {
             if (!attach(view)) return;
             if (this.quic == null) {
+                if (!this.policy.available()) return;
                 if (!ClientLodDebug.connectionAllowed() || this.connector == null) return;
                 if (this.attempt == null) {
                     if (System.nanoTime() - this.retry < 0) return;
@@ -438,6 +439,9 @@ public final class ClientSession {
         RegionalSectionCodec.BoundCatalog catalog;
         VoxyRenderSystem.SectionPublication publication;
         VoxyRenderSystem.SectionPublication previousPublication;
+        VoxyRenderSystem.SectionPublication preservedPublication;
+        LocalSection preservedContent;
+        boolean networkWork;
         long wireTicket;
         int sentPurpose = -1;
         long cacheActivatedFrame = -1;
@@ -511,6 +515,9 @@ public final class ClientSession {
         final Set<Long> coarseningRoots = new HashSet<>();
         final Set<Long> rendererBlocked = new LinkedHashSet<>();
         final Set<Long> missingInterests = new HashSet<>();
+        final Set<Long> unactivatedRequired = new HashSet<>();
+        final Set<Long> unavailableSourceRegions = new HashSet<>();
+        boolean sourceSnapshotStarted;
         final Set<Long> emptyTopologyKeys = new HashSet<>();
         final Map<Long, LinkedHashSet<Long>> emptyTopologyDependents = new HashMap<>();
         final PendingInterests interestChanges = new PendingInterests();
@@ -634,7 +641,9 @@ public final class ClientSession {
                 RegionalSectionCodec.BoundCatalog> savedMappings =
                 new java.util.concurrent.ConcurrentHashMap<>();
         volatile AssociationTask associationIntent;
-        PersistTask deferredPersistence;
+        Object blockedMetadataGoal;
+        long blockedMetadataGeneration = Long.MIN_VALUE;
+        boolean metadataRetryOnAdmission;
         final long[] persistenceOutcomes = new long[RegionalMetadataStore.Persistence.values().length];
         long associationPersisted, regionPersisted;
         String lastPersistenceFailure;
@@ -732,13 +741,14 @@ public final class ClientSession {
         private record AssociationTask(long view, RegionalProtocol.Hash32 world) {}
         private record LoadMetadataTask(long view, long region, long revision,
                                         RegionalProtocol.Hash32 world, CompletedSectionCache cache) implements WorkerTask {}
-        private record PersistTask(Object intent, CompletedSectionCache cache, long stamp,
+        private record PersistTask(Object intent, CompletedSectionCache cache, long stamp, long admissionGeneration,
                                    java.util.function.BooleanSupplier current) implements WorkerTask {}
         private record WorkerBootstrap(RegionalMetadataStore metadata, RegionalProtocol.Hash32 hint)
                 implements WorkerResult {}
         private record WorkerWorld(long view, CompletedSectionCache cache) implements WorkerResult {}
         private record WorkerMetadata(LoadMetadataTask task, Map<Long, LocalSection> sections) implements WorkerResult {}
-        private record WorkerSaved(PersistTask task, RegionalMetadataStore.Persistence outcome, String reason) implements WorkerResult {}
+        private record WorkerSaved(PersistTask task, RegionalMetadataStore.Persistence outcome, String reason,
+                                   boolean retryOnAdmission) implements WorkerResult {}
         private record WorkerMiss(SectionDemandTable.Ticket ticket, boolean corrupt, LocalSection fallback)
                 implements WorkerResult {}
         private record SaveInput(WorkerResource.Lease lease, SectionDemandTable.Ticket ticket,
@@ -870,7 +880,7 @@ public final class ClientSession {
                                     var store = new RegionalMetadataStore(bootstrap.root());
                                     RegionalProtocol.Hash32 hint;
                                     try {
-                                        if (policy != null) store.bindServer(policy.serverId(), bootstrap.server(), policy.storageBytes());
+                                        if (policy != null) store.bindServer(policy, bootstrap.server());
                                         hint = store.world(bootstrap.server(), bootstrap.dimension());
                                     }
                                     catch (IOException invalid) { hint = null; }
@@ -1031,9 +1041,9 @@ public final class ClientSession {
             private WorkerSaved persist(PersistTask task) {
                 var outcome = RegionalMetadataStore.Persistence.OBSOLETE;
                 String reason = task.intent().getClass().getSimpleName() + "-refused";
+                boolean retryOnAdmission = true;
                 try {
-                    java.util.function.BooleanSupplier current = () -> task.current().getAsBoolean()
-                            && task.stamp() == metadata.budget.stamp();
+                    var current = task.current();
                     if (current.getAsBoolean()) {
                         outcome = switch (task.intent()) {
                             case AssociationTask association -> metadata.associate(serverKey, dimension, association.world(), task.stamp(), current);
@@ -1045,8 +1055,9 @@ public final class ClientSession {
                 } catch (Exception optional) {
                     outcome = RegionalMetadataStore.Persistence.UNAVAILABLE;
                     reason = optional.toString();
+                    retryOnAdmission = optional instanceof RegionalDiskBudget.Capacity || RegionalDiskBudget.outOfSpace(optional);
                 }
-                return new WorkerSaved(task, outcome, reason);
+                return new WorkerSaved(task, outcome, reason, retryOnAdmission);
             }
 
             synchronized void close() {
@@ -1070,8 +1081,11 @@ public final class ClientSession {
             var server = minecraft.getCurrentServer();
             // Integrated worlds without a persistent logical identity do not use optimistic lookup.
             this.serverKey = server == null ? null : server.ip;
-            this.policy = this.serverKey == null ? null : ServerDownloadSettings.forServer(this.serverKey);
             this.minecraftConnection = listener == null ? null : listener.getConnection();
+            if (this.serverKey != null && (connectionOwner == null
+                    || connectionOwner.minecraftConnection != this.minecraftConnection))
+                ServerDownloadSettings.reloadUnavailable();
+            this.policy = this.serverKey == null ? null : ServerDownloadSettings.forServer(this.serverKey);
             this.connector = () -> QuicEndpointDiscovery.connect(listener, this.policy == null ? 1000 : this.policy.downloadKbps());
         }
 
@@ -1203,12 +1217,27 @@ public final class ClientSession {
             else if (previous != null) previous.close();
             this.openSent = false;
             this.welcome = null;
+            this.sourceSnapshotStarted = false;
+            this.unavailableSourceRegions.clear();
             this.savedMappings.clear();
             if (this.currentCatalog != null) this.savedMappings.put(this.currentCatalog.fingerprint(), this.currentCatalog);
             this.interestDrops.clear();
             this.interestChanges.clear();
             this.frameInterests.clear(); this.coverDependents.clear();
-            for (Demand demand : this.demands.values()) { demand.wireTicket = 0; this.interestChanges.add(demand.key); }
+            for (Demand demand : this.demands.values()) {
+                demand.wireTicket = 0; demand.regionGeneration = 0;
+                this.invalidateNetworkCandidate(demand); this.interestChanges.add(demand.key);
+                if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                if (demand.cachedCover && demand.cachedCutPending != null) {
+                    var pending = demand.cachedCutPending.iterator();
+                    while (pending.hasNext()) {
+                        long key = pending.next(); var source = this.demands.get(key);
+                        if (source != null && source.installed) {
+                            pending.remove(); demand.cachedCoverActivatedFrame = Math.max(demand.cachedCoverActivatedFrame, source.cacheActivatedFrame);
+                        } else this.coverDependents.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(demand.key);
+                    }
+                }
+            }
             ClientLodDebug.startupEvent(this, "subscriptionReset", 0);
             NetworkReply reply;
             while ((reply = this.networkReplies.poll()) != null) reply.transferred();
@@ -1230,7 +1259,7 @@ public final class ClientSession {
         void drainControls() throws Exception {
             if (this.networkOwner.pendingInventory != null) {
                 if (this.networkOwner.downloads == null) return;
-                this.networkOwner.downloads.inventory(this.networkOwner.pendingInventory); this.networkOwner.pendingInventory = null;
+                this.applyInventory(this.networkOwner.pendingInventory); this.networkOwner.pendingInventory = null;
             }
             while (true) {
                 var control = this.quic.pollControl();
@@ -1243,13 +1272,75 @@ public final class ClientSession {
                     }
                     case RegionalProtocol.RegionInventory inventory -> {
                         if (this.networkOwner.downloads == null) { this.networkOwner.pendingInventory = inventory; return; }
-                        this.networkOwner.downloads.inventory(inventory);
+                        this.applyInventory(inventory);
                     }
                     case RegionalProtocol.ServerError error -> throw new IOException("Voxy server error " + error.code() + ": " + error.message());
                     case RegionalProtocol.ServerShutdown shutdown -> throw new IOException(shutdown.message());
                     default -> throw new IOException("unexpected primary control frame");
                 }
             }
+        }
+        private void applyInventory(RegionalProtocol.RegionInventory inventory) {
+            this.networkOwner.downloads.inventory(inventory);
+            if (inventory.dimensionId() != this.dimensionId) return;
+            if (inventory.state() == RegionalProtocol.InventoryState.SNAPSHOT_BEGIN) {
+                if (this.sourceSnapshotStarted) {
+                    this.unavailableSourceRegions.clear();
+                    for (var region : List.copyOf(this.demands.regions())) this.invalidateRegionWire(region.key);
+                }
+                this.sourceSnapshotStarted = true;
+            } else if (inventory.state() == RegionalProtocol.InventoryState.REMOVED_REGION) {
+                long region = regionKey(inventory.regionX(), inventory.regionZ());
+                this.unavailableSourceRegions.add(region); this.invalidateRegionWire(region);
+            } else if (inventory.state().saved()) {
+                long key = regionKey(inventory.regionX(), inventory.regionZ());
+                boolean reappeared = this.unavailableSourceRegions.remove(key);
+                var region = this.demands.region(key);
+                if (region != null) for (long member : region.members.keySet()) {
+                    Demand demand = this.demands.get(member);
+                    if (!demand.installed && (reappeared || demand.content == null && !demand.cachedCover)) {
+                        this.unactivatedRequired.add(demand.key);
+                        if (demand.content == null && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
+                    }
+                    if (reappeared) this.interestChanges.add(demand.key);
+                }
+            } else if (inventory.state() == RegionalProtocol.InventoryState.SNAPSHOT_COMPLETE
+                    && this.networkOwner.downloads.inventoryKnown(this.dimensionId)) {
+                for (var region : List.copyOf(this.demands.regions()))
+                    if (this.networkOwner.downloads.absentRegion(this.dimensionId, region.key)
+                            && this.unavailableSourceRegions.add(region.key)) this.invalidateRegionWire(region.key);
+            }
+        }
+        private void invalidateRegionWire(long key) {
+            var region = this.demands.region(key); if (region == null) return;
+            for (long member : region.members.keySet()) {
+                Demand demand = this.demands.get(member);
+                this.dropInterest(demand); demand.regionGeneration = 0;
+                this.invalidateNetworkCandidate(demand);
+                if (this.unavailableSourceRegions.contains(key)) {
+                    this.networkWanted(demand, false); this.unactivatedRequired.remove(demand.key);
+                } else {
+                    if (!demand.installed && demand.content == null && demand.preservedPublication == null) this.bindAvailable(demand);
+                    this.interestChanges.add(demand.key);
+                }
+            }
+        }
+        private void invalidateNetworkCandidate(Demand demand) {
+            if (!demand.networkWork) {
+                if (demand.candidate == SectionDemandTable.CandidateState.NETWORK_OWNED) {
+                    this.demands.revise(demand); demand.candidate = SectionDemandTable.CandidateState.WAIT_REGION;
+                }
+                return;
+            }
+            if (demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED) {
+                demand.preservedPublication = demand.publication; demand.preservedContent = demand.content;
+                demand.publication = demand.previousPublication; demand.previousPublication = null;
+            }
+            this.demands.revise(demand); this.discardCompletedGeometry(demand);
+            this.releasePublishingGeometryAccounting(demand); this.rendererBlocked.remove(demand.key);
+            demand.networkWork = false; demand.content = demand.activeContent; demand.catalog = null;
+            demand.candidate = demand.content == null ? SectionDemandTable.CandidateState.WAIT_REGION : SectionDemandTable.CandidateState.NONE;
+            if (demand.preservedPublication == null && !demand.installed && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
         }
         void acceptHello(RegionalProtocol.ServerHello hello) {
             this.helloAccepted = true;
@@ -1751,6 +1842,8 @@ public final class ClientSession {
             this.topologyChanged(demand);
             this.emptyTopology(demand, false);
             this.missingInterests.remove(key);
+            this.unactivatedRequired.remove(key);
+            demand.preservedPublication = null; demand.preservedContent = null;
             this.rendererBlocked.remove(key);
             this.forgetDormancyForSubtree(key);
             this.discardCompletedGeometry(demand);
@@ -1819,12 +1912,17 @@ public final class ClientSession {
         void addDemand(long key) { this.addDemand(key, 0); }
 
         void addDemand(long key, int bucket) {
+            if (this.networkOwner != null && this.networkOwner.downloads != null
+                    && this.networkOwner.downloads.absentRegion(this.dimensionId, regionFor(key)))
+                this.unavailableSourceRegions.add(regionFor(key));
             Demand existing = this.demands.get(key);
             if (existing != null) {
+                if (!existing.installed && !this.unavailableSourceRegions.contains(existing.regionKey)) this.unactivatedRequired.add(key);
                 this.demands.setPriority(existing, bucket);
                 return;
             }
             Demand demand = this.demands.adopt(new Demand(key));
+            if (!this.unavailableSourceRegions.contains(demand.regionKey)) this.unactivatedRequired.add(key);
             this.interestChanges.add(key);
             this.demands.setPriority(demand, bucket);
             if (demand.coverage) this.missingCoverage.add(key);
@@ -1971,6 +2069,8 @@ public final class ClientSession {
         void retireDemand(long key) {
             Demand demand = this.demands.get(key);
             if (demand == null) return;
+            this.unactivatedRequired.remove(key);
+            demand.preservedPublication = null; demand.preservedContent = null;
             demand.childrenRequired = false;
             this.topologyChanged(demand);
             this.emptyTopology(demand, false);
@@ -2013,6 +2113,7 @@ public final class ClientSession {
         }
 
         void releaseRegion(long region, SectionDemandTable.RegionDemand state) {
+            if (state.members.isEmpty()) this.unavailableSourceRegions.remove(region);
             for (long key : state.members.keySet()) {
                 var demand = this.demands.get(key); if (demand != null) this.dropInterest(demand);
             }
@@ -2034,6 +2135,7 @@ public final class ClientSession {
                     || this.worldIdentity == null || region != null && region.localLoaded);
         }
         private boolean networkEligible(Demand demand) {
+            if (this.unavailableSourceRegions.contains(demand.regionKey)) return false;
             if (!this.localProbed(demand)) return false;
             demand.gatingCoverKey = 0; demand.gatingCoverFrame = -1;
             if (demand.cachedCover) {
@@ -2081,6 +2183,7 @@ public final class ClientSession {
             return true;
         }
         private void networkWanted(Demand demand, boolean wanted) {
+            wanted &= !this.unavailableSourceRegions.contains(demand.regionKey);
             demand.networkWanted = wanted;
             if (wanted) this.missingInterests.add(demand.key); else this.missingInterests.remove(demand.key);
         }
@@ -2107,6 +2210,15 @@ public final class ClientSession {
             }
         }
         private boolean refreshAllowed() throws IOException {
+            var required = this.unactivatedRequired.iterator();
+            while (required.hasNext()) {
+                var demand = this.demands.get(required.next());
+                if (demand == null || demand.installed || demand.cachedCover
+                        && demand.cachedCutPending.isEmpty() && demand.cachedCoverActivatedFrame < this.renderedFrames) {
+                    required.remove(); continue;
+                }
+                if (this.downloadVisible(demand.key) && !this.isCoarsening(demand.key)) return false;
+            }
             for (long key : this.missingInterests) {
                 var demand = this.demands.get(key);
                 if (demand != null && this.downloadVisible(key) && !demand.cachedCover) return false;
@@ -2128,7 +2240,7 @@ public final class ClientSession {
                 this.checkedFrame = this.renderedFrames; this.interestChanges.addAll(this.frameInterests); this.frameInterests.clear();
             }
             long interval = Math.multiplyExact((long) VoxyConfig.CONFIG.getBackgroundUpdateIntervalSeconds(), 1000L);
-            long bandwidth = this.policy.downloadKbps();
+            long bandwidth = this.policy.available() ? this.policy.downloadKbps() : this.sentBandwidthKbps;
             boolean refresh = this.helloAccepted && (this.metadata == null || this.metadata.canDownload()) && this.refreshAllowed();
             if (this.openSent && this.dimensionId >= 0 && (interval != this.sentIntervalMillis || bandwidth != this.sentBandwidthKbps
                     || refresh != this.sentRefreshAllowed || this.dimensionId != this.sentDimensionId || this.cameraBlockX != this.sentAnchorX || this.cameraBlockZ != this.sentAnchorZ)) {
@@ -2208,7 +2320,8 @@ public final class ClientSession {
                         : "Cache file inventory pending");
             }
             if (this.sentStorageBytes != this.policy.storageBytes()) {
-                this.metadata.bindServer(this.policy.serverId(), this.serverKey, this.policy.storageBytes());
+                this.metadata.bindServer(this.policy, this.serverKey);
+                this.resetMetadataRetry();
                 if (downloads != null) downloads.policyChanged();
                 this.sentStorageBytes = this.policy.storageBytes();
             }
@@ -2269,6 +2382,7 @@ public final class ClientSession {
 
         void changeWorld(RegionalProtocol.Hash32 world) {
             ++this.viewRevision;
+            this.unavailableSourceRegions.clear();
             if (this.worldIdentity != null) {
                 ClientLodDebug.startupEvent(this, "worldCorrection", 0);
                 for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
@@ -2386,30 +2500,21 @@ public final class ClientSession {
 
         private boolean persistMetadata() {
             var unavailable = this.metadata.budget.persistenceUnavailable();
-            if (unavailable == RegionalMetadataStore.Persistence.DEFERRED_INVENTORY) return false;
-            if (unavailable != null) {
-                long count = (this.associationPending ? 1 : 0);
-                this.persistenceOutcomes[unavailable.ordinal()] += count;
-                if (count != 0) this.lastPersistenceFailure = "inventory-" + unavailable;
-                this.clearPersistence();
-                return false;
-            }
-            if (this.deferredPersistence != null) {
-                var attempt = this.deferredPersistence;
-                this.deferredPersistence = null;
-                this.metadataWorker.assign(attempt); // Preserve the original stamp after an attempted write.
-                return true;
-            }
+            if (unavailable != null || !this.metadata.canDownload()) return false;
+            long generation = this.metadata.admissionGeneration();
+            Object goal = this.associationPending ? this.associationIntent : this.catalogueIntent;
+            if (goal == null || goal == this.blockedMetadataGoal
+                    && (!this.metadataRetryOnAdmission || generation == this.blockedMetadataGeneration)) return false;
             long stamp = this.metadata.budget.stamp();
             if (this.associationPending) {
                 var intent = this.associationIntent;
-                this.metadataWorker.assign(new PersistTask(intent, this.cache, stamp,
+                this.metadataWorker.assign(new PersistTask(intent, this.cache, stamp, generation,
                         () -> this.open.get() && this.viewRevision == intent.view() && this.associationIntent == intent));
                 return true;
             }
             if (this.catalogueIntent != null) {
                 var intent = this.catalogueIntent;
-                this.metadataWorker.assign(new PersistTask(intent, this.cache, stamp,
+                this.metadataWorker.assign(new PersistTask(intent, this.cache, stamp, generation,
                         () -> this.open.get() && this.viewRevision == intent.view() && this.catalogueIntent == intent));
                 return true;
             }
@@ -2424,10 +2529,15 @@ public final class ClientSession {
                 else this.regionPersisted++;
             }
             if (outcome == RegionalMetadataStore.Persistence.UNAVAILABLE) this.lastPersistenceFailure = saved.reason();
-            if (outcome == RegionalMetadataStore.Persistence.DEFERRED_INVENTORY && saved.task().current().getAsBoolean()) {
-                this.deferredPersistence = saved.task();
+            if (outcome != RegionalMetadataStore.Persistence.PERSISTED) {
+                if (saved.task().current().getAsBoolean()) {
+                    this.blockedMetadataGoal = saved.task().intent();
+                    this.blockedMetadataGeneration = saved.task().admissionGeneration();
+                    this.metadataRetryOnAdmission = saved.retryOnAdmission();
+                }
                 return;
             }
+            if (this.blockedMetadataGoal == saved.task().intent()) this.blockedMetadataGoal = null;
             switch (saved.task().intent()) {
                 case AssociationTask association -> {
                     if (this.associationIntent == association) { this.associationPending = false; this.associationIntent = null; }
@@ -2440,8 +2550,15 @@ public final class ClientSession {
         private void clearPersistence() {
             this.associationPending = false;
             this.associationIntent = null;
-            this.deferredPersistence = null;
+            this.blockedMetadataGoal = null;
             this.catalogueIntent = null;
+        }
+        private void resetMetadataRetry() {
+            this.blockedMetadataGoal = null;
+            var association = this.associationIntent;
+            if (association != null) this.associationIntent = new AssociationTask(association.view(), association.world());
+            var catalogue = this.catalogueIntent;
+            if (catalogue != null) this.catalogueIntent = new CatalogueSave(catalogue.view(), catalogue.world(), catalogue.message());
         }
 
         void applyLocalIndex(WorkerMetadata ready) {
@@ -2462,7 +2579,8 @@ public final class ClientSession {
                 boolean covered = false;
                 while (SectionKey.level(ancestor) < SectionKey.MAX_LOD_LAYER) {
                     ancestor = parent(ancestor);
-                    if (state.localSections.containsKey(ancestor)) { covered = true; break; }
+                    var cover = state.localSections.get(ancestor);
+                    if (cover != null && cover.kind() != LocalSection.ABSENT) { covered = true; break; }
                 }
                 if (!covered) this.addDemand(section.key());
             }
@@ -2764,6 +2882,7 @@ public final class ClientSession {
                 Demand demand = this.demands.poll(SectionDemandTable.ReadyKind.SOURCE);
                 if (demand == null) return;
                 if (demand.candidate != SectionDemandTable.CandidateState.READY_SOURCE) continue;
+                if (demand.preservedPublication != null) { this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE); continue; }
                 if (demand.content.kind() == LocalSection.EMPTY) {
                     if (!this.publishEmpty(demand)) {
                         this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
@@ -2777,6 +2896,7 @@ public final class ClientSession {
                     return;
                 }
                 WorkerSource source = WorkerSource.CACHE;
+                demand.networkWork = false;
                 SectionDemandTable.Ticket ticket = demand.ticket(this.id, worker.index);
                 SectionWorkerTask task = new SectionWorkerTask(ticket, demand.content,
                         source, null, demand.catalog == null ? null : demand.catalog.mappings(), this.cache,
@@ -2809,7 +2929,9 @@ public final class ClientSession {
                     if (job == null || !downloads.current(job) || job.connection != this.connectionEpoch
                             || job.dimension.info.id() != handoff.reply.dimensionId()
                             || !job.dimension.info.worldIdentity().equals(handoff.reply.worldIdentity())) { this.finishReply(handoff); continue; }
-                    if (handoff.reply.status() == RegionalProtocol.Status.NOT_READY) { this.finishReply(handoff); continue; }
+                    if (handoff.reply.status() == RegionalProtocol.Status.NOT_READY) {
+                        downloads.notReady(job); this.finishReply(handoff); continue;
+                    }
                     if (job.processing || this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) != 0) continue;
                     var worker = this.idleWorker(); if (worker == null) continue;
                     job.processing = true;
@@ -2821,6 +2943,7 @@ public final class ClientSession {
                 if (Long.compareUnsigned(reply.generation(), demand.regionGeneration) < 0) { this.finishReply(handoff); continue; }
                 // The lane owns its one record while cache work/publication finishes. Never cancel cached work for refresh.
                 if (demand.workLease != null || demand.completedGeometry != null
+                        || demand.preservedPublication != null
                         || demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
                         || demand.installed && demand.cacheActivatedFrame >= this.renderedFrames
                         && demand.activeContent.kind() != LocalSection.EMPTY) continue;
@@ -2837,10 +2960,12 @@ public final class ClientSession {
                 demand.content = content; demand.catalog = binding; demand.regionGeneration = reply.generation(); this.networkWanted(demand, false);
                 var ticket = demand.ticket(this.id, worker.index);
                 if (content.kind() != LocalSection.DATA) {
+                    demand.networkWork = true;
                     demand.workLease = worker.assign(new EmptyWorkerTask(ticket, (byte) content.children(), content, this.cache,
                             () -> this.open.get() && demand.revision == ticket.demandRevision()));
                 } else {
                     boolean reuse = reply.status() == RegionalProtocol.Status.REUSE;
+                    demand.networkWork = !reuse;
                     demand.workLease = worker.assign(new SectionWorkerTask(ticket, content,
                             reuse ? WorkerSource.CACHE : WorkerSource.NETWORK, reuse ? null : reply.compressed(), binding.mappings(), this.cache,
                             () -> this.open.get() && demand.revision == ticket.demandRevision()));
@@ -2855,6 +2980,7 @@ public final class ClientSession {
             WorkerSlot worker = this.idleWorker(demand);
             if (worker == null) return false;
             var ticket = demand.ticket(this.id, worker.index);
+            demand.networkWork = false;
             demand.workLease = worker.assign(new EmptyWorkerTask(ticket,
                     (byte) demand.content.children(), demand.content, this.cache,
                     () -> this.open.get() && demand.revision == ticket.demandRevision()));
@@ -3028,7 +3154,8 @@ public final class ClientSession {
                 boolean current = demand == ref.demand() && demand.revision == ref.revision()
                         && demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
                         && demand.publication == ref.publication();
-                if (!current) ref.publication().close();
+                boolean preserving = demand == ref.demand() && demand.preservedPublication == ref.publication();
+                if (!current && !preserving) ref.publication().close();
                 if (ref.bytes() > 0 && ref.publication().rendererAdmitted()) {
                     WorkerResource.Lease lease = this.detachPublicationLease(ref);
                     if (lease != null) {
@@ -3044,6 +3171,21 @@ public final class ClientSession {
                 VoxyRenderSystem.UploadOutcome result = outcome.orElseThrow();
                 this.publicationOutcomes[result.status().ordinal()]++;
                 this.publishingGeometryBytes -= ref.bytes();
+                if (preserving) {
+                    var content = demand.preservedContent;
+                    demand.preservedPublication = null; demand.preservedContent = null;
+                    if (result.status() == VoxyRenderSystem.UploadStatus.ACTIVATED) {
+                        // Activation may have won the race with source removal.
+                        // Its validated geometry is now the installed stale fallback.
+                        demand.publication = ref.publication(); demand.content = content;
+                        this.activated(demand, content, ref.bytes(), false);
+                    } else {
+                        if (result.block() != null) result.block().geometry().free();
+                        if (!demand.installed && !this.bindAvailable(demand)) this.ensureRegion(demand.key);
+                    }
+                    this.releaseRendererSlot(this.detachPublicationLease(ref));
+                    continue;
+                }
                 if (!current) {
                     if (result.block() != null) result.block().geometry().free();
                     this.releaseRendererSlot(this.detachPublicationLease(ref));
@@ -3069,33 +3211,34 @@ public final class ClientSession {
                                 "Regional upload failed after rollback; retaining fallback", result.failure());
                     }
                     case ACTIVATED -> {
-                        var previousContent = demand.activeContent;
-                        demand.candidate = SectionDemandTable.CandidateState.NONE;
-                        this.setActiveGeometryBytes(demand, ref.bytes());
-                        if (!demand.installed) { demand.installed = true; this.activeCount++; }
-                        demand.activeContent = demand.content;
-                        this.emptyTopology(demand, demand.activeGeometryBytes == 0);
-                        if (demand.childrenRequired && SectionKey.level(demand.key) != 0
-                                && !this.isCoarsening(demand.key)) {
-                            int previousChildren = previousContent == null ? 0 : previousContent.children();
-                            int added = demand.activeContent.children() & ~previousChildren;
-                            for (int child = 0; child < 8; child++) if ((added & 1 << child) != 0)
-                                this.addDemand(child(demand.key, child), demand.pixelBucket);
-                            if (previousChildren != demand.activeContent.children()) this.topologyChanged(demand);
-                        }
-                        demand.cacheActivatedFrame = demand.candidateCacheHit ? this.renderedFrames : -1;
-                        this.interestChanges.add(demand.key);
-                        this.coverageActivated(demand);
-                        ClientLodDebug.sectionActivated(this, demand.activeContent, demand.candidateCacheHit);
-                        if (demand.coverage) this.missingCoverage.remove(demand.key);
-                        this.activated++;
-                        ClientLodDebug.startupEvent(this, this.helloAccepted ? "activation" : "localActivation", 0);
-                        this.uploadedSections++;
+                        this.activated(demand, demand.content, ref.bytes(), demand.candidateCacheHit);
                         this.releaseRendererSlot(this.detachPublicationLease(ref));
                     }
                 }
             }
             this.retryRendererBlocked();
+        }
+        private void activated(Demand demand, LocalSection content, long bytes, boolean cacheHit) {
+            var previous = demand.activeContent;
+            demand.candidate = SectionDemandTable.CandidateState.NONE; demand.networkWork = false;
+            this.setActiveGeometryBytes(demand, bytes);
+            if (!demand.installed) { demand.installed = true; this.activeCount++; }
+            this.unactivatedRequired.remove(demand.key); demand.activeContent = content;
+            this.emptyTopology(demand, bytes == 0);
+            if (demand.childrenRequired && SectionKey.level(demand.key) != 0 && !this.isCoarsening(demand.key)) {
+                int previousChildren = previous == null ? 0 : previous.children();
+                int added = content.children() & ~previousChildren;
+                for (int child = 0; child < 8; child++) if ((added & 1 << child) != 0)
+                    this.addDemand(child(demand.key, child), demand.pixelBucket);
+                if (previousChildren != content.children()) this.topologyChanged(demand);
+            }
+            demand.cacheActivatedFrame = cacheHit ? this.renderedFrames : -1;
+            this.interestChanges.add(demand.key); this.coverageActivated(demand);
+            ClientLodDebug.sectionActivated(this, content, cacheHit);
+            if (demand.coverage) this.missingCoverage.remove(demand.key);
+            this.activated++;
+            ClientLodDebug.startupEvent(this, this.helloAccepted ? "activation" : "localActivation", 0);
+            this.uploadedSections++;
         }
 
         void blockPublication(Demand demand, VoxyRenderSystem.AllocationBlock block) {
@@ -3312,6 +3455,8 @@ public final class ClientSession {
             while ((event = this.events.poll()) != null) discardEvent(event);
             this.demands.clear();
             this.missingInterests.clear();
+            this.unactivatedRequired.clear();
+            this.unavailableSourceRegions.clear();
             this.emptyTopologyKeys.clear(); this.emptyTopologyDependents.clear();
             this.blockNames.clear();
             this.biomeNames.clear();

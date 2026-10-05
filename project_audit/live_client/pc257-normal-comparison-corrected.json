@@ -1,0 +1,10 @@
+{
+  "before_receipt": "pc257-normal-175640.json",
+  "comparison_receipt": "pc257-normal-175951.json",
+  "cause": "WindowsPowerShell ConvertTo-Json serialized the pipeline array wrapper as value/Count; the helper compared one wrapper against individual files. Normalized the actual stored full per-file records and the actual current tuple list from the raw receipt offline.",
+  "files": 227,
+  "bytes": 261695964,
+  "before_minus_after": [],
+  "after_minus_before": [],
+  "preserved": true
+}

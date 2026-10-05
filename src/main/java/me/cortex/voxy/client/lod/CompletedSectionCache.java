@@ -87,7 +87,7 @@ final class CompletedSectionCache implements AutoCloseable {
     Save begin(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
                BooleanSupplier current) throws IOException {
         var writer = writer(section.region(), current);
-        try { return beginOwned(section, codec, canonical, source, current, writer); }
+        try { return beginOwned(section, codec, canonical, source, current, writer, true); }
         catch (Throwable failure) { writer.close(); throw failure; }
     }
     private Writer writer(long region, BooleanSupplier current) throws IOException {
@@ -104,16 +104,34 @@ final class CompletedSectionCache implements AutoCloseable {
         public void close() { this.owned.close(); released(); }
     }
     private Save beginOwned(LocalSection section, LocalSectionCodec codec, byte[] canonical, CatalogCodec.Source source,
-                            BooleanSupplier current, Writer releaseWriter) throws IOException {
+                            BooleanSupplier current, Writer writer, boolean releaseWriter) throws IOException {
         RegionalDiskBudget.checkCurrent(current);
         long region = section.region();
         var pin = acquire(region);
         LocalSectionCodec.Encoder encoder = null;
         try {
-            if (section.kind() == LocalSection.DATA) encoder = codec.encode(canonical, source);
-            var journal = this.budget.journal(path(region), this.world, region, true);
-            return new Save(section, encoder, journal.begin(section, encoder, space(region), current), pin, releaseWriter);
+            var journal = this.budget.journal(path(region), this.world, region, false);
+            long growth = CompletedSectionJournal.FRAME_BYTES + CompletedSectionJournal.BINDING_BYTES + CompletedSectionJournal.FOOTER_BYTES;
+            if (journal == null) growth += CompletedSectionJournal.HEADER_BYTES;
+            if (journal != null && section.equals(journal.binding(section.key()))) growth = 0;
+            else if (section.kind() == LocalSection.DATA && (journal == null || !journal.hasPayload(section))) {
+                encoder = codec.encode(canonical, source);
+                long overhead = growth + CompletedSectionJournal.FRAME_BYTES + CompletedSectionJournal.PAYLOAD_METADATA_BYTES + CompletedSectionJournal.FOOTER_BYTES;
+                growth = Math.addExact(overhead, LocalSectionCodec.compressedBound(encoder.canonicalBytes()));
+                if (!writer.owned.fits(growth)) {
+                    // Only the refusal path counts exact output; normal writes stay one-pass.
+                    while (!encoder.step(java.io.OutputStream.nullOutputStream())) RegionalDiskBudget.checkCurrent(current);
+                    growth = Math.addExact(overhead, encoder.compressedBytes());
+                    encoder.close(); encoder = null;
+                    writer.owned.expect(growth);
+                    encoder = codec.encode(canonical, source);
+                }
+            }
+            writer.owned.expect(growth);
+            if (journal == null) journal = this.budget.journal(path(region), this.world, region, true);
+            return new Save(section, encoder, journal.begin(section, encoder, space(region, writer.owned), current), pin, writer, releaseWriter);
         } catch (Throwable failure) {
+            if (failure instanceof IOException io) writer.owned.failed(io);
             if (encoder != null) encoder.close();
             pin.close(); released(); throw failure;
         }
@@ -129,7 +147,7 @@ final class CompletedSectionCache implements AutoCloseable {
             boolean compacted = false;
             while (true) {
                 RegionalDiskBudget.checkCurrent(current);
-                try (var save = beginOwned(section, codec, canonical, source, current, null)) {
+                try (var save = beginOwned(section, codec, canonical, source, current, writer, false)) {
                     while (!save.step()) RegionalDiskBudget.checkCurrent(current);
                     return;
                 } catch (RegionalDiskBudget.Capacity full) {
@@ -138,15 +156,15 @@ final class CompletedSectionCache implements AutoCloseable {
                     compacted = true;
                 }
             }
-        } catch (IOException failure) {
-            this.budget.writeFailure(path(section.region()), failure); throw failure;
         }
     }
-    private CompletedSectionJournal.Space space(long region) {
+    private CompletedSectionJournal.Space space(long region, RegionalDiskBudget.Writer writer) {
         Path path = path(region);
         return new CompletedSectionJournal.Space() {
             public void reserve(long bytes) throws IOException { budget.reserve(path, bytes); }
             public void resized(long delta) { budget.resized(path, delta); }
+            public void commit(CompletedSectionJournal.IOAction action) throws IOException { budget.commit(path, action); }
+            public void failed(IOException failure) { writer.failed(failure); }
         };
     }
 
@@ -156,13 +174,16 @@ final class CompletedSectionCache implements AutoCloseable {
         private final CompletedSectionJournal.Append append;
         private final RegionalDiskBudget.Pin pin;
         private final Writer writer;
+        private final boolean releaseWriter;
         private boolean closed;
         private Save(LocalSection section, LocalSectionCodec.Encoder encoder,
-                     CompletedSectionJournal.Append append, RegionalDiskBudget.Pin pin, Writer writer) {
+                     CompletedSectionJournal.Append append, RegionalDiskBudget.Pin pin, Writer writer, boolean releaseWriter) {
             this.section = section; this.encoder = encoder; this.append = append; this.pin = pin; this.writer = writer;
+            this.releaseWriter = releaseWriter;
         }
         boolean step() throws IOException {
             boolean done = this.append.step();
+            if (done) this.writer.owned.completed();
             if (done && this.section != null) ClientLodDebug.cacheCommitted(CompletedSectionCache.this, this.section);
             return done;
         }
@@ -173,7 +194,7 @@ final class CompletedSectionCache implements AutoCloseable {
             finally {
                 if (this.encoder != null) this.encoder.close();
                 this.pin.close(); released();
-                if (this.writer != null) this.writer.close();
+                if (this.releaseWriter) this.writer.close();
             }
         }
     }
@@ -195,7 +216,9 @@ final class CompletedSectionCache implements AutoCloseable {
             try (var pin = acquired) {
                 var journal = this.budget.journal(path(region), this.world, region, false);
                 if (journal == null || !journal.hasBindings()) return RegionalMetadataStore.Persistence.PERSISTED;
-                try (var append = journal.begin(null, null, space(region), current)) { while (!append.step()) {} }
+                writer.owned.expect(CompletedSectionJournal.FRAME_BYTES + 8 + CompletedSectionJournal.FOOTER_BYTES);
+                try (var append = journal.begin(null, null, space(region, writer.owned), current)) { while (!append.step()) {} }
+                writer.owned.completed();
             } finally { released(); }
         }
         return RegionalMetadataStore.Persistence.PERSISTED;

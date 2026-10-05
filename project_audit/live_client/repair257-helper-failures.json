@@ -1,0 +1,7 @@
+{
+  "secondary_hostname_command": "Remote hostname was expanded into a PowerShell command; encoded secondary query later succeeded.",
+  "state_queries": "Two50-second queries timed out when attempting to include Get-Content -Tail of the continuously written debug log; subsequent queries omitting that read succeeded. Exact blocking cause not established.",
+  "normal_baseline": "Initial Measure-Object could not read a hashtable bytes key; corrected numeric extraction. Later array-wrapper comparison false mismatch was reconstructed exactly from receipts.",
+  "finish_status": "An attempted restored status was rejected; subsequent PASS accepted only after END_RUN.",
+  "restoration_step_sequence": "Checkpoint submitted before BEGIN_RUN ready, then incorrect next step retries; optional screenshot crossed600-second limit and is excluded."
+}

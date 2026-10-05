@@ -2,6 +2,8 @@
 
 Status: implemented, built, deployed and permitted real-PC checks completed in debug 256, 2026-10-05. Temporary runtime state is restored. Receipts remain version-specific; unverified acceptance cases are listed explicitly.
 
+
+Current qualification (2026-10-05): debug256 completion does not establish lifecycle correctness. The subsequent [repair implementation](per_server_world_cache_lifecycle_repair_implementation.md) fixes the reviewed defects and separates source completion from limited live evidence, including the missed600-second cap.
 Scope: `feature/cache-first-background-updates`, Voxy_Testing and GIORKOSPC only.
 Original source trees and Main are read only. Normal PC cache is preserved;
 quota/cold work uses an isolated debug-profile cache. No integration/unit suites,

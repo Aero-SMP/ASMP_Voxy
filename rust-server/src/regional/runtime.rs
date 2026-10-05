@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -25,13 +25,14 @@ pub struct RegionalRefresh {
     pub changed: Vec<(i32, i32, u64)>,
     pub changed_ordinals: BTreeMap<(i32, i32), Arc<[u32]>>,
     pub removed: Vec<(i32, i32)>,
+    pub ready: Vec<(i32, i32)>,
     pub metadata_only: usize,
     pub more_pending: bool,
     pub incomplete: bool,
     pub failure: Option<String>,
     pub inventory_changed: bool,
     pub inventory_reset: bool,
-    pub inventory_updates: Vec<((i32, i32), Option<RegionAvailability>)>,
+    pub inventory_updates: Vec<((i32, i32), Option<RegionAvailability>, bool)>,
 }
 
 #[derive(Debug)]
@@ -53,9 +54,14 @@ pub struct RegionalRuntime {
     maintenance: Mutex<Maintenance>,
     priority: Mutex<PriorityRequests>,
     dirty: Mutex<BTreeMap<(i32, i32), [u64; 16]>>,
+    // Remains set after dirty bits are captured and after a failed transaction. Negative
+    // answers must not mistake a temporarily empty dirty map for completed reconciliation.
+    reconciling: Mutex<BTreeSet<(i32, i32)>>,
+    waiting_ready: Mutex<BTreeSet<(i32, i32)>>,
     dirty_discovery: Mutex<BTreeSet<(i32, i32)>>,
     freshness_attempts: Mutex<BTreeMap<(i32, i32), Instant>>,
     freshness_millis: AtomicU64,
+    retired: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,14 +70,26 @@ struct SourceStamp {
     marker: u64,
     header: [u8; 16],
     reconciled: bool,
+    saved: [u64; 16],
 }
 impl SourceStamp {
     fn from_table(table: &RegionSourceTable) -> Self {
+        let mut saved = [0; 16];
+        for z in 0..32 {
+            for x in 0..32 {
+                let record = table.record(x, z).expect("valid source-table coordinate");
+                if record.generated {
+                    let slot = z as usize * 32 + x as usize;
+                    saved[slot / 64] |= 1 << (slot % 64);
+                }
+            }
+        }
         Self {
             generation: table.terrain_generation,
             marker: table.anvil_file_marker,
             header: table.header_fingerprint(),
             reconciled: table.reconciled,
+            saved,
         }
     }
 }
@@ -368,9 +386,12 @@ impl RegionalRuntime {
             maintenance: Mutex::new(maintenance),
             priority: Mutex::new(PriorityRequests::default()),
             dirty: Mutex::new(BTreeMap::new()),
+            reconciling: Mutex::new(BTreeSet::new()),
+            waiting_ready: Mutex::new(BTreeSet::new()),
             dirty_discovery: Mutex::new(BTreeSet::new()),
             freshness_attempts: Mutex::new(BTreeMap::new()),
             freshness_millis: AtomicU64::new(1000),
+            retired: AtomicBool::new(false),
         })
     }
 
@@ -382,10 +403,169 @@ impl RegionalRuntime {
         self.world_identity
     }
 
+    pub fn retire(&self) -> Result<()> {
+        self.retired.store(true, Ordering::Release);
+        // The Java-owned IPC thread may wait for its current transaction, never the tick
+        // thread. No old writer can publish into a replacement runtime's files afterward.
+        drop(
+            self.maintenance
+                .lock()
+                .map_err(|_| crate::UnsafeState("regional maintenance lock poisoned"))?,
+        );
+        Ok(())
+    }
+
+    pub fn reconcile_source_root(&self) -> Result<()> {
+        // A different root can preserve file markers and headers while containing different
+        // payloads. Force semantic reads once; preserve published terrain and its identity.
+        let coordinates = read_lock(&self.regions)?
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut dirty = self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?;
+        for coordinate in coordinates {
+            dirty.insert(coordinate, [u64::MAX; 16]);
+        }
+        Ok(())
+    }
+
     pub fn confirmed_absent(&self, x: i32, z: i32) -> Result<bool> {
+        if self.reconciliation_pending((x, z))? {
+            return Ok(false);
+        }
         Ok(read_lock(&self.inventory)?
             .as_ref()
             .is_some_and(|coordinates| !coordinates.contains_key(&(x, z))))
+    }
+
+    fn reconciliation_pending(&self, coordinate: (i32, i32)) -> Result<bool> {
+        let dirty = self
+            .dirty
+            .lock()
+            .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?;
+        let reconciling = self
+            .reconciling
+            .lock()
+            .map_err(|_| crate::UnsafeState("source reconciliation owner poisoned"))?;
+        Ok(dirty.contains_key(&coordinate) || reconciling.contains(&coordinate))
+    }
+
+    /// Positive old terrain is usable while stale. An old negative is authoritative only
+    /// after the currently observed source and its published sidecar agree.
+    pub fn negative_authority(&self, x: i32, z: i32, generation: u64) -> Result<bool> {
+        let coordinate = (x, z);
+        if self.retired.load(Ordering::Acquire) || self.reconciliation_pending(coordinate)? {
+            return Ok(false);
+        }
+        let inventory = read_lock(&self.inventory)?;
+        let Some(availability) = inventory.as_ref().and_then(|map| map.get(&coordinate)) else {
+            return Ok(false);
+        };
+        if !availability.readable {
+            return Ok(false);
+        }
+        let regions = read_lock(&self.regions)?;
+        let sources = read_lock(&self.sources)?;
+        Ok(regions.get(&coordinate) == Some(&generation)
+            && sources.get(&coordinate).is_some_and(|stamp| {
+                stamp.reconciled
+                    && stamp.generation == generation
+                    && stamp.marker == availability.file_marker
+                    && stamp.header == availability.header_fingerprint
+            }))
+    }
+
+    // Readiness is coverage, not the freshness of every edit. Routine edits preserve this
+    // state; only saved slots not covered by a valid publication require a ready transition.
+    fn coverage_published(
+        &self,
+        coordinate: (i32, i32),
+        availability: &RegionAvailability,
+    ) -> Result<bool> {
+        if !availability.readable {
+            return Ok(false);
+        }
+        let regions = read_lock(&self.regions)?;
+        let sources = read_lock(&self.sources)?;
+        Ok(sources.get(&coordinate).is_some_and(|stamp| {
+            // An explicitly older, validated stamp still proves existing saved coverage
+            // during a routine replacement. Freshness/negatives require exact generation.
+            regions.contains_key(&coordinate)
+                && availability
+                    .saved
+                    .iter()
+                    .zip(stamp.saved)
+                    .all(|(saved, covered)| saved & !covered == 0)
+        }))
+    }
+
+    pub fn wait_for_publication(&self, x: i32, z: i32) -> Result<()> {
+        self.waiting_ready
+            .lock()
+            .map_err(|_| crate::UnsafeState("publication readiness owner poisoned"))?
+            .insert((x, z));
+        self.prioritize_region(x, z)
+    }
+
+    fn confirm_source_stamp(
+        &self,
+        coordinate: (i32, i32),
+        availability: &RegionAvailability,
+    ) -> Result<()> {
+        if !availability.readable || self.reconciliation_pending(coordinate)? {
+            return Ok(());
+        }
+        let regions = read_lock(&self.regions)?;
+        let mut sources = write_lock(&self.sources)?;
+        if let Some(stamp) = sources.get_mut(&coordinate)
+            && regions.get(&coordinate) == Some(&stamp.generation)
+            && stamp.marker == availability.file_marker
+            && stamp.header == availability.header_fingerprint
+        {
+            // A validated persisted table and the unchanged freshly read Anvil header agree.
+            // Changed markers still require semantic reads, including missed saves on restart.
+            stamp.reconciled = true;
+        }
+        Ok(())
+    }
+
+    fn publish_ready(
+        &self,
+        coordinate: (i32, i32),
+        result: &mut RegionalRefresh,
+        coverage_changed: bool,
+    ) -> Result<()> {
+        let availability = read_lock(&self.inventory)?
+            .as_ref()
+            .and_then(|map| map.get(&coordinate))
+            .cloned();
+        let Some(availability) = availability else {
+            return Ok(());
+        };
+        let generation = read_lock(&self.regions)?
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0);
+        if !self.negative_authority(coordinate.0, coordinate.1, generation)? {
+            return Ok(());
+        }
+        let waited = self
+            .waiting_ready
+            .lock()
+            .map_err(|_| crate::UnsafeState("publication readiness owner poisoned"))?
+            .remove(&coordinate);
+        if coverage_changed || waited {
+            result
+                .inventory_updates
+                .push((coordinate, Some(availability), true));
+            result.inventory_changed = true;
+            self.inventory_revision.fetch_add(1, Ordering::Release);
+            result.ready.push(coordinate);
+        }
+        Ok(())
     }
 
     pub fn region(&self, x: i32, z: i32) -> Result<Option<Arc<RegionFile>>> {
@@ -514,7 +694,8 @@ impl RegionalRuntime {
     }
 
     /// Tracks live client interest separately from immutable region data. The first subscriber
-    /// queues missing work; the last release cancels that priority without deleting terrain.
+    /// queues missing work; the last release drops its index, while an already requested
+    /// shared build remains queued even when a client parks its NotReady frontier.
     pub fn subscribe_region(&self, region_x: i32, region_z: i32) -> Result<()> {
         let mut queue = self
             .priority
@@ -552,7 +733,6 @@ impl RegionalRuntime {
         };
         if remove {
             queue.subscriptions.remove(&coordinate);
-            queue.membership.remove(&coordinate);
             queue.active.remove(&coordinate);
         }
         Ok(())
@@ -570,6 +750,9 @@ impl RegionalRuntime {
             .maintenance
             .lock()
             .map_err(|_| crate::UnsafeState("regional maintenance lock poisoned"))?;
+        if self.retired.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let coordinate = (region_x, region_z);
         {
             let regions = read_lock(&self.regions)?;
@@ -625,7 +808,7 @@ impl RegionalRuntime {
     pub fn inventory_after(
         &self,
         after: Option<(i32, i32)>,
-    ) -> Result<Option<((i32, i32), RegionAvailability)>> {
+    ) -> Result<Option<((i32, i32), RegionAvailability, bool)>> {
         use std::ops::Bound::{Excluded, Unbounded};
         let inventory = read_lock(&self.inventory)?;
         let Some(inventory) = inventory.as_ref() else {
@@ -635,7 +818,14 @@ impl RegionalRuntime {
             Some(after) => inventory.range((Excluded(after), Unbounded)).next(),
             None => inventory.first_key_value(),
         };
-        Ok(next.map(|(coordinate, availability)| (*coordinate, availability.clone())))
+        next.map(|(coordinate, availability)| {
+            Ok((
+                *coordinate,
+                availability.clone(),
+                self.coverage_published(*coordinate, availability)?,
+            ))
+        })
+        .transpose()
     }
 
     /// A shared compact snapshot/cursor survives individual publications. Full source records
@@ -645,6 +835,9 @@ impl RegionalRuntime {
             .maintenance
             .lock()
             .map_err(|_| crate::UnsafeState("regional maintenance lock poisoned"))?;
+        if self.retired.load(Ordering::Acquire) {
+            return Ok(RegionalRefresh::default());
+        }
         let mut result = RegionalRefresh::default();
         // Finish the current sweep before reconciling the entire directory again. Completed-save
         // hints below still discover changed/new sources immediately during a long import.
@@ -659,11 +852,18 @@ impl RegionalRuntime {
                 Ok(next) => {
                     let mut updates = Vec::new();
                     for (&coordinate, availability) in &next {
+                        if !previous_known {
+                            self.confirm_source_stamp(coordinate, availability)?;
+                        }
                         if !previous
                             .get(&coordinate)
                             .is_some_and(|old| old.same_inventory(availability))
                         {
-                            updates.push((coordinate, Some(availability.clone())));
+                            updates.push((
+                                coordinate,
+                                Some(availability.clone()),
+                                self.coverage_published(coordinate, availability)?,
+                            ));
                         }
                         if availability.readable
                             && !self.availability_is_current(
@@ -688,7 +888,7 @@ impl RegionalRuntime {
                         .copied()
                         .collect::<Vec<_>>()
                     {
-                        updates.push((coordinate, None));
+                        updates.push((coordinate, None, false));
                     }
                     // Stored files absent from a successful inventory are removals, including
                     // deletions that happened while Java/native was offline.
@@ -700,6 +900,18 @@ impl RegionalRuntime {
                         .collect::<BTreeSet<_>>();
                     for coordinate in stale {
                         self.take_dirty(coordinate)?;
+                        self.reconciling
+                            .lock()
+                            .map_err(|_| {
+                                crate::UnsafeState("source reconciliation owner poisoned")
+                            })?
+                            .remove(&coordinate);
+                        self.waiting_ready
+                            .lock()
+                            .map_err(|_| {
+                                crate::UnsafeState("publication readiness owner poisoned")
+                            })?
+                            .remove(&coordinate);
                         self.freshness_attempts
                             .lock()
                             .map_err(|_| crate::UnsafeState("freshness owner poisoned"))?
@@ -773,9 +985,11 @@ impl RegionalRuntime {
                         // Keep current file/header stamps even when the saved footprint is unchanged.
                         inventory.insert(coordinate, availability.clone());
                         if changed {
-                            result
-                                .inventory_updates
-                                .push((coordinate, Some(availability)));
+                            result.inventory_updates.push((
+                                coordinate,
+                                Some(availability.clone()),
+                                self.coverage_published(coordinate, &availability)?,
+                            ));
                             result.inventory_changed = true;
                             self.inventory_revision.fetch_add(1, Ordering::Release);
                         }
@@ -827,11 +1041,21 @@ impl RegionalRuntime {
                     &maintenance,
                 )?
             {
+                self.publish_ready(coordinate, &mut result, false)?;
                 continue;
             }
             if current.is_none() {
                 continue;
             }
+            let was_published = current
+                .as_ref()
+                .map(|availability| self.coverage_published(coordinate, availability))
+                .transpose()?
+                .unwrap_or(false);
+            self.reconciling
+                .lock()
+                .map_err(|_| crate::UnsafeState("source reconciliation owner poisoned"))?
+                .insert(coordinate);
             let captured = self.take_dirty(coordinate)?;
             self.freshness_attempts
                 .lock()
@@ -844,6 +1068,11 @@ impl RegionalRuntime {
                 self.failed(&mut maintenance, &mut result, coordinate, round, error)?;
             } else {
                 maintenance.retry.remove(&coordinate);
+                self.reconciling
+                    .lock()
+                    .map_err(|_| crate::UnsafeState("source reconciliation owner poisoned"))?
+                    .remove(&coordinate);
+                self.publish_ready(coordinate, &mut result, !was_published)?;
             }
             if !result.changed.is_empty() {
                 break;
@@ -865,6 +1094,11 @@ impl RegionalRuntime {
             .lock()
             .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?
             .contains_key(&coordinate)
+            || self
+                .reconciling
+                .lock()
+                .map_err(|_| crate::UnsafeState("source reconciliation owner poisoned"))?
+                .contains(&coordinate)
             || maintenance.retry.contains_key(&coordinate)
         {
             return Ok(false);
@@ -873,7 +1107,8 @@ impl RegionalRuntime {
         let sources = read_lock(&self.sources)?;
         Ok(regions.get(&coordinate).is_some_and(|generation| {
             sources.get(&coordinate).is_some_and(|source| {
-                source.generation == *generation
+                source.reconciled
+                    && source.generation == *generation
                     && source.marker == header.file_marker
                     && source.header == header.header_fingerprint
             })
@@ -1028,6 +1263,9 @@ impl RegionalRuntime {
             && source.header_matches(&header.entries, header.file_marker)
             && forced.iter().all(|bits| *bits == 0)
         {
+            if let Some(stamp) = write_lock(&self.sources)?.get_mut(&coordinate) {
+                stamp.reconciled = true;
+            }
             if !was_authoritative {
                 self.install(region.clone(), result)?;
             }
@@ -1134,8 +1372,8 @@ impl RegionalRuntime {
             built.stats.reused_sections,
             built.stats.output_bytes
         );
-        // Never pair old source metadata with new terrain, even if the sidecar write fails.
-        write_lock(&self.sources)?.remove(&coordinate);
+        // Retain the old explicitly generation-bound stamp for stale coverage. It cannot
+        // satisfy source-current or negative-authority checks for the new generation.
         maintenance.retry.insert(
             coordinate,
             Retry {
@@ -1216,13 +1454,6 @@ impl RegionalRuntime {
             priority.active.insert(coordinate, Arc::new(region));
         }
         if previous != Some(generation) {
-            let mut sources = write_lock(&self.sources)?;
-            if sources
-                .get(&coordinate)
-                .is_some_and(|table| table.generation != generation)
-            {
-                sources.remove(&coordinate);
-            }
             report
                 .changed
                 .push((coordinate.0, coordinate.1, generation));
@@ -1231,7 +1462,6 @@ impl RegionalRuntime {
     }
 
     fn load_source(&self, coordinate: (i32, i32), generation: u64) -> Result<()> {
-        write_lock(&self.sources)?.remove(&coordinate);
         if let Ok(table) = RegionSourceTable::open(self.source_path(coordinate))
             && (table.region_x, table.region_z) == coordinate
             && table.terrain_generation == generation

@@ -1,0 +1,12 @@
+[
+  {
+    "path": "build/libs/ASMP_voxy-0.2.257-beta+1.21.1-neoforge.jar",
+    "bytes": 3907988,
+    "sha256": "6cc89fc051d948ef5eabeabb688dc1e820106716875ba116bef5cb02a31df0b0"
+  },
+  {
+    "path": "server/build/libs/voxy-server-0.2.257-beta+1.21.1-neoforge.jar",
+    "bytes": 1705093,
+    "sha256": "799e2310c7d6b4dec47f7648fcfade4cd617f431aa61a201ac79b77cbbc432c3"
+  }
+]

@@ -626,11 +626,11 @@ async fn main() -> Result<()> {
                             scope = Some((active_dimension, world_identity)); atomic(&link, &world_identity)?;
                             emit(&format!("{{\"event\":\"consumer_hello\",\"clients\":1,\"dimension_id\":{active_dimension},\"world\":{}}}", quote(&hex(&world_identity))));
                         }
-                        ControlMessage::Manifest(manifest) => {
+                        ControlMessage::Manifest { dimensions: manifest, excluded } => {
                             if let Some((id, world)) = scope {
                                 ensure!(manifest.iter().any(|item| item.id == id && item.name == dimension && item.world_identity == world), "manifest active scope mismatch");
                             }
-                            emit(&format!("{{\"event\":\"consumer_manifest\",\"dimensions\":{}}}", manifest.len()));
+                            emit(&format!("{{\"event\":\"consumer_manifest\",\"dimensions\":{},\"excluded\":{}}}", manifest.len(), excluded.len()));
                             for item in manifest { manifest_worlds.insert(item.id, item.world_identity); }
                             let _ = authority.send(true);
                         }

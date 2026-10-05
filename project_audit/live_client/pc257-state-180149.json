@@ -1,0 +1,50 @@
+{
+  "action": "state",
+  "utc": "2026-10-05T18:01:49.654229+00:00",
+  "elapsed": 543.4042274310486,
+  "exit": 0,
+  "stdout": "{\"cloneBytes\":100682614,\"policy\":{\"servers\":{\"play.aerosmp.com:25587\":{\"downloadKbps\":1000,\"storageBytes\":500000000,\"estimatedWorldBytes\":220441284,\"anchors\":{\"minecraft:overworld\":{\"x\":-90,\"z\":190},\"minecraft:the_nether\":{\"x\":-1,\"z\":-1}}}}},\"utc\":\"2026-10-05T18:01:49.5772466Z\",\"lease\":\"94d59422-a56a-4277-8800-dc9583c145b1 off 1791224021284 0\",\"mods\":[{\"sha256\":\"b4599a9c0936c92849be6e837601dc04e132db5d17e529dad765d001d79d5c3d\",\"name\":\"ASMP_voxy-0.2.257-beta+1.21.1-neoforge-debug.jar\"}],\"host\":\"GIORKOSPC\",\"helpers\":[19916,22444],\"holdExists\":false,\"game\":[{\"startUtc\":\"2026-10-05T18:00:05.4197168Z\",\"pid\":25688}]}\n",
+  "stderr": "#< CLIXML\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N=\"SourceId\">1</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S=\"progress\" RefId=\"1\"><TNRef RefId=\"0\" /><MS><I64 N=\"SourceId\">2</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><Obj S=\"progress\" RefId=\"2\"><TNRef RefId=\"0\" /><MS><I64 N=\"SourceId\">1</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>",
+  "data": {
+    "cloneBytes": 100682614,
+    "policy": {
+      "servers": {
+        "play.aerosmp.com:25587": {
+          "downloadKbps": 1000,
+          "storageBytes": 500000000,
+          "estimatedWorldBytes": 220441284,
+          "anchors": {
+            "minecraft:overworld": {
+              "x": -90,
+              "z": 190
+            },
+            "minecraft:the_nether": {
+              "x": -1,
+              "z": -1
+            }
+          }
+        }
+      }
+    },
+    "utc": "2026-10-05T18:01:49.5772466Z",
+    "lease": "94d59422-a56a-4277-8800-dc9583c145b1 off 1791224021284 0",
+    "mods": [
+      {
+        "sha256": "b4599a9c0936c92849be6e837601dc04e132db5d17e529dad765d001d79d5c3d",
+        "name": "ASMP_voxy-0.2.257-beta+1.21.1-neoforge-debug.jar"
+      }
+    ],
+    "host": "GIORKOSPC",
+    "helpers": [
+      19916,
+      22444
+    ],
+    "holdExists": false,
+    "game": [
+      {
+        "startUtc": "2026-10-05T18:00:05.4197168Z",
+        "pid": 25688
+      }
+    ]
+  }
+}

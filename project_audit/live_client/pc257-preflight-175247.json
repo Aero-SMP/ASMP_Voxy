@@ -1,0 +1,74 @@
+{
+  "action": "preflight",
+  "utc": "2026-10-05T17:52:47.813145+00:00",
+  "elapsed": 1.5631475790287368,
+  "exit": 0,
+  "stdout": "{\"cloneBytes\":101526000,\"holdExists\":false,\"profile\":\"C:\\\\Users\\\\USER\\\\AppData\\\\Roaming\\\\ModrinthApp\\\\profiles\\\\Aero SMP\",\"mods\":[{\"sha256\":\"4c974d1fa21ef7ac935b8f6812e97cd0a0ac3a1a50a7cf7d48df77882ac2eb45\",\"name\":\"ASMP_voxy-0.2.256-beta+1.21.1-neoforge-debug.jar\"}],\"diskFree\":952721838080,\"utc\":\"2026-10-05T17:52:47.9533296Z\",\"host\":\"GIORKOSPC\",\"audit\":\"C:\\\\Users\\\\USER\\\\AppData\\\\Roaming\\\\ModrinthApp\\\\profiles\\\\Aero SMP\\\\.voxy-updater\\\\cache-first-live\\\\repair257\",\"general\":{\"enabled\":true,\"enable_rendering\":true,\"geometry_memory_mib\":0,\"section_render_distance\":6.5,\"sub_division_size\":63.497753,\"background_update_interval_seconds\":2,\"sky_fog_distance\":96,\"fog_intensity\":1.0,\"fog_density\":0.0,\"adapt_cloud_distance\":true,\"cloud_distance\":0,\"use_environmental_fog\":true},\"lease\":\"6bf4cbae-df78-4a9f-9fb5-5eed16acfff1 off 1791217156531 0\",\"game\":[{\"startUtc\":\"2026-10-05T15:50:39.2787591Z\",\"pid\":31200}],\"clone\":\"C:\\\\Users\\\\USER\\\\AppData\\\\Roaming\\\\ModrinthApp\\\\profiles\\\\Aero SMP\\\\.voxy\\\\test-cdce8542-bb60-4a2d-b418-eeffd878ddff\",\"helpers\":[{\"command\":\"\\\"C:\\\\Users\\\\USER\\\\AppData\\\\Roaming\\\\ModrinthApp\\\\meta\\\\java_versions\\\\zulu21.50.19-ca-jre21.0.11-win_x64\\\\bin\\\\javaw.exe\\\" -Xms16m -Xmx96m -Daerosmp.backup.metadata=pc-backup -jar \\\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\AeroSMP\\\\BackupSSH\\\\aerosmp-laptop-backup-ssh.jar\\\" \\\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\AeroSMP\\\\BackupSSH\\\" \",\"pid\":19916},{\"command\":\"\\\"C:\\\\Users\\\\USER\\\\AppData\\\\Roaming\\\\ModrinthApp\\\\meta\\\\java_versions\\\\zulu21.50.19-ca-jre21.0.11-win_x64\\\\bin\\\\javaw.exe\\\" -Xms16m -Xmx96m -Daerosmp.backup.name=secondary -Daerosmp.backup.metadata=pc-backup -jar \\\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\AeroSMP\\\\BackupSSHsecondary\\\\aerosmp-laptop-backup-ssh.jar\\\" \\\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\AeroSMP\\\\BackupSSHsecondary\\\" \",\"pid\":22444}],\"servers\":{\"servers\":{\"play.aerosmp.com:25587\":{\"downloadKbps\":1000,\"storageBytes\":500000000,\"estimatedWorldBytes\":99681903,\"anchors\":{\"minecraft:overworld\":{\"x\":-90,\"z\":190},\"minecraft:the_nether\":{\"x\":-1,\"z\":-1}}}}}}\n",
+  "stderr": "",
+  "data": {
+    "cloneBytes": 101526000,
+    "holdExists": false,
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP",
+    "mods": [
+      {
+        "sha256": "4c974d1fa21ef7ac935b8f6812e97cd0a0ac3a1a50a7cf7d48df77882ac2eb45",
+        "name": "ASMP_voxy-0.2.256-beta+1.21.1-neoforge-debug.jar"
+      }
+    ],
+    "diskFree": 952721838080,
+    "utc": "2026-10-05T17:52:47.9533296Z",
+    "host": "GIORKOSPC",
+    "audit": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP\\.voxy-updater\\cache-first-live\\repair257",
+    "general": {
+      "enabled": true,
+      "enable_rendering": true,
+      "geometry_memory_mib": 0,
+      "section_render_distance": 6.5,
+      "sub_division_size": 63.497753,
+      "background_update_interval_seconds": 2,
+      "sky_fog_distance": 96,
+      "fog_intensity": 1.0,
+      "fog_density": 0.0,
+      "adapt_cloud_distance": true,
+      "cloud_distance": 0,
+      "use_environmental_fog": true
+    },
+    "lease": "6bf4cbae-df78-4a9f-9fb5-5eed16acfff1 off 1791217156531 0",
+    "game": [
+      {
+        "startUtc": "2026-10-05T15:50:39.2787591Z",
+        "pid": 31200
+      }
+    ],
+    "clone": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP\\.voxy\\test-cdce8542-bb60-4a2d-b418-eeffd878ddff",
+    "helpers": [
+      {
+        "command": "\"C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\meta\\java_versions\\zulu21.50.19-ca-jre21.0.11-win_x64\\bin\\javaw.exe\" -Xms16m -Xmx96m -Daerosmp.backup.metadata=pc-backup -jar \"C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSH\\aerosmp-laptop-backup-ssh.jar\" \"C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSH\" ",
+        "pid": 19916
+      },
+      {
+        "command": "\"C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\meta\\java_versions\\zulu21.50.19-ca-jre21.0.11-win_x64\\bin\\javaw.exe\" -Xms16m -Xmx96m -Daerosmp.backup.name=secondary -Daerosmp.backup.metadata=pc-backup -jar \"C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSHsecondary\\aerosmp-laptop-backup-ssh.jar\" \"C:\\Users\\USER\\AppData\\Local\\AeroSMP\\BackupSSHsecondary\" ",
+        "pid": 22444
+      }
+    ],
+    "servers": {
+      "servers": {
+        "play.aerosmp.com:25587": {
+          "downloadKbps": 1000,
+          "storageBytes": 500000000,
+          "estimatedWorldBytes": 99681903,
+          "anchors": {
+            "minecraft:overworld": {
+              "x": -90,
+              "z": 190
+            },
+            "minecraft:the_nether": {
+              "x": -1,
+              "z": -1
+            }
+          }
+        }
+      }
+    }
+  }
+}

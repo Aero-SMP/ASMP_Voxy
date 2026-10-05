@@ -30,7 +30,13 @@ final class CompletedSectionJournal implements AutoCloseable {
     record Payload(long offset, int compressed, int canonical, int crc, RegionalProtocol.Fingerprint local) {}
     record Binding(LocalSection section, long offset, long previous, long payload) {}
     /** Charge BEFORE writing, reconcile aborted tails including failed truncation. */
-    interface Space { void reserve(long bytes) throws IOException; void resized(long delta); }
+    @FunctionalInterface interface IOAction { void run() throws IOException; }
+    interface Space {
+        void reserve(long bytes) throws IOException;
+        void resized(long delta);
+        void commit(IOAction action) throws IOException;
+        void failed(IOException failure);
+    }
     interface Source extends AutoCloseable {
         boolean step(OutputStream sink) throws IOException;
         long canonicalBytes();
@@ -203,6 +209,7 @@ final class CompletedSectionJournal implements AutoCloseable {
         }
     }
     synchronized boolean hasBindings() { return !this.bindings.isEmpty(); }
+    synchronized boolean hasPayload(LocalSection section) { return this.payloads.containsKey(token(section)); }
     synchronized boolean closed() { return this.closed; }
     synchronized Map<Long, LocalSection> directory() throws IOException {
         checkOpen();
@@ -218,7 +225,7 @@ final class CompletedSectionJournal implements AutoCloseable {
     synchronized boolean busy() { return this.appending || this.readers != 0; }
     synchronized boolean closeHandle() throws IOException {
         if (this.appending) return false;
-        if (this.writer != null) { this.writer.close(); this.writer = null; }
+        if (this.writer != null) { var handle = this.writer; this.writer = null; handle.close(); }
         return true;
     }
     LocalSection previous(LocalSection invalid) throws IOException {
@@ -278,10 +285,18 @@ final class CompletedSectionJournal implements AutoCloseable {
         if (this.appending) throw new IOException("local append already owned");
         if (section != null && section.region() != this.region) throw new IOException("section outside local region");
         if (this.writer == null) {
-            this.writer = FileChannel.open(this.path, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
-            long before = this.writer.size();
-            this.writer.truncate(this.end);
-            space.resized(this.writer.size() - before);
+            try {
+                space.commit(() -> {
+                    this.writer = FileChannel.open(this.path, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+                    long before = this.writer.size();
+                    try { this.writer.truncate(this.end); }
+                    finally { space.resized(Files.size(this.path) - before); }
+                });
+            } catch (IOException failure) {
+                space.failed(failure);
+                try { closeHandle(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
         }
         this.appending = true;
         return new Append(section, encoder, space, current);
@@ -303,6 +318,10 @@ final class CompletedSectionJournal implements AutoCloseable {
             this.payload = section == null ? null : payloads.get(token(section));
         }
         boolean step() throws IOException {
+            try { return stepOwned(); }
+            catch (IOException failure) { this.space.failed(failure); throw failure; }
+        }
+        private boolean stepOwned() throws IOException {
             if (this.released) throw new IOException("released local append");
             if (this.committed) return true;
             if (!this.current.getAsBoolean()) throw new IOException("obsolete local append");
@@ -331,30 +350,33 @@ final class CompletedSectionJournal implements AutoCloseable {
                 finishFrame(this.start, PAYLOAD, metadata, this.payload.compressed());
             }
             if (!this.current.getAsBoolean()) throw new IOException("obsolete local commit");
-            long at = this.start + this.charged;
-            if (this.section == null) {
-                reserve(FRAME_BYTES + 8 + FOOTER_BYTES);
-                finishFrame(at, RESET, new byte[8], 0);
-            } else {
-                long previous;
-                synchronized (CompletedSectionJournal.this) { var old = bindings.get(this.section.key()); previous = old == null ? 0 : old.offset(); }
-                var s = this.section;
-                byte[] metadata = buffer(BINDING_BYTES).putLong(s.key()).putInt(s.kind()).putInt(s.children())
-                        .putInt(s.compressedBytes()).putInt(s.canonicalBytes()).putInt(s.crc()).putInt(0)
-                        .put(s.fingerprint().bytes()).put(s.catalog().bytes()).putLong(previous)
-                        .putLong(s.kind() == LocalSection.DATA ? this.payload.offset() : 0).array();
-                reserve(FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES);
-                finishFrame(at, BINDING, metadata, 0);
-                synchronized (CompletedSectionJournal.this) {
-                    if (s.kind() == LocalSection.DATA) payloads.put(token(s), this.payload);
-                    bindings.put(s.key(), binding(buffer(metadata), at));
+            this.space.commit(() -> {
+                if (!this.current.getAsBoolean()) throw new IOException("obsolete local commit");
+                long at = this.start + this.charged;
+                if (this.section == null) {
+                    reserve(FRAME_BYTES + 8 + FOOTER_BYTES);
+                    finishFrame(at, RESET, new byte[8], 0);
+                } else {
+                    long previous;
+                    synchronized (CompletedSectionJournal.this) { var old = bindings.get(this.section.key()); previous = old == null ? 0 : old.offset(); }
+                    var s = this.section;
+                    byte[] metadata = buffer(BINDING_BYTES).putLong(s.key()).putInt(s.kind()).putInt(s.children())
+                            .putInt(s.compressedBytes()).putInt(s.canonicalBytes()).putInt(s.crc()).putInt(0)
+                            .put(s.fingerprint().bytes()).put(s.catalog().bytes()).putLong(previous)
+                            .putLong(s.kind() == LocalSection.DATA ? this.payload.offset() : 0).array();
+                    reserve(FRAME_BYTES + BINDING_BYTES + FOOTER_BYTES);
+                    finishFrame(at, BINDING, metadata, 0);
+                    synchronized (CompletedSectionJournal.this) {
+                        if (s.kind() == LocalSection.DATA) payloads.put(token(s), this.payload);
+                        bindings.put(s.key(), binding(buffer(metadata), at));
+                    }
                 }
-            }
-            synchronized (CompletedSectionJournal.this) {
-                if (this.section == null) bindings.clear();
-                end = this.start + this.charged;
-            }
-            this.committed = true;
+                synchronized (CompletedSectionJournal.this) {
+                    if (this.section == null) bindings.clear();
+                    end = this.start + this.charged;
+                }
+                this.committed = true;
+            });
             return true;
         }
         private void reserve(long bytes) throws IOException {
@@ -376,6 +398,7 @@ final class CompletedSectionJournal implements AutoCloseable {
                 if (!this.committed) {
                     try { writer.truncate(this.start); }
                     catch (IOException failure) {
+                        this.space.failed(failure);
                         synchronized (CompletedSectionJournal.this) { closed = true; }
                         throw failure;
                     }

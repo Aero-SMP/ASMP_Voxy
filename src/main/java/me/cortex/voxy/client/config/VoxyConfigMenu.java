@@ -194,16 +194,18 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 "voxy.config.streaming.bandwidth", () -> {
                     var policy = ServerDownloadSettings.current();
                     return policy == null ? ServerDownloadSettings.DEFAULT_KBPS : policy.downloadKbps();
-                }, value -> { var policy = ServerDownloadSettings.current(); if (policy != null) policy.setDownloadKbps(value); }, STREAMING_SETTINGS)
+                }, value -> { var policy = ServerDownloadSettings.current(); if (policy != null && policy.available()) policy.setDownloadKbps(value); }, STREAMING_SETTINGS)
                 .setRange(new Range(ServerDownloadSettings.MIN_KBPS, ServerDownloadSettings.MAX_KBPS, 100))
-                .setValueFormatter(value -> Component.literal(value < 1000 ? value + " kbps"
+                .setValueFormatter(value -> unavailablePolicy() ? Component.translatable("voxy.config.streaming.policy_unavailable")
+                        : Component.literal(value < 1000 ? value + " kbps"
                         : String.format(java.util.Locale.ROOT, "%.1f Mbps", value / 1000.0)))
-                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && voxyEnabled(state),
+                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && !unavailablePolicy() && voxyEnabled(state),
                         ENABLED, ConfigState.UPDATE_ON_REBUILD);
         bandwidth.setTooltip(value -> {
             var policy = ServerDownloadSettings.current();
             return policy == null ? Component.translatable("voxy.config.streaming.no_server")
-                    : Component.translatable("voxy.config.streaming.bandwidth.tooltip", policy.serverId());
+                    : Component.translatable("voxy.config.streaming.bandwidth.tooltip", policy.serverId())
+                    .append(Component.literal(policy.available() ? "" : "\n" + policy.failureReason()));
         });
         bandwidth.setDefaultValue(ServerDownloadSettings.DEFAULT_KBPS);
         bandwidth.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
@@ -213,19 +215,24 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 "voxy.config.streaming.storage", values::index, values::apply, STREAMING_SETTINGS)
                 .setValidator(values)
                 .setValueFormatter(values::label)
-                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && voxyEnabled(state),
+                .setEnabledProvider(state -> ServerDownloadSettings.current() != null && !unavailablePolicy() && voxyEnabled(state),
                         ENABLED, ConfigState.UPDATE_ON_REBUILD);
         storage.setTooltip(value -> {
             var policy = ServerDownloadSettings.current();
             return policy == null ? Component.translatable("voxy.config.streaming.no_server")
                     : Component.translatable("voxy.config.streaming.storage.tooltip", policy.serverId())
-                    .append(Component.literal("\n" + ClientSession.storageStatus(policy.serverId())));
+                    .append(Component.literal("\n" + (policy.available() ? ClientSession.storageStatus(policy.serverId()) : policy.failureReason())));
         });
         storage.setDefaultProvider(state -> values.defaultIndex(), ConfigState.UPDATE_ON_REBUILD);
         storage.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
         group.addOption(bandwidth);
         group.addOption(storage);
         return group;
+    }
+
+    private static boolean unavailablePolicy() {
+        var policy = ServerDownloadSettings.current();
+        return policy != null && !policy.available();
     }
 
     private static void saveCurrentServerPolicy() {
@@ -241,7 +248,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         private ServerDownloadSettings select(boolean rebuild) {
             var policy = ServerDownloadSettings.current();
             String selected = policy == null ? null : policy.serverId();
-            long bytes = policy == null ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
+            long bytes = policy == null || !policy.available() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
             if (rebuild || this.choices == null || !java.util.Objects.equals(this.serverId, selected)
                     || bytes != Long.MAX_VALUE && java.util.Arrays.binarySearch(this.choices, bytes) < 0) {
                 this.serverId = selected;
@@ -253,12 +260,12 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         int index() {
             var policy = select(true);
             return policy != null && policy.entireWorld() ? this.choices.length : java.util.Arrays.binarySearch(this.choices,
-                    policy == null ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes());
+                    policy == null || !policy.available() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes());
         }
 
         void apply(int value) {
             var policy = select(false);
-            if (policy != null) policy.setStorageBytes(value == this.choices.length ? Long.MAX_VALUE : this.choices[value]);
+            if (policy != null && policy.available()) policy.setStorageBytes(value == this.choices.length ? Long.MAX_VALUE : this.choices[value]);
         }
 
         @Override public int min() { return 0; }
@@ -267,6 +274,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         int defaultIndex() { select(false); return java.util.Arrays.binarySearch(this.choices, ServerDownloadSettings.DEFAULT_STORAGE_BYTES); }
         Component label(int value) {
             select(false);
+            if (unavailablePolicy()) return Component.translatable("voxy.config.streaming.policy_unavailable");
             return value == this.choices.length ? Component.translatable("voxy.config.streaming.entire_world")
                     : Component.literal(storageLabel(this.choices[value]));
         }
@@ -275,7 +283,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
     private static long[] storageChoices(ServerDownloadSettings policy) {
         var choices = new java.util.TreeSet<Long>();
         choices.add(ServerDownloadSettings.DEFAULT_STORAGE_BYTES);
-        long current = policy == null || policy.entireWorld() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
+        long current = policy == null || !policy.available() || policy.entireWorld() ? ServerDownloadSettings.DEFAULT_STORAGE_BYTES : policy.storageBytes();
         choices.add(current);
         long maximum = Math.min(Long.MAX_VALUE - 1, Math.max(current,
                 Math.max(ServerDownloadSettings.DEFAULT_STORAGE_BYTES, policy == null ? 0 : policy.estimatedWorldBytes())));

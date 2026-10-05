@@ -171,7 +171,8 @@ pub struct DimensionMetadata {
 pub struct InventoryRecord {
     pub dimension: u32,
     pub revision: u64,
-    /// 0 begin, 1 saved, 2 unreadable, 3 removed, 4 complete, 5 inventory failure.
+    /// 0 begin, 1 saved/published, 2 unreadable, 3 removed, 4 complete, 5 failure,
+    /// 6 saved/not published. Readiness is coverage, not freshness of routine edits.
     pub state: u8,
     pub x: i32,
     pub z: i32,
@@ -202,7 +203,10 @@ pub enum ControlMessage {
         catalog_id: u64,
         catalog_fingerprint: [u8; 32],
     },
-    Manifest(Vec<DimensionMetadata>),
+    Manifest {
+        dimensions: Vec<DimensionMetadata>,
+        excluded: Vec<(String, String)>,
+    },
     Inventory(InventoryRecord),
     Catalog {
         dimension: u32,
@@ -359,7 +363,10 @@ pub fn encode_control_record(message: &ControlMessage) -> Result<Vec<u8>> {
             payload.extend_from_slice(catalog_fingerprint);
             0x81
         }
-        ControlMessage::Manifest(dimensions) => {
+        ControlMessage::Manifest {
+            dimensions,
+            excluded,
+        } => {
             put_count(&mut payload, dimensions.len())?;
             for d in dimensions {
                 payload.extend_from_slice(&d.id.to_le_bytes());
@@ -373,6 +380,11 @@ pub fn encode_control_record(message: &ControlMessage) -> Result<Vec<u8>> {
                 payload.extend_from_slice(&d.size.to_le_bytes());
                 payload.extend_from_slice(&d.catalog_id.to_le_bytes());
                 payload.extend_from_slice(&d.catalog_fingerprint);
+            }
+            put_count(&mut payload, excluded.len())?;
+            for (name, reason) in excluded {
+                put_string(&mut payload, name, MAX_DIMENSION_BYTES)?;
+                put_string(&mut payload, reason, 4096)?;
             }
             0x82
         }
@@ -499,7 +511,10 @@ fn maximum_payload(kind: u8) -> Result<usize> {
         0x04 => 2 + MAX_SECTION_REQUESTS * 12,
         0x05 => 23 + MAX_SECTION_REQUESTS * 12,
         0x81 => 84,
-        0x82 => 2 + MAX_SECTION_REQUESTS * (2 + MAX_DIMENSION_BYTES + 109),
+        0x82 => {
+            4 + MAX_SECTION_REQUESTS
+                * (2 + MAX_DIMENSION_BYTES + 109 + 4 + MAX_DIMENSION_BYTES + 4096)
+        }
         0x84 => 149,
         0x83 => zstd::zstd_safe::compress_bound(MAX_CATALOG_BYTES)
             .checked_add(76)
@@ -603,13 +618,24 @@ pub fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> 
                     catalog_fingerprint: take(&mut input, 32)?.try_into().unwrap(),
                 });
             }
-            ControlMessage::Manifest(dimensions)
+            let count = take_u16(&mut input)?;
+            let mut excluded = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                excluded.push((
+                    take_string(&mut input, MAX_DIMENSION_BYTES)?,
+                    take_string(&mut input, 4096)?,
+                ));
+            }
+            ControlMessage::Manifest {
+                dimensions,
+                excluded,
+            }
         }
         0x84 => {
             let dimension = take_u32(&mut input)?;
             let revision = take_u64(&mut input)?;
             let state = take_u8(&mut input)?;
-            if state > 5 {
+            if state > 6 {
                 bail!("invalid inventory state");
             }
             let x = take_i32(&mut input)?;
@@ -673,7 +699,8 @@ pub fn decode_control_payload(kind: u8, bytes: &[u8]) -> Result<ControlMessage> 
     Ok(message)
 }
 
-pub async fn write_record<W: AsyncWrite + Unpin>(
+/// Writes the rest of a record after its type byte has been admitted by the session owner.
+pub async fn write_record_body<W: AsyncWrite + Unpin>(
     out: &mut W,
     dimension: u32,
     world_identity: [u8; 32],
@@ -689,7 +716,6 @@ pub async fn write_record<W: AsyncWrite + Unpin>(
     if size != body.len() {
         bail!("terrain body size mismatch");
     }
-    out.write_u8(S_RECORD).await?;
     out.write_u32_le((RECORD_SCOPE_BYTES + header.len() + body.len()) as u32)
         .await?;
     out.write_u32_le(dimension).await?;

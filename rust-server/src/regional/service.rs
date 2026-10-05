@@ -76,6 +76,15 @@ mod round_tests {
 
 #[derive(Clone, Debug)]
 pub enum RegionalAnnouncement {
+    RuntimeReplaced {
+        dimension: u32,
+        previous: Arc<RegionalRuntime>,
+    },
+    Ready {
+        dimension: String,
+        region_x: i32,
+        region_z: i32,
+    },
     Changed {
         dimension: String,
         region_x: i32,
@@ -86,7 +95,7 @@ pub enum RegionalAnnouncement {
     Discovery {
         dimension: String,
         revision: u64,
-        updates: Arc<[((i32, i32), Option<crate::anvil::RegionAvailability>)]>,
+        updates: Arc<[((i32, i32), Option<crate::anvil::RegionAvailability>, bool)]>,
         reset: bool,
     },
     Manifest,
@@ -114,12 +123,15 @@ pub struct RegionalService {
     worker: Mutex<Option<JoinHandle<()>>>,
     cadences: Mutex<SharedCadence>,
     pending_saves: Mutex<BTreeMap<String, BTreeMap<(i32, i32), [u64; 16]>>>,
+    exclusions: RwLock<BTreeMap<String, String>>,
+    definitions: Mutex<()>,
 }
 
 #[derive(Clone, Debug)]
 struct DimensionEntry {
     metadata: DimensionMetadata,
     runtime: Arc<RegionalRuntime>,
+    source_root: PathBuf,
 }
 
 impl RegionalService {
@@ -143,6 +155,8 @@ impl RegionalService {
             worker: Mutex::new(None),
             cadences: Mutex::new(SharedCadence::default()),
             pending_saves: Mutex::new(BTreeMap::new()),
+            exclusions: RwLock::new(BTreeMap::new()),
+            definitions: Mutex::new(()),
         })
     }
 
@@ -157,6 +171,10 @@ impl RegionalService {
         center_z: f64,
         size: f64,
     ) -> Result<()> {
+        let _definition = self
+            .definitions
+            .lock()
+            .map_err(|_| crate::UnsafeState("dimension definition owner poisoned"))?;
         if name.is_empty()
             || !center_x.is_finite()
             || !center_z.is_finite()
@@ -167,16 +185,28 @@ impl RegionalService {
         }
         let layout = super::RegionLayout::new(min_y, count.try_into()?, crate::MAX_LOD + 1)?;
         let existing = read_lock(&self.runtimes)?.get(&name).cloned();
+        let replaced = existing
+            .as_ref()
+            .is_some_and(|entry| entry.runtime.layout() != layout || entry.source_root != root);
+        if replaced {
+            existing.as_ref().unwrap().runtime.retire()?;
+        }
         let runtime = match &existing {
-            Some(entry) if entry.runtime.layout() == layout => entry.runtime.clone(),
+            Some(entry) if !replaced => entry.runtime.clone(),
             _ => Arc::new(RegionalRuntime::open(
                 &self.data_root,
                 name.clone(),
-                Arc::new(AnvilWorld::new(name.clone(), root)),
+                Arc::new(AnvilWorld::new(name.clone(), root.clone())),
                 self.registry.clone(),
                 layout,
             )?),
         };
+        if existing
+            .as_ref()
+            .is_some_and(|entry| entry.source_root != root)
+        {
+            runtime.reconcile_source_root()?;
+        }
         let id = existing.as_ref().map_or_else(
             || self.next_dimension.fetch_add(1, Ordering::Relaxed) as u32,
             |entry| entry.metadata.id,
@@ -195,9 +225,12 @@ impl RegionalService {
             catalog_id: catalogue.catalog_id,
             catalog_fingerprint: catalogue.definition.fingerprint,
         };
-        if existing
-            .as_ref()
-            .is_some_and(|entry| entry.metadata == metadata)
+        let exclusion_cleared = crate::write_lock(&self.exclusions)?.remove(&name).is_some();
+        if !exclusion_cleared
+            && !replaced
+            && existing
+                .as_ref()
+                .is_some_and(|entry| entry.metadata == metadata)
         {
             return Ok(());
         }
@@ -206,6 +239,7 @@ impl RegionalService {
             DimensionEntry {
                 metadata,
                 runtime: runtime.clone(),
+                source_root: root,
             },
         );
         // A storage worker can finish a dimension's first save before the next Minecraft tick
@@ -230,9 +264,59 @@ impl RegionalService {
                 }
             }
         }
+        if replaced {
+            let previous = existing.unwrap();
+            let _ = self
+                .announcements
+                .send(RegionalAnnouncement::RuntimeReplaced {
+                    dimension: id,
+                    previous: previous.runtime,
+                });
+        }
         let _ = self.announcements.send(RegionalAnnouncement::Manifest);
         self.wake.notify_one();
         Ok(())
+    }
+
+    pub fn exclude_dimension(&self, name: String, reason: String) -> Result<()> {
+        let _definition = self
+            .definitions
+            .lock()
+            .map_err(|_| crate::UnsafeState("dimension definition owner poisoned"))?;
+        if name.is_empty() || reason.is_empty() {
+            bail!("invalid excluded dimension")
+        }
+        let mut exclusions = crate::write_lock(&self.exclusions)?;
+        if exclusions.get(&name) == Some(&reason) {
+            return Ok(());
+        }
+        exclusions.insert(name.clone(), reason);
+        drop(exclusions);
+        if let Some(previous) = crate::write_lock(&self.runtimes)?.remove(&name) {
+            previous.runtime.retire()?;
+            let _ = self
+                .announcements
+                .send(RegionalAnnouncement::RuntimeReplaced {
+                    dimension: previous.metadata.id,
+                    previous: previous.runtime,
+                });
+        }
+        let _ = self.announcements.send(RegionalAnnouncement::Manifest);
+        Ok(())
+    }
+
+    pub fn manifest_record(&self) -> Result<ControlMessage> {
+        let _definition = self
+            .definitions
+            .lock()
+            .map_err(|_| crate::UnsafeState("dimension definition owner poisoned"))?;
+        Ok(ControlMessage::Manifest {
+            dimensions: self.manifest()?,
+            excluded: read_lock(&self.exclusions)?
+                .iter()
+                .map(|(name, reason)| (name.clone(), reason.clone()))
+                .collect(),
+        })
     }
     pub fn manifest(&self) -> Result<Vec<DimensionMetadata>> {
         let catalogue = self.catalog.get()?;
@@ -349,6 +433,16 @@ impl RegionalService {
             .collect::<Vec<_>>();
         for (dimension, runtime) in runtimes {
             let refresh = runtime.refresh(round)?;
+            // A replacement may finish once refresh releases its maintenance lock. Keep
+            // announcement emission ordered before insertion, or discard the old result;
+            // otherwise its inventory revision could poison a fresh replacement session.
+            let current = read_lock(&self.runtimes)?;
+            if !current
+                .get(&dimension)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.runtime, &runtime))
+            {
+                continue;
+            }
             if refresh.inventory_changed {
                 let _ = self.announcements.send(RegionalAnnouncement::Discovery {
                     dimension: dimension.clone(),
@@ -378,6 +472,13 @@ impl RegionalService {
                     region_z,
                     generation: 0,
                     changed_ordinals: None,
+                });
+            }
+            for (region_x, region_z) in refresh.ready {
+                let _ = self.announcements.send(RegionalAnnouncement::Ready {
+                    dimension: dimension.clone(),
+                    region_x,
+                    region_z,
                 });
             }
         }
@@ -496,6 +597,10 @@ impl RegionalResponder {
         self.runtime.layout()
     }
 
+    pub fn uses_runtime(&self, runtime: &Arc<RegionalRuntime>) -> bool {
+        Arc::ptr_eq(&self.runtime, runtime)
+    }
+
     pub fn prepare(&self, ticket: u64, key: u64) -> Result<PreparedSection> {
         let coordinate = crate::key::SectionKey::unpack(key)?;
         let side = 16i32 >> coordinate.level;
@@ -518,18 +623,32 @@ impl RegionalResponder {
                     ordinal = index as u32;
                     let entry = region.entry_ordinal(ordinal)?;
                     descriptor.status = if !entry.is_present() {
-                        RecordStatus::Absent
+                        if self.runtime.negative_authority(
+                            region_x,
+                            region_z,
+                            region.generation(),
+                        )? {
+                            RecordStatus::Absent
+                        } else {
+                            RecordStatus::NotReady
+                        }
                     } else if !entry.has_payload() {
                         RecordStatus::Empty
                     } else {
                         RecordStatus::Data
                     };
-                    descriptor.binding = ContentBinding::from_entry(entry, catalog.fingerprint);
+                    if descriptor.status != RecordStatus::NotReady {
+                        descriptor.binding = ContentBinding::from_entry(entry, catalog.fingerprint);
+                    }
                 }
                 Err(_) => descriptor.status = RecordStatus::Absent,
             }
         } else if self.runtime.confirmed_absent(region_x, region_z)? {
             descriptor.status = RecordStatus::Absent;
+        }
+        if descriptor.status == RecordStatus::NotReady {
+            self.runtime.wait_for_publication(region_x, region_z)?;
+            self.wake.notify_one();
         }
         Ok(PreparedSection {
             descriptor,

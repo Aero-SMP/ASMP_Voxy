@@ -30,6 +30,8 @@ final class ChunkSaveNotifications implements AutoCloseable {
     private Map<ResourceKey<Level>, Long2ObjectOpenHashMap<BitSet>> dirty = new HashMap<>();
     private final Map<String, Dimension> dimensions = new HashMap<>();
     private final Map<String, Dimension> changedDimensions = new HashMap<>();
+    private final Map<String, String> excludedDimensions = new HashMap<>();
+    private final Map<String, String> changedExclusions = new HashMap<>();
     private final Map<String, Route> routes = new HashMap<>();
     private Map<String, byte[]> revoked = new HashMap<>();
     private Process child;
@@ -43,6 +45,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
             if (child == next) return;
             child = next;
             changedDimensions.putAll(dimensions);
+            changedExclusions.putAll(excludedDimensions);
             for (Route route : routes.values()) {
                 route.pending = true;
                 if (route.ready.isDone()) route.ready = new CompletableFuture<>();
@@ -53,8 +56,20 @@ final class ChunkSaveNotifications implements AutoCloseable {
 
     void dimension(Dimension dimension) {
         synchronized (wake) {
+            excludedDimensions.remove(dimension.name());
+            changedExclusions.remove(dimension.name());
             if (!open || dimension.equals(dimensions.put(dimension.name(), dimension))) return;
             changedDimensions.put(dimension.name(), dimension);
+            wake.notifyAll();
+        }
+    }
+
+    void excludedDimension(String name, String reason) {
+        synchronized (wake) {
+            if (!open || reason.equals(excludedDimensions.put(name, reason))) return;
+            dimensions.remove(name);
+            changedDimensions.remove(name);
+            changedExclusions.put(name, reason);
             wake.notifyAll();
         }
     }
@@ -107,7 +122,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
     }
 
     private boolean pending() {
-        return !dirty.isEmpty() || !changedDimensions.isEmpty() || !revoked.isEmpty()
+        return !dirty.isEmpty() || !changedDimensions.isEmpty() || !changedExclusions.isEmpty() || !revoked.isEmpty()
                 || routes.values().stream().anyMatch(route -> route.pending);
     }
 
@@ -116,6 +131,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
             Process target;
             Map<ResourceKey<Level>, Long2ObjectOpenHashMap<BitSet>> saves;
             Map<String, Dimension> definitions;
+            Map<String, String> exclusions;
             Map<String, byte[]> removals;
             Map<String, Integer> registrations = new HashMap<>();
             synchronized (wake) {
@@ -126,6 +142,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
                 target = child;
                 saves = dirty; dirty = new HashMap<>();
                 definitions = new java.util.TreeMap<>(changedDimensions); changedDimensions.clear();
+                exclusions = new java.util.TreeMap<>(changedExclusions); changedExclusions.clear();
                 removals = revoked; revoked = new HashMap<>();
                 for (var entry : routes.entrySet()) if (entry.getValue().pending) {
                     registrations.put(entry.getKey(), entry.getValue().rate);
@@ -144,6 +161,11 @@ final class ChunkSaveNotifications implements AutoCloseable {
                             .putInt(dimension.sectionCount()).put((byte) (dimension.customBorder() ? 1 : 0))
                             .putDouble(dimension.centerX()).putDouble(dimension.centerZ()).putDouble(dimension.size());
                     write(target, output, frame);
+                }
+                for (var exclusion : exclusions.entrySet()) {
+                    byte[] name = utf8(exclusion.getKey()), reason = utf8(exclusion.getValue());
+                    write(target, output, frame(5 + name.length + reason.length).put((byte) 5)
+                            .putShort((short) name.length).put(name).putShort((short) reason.length).put(reason));
                 }
                 for (var removal : removals.values()) write(target, output, frame(33).put((byte) 3).put(removal));
                 for (var registration : registrations.entrySet()) {
@@ -169,7 +191,12 @@ final class ChunkSaveNotifications implements AutoCloseable {
                 synchronized (wake) {
                     if (!open) return;
                     merge(saves);
-                    definitions.forEach(changedDimensions::putIfAbsent);
+                    definitions.forEach((name, definition) -> {
+                        if (definition.equals(dimensions.get(name))) changedDimensions.putIfAbsent(name, definition);
+                    });
+                    exclusions.forEach((name, reason) -> {
+                        if (reason.equals(excludedDimensions.get(name))) changedExclusions.putIfAbsent(name, reason);
+                    });
                     revoked.putAll(removals);
                     for (String key : registrations.keySet()) if (routes.containsKey(key)) routes.get(key).pending = true;
                     if (child == target) child = null;

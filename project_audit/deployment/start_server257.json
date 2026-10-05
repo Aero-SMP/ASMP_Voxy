@@ -1,0 +1,8 @@
+{
+  "type": "operation_result",
+  "request_id": 25702,
+  "server_id": "voxy_testing",
+  "operation": "start",
+  "ok": true,
+  "output": "Starting Voxy_Testing..."
+}

@@ -6,7 +6,7 @@ use crate::{
     quarantine,
     regional::{
         CatalogDefinition, PreparedSection, RegionalAnnouncement, RegionalResponder,
-        RegionalService,
+        RegionalRuntime, RegionalService,
         wire::{
             self, ALPN, ContentBinding, ControlMessage, Desire, DimensionAnchor, InventoryRecord,
             RecordStatus, STREAM_CONTROL, STREAM_DISCOVERY, STREAM_SECTION_LANE, ScopedDesire,
@@ -28,6 +28,7 @@ use std::{
     net::SocketAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
@@ -69,6 +70,7 @@ pub struct ServerState {
     server_instance: u64,
     regional: Arc<RegionalService>,
     subscribers: Mutex<Subscribers>,
+    sessions: Mutex<HashMap<usize, Weak<Session>>>,
     network: OnceLock<Network>,
     routes: Mutex<HashMap<[u8; 32], Arc<RouteOwner>>>,
     bridge_stopped: Notify,
@@ -92,6 +94,7 @@ impl ServerState {
             server_instance,
             regional,
             subscribers: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
             network: OnceLock::new(),
             routes: Mutex::new(HashMap::new()),
             bridge_stopped: Notify::new(),
@@ -182,6 +185,71 @@ impl ServerState {
         tokio::spawn(async move {
             loop {
                 match announcements.recv().await {
+                    Ok(RegionalAnnouncement::RuntimeReplaced {
+                        dimension,
+                        previous,
+                    }) => {
+                        let sessions = state
+                            .sessions
+                            .lock()
+                            .expect("terrain session owner poisoned")
+                            .values()
+                            .filter_map(Weak::upgrade)
+                            .collect::<Vec<_>>();
+                        for session in sessions {
+                            let affected = session
+                                .scopes
+                                .lock()
+                                .expect("dimension scope owner poisoned")
+                                .get(&dimension)
+                                .is_some_and(|scope| scope.responder.uses_runtime(&previous));
+                            let affected = affected
+                                || session
+                                    .discovered
+                                    .lock()
+                                    .expect("discovery scope owner poisoned")
+                                    .get(&dimension)
+                                    .and_then(Weak::upgrade)
+                                    .is_some_and(|runtime| Arc::ptr_eq(&runtime, &previous));
+                            if affected {
+                                session.close();
+                                if let Some(connection) = session
+                                    .route
+                                    .connection
+                                    .lock()
+                                    .expect("route connection owner poisoned")
+                                    .as_ref()
+                                    && connection.stable_id() == session.id
+                                {
+                                    connection
+                                        .close(VarInt::from_u32(0), b"dimension source replaced");
+                                }
+                            }
+                        }
+                    }
+                    Ok(RegionalAnnouncement::Ready {
+                        dimension,
+                        region_x,
+                        region_z,
+                    }) => {
+                        if let Ok(id) = state.regional.dimension_id(&dimension) {
+                            let recipients = state
+                                .subscribers
+                                .lock()
+                                .expect("terrain subscriber owner poisoned")
+                                .get(&(id, region_x, region_z))
+                                .map(|region| {
+                                    region
+                                        .values()
+                                        .filter_map(Weak::upgrade)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            for session in recipients {
+                                session.ready((id, region_x, region_z));
+                            }
+                        }
+                    }
                     Ok(RegionalAnnouncement::Changed {
                         dimension,
                         region_x,
@@ -209,20 +277,14 @@ impl ServerState {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let mut recipients = HashMap::new();
-                        for region in state
-                            .subscribers
+                        let recipients = state
+                            .sessions
                             .lock()
-                            .expect("terrain subscriber owner poisoned")
+                            .expect("terrain session owner poisoned")
                             .values()
-                        {
-                            for (&id, weak) in region {
-                                if let Some(session) = weak.upgrade() {
-                                    recipients.insert(id, session);
-                                }
-                            }
-                        }
-                        for session in recipients.into_values() {
+                            .filter_map(Weak::upgrade)
+                            .collect::<Vec<_>>();
+                        for session in recipients {
                             session.reconcile();
                         }
                     }
@@ -299,6 +361,10 @@ impl ServerState {
                                     size,
                                 )?;
                             }
+                            5 => state.regional.exclude_dimension(
+                                read_string(&mut input)?,
+                                read_string(&mut input)?,
+                            )?,
                             _ => bail!("unknown owned IPC opcode"),
                         }
                     }
@@ -357,6 +423,7 @@ struct Interest {
     active: Option<(u64, u64)>,
     revision: u64,
     dirty: bool,
+    waiting_source: bool,
     queued: Option<QueueEntry>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -376,7 +443,8 @@ struct Wants {
     prefetch: BTreeMap<u32, BTreeSet<QueueEntry>>,
     refresh: BTreeSet<QueueEntry>,
     changed: HashSet<ScopedKey>,
-    next_refresh: Instant,
+    last_refresh: Option<Instant>,
+    refresh_started: bool,
     refresh_inflight: usize,
 }
 impl Default for Wants {
@@ -388,7 +456,8 @@ impl Default for Wants {
             prefetch: BTreeMap::new(),
             refresh: BTreeSet::new(),
             changed: HashSet::new(),
-            next_refresh: Instant::now(),
+            last_refresh: None,
+            refresh_started: false,
             refresh_inflight: 0,
         }
     }
@@ -481,6 +550,7 @@ struct Session {
     state: Arc<ServerState>,
     route: Arc<RouteOwner>,
     scopes: Mutex<HashMap<u32, Scope>>,
+    discovered: Mutex<HashMap<u32, Weak<RegionalRuntime>>>,
     wants: Mutex<Wants>,
     available: Notify,
     stopped: Notify,
@@ -498,6 +568,11 @@ struct Claim {
     revision: u64,
     known: Option<ContentBinding>,
     refresh: bool,
+}
+enum ClaimOutcome {
+    Sent(ContentBinding),
+    NotReady,
+    Cancelled,
 }
 impl Session {
     fn wake(&self) {
@@ -598,6 +673,7 @@ impl Session {
                     revision,
                     dirty: old.as_ref().is_some_and(|old| old.dirty)
                         || (scoped.desire.purpose == 2 && known.is_some()),
+                    waiting_source: false,
                     queued: None,
                 },
             );
@@ -670,7 +746,73 @@ impl Session {
         drop(wants);
         self.wake();
     }
+    fn retire_replaced_scopes(&self) -> bool {
+        let scopes = self
+            .scopes
+            .lock()
+            .expect("dimension scope owner poisoned")
+            .iter()
+            .map(|(&id, scope)| (id, scope.clone()))
+            .collect::<Vec<_>>();
+        for (id, scope) in scopes {
+            let current = self
+                .state
+                .regional
+                .dimension_name(id)
+                .and_then(|name| self.state.regional.runtime(&name));
+            if current.is_err()
+                || current.is_ok_and(|runtime| !scope.responder.uses_runtime(&runtime))
+            {
+                self.close();
+                if let Some(connection) = self
+                    .route
+                    .connection
+                    .lock()
+                    .expect("route connection owner poisoned")
+                    .as_ref()
+                    && connection.stable_id() == self.id
+                {
+                    connection.close(VarInt::from_u32(0), b"dimension source replaced");
+                }
+                return true;
+            }
+        }
+        let discovered = self
+            .discovered
+            .lock()
+            .expect("discovery scope owner poisoned")
+            .iter()
+            .map(|(&id, runtime)| (id, runtime.clone()))
+            .collect::<Vec<_>>();
+        for (id, previous) in discovered {
+            let current = self
+                .state
+                .regional
+                .dimension_name(id)
+                .and_then(|name| self.state.regional.runtime(&name));
+            if previous.upgrade().is_none_or(|old| {
+                current.is_err() || current.as_ref().is_ok_and(|new| !Arc::ptr_eq(&old, new))
+            }) {
+                self.close();
+                if let Some(connection) = self
+                    .route
+                    .connection
+                    .lock()
+                    .expect("route connection owner poisoned")
+                    .as_ref()
+                    && connection.stable_id() == self.id
+                {
+                    connection.close(VarInt::from_u32(0), b"dimension source replaced");
+                }
+                return true;
+            }
+        }
+        false
+    }
     fn reconcile(&self) {
+        if self.retire_replaced_scopes() {
+            return;
+        }
         let coordinates = self
             .wants
             .lock()
@@ -682,6 +824,28 @@ impl Session {
         for coordinate in coordinates {
             self.changed(coordinate, None);
         }
+    }
+    fn ready(&self, region: Region) {
+        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+        let keys = wants
+            .regions
+            .get(&region)
+            .map(|keys| keys.values().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for key in keys {
+            if let Some(interest) = wants.interests.get_mut(&key)
+                && (interest.known.is_none()
+                    || interest.waiting_source
+                    || interest.active.is_some())
+            {
+                interest.revision += 1;
+                interest.waiting_source = false;
+                interest.dirty = interest.known.is_some() || interest.desire.purpose == 2;
+                wants.enqueue(key);
+            }
+        }
+        drop(wants);
+        self.wake();
     }
     fn policy(
         &self,
@@ -724,6 +888,9 @@ impl Session {
         wants.visible = Default::default();
         wants.prefetch.clear();
         wants.refresh.clear();
+        if wants.refresh_inflight == 0 {
+            wants.refresh_started = false;
+        }
         let anchors = self.anchors.lock().expect("spatial anchor owner poisoned");
         let keys = wants.interests.keys().copied().collect::<Vec<_>>();
         for key in keys {
@@ -760,7 +927,10 @@ impl Session {
             && wants.refresh_inflight == 0
             && !wants.changed.is_empty()
         {
-            if Instant::now() >= wants.next_refresh {
+            let next_refresh = wants
+                .last_refresh
+                .map(|start| start + Duration::from_millis(settings.interval_millis));
+            if next_refresh.is_none_or(|deadline| Instant::now() >= deadline) {
                 let changed = std::mem::take(&mut wants.changed);
                 for key in changed {
                     let Some(interest) = wants.interests.get(&key) else {
@@ -781,10 +951,9 @@ impl Session {
                     wants.refresh.insert(entry);
                     wants.interests.get_mut(&key).unwrap().queued = Some(entry);
                 }
-                wants.next_refresh =
-                    Instant::now() + Duration::from_millis(settings.interval_millis);
+                wants.refresh_started = false;
             } else {
-                deadline = Some(wants.next_refresh);
+                deadline = next_refresh;
             }
         }
         let entry = if let Some(entry) = wants.visible[lane].first().copied() {
@@ -841,7 +1010,7 @@ impl Session {
         }
         (Some(claim), deadline)
     }
-    fn finish(&self, claim: Claim, binding: Option<ContentBinding>) {
+    fn finish(&self, claim: Claim, outcome: ClaimOutcome) {
         let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
         if claim.refresh {
             wants.refresh_inflight -= 1;
@@ -855,8 +1024,17 @@ impl Session {
             return;
         }
         interest.active = None;
+        if matches!(outcome, ClaimOutcome::Cancelled) {
+            // A gate/ticket change is not a source-not-ready result. Preserve latest work;
+            // reopening the gate or adopting the new ticket will make it eligible again.
+            wants.enqueue(claim.scope);
+            drop(wants);
+            self.wake();
+            return;
+        }
         if interest.desire.ticket == claim.desire.ticket {
-            if let Some(binding) = binding {
+            interest.waiting_source = matches!(outcome, ClaimOutcome::NotReady);
+            if let ClaimOutcome::Sent(binding) = outcome {
                 interest.known = Some(binding);
             }
             // NotReady retains the subscription and waits for publication, without polling.
@@ -869,6 +1047,61 @@ impl Session {
         }
         drop(wants);
         self.wake();
+    }
+    fn claim_valid(&self, claim: Claim, settings: &StreamingSettings, wants: &Wants) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && (!claim.refresh || settings.refresh_allowed)
+            && wants.interests.get(&claim.scope).is_some_and(|interest| {
+                interest.desire.ticket == claim.desire.ticket
+                    && interest.revision == claim.revision
+                    && interest.active == Some((claim.desire.ticket, claim.revision))
+            })
+    }
+    fn eligible(&self, claim: Claim) -> bool {
+        let settings = self
+            .settings
+            .lock()
+            .expect("streaming policy owner poisoned");
+        let wants = self.wants.lock().expect("terrain desire owner poisoned");
+        self.claim_valid(claim, &settings, &wants)
+    }
+    async fn begin_record(&self, send: &mut quinn::SendStream, claim: Claim) -> Result<bool> {
+        loop {
+            let changed = self.available.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let admitted = std::future::poll_fn(|cx| {
+                let settings = self
+                    .settings
+                    .lock()
+                    .expect("streaming policy owner poisoned");
+                let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+                if !self.claim_valid(claim, &settings, &wants) {
+                    return std::task::Poll::Ready(Ok(false));
+                }
+                // A one-byte poll is cancellation safe. Policy/ticket ownership cannot
+                // change between this check and actual acceptance into Quinn's stream.
+                match Pin::new(&mut *send).poll_write(cx, &[wire::S_RECORD]) {
+                    std::task::Poll::Ready(Ok(1)) => {
+                        if claim.refresh && !wants.refresh_started {
+                            wants.last_refresh = Some(Instant::now());
+                            wants.refresh_started = true;
+                        }
+                        std::task::Poll::Ready(Ok(true))
+                    }
+                    std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(anyhow::anyhow!(
+                        "terrain lane accepted no record byte"
+                    ))),
+                    std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error.into())),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            });
+            tokio::select! {
+                biased;
+                _ = &mut changed => {},
+                result = admitted => return result,
+            }
+        }
     }
     async fn metadata(&self, message: &ControlMessage) -> Result<()> {
         let mut writer = self.metadata.lock().await;
@@ -1107,10 +1340,8 @@ async fn serve_established(
         state: state.clone(),
         route,
         scopes: Mutex::new(HashMap::new()),
-        wants: Mutex::new(Wants {
-            next_refresh: Instant::now() + Duration::from_millis(settings.interval_millis),
-            ..Default::default()
-        }),
+        discovered: Mutex::new(HashMap::new()),
+        wants: Mutex::new(Wants::default()),
         available: Notify::new(),
         stopped: Notify::new(),
         closed: AtomicBool::new(false),
@@ -1123,13 +1354,18 @@ async fn serve_established(
         }),
         catalogues: Mutex::new(catalogues),
     });
+    state
+        .sessions
+        .lock()
+        .expect("terrain session owner poisoned")
+        .insert(session.id, Arc::downgrade(&session));
     let result = async {
         session.policy(settings, active, vec![DimensionAnchor { dimension:active, x:anchor_x, z:anchor_z }])?;
         session.metadata(&responder.hello(active)?).await?;
         if state.trace {
             eprintln!("VOXY_BOOTSTRAP stage=HELLO_SENT session={} route={}", session.id, hex(&session.route.token[..16]));
         }
-        session.metadata(&ControlMessage::Manifest(state.regional.manifest()?)).await?;
+        session.metadata(&state.regional.manifest_record()?).await?;
         if state.trace {
             eprintln!("VOXY_BOOTSTRAP stage=MANIFEST_SENT session={} route={}", session.id, hex(&session.route.token[..16]));
         }
@@ -1173,6 +1409,11 @@ async fn serve_established(
         result
     }.await;
     session.close();
+    state
+        .sessions
+        .lock()
+        .expect("terrain session owner poisoned")
+        .remove(&session.id);
     let regions = session
         .wants
         .lock()
@@ -1213,8 +1454,8 @@ async fn serve_lane(
         }
         let (claim, deadline) = session.claim(lane);
         if let Some(claim) = claim {
-            let binding = tokio::select! {result=send_claim(&session,&mut send,claim)=>result?,_=session.ended()=>return Ok(())};
-            session.finish(claim, binding);
+            let outcome = tokio::select! {result=send_claim(&session,&mut send,claim)=>result?,_=session.ended()=>return Ok(())};
+            session.finish(claim, outcome);
         } else {
             tokio::select! {_=notified=>{},_=async{if let Some(deadline)=deadline{tokio::time::sleep_until(deadline).await}else{std::future::pending::<()>().await}}=>{},_=session.ended()=>return Ok(())}
         }
@@ -1243,23 +1484,29 @@ async fn send_claim(
     session: &Session,
     send: &mut quinn::SendStream,
     claim: Claim,
-) -> Result<Option<ContentBinding>> {
+) -> Result<ClaimOutcome> {
     let scope = session.scope(claim.scope.dimension)?;
     let responder = scope.responder.clone();
     let desire = claim.desire;
     let mut prepared: PreparedSection =
         tokio::task::spawn_blocking(move || responder.prepare(desire.ticket, desire.key)).await??;
     let descriptor = prepared.descriptor;
+    if !session.eligible(claim) {
+        return Ok(ClaimOutcome::Cancelled);
+    }
     if claim.refresh
         && claim.known == Some(descriptor.binding)
         && descriptor.status != RecordStatus::NotReady
     {
-        return Ok(Some(descriptor.binding));
+        return Ok(ClaimOutcome::Sent(descriptor.binding));
     }
     if descriptor.binding.catalog_fingerprint != [0; 32] {
         session
             .announce_catalogue(claim.scope.dimension, scope.world, &prepared.catalog)
             .await?;
+    }
+    if !session.eligible(claim) {
+        return Ok(ClaimOutcome::Cancelled);
     }
     if descriptor.status == RecordStatus::Data
         && claim
@@ -1270,13 +1517,29 @@ async fn send_claim(
     }
     let descriptor = prepared.descriptor;
     let body = tokio::task::spawn_blocking(move || prepared.body()).await??;
-    wire::write_record(send, claim.scope.dimension, scope.world, descriptor, &body).await?;
-    Ok((descriptor.status != RecordStatus::NotReady).then_some(descriptor.binding))
+    if !session.begin_record(send, claim).await? {
+        return Ok(ClaimOutcome::Cancelled);
+    }
+    wire::write_record_body(send, claim.scope.dimension, scope.world, descriptor, &body).await?;
+    Ok(if descriptor.status == RecordStatus::NotReady {
+        ClaimOutcome::NotReady
+    } else {
+        ClaimOutcome::Sent(descriptor.binding)
+    })
 }
 async fn write_discovery(send: &mut quinn::SendStream, message: &ControlMessage) -> Result<()> {
     send.write_all(&encode_control_record(message)?)
         .await
         .context("discovery stream frame failed")
+}
+fn inventory_state(availability: &crate::anvil::RegionAvailability, published: bool) -> u8 {
+    if !availability.readable {
+        2
+    } else if published {
+        1
+    } else {
+        6
+    }
 }
 fn discovery_priority(session: &Session, send: &quinn::SendStream, dimension: u32) -> Result<()> {
     let active = *session
@@ -1297,6 +1560,11 @@ async fn snapshot_inventory(
     discovery_priority(session, send, dimension)?;
     let name = session.state.regional.dimension_name(dimension)?;
     let runtime = session.state.regional.runtime(&name)?;
+    session
+        .discovered
+        .lock()
+        .expect("discovery scope owner poisoned")
+        .insert(dimension, Arc::downgrade(&runtime));
     let revision = runtime.inventory_revision();
     let known = runtime.inventory_known()?;
     let record = |state, x, z, saved| {
@@ -1321,11 +1589,11 @@ async fn snapshot_inventory(
     }
     let mut after = None;
     let mut rows = 0u64;
-    while let Some((coordinate, availability)) = runtime.inventory_after(after)? {
+    while let Some((coordinate, availability, published)) = runtime.inventory_after(after)? {
         write_discovery(
             send,
             &record(
-                if availability.readable { 1 } else { 2 },
+                inventory_state(&availability, published),
                 coordinate.0,
                 coordinate.1,
                 availability.saved,
@@ -1424,8 +1692,11 @@ async fn discovery_loop(session: Arc<Session>, send: &mut quinn::SendStream) -> 
         };
         match event {
             Ok(RegionalAnnouncement::Manifest) => {
+                if session.retire_replaced_scopes() {
+                    return Ok(());
+                }
                 let manifest = session.state.regional.manifest()?;
-                write_discovery(send, &ControlMessage::Manifest(manifest.clone())).await?;
+                write_discovery(send, &session.state.regional.manifest_record()?).await?;
                 for dimension in manifest {
                     if known_dimensions.insert(dimension.id) {
                         pending_snapshots.push_back(dimension.id);
@@ -1475,7 +1746,7 @@ async fn discovery_loop(session: Arc<Session>, send: &mut quinn::SendStream) -> 
                     .await?;
                     continue;
                 }
-                for (coordinate, availability) in updates.iter() {
+                for (coordinate, availability, published) in updates.iter() {
                     write_discovery(
                         send,
                         &ControlMessage::Inventory(InventoryRecord {
@@ -1483,7 +1754,7 @@ async fn discovery_loop(session: Arc<Session>, send: &mut quinn::SendStream) -> 
                             revision,
                             state: availability
                                 .as_ref()
-                                .map_or(3, |entry| if entry.readable { 1 } else { 2 }),
+                                .map_or(3, |entry| inventory_state(entry, *published)),
                             x: coordinate.0,
                             z: coordinate.1,
                             saved: availability.as_ref().map_or([0; 16], |entry| entry.saved),
@@ -1494,7 +1765,7 @@ async fn discovery_loop(session: Arc<Session>, send: &mut quinn::SendStream) -> 
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 let manifest = session.state.regional.manifest()?;
-                write_discovery(send, &ControlMessage::Manifest(manifest.clone())).await?;
+                write_discovery(send, &session.state.regional.manifest_record()?).await?;
                 known_dimensions = manifest.iter().map(|dimension| dimension.id).collect();
                 pending_snapshots = manifest.iter().map(|dimension| dimension.id).collect();
                 initialized.clear();

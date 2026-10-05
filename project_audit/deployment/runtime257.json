@@ -1,0 +1,48 @@
+{
+  "utc": "2026-10-05T17:53:51.245522+00:00",
+  "version": "0.2.257-beta",
+  "processes": [
+    {
+      "pid": 4176932,
+      "comm": "java",
+      "cwd": "/home/aerosmp/Desktop/Voxy_Testing",
+      "start_ticks": "44596567",
+      "heap_bytes": {
+        "InitialHeapSize": 1073741824,
+        "MaxHeapSize": 4294967296
+      }
+    },
+    {
+      "pid": 4177620,
+      "comm": "voxy-rust-serve",
+      "cwd": "/home/aerosmp/Desktop/Voxy_Testing",
+      "start_ticks": "44597892",
+      "executable_sha256": "85dd01efb215ec1c33629b8bf1f8cbd7805f128e46b843c0bae1827215f06a01",
+      "cgroup_path": "/sys/fs/cgroup/user.slice/user-1007.slice/user@1007.service/app.slice/voxy-testing-rust-4177616.service",
+      "limits": {
+        "memory.max": "999997440",
+        "memory.swap.max": "0",
+        "memory.current": "628834304",
+        "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.257-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "b4599a9c0936c92849be6e837601dc04e132db5d17e529dad765d001d79d5c3d",
+      "bytes": 4062736
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/server/build/libs/voxy-server-0.2.257-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "51a6046ad551d7486b691d228ea76bc1a024ec9432f754efe762f3e9105636da",
+      "bytes": 1771102
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/rust-server/target/release/voxy-rust-server",
+      "sha256": "85dd01efb215ec1c33629b8bf1f8cbd7805f128e46b843c0bae1827215f06a01",
+      "bytes": 3462352
+    }
+  ],
+  "rollback": "/home/aerosmp/Desktop/Voxy_Testing/logs/cache-first-deployment/257-20261005T175334Z"
+}

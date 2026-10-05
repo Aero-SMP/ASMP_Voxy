@@ -21,14 +21,15 @@ final class RegionalMetadataStore implements AutoCloseable {
     private volatile String rawAddress;
     RegionalMetadataStore(Path root) throws IOException { this.budget = RegionalDiskBudget.acquire(root); }
     RegionalMetadataStore(RegionalDiskBudget budget) { this.budget = budget; budget.retain(); }
-    void bindServer(String normalizedPolicyKey, String rawAssociationAddress, long allowanceBytes) throws IOException {
-        this.account = this.budget.configure(normalizedPolicyKey, allowanceBytes);
+    void bindServer(me.cortex.voxy.client.config.ServerDownloadSettings policy, String rawAssociationAddress) throws IOException {
+        this.account = this.budget.configure(policy);
         this.rawAddress = rawAssociationAddress;
     }
     void updateRetention(String dimension, long blockX, long blockZ, java.util.Set<Long> protectedVisibleRegions) {
         this.budget.retention(this.account, dimension, blockX, blockZ, protectedVisibleRegions);
     }
     RegionalDiskBudget.StorageState namespaceBudget() { return this.budget.storage(this.account); }
+    long admissionGeneration() { var owner = this.account; return owner == null ? 0 : this.budget.admissionGeneration(owner.key); }
     boolean canDownload() { return !namespaceBudget().downloadPaused(); }
     void remember(String dimension, RegionalProtocol.Hash32 world) throws IOException {
         this.budget.claim(this.account, namespace(world, dimension), dimension,
@@ -89,13 +90,21 @@ final class RegionalMetadataStore implements AutoCloseable {
             try (var writer = this.budget.writer(path, current);
                  var pin = this.budget.pin(path); var pending = this.budget.pin(temporary)) {
                 LocalCacheOwnership.rejectLinks(path); LocalCacheOwnership.rejectLinks(temporary);
-                return install(path, temporary, ByteBuffer.wrap(RegionalProtocol.catalogFrame(catalog)), current);
+                return install(path, temporary, ByteBuffer.wrap(RegionalProtocol.catalogFrame(catalog)), current, writer);
             }
         } finally { this.budget.release(); }
     }
     Persistence associate(String server, String dimension, RegionalProtocol.Hash32 world,
                           long stamp, BooleanSupplier current) throws IOException {
-        if (server == null || this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
+        synchronized (this) {
+            if (server == null || this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
+            this.budget.retain();
+        }
+        try { return associateOwned(server, dimension, world, current); }
+        finally { this.budget.release(); }
+    }
+    private Persistence associateOwned(String server, String dimension, RegionalProtocol.Hash32 world,
+                                       BooleanSupplier current) throws IOException {
         var unavailable = this.budget.persistenceUnavailable();
         if (unavailable != null) return unavailable;
         remember(dimension, world);
@@ -106,19 +115,23 @@ final class RegionalMetadataStore implements AutoCloseable {
             if (world.equals(world(server, dimension))) return Persistence.PERSISTED;
             var bytes = ByteBuffer.allocate(BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(MAGIC).put(world.bytes());
             bytes.putInt(RegionalProtocol.crc32c(java.util.Arrays.copyOf(bytes.array(), 40))).flip();
-            return install(path, temporary, bytes, current);
+            return install(path, temporary, bytes, current, writer);
         }
     }
     /** Caller owns the writer and both pins. Partial records never replace committed metadata. */
-    private Persistence install(Path path, Path temporary, ByteBuffer bytes, BooleanSupplier current) throws IOException {
+    private Persistence install(Path path, Path temporary, ByteBuffer bytes, BooleanSupplier current,
+                                RegionalDiskBudget.Writer writer) throws IOException {
         if (this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
-        Files.createDirectories(path.getParent());
         int length = bytes.remaining();
         long oldTemporary = RegionalDiskBudget.size(temporary);
-        this.budget.reserve(temporary, Math.max(0, length - oldTemporary));
+        long charged = oldTemporary;
         long before = RegionalDiskBudget.size(path);
-        boolean installed = false;
+        boolean installed = false, touched = false;
         try {
+            writer.expect(length);
+            Files.createDirectories(path.getParent());
+            this.budget.reserve(temporary, Math.max(0, length - oldTemporary)); charged = Math.max(length, oldTemporary);
+            touched = true;
             try (var file = FileChannel.open(temporary, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                     StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS)) {
                 while (bytes.hasRemaining()) {
@@ -128,18 +141,16 @@ final class RegionalMetadataStore implements AutoCloseable {
                 file.force(true);
             }
             if (this.closed || !current.getAsBoolean()) return Persistence.OBSOLETE;
-            Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            this.budget.resized(temporary, -Math.max(length, oldTemporary));
-            this.budget.resized(path, length - before);
-            installed = true;
+            this.budget.replace(temporary, path, length, before, charged, () -> !this.closed && current.getAsBoolean());
+            installed = true; writer.completed();
             return Persistence.PERSISTED;
         } catch (IOException failure) {
-            this.budget.writeFailure(temporary, failure); throw failure;
+            writer.failed(failure); throw failure;
         } finally {
-            if (!installed) {
-                long reserved = Math.max(length, oldTemporary);
-                try { Files.deleteIfExists(temporary); }
-                finally { this.budget.resized(temporary, RegionalDiskBudget.size(temporary) - reserved); }
+            if (!installed && touched) {
+                try { LocalCacheOwnership.rejectLinks(temporary); Files.deleteIfExists(temporary); }
+                catch (IOException failure) { writer.failed(failure); throw failure; }
+                finally { this.budget.resized(temporary, RegionalDiskBudget.size(temporary) - charged); }
             }
         }
     }

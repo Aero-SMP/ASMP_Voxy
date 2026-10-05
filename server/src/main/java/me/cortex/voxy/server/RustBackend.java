@@ -380,6 +380,11 @@ final class RustBackend {
         if (current != null && current.wanted) current.saves.dimension(dimension);
     }
 
+    static void excludedDimension(String name, String reason) {
+        Owner current = owner;
+        if (current != null && current.wanted) current.saves.excludedDimension(name, reason);
+    }
+
     static java.util.concurrent.CompletableFuture<Void> register(byte[] token, int rate) {
         Owner current = owner;
         return current == null || !current.wanted

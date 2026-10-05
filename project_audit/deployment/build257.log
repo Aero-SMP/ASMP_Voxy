@@ -1,0 +1,40 @@
+To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/9.4.1/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+> Task :createMinecraftArtifacts UP-TO-DATE
+> Task :server:createMinecraftArtifacts UP-TO-DATE
+> Task :server:compileJava UP-TO-DATE
+> Task :server:processDebugResources UP-TO-DATE
+> Task :server:debugJarJar NO-SOURCE
+> Task :server:jarJar NO-SOURCE
+
+> Task :compileJava
+Note: /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/src/main/java/me/cortex/voxy/client/core/model/ModelFactory.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :processResources
+> Task :classes
+> Task :compileDebugJava
+> Task :processDebugResources
+> Task :debugClasses
+> Task :debugJarJar NO-SOURCE
+> Task :debugJar
+> Task :jarJar NO-SOURCE
+> Task :jar
+
+> Task :buildRustServer
+   Compiling voxy-rust-server v0.1.0 (/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/rust-server)
+    Finished `release` profile [optimized] target(s) in 20.24s
+
+> Task :server:processResources
+> Task :server:classes
+> Task :server:compileDebugJava
+> Task :server:debugClasses
+> Task :server:debugJar
+> Task :server:jar
+> Task :buildAll
+
+[Incubating] Problems report is available at: file:///home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/reports/problems/problems-report.html
+
+BUILD SUCCESSFUL in 26s
+15 actionable tasks: 11 executed, 4 up-to-date
+Consider enabling configuration cache to speed up this build: https://docs.gradle.org/9.4.1/userguide/configuration_cache_enabling.html

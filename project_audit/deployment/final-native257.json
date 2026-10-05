@@ -1,0 +1,11 @@
+{
+  "elapsed": 535.5960496950429,
+  "pid": 4177620,
+  "limits": {
+    "memory.max": "999997440",
+    "memory.swap.max": "0",
+    "memory.current": "586133504",
+    "memory.peak": "654311424",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+  }
+}

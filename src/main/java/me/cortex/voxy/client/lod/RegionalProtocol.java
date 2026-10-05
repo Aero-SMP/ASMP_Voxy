@@ -78,9 +78,14 @@ final class RegionalProtocol {
     record DimensionInfo(int id, String name, Hash32 worldIdentity, int minSectionY, int sectionCount,
                          boolean customBorder, double centerX, double centerZ, double borderSize,
                          long catalogId, Hash32 catalogFingerprint) {}
-    enum InventoryState { SNAPSHOT_BEGIN, SAVED_REGION, UNREADABLE_REGION, REMOVED_REGION, SNAPSHOT_COMPLETE, FAILURE }
-    record Manifest(List<DimensionInfo> dimensions) implements Control {
-        Manifest { dimensions = List.copyOf(dimensions); }
+    enum InventoryState {
+        SNAPSHOT_BEGIN, SAVED_PUBLISHED, UNREADABLE_REGION, REMOVED_REGION,
+        SNAPSHOT_COMPLETE, FAILURE, SAVED_NOT_PUBLISHED;
+        boolean saved() { return this == SAVED_PUBLISHED || this == SAVED_NOT_PUBLISHED; }
+    }
+    record DimensionExclusion(String name, String reason) {}
+    record Manifest(List<DimensionInfo> dimensions, List<DimensionExclusion> excluded) implements Control {
+        Manifest { dimensions = List.copyOf(dimensions); excluded = List.copyOf(excluded); }
     }
     record RegionInventory(int dimensionId, long revision, InventoryState state,
                            int regionX, int regionZ, long[] savedSlots) implements Control {
@@ -247,7 +252,14 @@ final class RegionalProtocol {
                 throw new IOException("invalid dimension manifest");
             dimensions.add(new DimensionInfo(id, name, world, minY, height, custom != 0, x, z, size, catalogId, catalog));
         }
-        return new Manifest(dimensions);
+        int excludedCount = Short.toUnsignedInt(payload.getShort());
+        var excluded = new ArrayList<DimensionExclusion>(excludedCount);
+        for (int i = 0; i < excludedCount; i++) {
+            String name = readString(payload, MAX_DIMENSION_BYTES), reason = readString(payload, 4096);
+            if (name.isBlank() || reason.isBlank() || !names.add(name)) throw new IOException("invalid excluded dimension");
+            excluded.add(new DimensionExclusion(name, reason));
+        }
+        return new Manifest(dimensions, excluded);
     }
 
     private static RegionInventory readInventory(ByteBuffer payload) throws IOException {

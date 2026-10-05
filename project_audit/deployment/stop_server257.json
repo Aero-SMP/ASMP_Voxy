@@ -1,0 +1,8 @@
+{
+  "type": "operation_result",
+  "request_id": 25701,
+  "server_id": "voxy_testing",
+  "operation": "shutdown",
+  "ok": true,
+  "output": "Stopping Voxy_Testing..."
+}
