@@ -27,8 +27,10 @@ import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -1268,7 +1270,7 @@ public final class ClientSession {
                         ClientLodDebug.ownerPhase(ownerTiming, 3); // CONTROLS
                         if (this.quic != null) this.drainControls();
                         ClientLodDebug.ownerPhase(ownerTiming, 4); // NETWORK_REPLIES
-                        this.drainNetworkReplies();
+                        this.drainNetworkReplies(false);
                         ClientLodDebug.ownerPhase(ownerTiming, 5); // EVENTS
                         this.drainEvents();
                         ClientLodDebug.ownerPhase(ownerTiming, 6); // DEMAND
@@ -1280,11 +1282,11 @@ public final class ClientSession {
                         ClientLodDebug.ownerPhase(ownerTiming, 9); // REGIONS
                         this.processRegions();
                         ClientLodDebug.ownerPhase(ownerTiming, 10); // DOWNLOADS
-                        this.processCacheDownloads();
+                        boolean downloadControlsReady = this.processCacheDownloads();
                         ClientLodDebug.ownerPhase(ownerTiming, 11); // PUBLICATIONS
                         this.pollPublications();
                         ClientLodDebug.ownerPhase(ownerTiming, 12); // STAGES
-                        this.processStages();
+                        this.processStages(downloadControlsReady);
                         ClientLodDebug.ownerPhase(ownerTiming, 13); // DEBUG_SAMPLE
                         ClientLodDebug.captureSession(this);
                         ClientLodDebug.ownerPhase(ownerTiming, 14); // HEALTH
@@ -2288,13 +2290,18 @@ public final class ClientSession {
             this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
         }
 
-        void processStages() throws Exception {
+        void processStages(boolean downloadControlsReady) throws Exception {
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 6);
             this.scheduleReadyPublications();
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 7);
             this.processWaitingModels();
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 8);
-            this.scheduleSourceWork();
+            boolean foregroundReady = this.drainNetworkReplies(false);
+            boolean sourceReady = this.scheduleSourceWork();
+            if (!foregroundReady || !sourceReady) return;
+            this.drainNetworkReplies(true);
+            var next = this.selectCacheDownload(downloadControlsReady);
+            if (next != null && !this.quic.desire(List.of(next))) this.networkOwner.downloads.unsent(next.ticket());
         }
         void ensureRegion(long key) { this.queueRegion(regionFor(key)); this.interestChanges.add(key); }
         void queueRegion(long region) { this.demands.readyRegion(this.demands.region(region)); }
@@ -2480,8 +2487,8 @@ public final class ClientSession {
                 if (demand.networkWanted) demand.candidate = SectionDemandTable.CandidateState.NETWORK_OWNED;
             }
         }
-        void processCacheDownloads() throws IOException {
-            if (this.metadata == null || this.policy == null) return;
+        boolean processCacheDownloads() throws IOException {
+            if (this.metadata == null || this.policy == null) return false;
             var downloads = this.networkOwner == null ? null : this.networkOwner.downloads;
             if (this.sentStorageBytes != this.policy.storageBytes()) {
                 this.metadata.bindServer(this.policy, this.serverKey);
@@ -2507,19 +2514,19 @@ public final class ClientSession {
                 this.retentionView = this.viewRevision; this.retentionEpoch = this.visibleEpoch;
                 this.retentionX = this.cameraBlockX; this.retentionZ = this.cameraBlockZ;
             }
-            if (downloads == null || !this.helloAccepted) return;
+            if (downloads == null || !this.helloAccepted) return false;
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 14);
             downloads.view(this.dimensionId, this.cameraBlockX, this.cameraBlockZ, this.visibility);
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 15);
-            if (this.quic == null || !this.openSent) return;
+            if (this.quic == null || !this.openSent) return false;
             // A key-only cancellation must reach the writer before its replacement desire.
-            if (!this.interestDrops.isEmpty() || !this.networkOwner.detachedDrops.isEmpty()) return;
+            if (!this.interestDrops.isEmpty() || !this.networkOwner.detachedDrops.isEmpty()) return false;
             var drops = downloads.drops();
             if (!drops.isEmpty()) {
                 int count = (this.quic.controlBatchBytes() - RegionalProtocol.CONTROL_LIST_HEADER_BYTES) / RegionalProtocol.SCOPED_DROP_BYTES;
                 var batch = drops.subList(0, Math.min(drops.size(), count));
                 if (this.quic.drop(batch)) downloads.dropped(batch);
-                return;
+                return false;
             }
             var changes = downloads.changes();
             if (!changes.isEmpty()) {
@@ -2531,13 +2538,41 @@ public final class ClientSession {
                 }
                 var batch = changes.subList(0, count);
                 if (this.quic.desire(batch)) downloads.changed(batch);
-                return;
+                return false;
             }
-            if (!this.interestChanges.isEmpty() || this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) != 0) return;
+            return this.metadata.canDownload();
+        }
+
+        /** Called only after the late foreground and source passes, using their spare slots. */
+        RegionalProtocol.Desire selectCacheDownload(boolean controlsReady) throws IOException {
+            var owner = this.networkOwner;
+            if (!controlsReady || !this.open.get() || !this.helloAccepted || !this.openSent
+                    || this.policy == null || this.metadata == null || !this.metadata.canDownload()
+                    || owner == null || owner.closed || owner.view() != this
+                    || owner.epoch != this.connectionEpoch || owner.quic != this.quic
+                    || this.quic == null || !this.quic.isOpen() || owner.downloads == null) return null;
+            var downloads = owner.downloads;
+            // Source/publication processing can add a cancellation after DOWNLOADS.
+            if (!this.interestDrops.isEmpty() || !owner.detachedDrops.isEmpty()
+                    || !downloads.drops().isEmpty() || !downloads.changes().isEmpty()
+                    || this.hasUrgentDownloadInterest()) return null;
             int available = 0; for (var worker : this.sectionWorkers) if (worker.idle()) available++;
-            if (downloads.waiting() >= available) return;
-            var next = downloads.next(this.networkOwner.ticket(), this.connectionEpoch);
-            if (next != null && !this.quic.desire(List.of(next))) downloads.unsent(next.ticket());
+            if (downloads.waiting() >= available) return null;
+            return downloads.next(owner.ticket(), this.connectionEpoch);
+        }
+
+        private boolean hasUrgentDownloadInterest() {
+            var pending = this.interestChanges.iterator(true);
+            while (pending.hasNext()) {
+                var demand = this.demands.get(pending.next());
+                if (demand == null || this.targetWindow != null && !this.inSubscriptionWindow(demand.regionKey)
+                        || !demand.networkWanted || !this.downloadVisible(demand.key)) continue;
+                // This check also records the frame/cover prerequisites used by REGIONS.
+                if (!this.networkEligible(demand) || this.cacheWorkBlocksReply(demand)) continue;
+                var job = this.networkOwner.downloads.pending(this.dimensionId, demand.key);
+                if (job == null || !job.processing) return true;
+            }
+            return false;
         }
 
         void changeWorld(RegionalProtocol.Hash32 world) {
@@ -3166,26 +3201,39 @@ public final class ClientSession {
             if (result instanceof WorkerWorld world) world.cache().close();
         }
 
-        void scheduleSourceWork() {
+        boolean scheduleSourceWork() {
             int remaining = this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE);
+            Demand blocked = null;
+            Set<Demand> blockedEntries = null;
+            boolean enqueuedSource = false;
             while (remaining-- > 0) {
                 Demand demand = this.demands.poll(SectionDemandTable.ReadyKind.SOURCE);
-                if (demand == null) return;
+                if (demand == null) break;
                 ClientLodDebug.ownerEvent(this.debugOwnerTiming, 9, 1);
                 if (demand.candidate != SectionDemandTable.CandidateState.READY_SOURCE) {
                     ClientLodDebug.ownerEvent(this.debugOwnerTiming, 10, 1); continue;
                 }
                 if (demand.preservedPublication != null) {
                     ClientLodDebug.ownerEvent(this.debugOwnerTiming, 11, 1);
+                    if (blocked == null) blocked = demand;
+                    else if (blocked != demand) {
+                        if (blockedEntries == null) {
+                            blockedEntries = Collections.newSetFromMap(new IdentityHashMap<>());
+                            blockedEntries.add(blocked);
+                        }
+                        blockedEntries.add(demand);
+                    }
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE); continue;
                 }
+                int beforeAllocation = this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE);
                 if (demand.content.kind() == LocalSection.EMPTY) {
                     if (!this.publishEmpty(demand)) {
                         ClientLodDebug.ownerEvent(this.debugOwnerTiming, 14, 1);
                         ClientLodDebug.ownerNoSlot(this.debugOwnerTiming, this);
                         this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
-                        return;
+                        return false;
                     }
+                    enqueuedSource |= this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) > beforeAllocation;
                     ClientLodDebug.ownerEvent(this.debugOwnerTiming, 12, 1);
                     continue;
                 }
@@ -3194,7 +3242,7 @@ public final class ClientSession {
                     ClientLodDebug.ownerEvent(this.debugOwnerTiming, 14, 1);
                     ClientLodDebug.ownerNoSlot(this.debugOwnerTiming, this);
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
-                    return;
+                    return false;
                 }
                 WorkerSource source = WorkerSource.CACHE;
                 demand.networkWork = false;
@@ -3209,10 +3257,13 @@ public final class ClientSession {
                     demand.workLease = null;
                     demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
-                    return;
+                    return false;
                 }
+                enqueuedSource |= this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) > beforeAllocation;
                 ClientLodDebug.ownerEvent(this.debugOwnerTiming, 13, 1);
             }
+            int observedBlocked = blockedEntries != null ? blockedEntries.size() : blocked == null ? 0 : 1;
+            return !enqueuedSource && this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) == observedBlocked;
         }
 
         Demand replyDemand(NetworkReply handoff) {
@@ -3222,34 +3273,41 @@ public final class ClientSession {
             return demand != null && demand.wireTicket == handoff.reply.ticket() ? demand : null;
         }
         void finishReply(NetworkReply handoff) { this.networkReplies.remove(handoff); handoff.transferred(); }
-        void drainNetworkReplies() throws IOException {
+        private boolean cacheWorkBlocksReply(Demand demand) {
+            return demand.workLease != null || demand.completedGeometry != null
+                    || demand.preservedPublication != null
+                    || demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
+                    || demand.installed && demand.cacheActivatedFrame >= this.renderedFrames
+                    && demand.activeContent.kind() != LocalSection.EMPTY;
+        }
+
+        /** Foreground passes release stale background records but transfer no cache-only work. */
+        boolean drainNetworkReplies(boolean cacheOnly) throws IOException {
+            boolean ready = true;
             for (var handoff : this.networkReplies) {
                 if (!this.helloAccepted && handoff.connectionEpoch == this.connectionEpoch) continue;
                 var demand = this.replyDemand(handoff);
                 if (demand == null) {
                     var downloads = this.networkOwner == null ? null : this.networkOwner.downloads;
                     var job = downloads == null ? null : downloads.job(handoff.reply.ticket());
-                    if (job == null || !downloads.current(job) || job.connection != this.connectionEpoch
+                    if (handoff.connectionEpoch != this.connectionEpoch || job == null || !downloads.current(job) || job.connection != this.connectionEpoch
                             || job.dimension.info.id() != handoff.reply.dimensionId()
                             || !job.dimension.info.worldIdentity().equals(handoff.reply.worldIdentity())) { this.finishReply(handoff); continue; }
                     if (handoff.reply.status() == RegionalProtocol.Status.NOT_READY) {
                         downloads.notReady(job); this.finishReply(handoff); continue;
                     }
-                    if (job.processing || this.demands.readyCount(SectionDemandTable.ReadyKind.SOURCE) != 0) continue;
+                    if (!cacheOnly || job.processing || !this.open.get()) continue;
                     var worker = this.idleWorker(); if (worker == null) continue;
                     job.processing = true;
                     if (worker.assign(new CacheOnlyTask(downloads, job, handoff.reply, handoff.catalog)) == null) throw new IllegalStateException("cache worker rejected record");
                     this.finishReply(handoff); continue;
                 }
+                if (cacheOnly) continue; // Promotion after the late pass belongs to foreground next turn.
                 var reply = handoff.reply;
                 if (reply.status() == RegionalProtocol.Status.NOT_READY) { this.finishReply(handoff); continue; }
                 if (Long.compareUnsigned(reply.generation(), demand.regionGeneration) < 0) { this.finishReply(handoff); continue; }
                 // The lane owns its one record while cache work/publication finishes. Never cancel cached work for refresh.
-                if (demand.workLease != null || demand.completedGeometry != null
-                        || demand.preservedPublication != null
-                        || demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
-                        || demand.installed && demand.cacheActivatedFrame >= this.renderedFrames
-                        && demand.activeContent.kind() != LocalSection.EMPTY) continue;
+                if (this.cacheWorkBlocksReply(demand)) continue;
                 var content = reply.content();
                 if (!demand.networkWanted && content.sameContent(demand.activeContent)) {
                     demand.regionGeneration = reply.generation(); demand.content = content; demand.activeContent = content;
@@ -3258,7 +3316,7 @@ public final class ClientSession {
                 var binding = content.kind() == LocalSection.DATA ? handoff.catalog : null;
                 if (content.kind() == LocalSection.DATA && binding == null) continue;
                 WorkerSlot worker = this.idleWorker(demand);
-                if (worker == null) continue;
+                if (worker == null) { ready = false; continue; }
                 this.demands.unlinkReady(demand); this.reviseDemand(demand);
                 demand.content = content; demand.catalog = binding; demand.regionGeneration = reply.generation(); this.networkWanted(demand, false);
                 var ticket = demand.ticket(this.id, worker.index);
@@ -3277,6 +3335,7 @@ public final class ClientSession {
                 this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
                 this.finishReply(handoff);
             }
+            return ready;
         }
 
         boolean publishEmpty(Demand demand) {

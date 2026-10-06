@@ -74,6 +74,8 @@ final class WorldCacheDownloads implements AutoCloseable {
     private static final class Node implements Comparable<Node> {
         final Dimension dimension;
         final int level, x, y, z;
+        boolean orderingVisible;
+        long orderingRank;
         Node(Dimension dimension, int level, int x, int y, int z) {
             this.dimension = dimension; this.level = level; this.x = x; this.y = y; this.z = z;
         }
@@ -89,9 +91,10 @@ final class WorldCacheDownloads implements AutoCloseable {
             return false;
         }
         long rank() { return WorldCacheDownloads.rank(this.level, this.x, this.z, this.dimension.x, this.dimension.z); }
+        void refreshOrdering() { this.orderingVisible = visible(); this.orderingRank = rank(); }
         @Override public int compareTo(Node other) {
-            int result = Boolean.compare(other.visible(), this.visible());
-            if (result == 0) result = Long.compare(this.rank(), other.rank());
+            int result = Boolean.compare(other.orderingVisible, this.orderingVisible);
+            if (result == 0) result = Long.compare(this.orderingRank, other.orderingRank);
             if (result == 0) result = Integer.compare(other.level, this.level);
             if (result == 0) result = Integer.compare(this.x, other.x);
             if (result == 0) result = Integer.compare(this.z, other.z);
@@ -153,6 +156,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         final Long2IntOpenHashMap pendingJobs = new Long2IntOpenHashMap();
         long directoryEpoch;
         PriorityQueue<Node> frontier = new PriorityQueue<>();
+        boolean orderingDirty;
         volatile RegionalProtocol.CatalogMessage catalogue;
         RegionalProtocol.Hash32 persistedCatalogue = RegionalProtocol.Hash32.ZERO;
         RegionalProtocol.Hash32 failedCatalogue;
@@ -170,10 +174,19 @@ final class WorldCacheDownloads implements AutoCloseable {
         Dimension(RegionalProtocol.DimensionInfo info, CompletedSectionCache cache) { this.info = info; this.cache = cache; }
         void anchor(int x, int z) {
             if (this.x == x && this.z == z) return;
-            this.x = x; this.z = z; reheap(); this.admissionBlocked.clear(); seed();
+            this.orderingDirty = true;
+            this.x = x; this.z = z; this.admissionBlocked.clear(); seed();
         }
-        void reheap() { this.frontier = new PriorityQueue<>(this.queued.values()); }
-        void resetFrontier() { this.frontier.clear(); this.queued.clear(); seed(); }
+        void normalizeOrdering() {
+            if (!this.orderingDirty) return;
+            // No comparison key changes while its node remains in a heap.
+            this.frontier.clear();
+            for (var node : this.queued.values()) node.refreshOrdering();
+            this.frontier = new PriorityQueue<>(this.queued.values());
+            this.orderingDirty = false;
+        }
+        void clearFrontier() { this.frontier.clear(); this.queued.clear(); this.orderingDirty = false; }
+        void resetFrontier() { clearFrontier(); seed(); }
         void seed() {
             for (int x = -1; x <= 0; x++) for (int z = -1; z <= 0; z++) offer(new Node(this, SEARCH_LEVEL, x, 0, z));
             for (long key : this.visibleRoots) expand(node(key));
@@ -228,7 +241,9 @@ final class WorldCacheDownloads implements AutoCloseable {
         }
         void offer(Node node) {
             if (!inside(node) || !height(node) || !saved(node) || this.queued.putIfAbsent(node.position(), node) != null) return;
-            this.frontier.add(node);
+            if (this.orderingDirty) return;
+            try { node.refreshOrdering(); this.frontier.add(node); }
+            catch (RuntimeException | Error failure) { this.orderingDirty = true; throw failure; }
         }
     }
 
@@ -359,7 +374,7 @@ final class WorldCacheDownloads implements AutoCloseable {
                 dimension.unreadableRegions.clear();
                 dimension.sourceSections = 0;
                 for (var job : List.copyOf(this.jobs.values())) if (job.dimension == dimension) remove(job, true);
-                dimension.frontier.clear(); dimension.queued.clear(); dimension.sourceBlocked.clear(); dimension.admissionBlocked.clear(); dimension.spaceBlocked.clear();
+                dimension.clearFrontier(); dimension.sourceBlocked.clear(); dimension.admissionBlocked.clear(); dimension.spaceBlocked.clear();
                 dimension.unpublishedRegions.clear(); dimension.parkedRegions.clear();
                 dimension.pendingBindings.clear();
             }
@@ -423,7 +438,9 @@ final class WorldCacheDownloads implements AutoCloseable {
         boolean changedDimension = this.activeDimension != dimensionId || this.viewedDimension != dimension;
         boolean sameScope = !changedDimension && this.viewedVisibility == visibility;
         boolean sameMembership = sameScope && this.viewedGeneration == visibility.generation();
-        if (sameMembership && dimension != null && dimension.x == x && dimension.z == z) return;
+        if (sameMembership && dimension != null && dimension.x == x && dimension.z == z) {
+            dimension.normalizeOrdering(); return;
+        }
         if (this.activeDimension != dimensionId) {
             var previous = this.dimensions.get(this.activeDimension);
             if (previous != null) clearVisible(previous);
@@ -441,6 +458,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         }
         if (!changedMembership && (changedDimension || changedAnchor))
             this.metadata.updateRetention(dimension.info.name(), x, z, dimension.visibleRegions);
+        dimension.normalizeOrdering();
         this.viewedDimension = dimension; this.viewedVisibility = visibility;
         this.viewedGeneration = visibility.generation();
     }
@@ -448,8 +466,14 @@ final class WorldCacheDownloads implements AutoCloseable {
         this.viewedDimension = null; this.viewedVisibility = null; this.viewedGeneration = Long.MIN_VALUE;
     }
     private void clearVisible(Dimension dimension) {
-        dimension.visibleRoots.clear(); dimension.visibleRegions.clear();
-        visibleChanged(dimension);
+        if (!dimension.visibleRoots.isEmpty()) dimension.orderingDirty = true;
+        try {
+            dimension.visibleRoots.clear(); dimension.visibleRegions.clear();
+            visibleChanged(dimension);
+        } catch (RuntimeException | Error failure) {
+            dimension.orderingDirty = true; throw failure;
+        }
+        dimension.normalizeOrdering();
     }
     private boolean resyncVisible(Dimension dimension, VisibleSectionState visibility) {
         var added = new LongArrayList();
@@ -457,32 +481,51 @@ final class WorldCacheDownloads implements AutoCloseable {
             long key = keys.nextLong();
             if (!dimension.visibleRoots.contains(key)) added.add(key);
         }
-        boolean changed = !added.isEmpty() || dimension.visibleRoots.size() != visibility.keys().size()
-                || !dimension.visibleRegions.equals(visibility.regions());
-        dimension.visibleRoots.clear(); dimension.visibleRoots.addAll(visibility.keys());
-        dimension.visibleRegions.clear(); dimension.visibleRegions.addAll(visibility.regions());
-        if (!changed) return false;
-        visibleChanged(dimension);
-        for (int index = 0; index < added.size(); index++) dimension.expand(dimension.node(added.getLong(index)));
+        boolean changedRoots = !added.isEmpty() || dimension.visibleRoots.size() != visibility.keys().size();
+        boolean changedRegions = !dimension.visibleRegions.equals(visibility.regions());
+        if (!changedRoots && !changedRegions) return false;
+        if (changedRoots) dimension.orderingDirty = true;
+        try {
+            if (changedRoots) { dimension.visibleRoots.clear(); dimension.visibleRoots.addAll(visibility.keys()); }
+            if (changedRegions) { dimension.visibleRegions.clear(); dimension.visibleRegions.addAll(visibility.regions()); }
+            visibleChanged(dimension);
+            for (int index = 0; index < added.size(); index++) dimension.expand(dimension.node(added.getLong(index)));
+        } catch (RuntimeException | Error failure) {
+            dimension.orderingDirty = true; throw failure;
+        }
         return true;
     }
     private boolean applyVisibleDelta(Dimension dimension, VisibleSectionState visibility) {
         boolean changed = false;
         var added = visibility.addedKeys();
-        for (int index = 0; index < added.size(); index++) changed |= dimension.visibleRoots.add(added.getLong(index));
         var removed = visibility.removedKeys();
-        for (int index = 0; index < removed.size(); index++) changed |= dimension.visibleRoots.remove(removed.getLong(index));
-        var addedRegions = visibility.addedRegions();
-        for (int index = 0; index < addedRegions.size(); index++) changed |= dimension.visibleRegions.add(addedRegions.getLong(index));
-        var removedRegions = visibility.removedRegions();
-        for (int index = 0; index < removedRegions.size(); index++) changed |= dimension.visibleRegions.remove(removedRegions.getLong(index));
-        if (!changed) return false;
-        visibleChanged(dimension);
-        for (int index = 0; index < added.size(); index++) dimension.expand(dimension.node(added.getLong(index)));
+        try {
+            for (int index = 0; index < added.size(); index++) {
+                long key = added.getLong(index);
+                if (!dimension.visibleRoots.contains(key)) {
+                    dimension.orderingDirty = true; changed |= dimension.visibleRoots.add(key);
+                }
+            }
+            for (int index = 0; index < removed.size(); index++) {
+                long key = removed.getLong(index);
+                if (dimension.visibleRoots.contains(key)) {
+                    dimension.orderingDirty = true; changed |= dimension.visibleRoots.remove(key);
+                }
+            }
+            var addedRegions = visibility.addedRegions();
+            for (int index = 0; index < addedRegions.size(); index++) changed |= dimension.visibleRegions.add(addedRegions.getLong(index));
+            var removedRegions = visibility.removedRegions();
+            for (int index = 0; index < removedRegions.size(); index++) changed |= dimension.visibleRegions.remove(removedRegions.getLong(index));
+            if (!changed) return false;
+            visibleChanged(dimension);
+            for (int index = 0; index < added.size(); index++) dimension.expand(dimension.node(added.getLong(index)));
+        } catch (RuntimeException | Error failure) {
+            dimension.orderingDirty = true; throw failure;
+        }
         return true;
     }
     private void visibleChanged(Dimension dimension) {
-        dimension.reheap(); trimCoverage(dimension);
+        trimCoverage(dimension);
         this.metadata.updateRetention(dimension.info.name(), dimension.x, dimension.z, dimension.visibleRegions);
         for (var job : List.copyOf(this.jobs.values())) if (job.dimension == dimension && job.purpose == 3
                 && !dimension.node(job.key).visible() && !job.processing) {
@@ -609,6 +652,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         });
         for (var dimension : ordered) {
             if (!dimension.inventoryReady) continue;
+            dimension.normalizeOrdering();
             while (!dimension.frontier.isEmpty()) {
                 Node node = dimension.frontier.remove(); dimension.queued.remove(node.position());
                 if (!dimension.inside(node) || !dimension.height(node) || !dimension.saved(node)) continue;
@@ -841,6 +885,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         invalidateView();
         for (var dimension : this.dimensions.values()) {
             if (!sameConnection) { dimension.inventoryReady = false; dimension.inventoryComplete = false; }
+            dimension.orderingDirty = true;
             dimension.visibleRoots.clear(); dimension.visibleRegions.clear(); dimension.admissionBlocked.clear(); dimension.spaceBlocked.clear();
             dimension.probeRegion = Long.MIN_VALUE;
             invalidateDirectories(dimension); clearCoverage(dimension); dimension.resetFrontier();

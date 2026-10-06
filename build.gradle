@@ -278,12 +278,14 @@ tasks.register('sectionKeyContainmentTest', JavaExec) {
 [
     visibilityMembershipTest: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest',
     worldCacheVisibilityTest: 'me.cortex.voxy.client.lod.WorldCacheVisibilityBehaviorTest',
+    worldCacheRankingBenchmark: 'me.cortex.voxy.client.lod.WorldCacheVisibilityBehaviorTest',
     visibilityMembershipBenchmark: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest'
 ].each { name, entrypoint ->
     tasks.register(name, JavaExec) {
         description = name == 'visibilityMembershipBenchmark'
                 ? 'Replay visibility traces against the former full-rebuild algorithm'
                 : 'Verify visibility membership and planner lifecycle behavior offline'
+        if (name == 'worldCacheRankingBenchmark') description = 'Replay exact frontier ordering against the former live-comparison algorithm'
         dependsOn tasks.named('schedulerTestClasses')
         classpath = sourceSets.schedulerTest.runtimeClasspath
         mainClass.set(entrypoint)
@@ -291,6 +293,10 @@ tasks.register('sectionKeyContainmentTest', JavaExec) {
         jvmArgs '-Xmx2g', "-Djava.io.tmpdir=${scratch.get().asFile}"
         doFirst { scratch.get().asFile.mkdirs() }
         if (name == 'visibilityMembershipBenchmark') args '--benchmark'
+        if (name == 'worldCacheRankingBenchmark') args '--benchmark'
+        if (name == 'worldCacheRankingBenchmark' && providers.gradleProperty('voxyRankingSizeAgent').isPresent()) {
+            jvmArgs '-javaagent:' + providers.gradleProperty('voxyRankingSizeAgent').get()
+        }
     }
 }
 
@@ -421,6 +427,26 @@ tasks.register('cacheLoadingOwnerEfficiencyTest') {
             dependsOn 'cacheLoading' + fixture + mode + 'Test'
         }
     }
+}
+['Normal', 'Debug'].each { mode ->
+    tasks.register('cacheDownloadAdmission' + mode + 'Test', JavaExec) {
+        group = 'verification'
+        description = 'Verify foreground, source and cache-download admission in the ' + mode.toLowerCase() + ' client'
+        dependsOn tasks.named('schedulerTestClasses')
+        if (mode == 'Debug') dependsOn tasks.named('compileDebugJava')
+        classpath = mode == 'Debug'
+                ? sourceSets.debug.output + sourceSets.schedulerTest.runtimeClasspath
+                : sourceSets.schedulerTest.runtimeClasspath
+        mainClass.set('me.cortex.voxy.client.lod.CacheDownloadAdmissionBehaviorTest')
+        def scratch = layout.buildDirectory.dir('download-admission-test-tmp')
+        doFirst { scratch.get().asFile.mkdirs() }
+        jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
+    }
+}
+tasks.register('cacheDownloadContinuityTest') {
+    group = 'verification'
+    description = 'Verify exact world-cache ranking and continuous download admission'
+    dependsOn 'worldCacheVisibilityTest', 'cacheDownloadAdmissionNormalTest', 'cacheDownloadAdmissionDebugTest'
 }
 tasks.register('verifyClientOwnershipArtifacts') {
     dependsOn 'jar', 'debugJar'
