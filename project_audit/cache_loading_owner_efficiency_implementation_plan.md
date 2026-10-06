@@ -1,6 +1,11 @@
 # Reduce repeated cache-loading owner work
 
-Status: implementation plan only; no runtime changes implemented.
+Status: implemented in client266, commit `6957a5432f1baaaa74459def6449cdc86aec2513`.
+Focused ownership/order/lifetime checks and both client builds passed. Client266
+was confirmed loaded on GIORKOSPC and its screenshot inspected. Live acceptance
+is **partial / TIMEOUT**: cleanup exceeded the ten-minute ceiling and the retained
+window does not establish a controlled warm-cache speedup. See the
+[implementation and evidence report](cache_loading_owner_efficiency_implementation_266.md).
 Written 2026-10-06 against `336b8cba6963017a1549fff3f43f1c311b99a7bb`.
 Repository: `/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates`.
 Branch: `feature/cache-first-background-updates`.
