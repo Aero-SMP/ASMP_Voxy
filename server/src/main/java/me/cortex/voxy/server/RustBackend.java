@@ -194,6 +194,7 @@ final class RustBackend {
                             if (fields.length != 3 || fields[1].length() != 64) throw new IOException("malformed route readiness");
                             owned.saves.routeReady(child, fields[1], Integer.parseInt(fields[2]));
                         }
+                        ServerDebug.nativeLine(child, line);
                         // Control processing precedes presentation; degraded logging still drains.
                         String message = line.startsWith("VOXY_ROUTE_READY ")
                                 ? "VOXY_ROUTE_READY authenticated route registered" : line;
@@ -322,6 +323,7 @@ final class RustBackend {
                     }
                 }
                 owned.exitCode = child.exitValue();
+                ServerDebug.nativeExited(child);
                 // Exit is proven before relinquishing ownership, even if a pipe close fails.
                 for (int pipe = 0; pipe < 3; pipe++) closePipe(owned, child, pipe);
                 owned.child = null;
@@ -401,6 +403,13 @@ final class RustBackend {
     static void revoke(byte[] token) {
         Owner current = owner;
         if (current != null && current.wanted) current.saves.revoke(token);
+    }
+
+    static java.util.concurrent.CompletableFuture<Void> command(Process target, byte[] frame) {
+        Owner current = owner;
+        return current == null || !current.wanted || current.child != target
+                ? java.util.concurrent.CompletableFuture.failedFuture(new IOException("native owner changed"))
+                : current.saves.command(target, frame);
     }
 
     static ReadyRecord ready() {

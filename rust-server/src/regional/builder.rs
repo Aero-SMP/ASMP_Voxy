@@ -68,76 +68,80 @@ pub fn rebuild_region_incremental(
     generation: u64,
     layout: RegionLayout,
 ) -> Result<RegionalBuild> {
-    #[cfg(test)]
-    super::faults::hit("incremental", output.as_ref())?;
-    if changed_groups.is_empty()
-        || previous.region() != (header.region_x, header.region_z)
-        || previous.layout() != layout
-        || source_table.terrain_generation != generation
-    {
-        bail!("incremental regional rebuild identity is invalid");
-    }
-    let initial_catalog = read_lock(registry)?.snapshot();
-    let initial_catalog_bytes = Catalog::from_snapshot(&initial_catalog)?.encode()?;
-    let mut file = RegionFileBuilder::new(
-        world_identity,
-        *blake3::hash(&initial_catalog_bytes).as_bytes(),
-        initial_catalog.catalog_id,
-        header.region_x,
-        header.region_z,
-        generation,
-        layout,
-    )?;
-    let mut stats = RegionalBuildStats::default();
-    let mut affected_horizontal = vec![BTreeSet::new(); layout.levels as usize];
-    affected_horizontal[0] = changed_groups.clone();
-    for lod in 1..layout.levels as usize {
-        affected_horizontal[lod] = affected_horizontal[lod - 1]
-            .iter()
-            .map(|&(x, z)| (x.div_euclid(2), z.div_euclid(2)))
-            .collect();
-    }
-
-    let top = layout.levels - 1;
-    for &(x, z) in &affected_horizontal[top as usize] {
-        let column = rebuild_changed_column(
-            source,
-            registry,
-            previous,
-            &mut file,
-            layout,
-            &affected_horizontal,
-            top,
-            x,
-            z,
-            &mut stats,
-        )?;
-        insert_column(&mut file, column)?;
-    }
-
-    let final_catalog = {
-        let mut registry = write_lock(registry)?;
-        registry.save()?;
-        registry.snapshot()
-    };
-    if final_catalog.catalog_id != initial_catalog.catalog_id {
-        bail!("catalog identity changed during an incremental regional rebuild");
-    }
-    let final_catalog_bytes = Catalog::from_snapshot(&final_catalog)?.encode()?;
-    file.set_catalog_fingerprint(*blake3::hash(&final_catalog_bytes).as_bytes())?;
-
-    for ordinal in 0..layout.entry_count()? {
-        let coordinate = layout.coordinate(header.region_x, header.region_z, ordinal)?;
-        if !affected_horizontal[coordinate.level as usize].contains(&(coordinate.x, coordinate.z)) {
-            file.copy_ordinal_from(previous, ordinal)
-                .context(UnusableBaseline)?;
-            stats.reused_sections +=
-                usize::from(previous.entry_ordinal(ordinal as u32)?.is_present());
+    crate::diagnostics::sync_result(crate::diagnostics::Stage::IncrementalBuild, || {
+        #[cfg(test)]
+        super::faults::hit("incremental", output.as_ref())?;
+        if changed_groups.is_empty()
+            || previous.region() != (header.region_x, header.region_z)
+            || previous.layout() != layout
+            || source_table.terrain_generation != generation
+        {
+            bail!("incremental regional rebuild identity is invalid");
         }
-    }
+        let initial_catalog = read_lock(registry)?.snapshot();
+        let initial_catalog_bytes = Catalog::from_snapshot(&initial_catalog)?.encode()?;
+        let mut file = RegionFileBuilder::new(
+            world_identity,
+            *blake3::hash(&initial_catalog_bytes).as_bytes(),
+            initial_catalog.catalog_id,
+            header.region_x,
+            header.region_z,
+            generation,
+            layout,
+        )?;
+        let mut stats = RegionalBuildStats::default();
+        let mut affected_horizontal = vec![BTreeSet::new(); layout.levels as usize];
+        affected_horizontal[0] = changed_groups.clone();
+        for lod in 1..layout.levels as usize {
+            affected_horizontal[lod] = affected_horizontal[lod - 1]
+                .iter()
+                .map(|&(x, z)| (x.div_euclid(2), z.div_euclid(2)))
+                .collect();
+        }
 
-    verify_header(source, header)?;
-    publish(file, output.as_ref(), source_table.clone(), stats)
+        let top = layout.levels - 1;
+        for &(x, z) in &affected_horizontal[top as usize] {
+            let column = rebuild_changed_column(
+                source,
+                registry,
+                previous,
+                &mut file,
+                layout,
+                &affected_horizontal,
+                top,
+                x,
+                z,
+                &mut stats,
+            )?;
+            insert_column(&mut file, column)?;
+        }
+
+        let final_catalog = {
+            let mut registry = write_lock(registry)?;
+            registry.save()?;
+            registry.snapshot()
+        };
+        if final_catalog.catalog_id != initial_catalog.catalog_id {
+            bail!("catalog identity changed during an incremental regional rebuild");
+        }
+        let final_catalog_bytes = Catalog::from_snapshot(&final_catalog)?.encode()?;
+        file.set_catalog_fingerprint(*blake3::hash(&final_catalog_bytes).as_bytes())?;
+
+        for ordinal in 0..layout.entry_count()? {
+            let coordinate = layout.coordinate(header.region_x, header.region_z, ordinal)?;
+            if !affected_horizontal[coordinate.level as usize]
+                .contains(&(coordinate.x, coordinate.z))
+            {
+                file.copy_ordinal_from(previous, ordinal)
+                    .context(UnusableBaseline)?;
+                stats.reused_sections +=
+                    usize::from(previous.entry_ordinal(ordinal as u32)?.is_present());
+            }
+        }
+
+        verify_header(source, header)?;
+        publish(file, output.as_ref(), source_table.clone(), stats)
+    })
 }
 
 type SectionColumn = BTreeMap<i32, Section>;
@@ -166,7 +170,13 @@ fn rebuild_changed_column(
         if group.chunks.iter().any(Option::is_some) {
             for y in layout.level_y_range(0)? {
                 let key = SectionKey::new(0, x, y, z)?;
-                sections.insert(y, group.build(key, source)?.section);
+                sections.insert(
+                    y,
+                    crate::diagnostics::sync_result(crate::diagnostics::Stage::LodBuild, || {
+                        group.build(key, source)
+                    })?
+                    .section,
+                );
                 stats.sections_by_level[0] += 1;
             }
         }
@@ -229,7 +239,12 @@ fn rebuild_changed_column(
                 .or(loaded[slot].as_ref())
         });
         if inputs.iter().any(Option::is_some) {
-            parents.insert(y, build_parent_from_refs(key, &inputs, &opacity)?);
+            parents.insert(
+                y,
+                crate::diagnostics::sync_result(crate::diagnostics::Stage::LodBuild, || {
+                    build_parent_from_refs(key, &inputs, &opacity)
+                })?,
+            );
             stats.sections_by_level[level as usize] += 1;
         }
     }
@@ -262,150 +277,162 @@ pub fn rebuild_region(
     generation: u64,
     layout: RegionLayout,
 ) -> Result<RegionalBuild> {
-    #[cfg(test)]
-    super::faults::hit("full", output.as_ref())?;
-    if header.entries.len() != 1024 {
-        bail!("regional rebuild requires exactly 1024 Anvil header entries");
-    }
-    let initial_catalog = read_lock(registry)?.snapshot();
-    let initial_catalog_bytes = Catalog::from_snapshot(&initial_catalog)?.encode()?;
-    let mut file = RegionFileBuilder::new(
-        world_identity,
-        *blake3::hash(&initial_catalog_bytes).as_bytes(),
-        initial_catalog.catalog_id,
-        header.region_x,
-        header.region_z,
-        generation,
-        layout,
-    )?;
-    let mut source_table = RegionSourceTable::new(
-        header.region_x,
-        header.region_z,
-        generation,
-        header.file_marker,
-    )?;
-    let base_group_x = header
-        .region_x
-        .checked_mul(16)
-        .context("regional group x overflow")?;
-    let base_group_z = header
-        .region_z
-        .checked_mul(16)
-        .context("regional group z overflow")?;
-    let mut stats = RegionalBuildStats::default();
-    let mut level = BTreeMap::<SectionKey, Section>::new();
-
-    // Four adjacent 32-cubed level-zero columns are precisely the children needed by one LOD-1
-    // column. This keeps decoded NBT and level-zero cells bounded to sixteen source chunks.
-    for tile_z in 0..8i32 {
-        for tile_x in 0..8i32 {
-            let first_group_x = base_group_x + tile_x * 2;
-            let first_group_z = base_group_z + tile_z * 2;
-            let mut groups = Vec::with_capacity(4);
-            for dz in 0..2i32 {
-                for dx in 0..2i32 {
-                    let group = source.load_level_zero_group(
-                        first_group_x + dx,
-                        first_group_z + dz,
-                        registry,
-                    )?;
-                    stats.chunks_read += 4;
-                    for (chunk_index, chunk) in group.chunks.iter().enumerate() {
-                        let chunk_x = (first_group_x + dx) * 2 + (chunk_index as i32 & 1);
-                        let chunk_z = (first_group_z + dz) * 2 + (chunk_index as i32 >> 1);
-                        let local_x = chunk_x.rem_euclid(32) as u8;
-                        let local_z = chunk_z.rem_euclid(32) as u8;
-                        let slot = local_x as usize + local_z as usize * 32;
-                        let entry = header.entries[slot];
-                        let generated = chunk.is_some();
-                        stats.generated_chunks += usize::from(generated);
-                        source_table.set_record(
-                            local_x,
-                            local_z,
-                            ChunkSourceRecord {
-                                generated,
-                                anvil_location: entry.location,
-                                anvil_timestamp: entry.timestamp,
-                                semantic_fingerprint: chunk
-                                    .as_ref()
-                                    .map_or([0; 2], |chunk| chunk.terrain_fingerprint),
-                            },
-                        )?;
-                    }
-                    groups.push(group);
-                }
-            }
-
-            let opacity = read_lock(registry)?.opacity_table();
-            let mut children = BTreeMap::<SectionKey, Section>::new();
-            for group in &groups {
-                if group.chunks.iter().all(Option::is_none) {
-                    continue;
-                }
-                for y in layout.level_y_range(0)? {
-                    let key = SectionKey::new(0, group.x, y, group.z)?;
-                    let section = group.build(key, source)?.section;
-                    insert_frame(&mut file, &section)?;
-                    stats.sections_by_level[0] += 1;
-                    children.insert(key, section);
-                }
-            }
-
-            let parent_x = first_group_x.div_euclid(2);
-            let parent_z = first_group_z.div_euclid(2);
-            for y in layout.level_y_range(1)? {
-                let key = SectionKey::new(1, parent_x, y, parent_z)?;
-                let inputs = child_refs(key, &children)?;
-                if inputs.iter().all(Option::is_none) {
-                    continue;
-                }
-                let section = build_parent_from_refs(key, &inputs, &opacity)?;
-                insert_frame(&mut file, &section)?;
-                stats.sections_by_level[1] += 1;
-                level.insert(key, section);
-            }
+    crate::diagnostics::sync_result(crate::diagnostics::Stage::FullBuild, || {
+        #[cfg(test)]
+        super::faults::hit("full", output.as_ref())?;
+        if header.entries.len() != 1024 {
+            bail!("regional rebuild requires exactly 1024 Anvil header entries");
         }
-    }
+        let initial_catalog = read_lock(registry)?.snapshot();
+        let initial_catalog_bytes = Catalog::from_snapshot(&initial_catalog)?.encode()?;
+        let mut file = RegionFileBuilder::new(
+            world_identity,
+            *blake3::hash(&initial_catalog_bytes).as_bytes(),
+            initial_catalog.catalog_id,
+            header.region_x,
+            header.region_z,
+            generation,
+            layout,
+        )?;
+        let mut source_table = RegionSourceTable::new(
+            header.region_x,
+            header.region_z,
+            generation,
+            header.file_marker,
+        )?;
+        let base_group_x = header
+            .region_x
+            .checked_mul(16)
+            .context("regional group x overflow")?;
+        let base_group_z = header
+            .region_z
+            .checked_mul(16)
+            .context("regional group z overflow")?;
+        let mut stats = RegionalBuildStats::default();
+        let mut level = BTreeMap::<SectionKey, Section>::new();
 
-    let final_catalog = {
-        let mut registry = write_lock(registry)?;
-        registry.save()?;
-        registry.snapshot()
-    };
-    if final_catalog.catalog_id != initial_catalog.catalog_id {
-        bail!("catalog identity changed during a regional rebuild");
-    }
-    let final_catalog_bytes = Catalog::from_snapshot(&final_catalog)?.encode()?;
-    file.set_catalog_fingerprint(*blake3::hash(&final_catalog_bytes).as_bytes())?;
-    let opacity = read_lock(registry)?.opacity_table();
+        // Four adjacent 32-cubed level-zero columns are precisely the children needed by one LOD-1
+        // column. This keeps decoded NBT and level-zero cells bounded to sixteen source chunks.
+        for tile_z in 0..8i32 {
+            for tile_x in 0..8i32 {
+                let first_group_x = base_group_x + tile_x * 2;
+                let first_group_z = base_group_z + tile_z * 2;
+                let mut groups = Vec::with_capacity(4);
+                for dz in 0..2i32 {
+                    for dx in 0..2i32 {
+                        let group = source.load_level_zero_group(
+                            first_group_x + dx,
+                            first_group_z + dz,
+                            registry,
+                        )?;
+                        stats.chunks_read += 4;
+                        for (chunk_index, chunk) in group.chunks.iter().enumerate() {
+                            let chunk_x = (first_group_x + dx) * 2 + (chunk_index as i32 & 1);
+                            let chunk_z = (first_group_z + dz) * 2 + (chunk_index as i32 >> 1);
+                            let local_x = chunk_x.rem_euclid(32) as u8;
+                            let local_z = chunk_z.rem_euclid(32) as u8;
+                            let slot = local_x as usize + local_z as usize * 32;
+                            let entry = header.entries[slot];
+                            let generated = chunk.is_some();
+                            stats.generated_chunks += usize::from(generated);
+                            source_table.set_record(
+                                local_x,
+                                local_z,
+                                ChunkSourceRecord {
+                                    generated,
+                                    anvil_location: entry.location,
+                                    anvil_timestamp: entry.timestamp,
+                                    semantic_fingerprint: chunk
+                                        .as_ref()
+                                        .map_or([0; 2], |chunk| chunk.terrain_fingerprint),
+                                },
+                            )?;
+                        }
+                        groups.push(group);
+                    }
+                }
 
-    for lod in 2..layout.levels {
-        let side = layout.horizontal_side(lod)? as i32;
-        let base_x = header.region_x * side;
-        let base_z = header.region_z * side;
-        let mut parents = BTreeMap::<SectionKey, Section>::new();
-        for y in layout.level_y_range(lod)? {
-            for z in base_z..base_z + side {
-                for x in base_x..base_x + side {
-                    let key = SectionKey::new(lod, x, y, z)?;
-                    let inputs = child_refs(key, &level)?;
+                let opacity = read_lock(registry)?.opacity_table();
+                let mut children = BTreeMap::<SectionKey, Section>::new();
+                for group in &groups {
+                    if group.chunks.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    for y in layout.level_y_range(0)? {
+                        let key = SectionKey::new(0, group.x, y, group.z)?;
+                        let section = crate::diagnostics::sync_result(
+                            crate::diagnostics::Stage::LodBuild,
+                            || group.build(key, source),
+                        )?
+                        .section;
+                        insert_frame(&mut file, &section)?;
+                        stats.sections_by_level[0] += 1;
+                        children.insert(key, section);
+                    }
+                }
+
+                let parent_x = first_group_x.div_euclid(2);
+                let parent_z = first_group_z.div_euclid(2);
+                for y in layout.level_y_range(1)? {
+                    let key = SectionKey::new(1, parent_x, y, parent_z)?;
+                    let inputs = child_refs(key, &children)?;
                     if inputs.iter().all(Option::is_none) {
                         continue;
                     }
-                    let section = build_parent_from_refs(key, &inputs, &opacity)?;
+                    let section = crate::diagnostics::sync_result(
+                        crate::diagnostics::Stage::LodBuild,
+                        || build_parent_from_refs(key, &inputs, &opacity),
+                    )?;
                     insert_frame(&mut file, &section)?;
-                    stats.sections_by_level[lod as usize] += 1;
-                    parents.insert(key, section);
+                    stats.sections_by_level[1] += 1;
+                    level.insert(key, section);
                 }
             }
         }
-        level = parents;
-    }
 
-    // Publication must describe one source snapshot. A changed marker/header aborts this bounded
-    // transaction; the caller retries the region rather than publishing mixed old/new cells.
-    verify_header(source, header)?;
-    publish(file, output.as_ref(), source_table, stats)
+        let final_catalog = {
+            let mut registry = write_lock(registry)?;
+            registry.save()?;
+            registry.snapshot()
+        };
+        if final_catalog.catalog_id != initial_catalog.catalog_id {
+            bail!("catalog identity changed during a regional rebuild");
+        }
+        let final_catalog_bytes = Catalog::from_snapshot(&final_catalog)?.encode()?;
+        file.set_catalog_fingerprint(*blake3::hash(&final_catalog_bytes).as_bytes())?;
+        let opacity = read_lock(registry)?.opacity_table();
+
+        for lod in 2..layout.levels {
+            let side = layout.horizontal_side(lod)? as i32;
+            let base_x = header.region_x * side;
+            let base_z = header.region_z * side;
+            let mut parents = BTreeMap::<SectionKey, Section>::new();
+            for y in layout.level_y_range(lod)? {
+                for z in base_z..base_z + side {
+                    for x in base_x..base_x + side {
+                        let key = SectionKey::new(lod, x, y, z)?;
+                        let inputs = child_refs(key, &level)?;
+                        if inputs.iter().all(Option::is_none) {
+                            continue;
+                        }
+                        let section = crate::diagnostics::sync_result(
+                            crate::diagnostics::Stage::LodBuild,
+                            || build_parent_from_refs(key, &inputs, &opacity),
+                        )?;
+                        insert_frame(&mut file, &section)?;
+                        stats.sections_by_level[lod as usize] += 1;
+                        parents.insert(key, section);
+                    }
+                }
+            }
+            level = parents;
+        }
+
+        // Publication must describe one source snapshot. A changed marker/header aborts this bounded
+        // transaction; the caller retries the region rather than publishing mixed old/new cells.
+        verify_header(source, header)?;
+        publish(file, output.as_ref(), source_table, stats)
+    })
 }
 
 fn publish(

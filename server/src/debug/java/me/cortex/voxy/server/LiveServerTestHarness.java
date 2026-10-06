@@ -58,6 +58,8 @@ final class LiveServerTestHarness {
 
     private LiveServerTestHarness() {}
 
+    static boolean permitsPressure(UUID runId) { return active == null || active.runId.equals(runId); }
+
     static void register(IEventBus modBus) {
         modBus.addListener(LiveServerTestHarness::registerPayload);
         NeoForge.EVENT_BUS.addListener(LiveServerTestHarness::registerCommands);
@@ -188,6 +190,7 @@ final class LiveServerTestHarness {
     private static int begin(CommandSourceStack source, ServerPlayer player, UUID runId,
                              String scenarioHash) {
         if (active != null) return fail(source, "another Voxy test run is active");
+        if (LivePressureRoutes.ownedByOther(runId)) return fail(source, "another pressure test owner is active");
         if (!isSha256(scenarioHash)) return fail(source, "scenario must be a SHA-256 hex value");
         Capability capability = CLIENTS.get(player.getUUID());
         if (capability == null || !player.connection.hasChannel(DebugTestCommandPayload.TYPE)) {

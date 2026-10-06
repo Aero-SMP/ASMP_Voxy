@@ -436,6 +436,7 @@ impl RegionalService {
             .collect::<Vec<_>>();
         for (dimension, runtime) in runtimes {
             let refresh = runtime.refresh(round)?;
+            let fanout = crate::diagnostics::Span::sync(crate::diagnostics::Stage::Fanout);
             // A replacement may finish once refresh releases its maintenance lock. Keep
             // announcement emission ordered before insertion, or discard the old result;
             // otherwise its inventory revision could poison a fresh replacement session.
@@ -444,6 +445,7 @@ impl RegionalService {
                 .get(&dimension)
                 .is_some_and(|entry| Arc::ptr_eq(&entry.runtime, &runtime))
             {
+                fanout.finish(true, 0);
                 continue;
             }
             if refresh.inventory_changed {
@@ -484,6 +486,7 @@ impl RegionalService {
                     region_z,
                 });
             }
+            fanout.finish(true, 0);
         }
         Ok(result)
     }
@@ -524,7 +527,13 @@ async fn publication_loop(service: Weak<RegionalService>, poll_interval: Duratio
         let wake = current.wake.clone();
         round.advance(Instant::now());
         let number = round.number;
-        let refresh = tokio::task::spawn_blocking(move || current.refresh_all(number)).await;
+        let refresh = crate::diagnostics::blocking(
+            crate::diagnostics::Stage::PublicationQueue,
+            crate::diagnostics::Stage::PublicationWork,
+            crate::diagnostics::Stage::PublicationResume,
+            move || current.refresh_all(number),
+        )
+        .await;
         let more = match refresh {
             Ok(Ok(status)) => status.more_pending,
             Ok(Err(error)) => {
@@ -742,15 +751,20 @@ impl CatalogCache {
 
     fn get(&self) -> Result<CachedCatalog> {
         let generation = read_lock(&self.registry)?.generation();
+        let waiting = crate::diagnostics::Span::sync(crate::diagnostics::Stage::CatalogueLock);
         let mut current = self
             .current
             .lock()
             .map_err(|_| anyhow::anyhow!("regional catalog cache lock poisoned"))?;
+        waiting.finish(true, 0);
         if let Some(cached) = current.as_ref()
             && cached.generation == generation
         {
+            crate::diagnostics::hit(2);
             return Ok(cached.clone());
         }
+        crate::diagnostics::hit(3);
+        let building = crate::diagnostics::Span::sync(crate::diagnostics::Stage::CatalogueBuild);
         let started = Instant::now();
         let snapshot = read_lock(&self.registry)?.snapshot();
         let canonical = Catalog::from_snapshot(&snapshot)?.encode()?;
@@ -765,7 +779,7 @@ impl CatalogCache {
         payload.extend_from_slice(&compressed_length.to_le_bytes());
         payload.extend_from_slice(&compressed);
         let payload: Arc<[u8]> = payload.into();
-        if self.trace {
+        if self.trace && !crate::diagnostics::quiet() {
             eprintln!(
                 "VOXY_CATALOG_BUILT catalog_id={} generation={} fingerprint={} canonical_bytes={canonical_length} compressed_bytes={compressed_length} build_ns={}",
                 snapshot.catalog_id,
@@ -785,6 +799,7 @@ impl CatalogCache {
             }),
         };
         *current = Some(cached.clone());
+        building.finish(true, (canonical.len() + compressed.len()) as u64);
         Ok(cached)
     }
 }

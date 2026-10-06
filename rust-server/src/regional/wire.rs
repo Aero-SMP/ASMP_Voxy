@@ -475,6 +475,7 @@ async fn read_control_frame<R: AsyncRead + Unpin>(
     input: &mut R,
     trace: Option<(u64, &str)>,
 ) -> Result<Option<ControlMessage>> {
+    let reading = crate::diagnostics::Span::new(crate::diagnostics::Stage::ControlRead);
     let kind = match input.read_u8().await {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -503,7 +504,11 @@ async fn read_control_frame<R: AsyncRead + Unpin>(
             );
         }
     }
-    decode_control_payload(kind, &bytes).map(Some)
+    reading.finish(true, length as u64);
+    let decoding = crate::diagnostics::Span::sync(crate::diagnostics::Stage::ControlDecode);
+    let decoded = decode_control_payload(kind, &bytes).map(Some);
+    decoding.finish(decoded.is_ok(), length as u64);
+    decoded
 }
 
 fn maximum_payload(kind: u8) -> Result<usize> {
@@ -880,7 +885,9 @@ mod bandwidth_tests {
                     interval_millis: 2_000,
                     bandwidth_kbps,
                     refresh_allowed: true,
-                }.validate().is_err()
+                }
+                .validate()
+                .is_err()
             );
         }
         assert!(
@@ -888,7 +895,9 @@ mod bandwidth_tests {
                 interval_millis: 999,
                 bandwidth_kbps: 0,
                 refresh_allowed: true,
-            }.validate().is_err()
+            }
+            .validate()
+            .is_err()
         );
     }
 }

@@ -359,6 +359,7 @@ impl RegionFileBuilder {
     }
 
     pub fn insert(&mut self, coordinate: SectionCoordinate, frame: SectionFrame) -> Result<()> {
+        let encoding = crate::diagnostics::Span::sync(crate::diagnostics::Stage::EncodeCompress);
         let index = self
             .layout
             .index(self.region_x, self.region_z, coordinate)?;
@@ -399,6 +400,7 @@ impl RegionFileBuilder {
             directory: entry,
             payload,
         };
+        encoding.finish(true, entry.compressed_length as u64);
         Ok(())
     }
 
@@ -439,6 +441,7 @@ impl RegionFileBuilder {
     /// Writes exactly one bounded shard transaction. The final name is never visible until the
     /// complete file and data have crossed a durability barrier.
     pub fn write_atomic(mut self, path: impl AsRef<Path>) -> Result<RegionFile> {
+        let writing = crate::diagnostics::Span::sync(crate::diagnostics::Stage::TerrainWrite);
         let path = path.as_ref();
         let parent = path
             .parent()
@@ -508,6 +511,8 @@ impl RegionFileBuilder {
                         length,
                         crc,
                     }) => {
+                        let copying =
+                            crate::diagnostics::Span::sync(crate::diagnostics::Stage::ReusedCopy);
                         let mut remaining = length as usize;
                         let mut actual_crc = 0;
                         while remaining != 0 {
@@ -526,6 +531,7 @@ impl RegionFileBuilder {
                             )
                             .context(super::builder::UnusableBaseline));
                         }
+                        copying.finish(true, length as u64);
                     }
                     None => {}
                 }
@@ -533,6 +539,7 @@ impl RegionFileBuilder {
             if file.metadata()?.len() != file_length {
                 bail!("regional file writer produced an unexpected length");
             }
+            let publishing = crate::diagnostics::Span::sync(crate::diagnostics::Stage::FsyncRename);
             file.sync_all()?;
             #[cfg(test)]
             super::faults::hit("terrain_before_rename", path)?;
@@ -540,6 +547,7 @@ impl RegionFileBuilder {
             #[cfg(test)]
             super::faults::hit("terrain_after_rename", path)?;
             sync_parent(path)?;
+            publishing.finish(true, file_length);
             Ok(())
         })();
         if result.is_err() {
@@ -559,6 +567,7 @@ impl RegionFileBuilder {
         let index = RegionIndex::from_file(&region);
         region.index_fingerprint = index.fingerprint()?;
         region.compressed_index = index.compressed()?.into();
+        writing.finish(true, file_length);
         Ok(region)
     }
 }
@@ -667,6 +676,7 @@ pub struct RegionFile {
 
 impl RegionFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let reading = crate::diagnostics::Span::sync(crate::diagnostics::Stage::DirectoryRead);
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let length = file.metadata()?.len();
@@ -682,9 +692,13 @@ impl RegionFile {
         let directory_length = header.entry_count as usize * SECTION_ENTRY_BYTES;
         let mut directory_bytes = vec![0u8; directory_length];
         file.read_exact_at(&mut directory_bytes, header.directory_offset)?;
+        reading.finish(true, (REGION_HEADER_BYTES + directory_length) as u64);
+        let checking = crate::diagnostics::Span::sync(crate::diagnostics::Stage::DirectoryCrc);
         if crc32c(&directory_bytes) != header.directory_crc {
             bail!("regional section directory checksum mismatch");
         }
+        checking.finish(true, directory_length as u64);
+        let constructing = crate::diagnostics::Span::sync(crate::diagnostics::Stage::Index);
         let sections = directory_bytes
             .chunks_exact(SECTION_ENTRY_BYTES)
             .map(RegionSectionEntry::decode)
@@ -718,6 +732,7 @@ impl RegionFile {
         let index = RegionIndex::from_file(&region);
         region.index_fingerprint = index.fingerprint()?;
         region.compressed_index = index.compressed()?.into();
+        constructing.finish(true, directory_length as u64);
         Ok(region)
     }
 
@@ -782,12 +797,16 @@ impl RegionFile {
             return Ok(None);
         }
         let mut compressed = vec![0u8; entry.compressed_length as usize];
+        let reading = crate::diagnostics::Span::sync(crate::diagnostics::Stage::BodyRead);
         self.file
             .read_exact_at(&mut compressed, entry.payload_offset)
             .with_context(|| format!("read section payload from {}", self.path.display()))?;
+        reading.finish(true, compressed.len() as u64);
+        let checking = crate::diagnostics::Span::sync(crate::diagnostics::Stage::BodyCrc);
         if crc32c(&compressed) != entry.compressed_crc {
             bail!("regional section compressed checksum mismatch");
         }
+        checking.finish(true, compressed.len() as u64);
         Ok(Some(compressed))
     }
 
@@ -797,12 +816,16 @@ impl RegionFile {
             return Ok(None);
         }
         let mut compressed = vec![0u8; entry.compressed_length as usize];
+        let reading = crate::diagnostics::Span::sync(crate::diagnostics::Stage::BodyRead);
         self.file
             .read_exact_at(&mut compressed, entry.payload_offset)
             .with_context(|| format!("read section payload from {}", self.path.display()))?;
+        reading.finish(true, compressed.len() as u64);
+        let checking = crate::diagnostics::Span::sync(crate::diagnostics::Stage::BodyCrc);
         if crc32c(&compressed) != entry.compressed_crc {
             bail!("regional section compressed checksum mismatch");
         }
+        checking.finish(true, compressed.len() as u64);
         Ok(Some(compressed))
     }
 

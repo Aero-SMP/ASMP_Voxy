@@ -1,7 +1,6 @@
 use super::{
     ChunkSourceRecord, RegionFile, RegionLayout, RegionSourceTable, rebuild_region,
-    rebuild_region_incremental,
-    wire::DEFAULT_UPDATE_INTERVAL_MILLIS,
+    rebuild_region_incremental, wire::DEFAULT_UPDATE_INTERVAL_MILLIS,
 };
 use crate::{
     anvil::{AnvilWorld, RegionAvailability, RegionHeader},
@@ -570,47 +569,80 @@ impl RegionalRuntime {
     }
 
     pub fn region(&self, x: i32, z: i32) -> Result<Option<Arc<RegionFile>>> {
-        let coordinate = (x, z);
-        if let Some(region) = self
-            .priority
-            .lock()
-            .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?
-            .active
-            .get(&coordinate)
-            .cloned()
-        {
-            return Ok(Some(region));
-        }
-        let Some(generation) = read_lock(&self.regions)?.get(&coordinate).copied() else {
-            return Ok(None);
-        };
-        match self.open_generation(coordinate, generation) {
-            Ok(region) => {
-                let region = Arc::new(region);
-                let mut priority = self
-                    .priority
-                    .lock()
-                    .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?;
-                if priority.subscriptions.contains_key(&coordinate) {
-                    priority.active.insert(coordinate, region.clone());
-                }
-                Ok(Some(region))
+        crate::diagnostics::sync_result(crate::diagnostics::Stage::Lookup, || {
+            let coordinate = (x, z);
+            if let Some(region) = self
+                .priority
+                .lock()
+                .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?
+                .active
+                .get(&coordinate)
+                .cloned()
+            {
+                crate::diagnostics::hit(0);
+                return Ok(Some(region));
             }
-            Err(error) => {
-                let removed = self.quarantine_generation(x, z, generation)?;
-                if removed {
-                    eprintln!(
-                        "{}: quarantined damaged regional shard ({x},{z}) generation {generation} while opening it: {error:#}",
-                        self.dimension
-                    );
+            crate::diagnostics::hit(1);
+            let Some(generation) = read_lock(&self.regions)?.get(&coordinate).copied() else {
+                return Ok(None);
+            };
+            match self.open_generation(coordinate, generation) {
+                Ok(region) => {
+                    let region = Arc::new(region);
+                    let mut priority = self
+                        .priority
+                        .lock()
+                        .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?;
+                    if priority.subscriptions.contains_key(&coordinate) {
+                        priority.active.insert(coordinate, region.clone());
+                    }
+                    Ok(Some(region))
                 }
-                Ok(None)
+                Err(error) => {
+                    let removed = self.quarantine_generation(x, z, generation)?;
+                    if removed {
+                        eprintln!(
+                            "{}: quarantined damaged regional shard ({x},{z}) generation {generation} while opening it: {error:#}",
+                            self.dimension
+                        );
+                    }
+                    Ok(None)
+                }
             }
-        }
+        })
     }
 
     pub fn layout(&self) -> RegionLayout {
         self.layout
+    }
+
+    /// Debug observations never wait behind the maintenance lock held by a regional build.
+    /// A busy owner is unknown, never evidence that outstanding work is absent.
+    #[cfg(feature = "debug-diagnostics")]
+    pub fn debug_work(&self, x: i32, z: i32, run_subscriptions: usize) -> (bool, bool, bool, bool) {
+        let coordinate = (x, z);
+        let Ok(priority) = self.priority.try_lock() else {
+            return (false, false, false, true);
+        };
+        let mut queued = priority.membership.contains(&coordinate);
+        let shared = priority
+            .subscriptions
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0)
+            > run_subscriptions;
+        drop(priority);
+        let Ok(reconciling) = self.reconciling.try_lock() else {
+            return (queued, false, shared, true);
+        };
+        let inflight = reconciling.contains(&coordinate);
+        drop(reconciling);
+        let Ok(maintenance) = self.maintenance.try_lock() else {
+            return (queued, inflight, shared, true);
+        };
+        queued |= maintenance.pending_set.contains(&coordinate)
+            || maintenance.retry.contains_key(&coordinate);
+        (queued, inflight, shared, false)
     }
 
     pub fn set_freshness_interval(&self, millis: u64) {
@@ -657,12 +689,18 @@ impl RegionalRuntime {
     }
 
     fn take_dirty(&self, coordinate: (i32, i32)) -> Result<[u64; 16]> {
-        Ok(self
+        let coalescing = crate::diagnostics::Span::sync(crate::diagnostics::Stage::DirtyCoalesce);
+        let captured = self
             .dirty
             .lock()
             .map_err(|_| crate::UnsafeState("dirty chunk owner poisoned"))?
             .remove(&coordinate)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        coalescing.finish(
+            true,
+            captured.iter().map(|bits| bits.count_ones() as u64).sum(),
+        );
+        Ok(captured)
     }
 
     fn restore_dirty(&self, coordinate: (i32, i32), captured: [u64; 16]) -> Result<()> {
@@ -832,10 +870,12 @@ impl RegionalRuntime {
     /// A shared compact snapshot/cursor survives individual publications. Full source records
     /// are opened only by the regional transaction that needs them.
     pub fn refresh(&self, round: u64) -> Result<RegionalRefresh> {
+        let waiting = crate::diagnostics::Span::sync(crate::diagnostics::Stage::MaintenanceLock);
         let mut maintenance = self
             .maintenance
             .lock()
             .map_err(|_| crate::UnsafeState("regional maintenance lock poisoned"))?;
+        waiting.finish(true, 0);
         if self.retired.load(Ordering::Acquire) {
             return Ok(RegionalRefresh::default());
         }
@@ -849,7 +889,9 @@ impl RegionalRuntime {
                 let inventory = read_lock(&self.inventory)?;
                 (inventory.is_some(), inventory.clone().unwrap_or_default())
             };
-            match self.source.region_inventory(&previous) {
+            match crate::diagnostics::sync_result(crate::diagnostics::Stage::Inventory, || {
+                self.source.region_inventory(&previous)
+            }) {
                 Ok(next) => {
                     let mut updates = Vec::new();
                     for (&coordinate, availability) in &next {
@@ -1042,6 +1084,7 @@ impl RegionalRuntime {
                     &maintenance,
                 )?
             {
+                crate::diagnostics::hit(5);
                 self.publish_ready(coordinate, &mut result, false)?;
                 continue;
             }
@@ -1170,225 +1213,234 @@ impl RegionalRuntime {
         result: &mut RegionalRefresh,
         forced: &[u64; 16],
     ) -> Result<()> {
-        use super::builder::{SourceChanged, UnusableBaseline, verify_header};
-        #[cfg(test)]
-        super::faults::hit("candidate", &self.terrain_path(coordinate))?;
-        let header = self
-            .source
-            .region_header(coordinate.0, coordinate.1)
-            .context("fresh candidate header")?
-            .ok_or(SourceChanged)?;
-
-        if let Some(retry) = maintenance.retry.get(&coordinate).copied()
-            && retry.kind == RetryKind::Reconcile
-        {
-            match self.open_generation(coordinate, retry.generation) {
-                Ok(region) => {
-                    if let Err(error) = self.sync_replacement(&region) {
-                        if error.is::<UnusableBaseline>() && !error.is::<std::io::Error>() {
-                            self.quarantine_failed_replacement(coordinate, maintenance)?;
-                        }
-                        return Err(error.context("reconcile final terrain durability/integrity"));
-                    }
-                    self.install(region, result)?;
-                    // No unpersisted source table survives a retry. Load a matching durable
-                    // sidecar, or reconstruct safely on the next invocation.
-                    self.load_source(coordinate, retry.generation)?;
-                    maintenance.retry.remove(&coordinate);
-                    return Ok(());
-                }
-                Err(error) => {
-                    // A pre-rename failure may have left the known old generation untouched.
-                    let old = read_lock(&self.regions)?.get(&coordinate).copied();
-                    if old.is_some_and(|old| self.open_generation(coordinate, old).is_ok())
-                        || !self.terrain_path(coordinate).try_exists()?
-                    {
-                        maintenance.retry.get_mut(&coordinate).unwrap().kind = RetryKind::Refresh;
-                    } else {
-                        if let Err(invalid) = RegionFile::open(self.terrain_path(coordinate))
-                            && !invalid.is::<std::io::Error>()
-                        {
-                            self.quarantine_failed_replacement(coordinate, maintenance)?;
-                        }
-                        return Err(error.context("reconcile final terrain"));
-                    }
-                }
-            }
-        }
-        let mut old_generation = read_lock(&self.regions)?
-            .get(&coordinate)
-            .copied()
-            .unwrap_or(0);
-        let was_authoritative = old_generation != 0;
-        // A source can reappear before failed removal cleanup. The final file still owns
-        // its generation even though logical authority was removed; never overwrite it
-        // using generation 1 or a different world/catalog identity.
-        if old_generation == 0
-            && let Ok(disk) = RegionFile::open(self.terrain_path(coordinate))
-        {
-            self.open_generation(coordinate, disk.generation())?;
-            old_generation = disk.generation();
-        }
-        if old_generation != 0 && maintenance.retry.contains_key(&coordinate) {
-            self.load_source(coordinate, old_generation)
-                .context("recover source-table durability")?;
-        }
-        let region = if old_generation != 0 {
-            match self.open_generation(coordinate, old_generation) {
-                Ok(region) => Some(region),
-                Err(error) if error.is::<crate::UnsafeState>() => return Err(error),
-                Err(error) => {
-                    // Missing/damaged baseline permits full reconstruction. A valid but
-                    // unexplained different identity/generation is never overwritten.
-                    if RegionFile::open(self.terrain_path(coordinate)).is_ok() {
-                        return Err(error);
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let stamp = read_lock(&self.sources)?.get(&coordinate).copied();
-        let stored = stamp.and_then(|stamp| {
-            RegionSourceTable::open(self.source_path(coordinate))
-                .ok()
-                .filter(|table| table.terrain_generation == stamp.generation)
-                .map(|mut table| {
-                    table.reconciled = stamp.reconciled;
-                    table
+        crate::diagnostics::sync_result(crate::diagnostics::Stage::Refresh, || {
+            use super::builder::{SourceChanged, UnusableBaseline, verify_header};
+            #[cfg(test)]
+            super::faults::hit("candidate", &self.terrain_path(coordinate))?;
+            let header =
+                crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceInspect, || {
+                    self.source.region_header(coordinate.0, coordinate.1)
                 })
-        });
-        if let (Some(region), Some(source)) = (&region, &stored)
-            && source.terrain_generation == region.generation()
-            && source.header_matches(&header.entries, header.file_marker)
-            && forced.iter().all(|bits| *bits == 0)
-        {
-            if let Some(stamp) = write_lock(&self.sources)?.get_mut(&coordinate) {
-                stamp.reconciled = true;
+                .context("fresh candidate header")?
+                .ok_or(SourceChanged)?;
+
+            if let Some(retry) = maintenance.retry.get(&coordinate).copied()
+                && retry.kind == RetryKind::Reconcile
+            {
+                match self.open_generation(coordinate, retry.generation) {
+                    Ok(region) => {
+                        if let Err(error) = self.sync_replacement(&region) {
+                            if error.is::<UnusableBaseline>() && !error.is::<std::io::Error>() {
+                                self.quarantine_failed_replacement(coordinate, maintenance)?;
+                            }
+                            return Err(
+                                error.context("reconcile final terrain durability/integrity")
+                            );
+                        }
+                        self.install(region, result)?;
+                        // No unpersisted source table survives a retry. Load a matching durable
+                        // sidecar, or reconstruct safely on the next invocation.
+                        self.load_source(coordinate, retry.generation)?;
+                        maintenance.retry.remove(&coordinate);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // A pre-rename failure may have left the known old generation untouched.
+                        let old = read_lock(&self.regions)?.get(&coordinate).copied();
+                        if old.is_some_and(|old| self.open_generation(coordinate, old).is_ok())
+                            || !self.terrain_path(coordinate).try_exists()?
+                        {
+                            maintenance.retry.get_mut(&coordinate).unwrap().kind =
+                                RetryKind::Refresh;
+                        } else {
+                            if let Err(invalid) = RegionFile::open(self.terrain_path(coordinate))
+                                && !invalid.is::<std::io::Error>()
+                            {
+                                self.quarantine_failed_replacement(coordinate, maintenance)?;
+                            }
+                            return Err(error.context("reconcile final terrain"));
+                        }
+                    }
+                }
             }
-            if !was_authoritative {
-                self.install(region.clone(), result)?;
+            let mut old_generation = read_lock(&self.regions)?
+                .get(&coordinate)
+                .copied()
+                .unwrap_or(0);
+            let was_authoritative = old_generation != 0;
+            // A source can reappear before failed removal cleanup. The final file still owns
+            // its generation even though logical authority was removed; never overwrite it
+            // using generation 1 or a different world/catalog identity.
+            if old_generation == 0
+                && let Ok(disk) = RegionFile::open(self.terrain_path(coordinate))
+            {
+                self.open_generation(coordinate, disk.generation())?;
+                old_generation = disk.generation();
             }
-            return Ok(());
-        }
-        let generation = old_generation
-            .max(
-                maintenance
-                    .retry
-                    .get(&coordinate)
-                    .map_or(0, |r| r.generation),
-            )
-            .checked_add(1)
-            .context("regional generation exhausted")?;
-        let incremental = if let (Some(region), Some(previous)) = (&region, stored)
-            && previous.terrain_generation == region.generation()
-        {
-            let probe = self
-                .probe_saved_changes(&header, &previous, generation, forced)
-                .context("source probe")?;
-            if probe.changed_groups.is_empty() {
-                probe
-                    .table
-                    .write_atomic(self.source_path(coordinate))
-                    .context("metadata-only sidecar")?;
-                write_lock(&self.sources)?
-                    .insert(coordinate, SourceStamp::from_table(&probe.table));
-                result.metadata_only += 1;
+            if old_generation != 0 && maintenance.retry.contains_key(&coordinate) {
+                self.load_source(coordinate, old_generation)
+                    .context("recover source-table durability")?;
+            }
+            let region = if old_generation != 0 {
+                match self.open_generation(coordinate, old_generation) {
+                    Ok(region) => Some(region),
+                    Err(error) if error.is::<crate::UnsafeState>() => return Err(error),
+                    Err(error) => {
+                        // Missing/damaged baseline permits full reconstruction. A valid but
+                        // unexplained different identity/generation is never overwritten.
+                        if RegionFile::open(self.terrain_path(coordinate)).is_ok() {
+                            return Err(error);
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let stamp = read_lock(&self.sources)?.get(&coordinate).copied();
+            let stored = stamp.and_then(|stamp| {
+                RegionSourceTable::open(self.source_path(coordinate))
+                    .ok()
+                    .filter(|table| table.terrain_generation == stamp.generation)
+                    .map(|mut table| {
+                        table.reconciled = stamp.reconciled;
+                        table
+                    })
+            });
+            if let (Some(region), Some(source)) = (&region, &stored)
+                && source.terrain_generation == region.generation()
+                && source.header_matches(&header.entries, header.file_marker)
+                && forced.iter().all(|bits| *bits == 0)
+            {
+                if let Some(stamp) = write_lock(&self.sources)?.get_mut(&coordinate) {
+                    stamp.reconciled = true;
+                }
                 if !was_authoritative {
                     self.install(region.clone(), result)?;
                 }
                 return Ok(());
             }
-            Some(probe)
-        } else {
-            None
-        };
-        let full = || {
-            rebuild_region(
-                &self.source,
-                &self.registry,
-                &header,
-                self.terrain_path(coordinate),
-                self.world_identity,
-                generation,
-                self.layout,
-            )
-        };
-        let attempted = match incremental {
-            Some(probe) => rebuild_region_incremental(
-                &self.source,
-                &self.registry,
-                &header,
-                region.as_ref().unwrap(),
-                &probe.table,
-                &probe.changed_groups,
-                self.terrain_path(coordinate),
-                self.world_identity,
-                generation,
-                self.layout,
-            ),
-            None => full(),
-        };
-        let built = match attempted {
-            Err(error) if error.is::<UnusableBaseline>() => {
-                verify_header(&self.source, &header)?;
-                full().context("full fallback for unusable reused payload")?
-            }
-            other => other.context("regional build")?,
-        };
-        let region = match built.terrain {
-            Ok(region) => region,
-            Err(error) => {
-                maintenance.retry.insert(
-                    coordinate,
-                    Retry {
-                        kind: RetryKind::Reconcile,
-                        generation,
-                        round: None,
-                    },
-                );
-                let region = self
+            let generation = old_generation
+                .max(
+                    maintenance
+                        .retry
+                        .get(&coordinate)
+                        .map_or(0, |r| r.generation),
+                )
+                .checked_add(1)
+                .context("regional generation exhausted")?;
+            let incremental = if let (Some(region), Some(previous)) = (&region, stored)
+                && previous.terrain_generation == region.generation()
+            {
+                let probe = crate::diagnostics::sync_result(
+                    crate::diagnostics::Stage::SourceInspect,
+                    || self.probe_saved_changes(&header, &previous, generation, forced),
+                )
+                .context("source probe")?;
+                if probe.changed_groups.is_empty() {
+                    crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceTable, || {
+                        probe.table.write_atomic(self.source_path(coordinate))
+                    })
+                    .context("metadata-only sidecar")?;
+                    write_lock(&self.sources)?
+                        .insert(coordinate, SourceStamp::from_table(&probe.table));
+                    result.metadata_only += 1;
+                    crate::diagnostics::hit(4);
+                    if !was_authoritative {
+                        self.install(region.clone(), result)?;
+                    }
+                    return Ok(());
+                }
+                Some(probe)
+            } else {
+                None
+            };
+            let full = || {
+                rebuild_region(
+                    &self.source,
+                    &self.registry,
+                    &header,
+                    self.terrain_path(coordinate),
+                    self.world_identity,
+                    generation,
+                    self.layout,
+                )
+            };
+            let attempted = match incremental {
+                Some(probe) => rebuild_region_incremental(
+                    &self.source,
+                    &self.registry,
+                    &header,
+                    region.as_ref().unwrap(),
+                    &probe.table,
+                    &probe.changed_groups,
+                    self.terrain_path(coordinate),
+                    self.world_identity,
+                    generation,
+                    self.layout,
+                ),
+                None => full(),
+            };
+            let built = match attempted {
+                Err(error) if error.is::<UnusableBaseline>() => {
+                    verify_header(&self.source, &header)?;
+                    full().context("full fallback for unusable reused payload")?
+                }
+                other => other.context("regional build")?,
+            };
+            let region = match built.terrain {
+                Ok(region) => region,
+                Err(error) => {
+                    maintenance.retry.insert(
+                        coordinate,
+                        Retry {
+                            kind: RetryKind::Reconcile,
+                            generation,
+                            round: None,
+                        },
+                    );
+                    let region = self
                     .open_generation(coordinate, generation)
                     .with_context(|| {
                         format!(
                             "terrain publication failed ({error:#}); final replacement unavailable"
                         )
                     })?;
-                self.sync_replacement(&region)
-                    .context("terrain publication durability recovery")?;
-                region
-            }
-        };
-        self.install(region, result)?;
-        eprintln!(
-            "{}: regional shard ({},{}) generation {} chunks={}/{} sections={:?} reused={} bytes={}",
-            self.dimension,
-            coordinate.0,
-            coordinate.1,
-            generation,
-            built.stats.generated_chunks,
-            built.stats.chunks_read,
-            built.stats.sections_by_level,
-            built.stats.reused_sections,
-            built.stats.output_bytes
-        );
-        // Retain the old explicitly generation-bound stamp for stale coverage. It cannot
-        // satisfy source-current or negative-authority checks for the new generation.
-        maintenance.retry.insert(
-            coordinate,
-            Retry {
-                kind: RetryKind::Refresh,
+                    self.sync_replacement(&region)
+                        .context("terrain publication durability recovery")?;
+                    region
+                }
+            };
+            self.install(region, result)?;
+            eprintln!(
+                "{}: regional shard ({},{}) generation {} chunks={}/{} sections={:?} reused={} bytes={}",
+                self.dimension,
+                coordinate.0,
+                coordinate.1,
                 generation,
-                round: None,
-            },
-        );
-        built
-            .source
-            .write_atomic(self.source_path(coordinate))
+                built.stats.generated_chunks,
+                built.stats.chunks_read,
+                built.stats.sections_by_level,
+                built.stats.reused_sections,
+                built.stats.output_bytes
+            );
+            // Retain the old explicitly generation-bound stamp for stale coverage. It cannot
+            // satisfy source-current or negative-authority checks for the new generation.
+            maintenance.retry.insert(
+                coordinate,
+                Retry {
+                    kind: RetryKind::Refresh,
+                    generation,
+                    round: None,
+                },
+            );
+            crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceTable, || {
+                built.source.write_atomic(self.source_path(coordinate))
+            })
             .context("source-table publication")?;
-        write_lock(&self.sources)?.insert(coordinate, SourceStamp::from_table(&built.source));
-        Ok(())
+            write_lock(&self.sources)?.insert(coordinate, SourceStamp::from_table(&built.source));
+            Ok(())
+        })
     }
 
     fn sync_replacement(&self, region: &RegionFile) -> Result<()> {

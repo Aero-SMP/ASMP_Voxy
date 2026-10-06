@@ -221,12 +221,35 @@ neoForge {
 }
 
 tasks.register('buildRustServer', Exec) {
-    description = 'Build the QUIC Rust backend embedded in the server-controller JAR'
+    description = 'Build the normal QUIC backend without debug diagnostics'
     workingDir 'rust-server'
-    commandLine 'cargo', 'build', '--release', '--locked', '--bin', 'voxy-rust-server'
+    commandLine 'cargo', 'build', '--release', '--locked', '--offline', '--no-default-features',
+            '--target-dir', 'target/normal', '--bin', 'voxy-rust-server'
     inputs.files 'rust-server/Cargo.toml', 'rust-server/Cargo.lock'
     inputs.dir 'rust-server/src'
-    outputs.file 'rust-server/target/release/voxy-rust-server'
+    outputs.file 'rust-server/target/normal/release/voxy-rust-server'
+}
+
+tasks.register('buildRustServerDebug', Exec) {
+    description = 'Build the debug QUIC backend with scoped diagnostics and test control'
+    workingDir 'rust-server'
+    commandLine 'cargo', 'build', '--release', '--locked', '--offline', '--no-default-features',
+            '--features', 'debug-diagnostics', '--target-dir', 'target/debug-diagnostics', '--bin', 'voxy-rust-server'
+    inputs.files 'rust-server/Cargo.toml', 'rust-server/Cargo.lock'
+    inputs.dir 'rust-server/src'
+    outputs.file 'rust-server/target/debug-diagnostics/release/voxy-rust-server'
+    mustRunAfter tasks.named('buildRustServer')
+}
+
+tasks.register('buildLivePressure', Exec) {
+    description = 'Build the current-protocol Rust clients and datagram impairment runner'
+    workingDir 'rust-server'
+    commandLine 'cargo', 'build', '--release', '--locked', '--offline', '--no-default-features',
+            '--target-dir', 'target/normal', '--bin', 'live_pressure'
+    inputs.files 'rust-server/Cargo.toml', 'rust-server/Cargo.lock'
+    inputs.dir 'rust-server/src'
+    outputs.file 'rust-server/target/normal/release/live_pressure'
+    mustRunAfter tasks.named('buildRustServer'), tasks.named('buildRustServerDebug')
 }
 
 tasks.register('buildAll') {
@@ -327,7 +350,7 @@ tasks.register('verifyDebugHarnessArtifacts') {
         [clientNormal, serverNormal].each { artifact ->
             def leaked = zipTree(artifact).matching {
                 include forbiddenPrefix + '**'
-                include '**/LiveClientTestHarness*', '**/LiveServerTestHarness*'
+                include '**/LiveClientTestHarness*', '**/LiveServerTestHarness*', '**/LivePressureRoutes*'
                 include '**/SessionDebugTelemetry*'
                 include '**/WorkerDebugTelemetry*', '**/ShaderDebugTelemetry*'
                 include '**/TransportDebugTelemetry*'
@@ -362,6 +385,41 @@ tasks.register('verifyDebugHarnessArtifacts') {
         if (!zipTree(serverDebug).matching {
             include 'me/cortex/voxy/server/LiveServerTestHarness.class'
         }.files.size()) throw new GradleException('debug server harness class is missing')
+    }
+}
+
+tasks.register('verifyServerDiagnosticsArtifacts') {
+    description = 'Prove separate native embedding and compile-time exclusion of pressure diagnostics'
+    dependsOn ':server:jar', ':server:debugJar'
+    doLast {
+        def reports = []
+        [false, true].each { debug ->
+            def artifact = project(':server').tasks.named(debug ? 'debugJar' : 'jar', Jar).get().archiveFile.get().asFile
+            def standalone = file('rust-server/target/' + (debug ? 'debug-diagnostics' : 'normal') + '/release/voxy-rust-server')
+            byte[] embedded
+            new java.util.zip.ZipFile(artifact).withCloseable { zip ->
+                def entries = java.util.Collections.list(zip.entries())
+                def natives = entries.findAll { it.name == 'native/linux-x86_64/voxy-rust-server' }
+                if (natives.size() != 1) throw new GradleException("expected one native member in ${artifact}")
+                embedded = zip.getInputStream(natives[0]).withCloseable { it.readAllBytes() }
+                def pressure = entries.findAll { it.name.startsWith('me/cortex/voxy/server/LivePressureRoutes') }
+                if (pressure.empty == debug) throw new GradleException("pressure-class inclusion mismatch in ${artifact}")
+            }
+            if (!java.util.Arrays.equals(embedded, standalone.bytes)) {
+                throw new GradleException("embedded native differs from standalone ${standalone}")
+            }
+            def nativeText = new String(embedded, java.nio.charset.StandardCharsets.ISO_8859_1)
+            ['VOXY_DEBUG_EPOCH ', 'VOXY_DEBUG_RESPONSE ', 'VOXY_DEBUG_TIMINGS '].each { marker ->
+                if (nativeText.contains(marker) != debug) throw new GradleException("diagnostic marker ${marker} mismatch in ${artifact}")
+            }
+            reports.add([debug: debug, artifact: artifact.absolutePath, standalone: standalone.absolutePath,
+                    nativeSha256: java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance('SHA-256').digest(embedded)),
+                    jarSha256: java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance('SHA-256').digest(artifact.bytes)),
+                    feature: debug ? 'debug-diagnostics' : 'none'])
+        }
+        def report = layout.buildDirectory.file('reports/server-diagnostics-artifacts.json').get().asFile
+        report.parentFile.mkdirs()
+        report.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(reports)) + '\n'
     }
 }
 

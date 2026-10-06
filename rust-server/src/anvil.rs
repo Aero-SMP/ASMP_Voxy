@@ -336,15 +336,20 @@ impl AnvilWorld {
         chunk_z: i32,
         registry: &Arc<RwLock<Registry>>,
     ) -> Result<Option<ParsedChunk>> {
+        let reading = crate::diagnostics::Span::sync(crate::diagnostics::Stage::SourceRead);
         let path = self.region_path(chunk_x, chunk_z);
         let mut file = match File::open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                reading.finish(true, 0);
+                return Ok(None);
+            }
             Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
         };
         // Some pregenerators leave durable zero-byte placeholders. They are an unambiguous
         // empty region snapshot; a later Anvil header changes both length and file marker.
         if file.metadata()?.len() == 0 {
+            reading.finish(true, 0);
             return Ok(None);
         }
         let index = (chunk_x.rem_euclid(32) + chunk_z.rem_euclid(32) * 32) as u64;
@@ -354,6 +359,7 @@ impl AnvilWorld {
         let sector = u32::from_be_bytes([0, location[0], location[1], location[2]]);
         let sectors = location[3] as usize;
         if sector == 0 || sectors == 0 {
+            reading.finish(true, 0);
             return Ok(None);
         }
         if sector < 2 {
@@ -381,13 +387,20 @@ impl AnvilWorld {
             bytes
         };
         let source_fingerprint = fingerprint(sector, sectors as u8, compression, &compressed);
-        let nbt = decompress(compression, &compressed).with_context(|| {
+        reading.finish(true, compressed.len() as u64);
+        let nbt = crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceDecode, || {
+            decompress(compression, &compressed)
+        })
+        .with_context(|| {
             format!(
                 "decompress chunk ({chunk_x},{chunk_z}) in {}",
                 path.display()
             )
         })?;
-        let mut chunk = parse_chunk(&nbt, registry, self.default_sky_light())?;
+        let mut chunk =
+            crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceNbt, || {
+                parse_chunk(&nbt, registry, self.default_sky_light())
+            })?;
         if chunk.x != chunk_x || chunk.z != chunk_z {
             bail!(
                 "chunk coordinate mismatch: requested ({chunk_x},{chunk_z}), NBT says ({},{})",

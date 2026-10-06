@@ -15,6 +15,11 @@ use voxy_rust_server::{
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    #[cfg(feature = "debug-diagnostics")]
+    if std::env::args_os().any(|arg| arg == "--debug-diagnostics-self-check") {
+        println!("{}", voxy_rust_server::diagnostics::self_check()?);
+        return Ok(());
+    }
     let config = match Config::load() {
         Ok(config) => config,
         Err(error) if std::env::args_os().any(|arg| arg == "--help" || arg == "-h") => {

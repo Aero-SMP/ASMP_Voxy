@@ -12,14 +12,20 @@ final class ServerDebug {
 
     private ServerDebug() {}
 
-    static boolean networkTrace() { return true; }
+    static boolean networkTrace() { return Boolean.getBoolean("voxy.network.trace"); }
     static boolean uncappedBandwidthSupported() { return true; }
+    static void nativeLine(Process child, String line) {
+        try { LivePressureRoutes.nativeLine(child, line); }
+        catch (RuntimeException failure) { LOGGER.warn("Native debug response rejected", failure); }
+    }
+    static void nativeExited(Process child) { LivePressureRoutes.nativeExited(child); }
 
     static void initialize(IEventBus modBus) {
         String version = VoxyServer.class.getPackage().getImplementationVersion();
         LOGGER.info("Voxy version {} role=server debug=true",
                 version == null ? "<UNKNOWN>" : version);
         LiveServerTestHarness.register(modBus);
+        LivePressureRoutes.register();
         LiveTerrainChanges.register();
     }
 

@@ -2,6 +2,7 @@ pub mod anvil;
 pub mod catalog;
 pub mod config;
 pub mod crc;
+pub mod diagnostics;
 pub mod key;
 pub mod lod;
 mod pacer;

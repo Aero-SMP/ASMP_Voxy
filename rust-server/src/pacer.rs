@@ -91,6 +91,14 @@ impl UdpMux {
             transmit: Mutex::new(Vec::new()),
         }))
     }
+    #[cfg(feature = "debug-diagnostics")]
+    pub fn debug_live_routes(&self, tokens: &[[u8; 32]]) -> usize {
+        let routes = self.routes.lock().expect("UDP route owner poisoned");
+        tokens
+            .iter()
+            .filter(|token| routes.get(&token[..16]).and_then(Weak::upgrade).is_some())
+            .count()
+    }
 }
 impl Drop for UdpMux {
     fn drop(&mut self) {
@@ -241,6 +249,8 @@ struct Clock {
 pub struct RateLedger {
     clock: Mutex<Clock>,
     changed: Arc<Notify>,
+    #[cfg(feature = "debug-diagnostics")]
+    blocked: [std::sync::atomic::AtomicU64; 3],
 }
 impl RateLedger {
     pub fn new(kbps: u64) -> Arc<Self> {
@@ -252,6 +262,8 @@ impl RateLedger {
                 datagrams: 0,
             }),
             changed: Arc::new(Notify::new()),
+            #[cfg(feature = "debug-diagnostics")]
+            blocked: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         })
     }
     pub fn update(&self, kbps: u64) {
@@ -274,6 +286,10 @@ impl RateLedger {
         let clock = self.clock.lock().expect("download rate owner poisoned");
         (clock.bytes, clock.datagrams)
     }
+    #[cfg(feature = "debug-diagnostics")]
+    pub fn debug_blocked(&self) -> [u64; 3] {
+        std::array::from_fn(|i| self.blocked[i].load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug)]
@@ -293,6 +309,10 @@ impl AsyncUdpSocket for PacedSocket {
             timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
             changed: Box::pin(self.ledger.changed.clone().notified_owned()),
             socket: self,
+            #[cfg(feature = "debug-diagnostics")]
+            pacing: None,
+            #[cfg(feature = "debug-diagnostics")]
+            writable: None,
         })
     }
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
@@ -303,6 +323,10 @@ impl AsyncUdpSocket for PacedSocket {
             .expect("download rate owner poisoned");
         let now = Instant::now();
         if clock.rate != 0 && now < clock.next {
+            #[cfg(feature = "debug-diagnostics")]
+            if crate::diagnostics::enabled() {
+                self.ledger.blocked[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Err(io::ErrorKind::WouldBlock.into());
         }
         // max_transmit_segments=1: exactly one unfragmented IP/UDP datagram per submission.
@@ -312,7 +336,18 @@ impl AsyncUdpSocket for PacedSocket {
             } else {
                 48
             };
-        self.inner.try_send(transmit)?;
+        if let Err(error) = self.inner.try_send(transmit) {
+            #[cfg(feature = "debug-diagnostics")]
+            if crate::diagnostics::enabled() {
+                self.ledger.blocked[if error.kind() == io::ErrorKind::WouldBlock {
+                    1
+                } else {
+                    2
+                }]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Err(error);
+        }
         clock.bytes = clock.bytes.saturating_add(cost);
         clock.datagrams = clock.datagrams.saturating_add(1);
         let nanos = if clock.rate == 0 {
@@ -351,6 +386,10 @@ struct PacedPoller {
     inner: Pin<Box<dyn UdpPoller>>,
     timer: Pin<Box<Sleep>>,
     changed: Pin<Box<OwnedNotified>>,
+    #[cfg(feature = "debug-diagnostics")]
+    pacing: Option<(crate::diagnostics::Span, Instant)>,
+    #[cfg(feature = "debug-diagnostics")]
+    writable: Option<crate::diagnostics::Span>,
 }
 impl UdpPoller for PacedPoller {
     fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -370,7 +409,39 @@ impl UdpPoller for PacedPoller {
                 (clock.rate, clock.next)
             };
             if rate == 0 || Instant::now() >= next {
-                return self.inner.as_mut().poll_writable(cx);
+                #[cfg(feature = "debug-diagnostics")]
+                if let Some((span, deadline)) = self.pacing.take() {
+                    span.finish(true, 0);
+                    crate::diagnostics::record(
+                        crate::diagnostics::Stage::PacerLate,
+                        Instant::now().saturating_duration_since(deadline),
+                        0,
+                    );
+                }
+                let result = self.inner.as_mut().poll_writable(cx);
+                #[cfg(feature = "debug-diagnostics")]
+                match &result {
+                    Poll::Pending => {
+                        self.writable.get_or_insert_with(|| {
+                            crate::diagnostics::Span::new(crate::diagnostics::Stage::SocketWait)
+                        });
+                    }
+                    Poll::Ready(result) => {
+                        if let Some(span) = self.writable.take() {
+                            span.finish(result.is_ok(), 0);
+                        }
+                    }
+                }
+                return result;
+            }
+            #[cfg(feature = "debug-diagnostics")]
+            {
+                self.pacing.get_or_insert_with(|| {
+                    (
+                        crate::diagnostics::Span::new(crate::diagnostics::Stage::PacerWait),
+                        next,
+                    )
+                });
             }
             self.timer.as_mut().reset(next);
             if self.timer.as_mut().poll(cx).is_pending() {
@@ -415,9 +486,15 @@ mod tests {
         fn local_addr(&self) -> io::Result<SocketAddr> {
             Ok("127.0.0.1:1".parse().unwrap())
         }
-        fn max_transmit_segments(&self) -> usize { 1 }
-        fn max_receive_segments(&self) -> usize { 1 }
-        fn may_fragment(&self) -> bool { false }
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
+        fn max_receive_segments(&self) -> usize {
+            1
+        }
+        fn may_fragment(&self) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
@@ -455,7 +532,10 @@ mod tests {
         ledger.clock.lock().unwrap().next = Instant::now() + Duration::from_secs(60);
         socket.try_send(&transmission).unwrap();
         socket.try_send(&transmission).unwrap();
-        assert_eq!(ledger.counters(), (2 * (64 + ENVELOPE_BYTES as u64 + 28), 2));
+        assert_eq!(
+            ledger.counters(),
+            (2 * (64 + ENVELOPE_BYTES as u64 + 28), 2)
+        );
         assert_eq!(inner.sends.load(Ordering::Relaxed), 2);
 
         ledger.update(100);
@@ -472,7 +552,10 @@ mod tests {
             socket.try_send(&transmission).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        assert_eq!(ledger.counters(), (3 * (64 + ENVELOPE_BYTES as u64 + 28), 3));
+        assert_eq!(
+            ledger.counters(),
+            (3 * (64 + ENVELOPE_BYTES as u64 + 28), 3)
+        );
         assert_eq!(RateLedger::new(0).clock.lock().unwrap().rate, 0);
     }
 }

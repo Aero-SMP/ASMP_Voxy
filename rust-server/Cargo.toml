@@ -8,6 +8,10 @@ autobins = false
 autotests = false
 autobenches = false
 
+[features]
+default = []
+debug-diagnostics = ["dep:serde_json"]
+
 [lib]
 test = true
 bench = false
@@ -37,6 +41,7 @@ rayon = "1.11"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "=1.0.151", optional = true }
 sha2 = "0.10"
 tokio = { version = "1.47", features = ["io-util", "io-std", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"

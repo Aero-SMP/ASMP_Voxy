@@ -1,4 +1,5 @@
 //! One authenticated Minecraft-session route, paced before TLS, across all dimensions.
+use crate::diagnostics::{self, Span, Stage};
 use crate::{
     anvil::AnvilWorld,
     crc::crc32c,
@@ -102,6 +103,16 @@ pub struct ServerState {
     bridge_stopped: Notify,
     trace: bool,
     uncapped_bandwidth: bool,
+    #[cfg(feature = "debug-diagnostics")]
+    debug: DebugOwner,
+}
+#[cfg(feature = "debug-diagnostics")]
+#[derive(Debug)]
+struct DebugOwner {
+    epoch: u64,
+    native_identity: String,
+    run: Mutex<String>,
+    observed: Mutex<HashMap<String, BTreeSet<Region>>>,
 }
 impl ServerState {
     pub fn new(
@@ -126,8 +137,26 @@ impl ServerState {
             routes: Mutex::new(HashMap::new()),
             bridge_stopped: Notify::new(),
             trace: std::env::var("VOXY_NETWORK_TRACE").as_deref() == Ok("1"),
-            uncapped_bandwidth: std::env::var("VOXY_DEBUG_UNCAPPED_BANDWIDTH").as_deref() == Ok("1"),
+            uncapped_bandwidth: std::env::var("VOXY_DEBUG_UNCAPPED_BANDWIDTH").as_deref()
+                == Ok("1"),
+            #[cfg(feature = "debug-diagnostics")]
+            debug: DebugOwner {
+                epoch: (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64)
+                    .min(i64::MAX as u64),
+                native_identity: fs::read("/proc/self/exe")
+                    .ok()
+                    .map(|bytes| hex(&Sha256::digest(bytes)))
+                    .unwrap_or_default(),
+                run: Mutex::new(String::new()),
+                observed: Mutex::new(HashMap::new()),
+            },
         }
+    }
+    fn tracing(&self) -> bool {
+        self.trace && !diagnostics::quiet()
     }
     fn register_route(self: &Arc<Self>, token: [u8; 32], kbps: u64) -> Result<()> {
         if token == [0; 32] {
@@ -168,7 +197,7 @@ impl ServerState {
                 });
             }
             route.endpoint.wait_idle().await;
-            if state.trace {
+            if state.tracing() {
                 let (bytes, packets) = route.ledger.counters();
                 eprintln!(
                     "VOXY_ROUTE_STATS route={} ip_bytes={bytes} datagrams={packets}",
@@ -187,6 +216,170 @@ impl ServerState {
         {
             route.close();
         }
+    }
+    #[cfg(feature = "debug-diagnostics")]
+    fn debug_status(&self, run: &str, tokens: &[[u8; 32]]) -> serde_json::Value {
+        let selected = tokens.iter().copied().collect::<HashSet<_>>();
+        let routes = self
+            .routes
+            .lock()
+            .expect("route owner poisoned")
+            .keys()
+            .filter(|t| selected.contains(*t))
+            .count();
+        let routed_sockets = self
+            .network
+            .get()
+            .map_or(0, |network| network.mux.debug_live_routes(tokens));
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("session owner poisoned")
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|s| selected.contains(&s.route.token))
+            .collect::<Vec<_>>();
+        let mut connections = Vec::with_capacity(sessions.len());
+        for session in &sessions {
+            let wants = session.wants.lock().expect("desire owner poisoned");
+            let queued = wants
+                .interests
+                .values()
+                .filter(|i| i.queued.is_some())
+                .count();
+            let waiting = wants
+                .interests
+                .values()
+                .filter(|i| i.waiting_source)
+                .count();
+            let active = wants
+                .interests
+                .values()
+                .filter(|i| i.active.is_some())
+                .count();
+            let oldest_queue = wants
+                .interests
+                .values()
+                .filter_map(|i| i.debug_enqueued)
+                .map(|i| i.elapsed().as_nanos() as u64)
+                .max()
+                .unwrap_or(0);
+            let oldest_source = wants
+                .interests
+                .values()
+                .filter_map(|i| i.debug_source)
+                .map(|i| i.elapsed().as_nanos() as u64)
+                .max()
+                .unwrap_or(0);
+            drop(wants);
+            let (ip_bytes, datagrams) = session.route.ledger.counters();
+            let mut record = serde_json::json!({"fingerprint":hex(&Sha256::digest(session.route.token)[..12]),"id":session.id,
+                "queued":queued,"waiting_source":waiting,"active_requests":active,"queue_oldest_ns":oldest_queue,"source_oldest_ns":oldest_source,
+                "route_ip_bytes":ip_bytes,"route_datagrams":datagrams,"pacer_blocked_attempts":session.route.ledger.debug_blocked(),"payload_bytes":session.debug_bytes.load(Ordering::Relaxed),
+                "closed":session.closed.load(Ordering::Acquire),"records":session.debug_records.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+                "lanes":session.debug_phase.iter().enumerate().map(|(lane,v)|{
+                    let start=v[1].load(Ordering::Relaxed);serde_json::json!({"lane":lane,"phase":v[0].load(Ordering::Relaxed),"age_ns":if start==0{0}else{diagnostics::now_ns().saturating_sub(start)},
+                        "ticket":v[2].load(Ordering::Relaxed),"key":v[3].load(Ordering::Relaxed),"dimension":v[4].load(Ordering::Relaxed),"generation":v[5].load(Ordering::Relaxed),"revision":v[6].load(Ordering::Relaxed)})
+                }).collect::<Vec<_>>()});
+            if let Some(connection) = session
+                .route
+                .connection
+                .lock()
+                .expect("connection owner poisoned")
+                .as_ref()
+                && connection.stable_id() == session.id
+            {
+                let stats = connection.stats();
+                record["quinn"] = serde_json::json!({"rtt_ns":stats.path.rtt.as_nanos() as u64,"cwnd":stats.path.cwnd,
+                    "lost_packets":stats.path.lost_packets,"lost_bytes":stats.path.lost_bytes,"sent_packets":stats.path.sent_packets,
+                    "congestion_events":stats.path.congestion_events,"udp_tx_bytes":stats.udp_tx.bytes,"udp_tx_datagrams":stats.udp_tx.datagrams,
+                    "udp_rx_bytes":stats.udp_rx.bytes,"udp_rx_datagrams":stats.udp_rx.datagrams});
+            }
+            connections.push(record);
+        }
+        // Subscriber ownership remains visible during session cleanup, after the session map
+        // entry has been removed but before runtime subscriptions have been released.
+        let mut run_counts = HashMap::<Region, usize>::new();
+        let mut subscriptions = 0;
+        for (&region, owners) in self
+            .subscribers
+            .lock()
+            .expect("subscriber owner poisoned")
+            .iter()
+        {
+            for session in owners.values().filter_map(Weak::upgrade) {
+                if selected.contains(&session.route.token) {
+                    subscriptions += 1;
+                    *run_counts.entry(region).or_default() += 1;
+                }
+            }
+        }
+        let coordinates = {
+            let mut observed = self
+                .debug
+                .observed
+                .lock()
+                .expect("debug observations poisoned");
+            let all = observed.entry(run.to_owned()).or_default();
+            all.extend(run_counts.keys().copied());
+            all.clone()
+        };
+        let (mut queued, mut inflight, mut outstanding, mut shared, mut exclusive, mut unknown) =
+            (0, 0, 0, 0, 0, 0);
+        for coordinate in &coordinates {
+            let observation = self
+                .regional
+                .dimension_name(coordinate.0)
+                .and_then(|name| self.regional.runtime(&name))
+                .map(|runtime| {
+                    runtime.debug_work(
+                        coordinate.1,
+                        coordinate.2,
+                        run_counts.get(coordinate).copied().unwrap_or(0),
+                    )
+                });
+            match observation {
+                Ok((q, i, s, u)) => {
+                    queued += usize::from(q);
+                    inflight += usize::from(i);
+                    unknown += usize::from(u);
+                    if q || i {
+                        outstanding += 1;
+                        if s { shared += 1 } else { exclusive += 1 }
+                    }
+                }
+                Err(_) => unknown += 1,
+            }
+        }
+        serde_json::json!({"routes":routes,"routed_sockets":routed_sockets,"sessions":sessions.len(),"subscriptions":subscriptions,
+            "queued_source_regions":queued,"inflight_source_regions":inflight,"outstanding_source_regions":outstanding,
+            "shared_source_regions":shared,"exclusive_source_regions":exclusive,"unknown_source_regions":unknown,
+            "cleanup_pending":routes!=0||routed_sockets!=0||!sessions.is_empty()||subscriptions!=0||exclusive!=0||unknown!=0,
+            "observed_source_regions":coordinates.len(),"connections":connections,"timings_enabled":diagnostics::enabled()})
+    }
+    #[cfg(feature = "debug-diagnostics")]
+    fn start_diagnostics(self: &Arc<Self>) {
+        eprintln!("VOXY_DEBUG_EPOCH {}", self.debug.epoch);
+        let state = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(state) = state.upgrade() else { return };
+                let run = state.debug.run.lock().expect("debug run poisoned").clone();
+                if run.is_empty() {
+                    continue;
+                }
+                // This allocation/logging is confined to the once-per-second reporting task.
+                let mut snapshot = diagnostics::snapshot();
+                snapshot["epoch"] = serde_json::json!(state.debug.epoch);
+                snapshot["run_id"] = serde_json::json!(run);
+                snapshot["pid"] = serde_json::json!(std::process::id());
+                snapshot["native_identity"] = serde_json::json!(state.debug.native_identity);
+                eprintln!("VOXY_DEBUG_TIMINGS {snapshot}");
+            }
+        });
     }
     fn register(&self, session: &Arc<Session>, coordinate: Region) {
         self.subscribers
@@ -394,6 +587,68 @@ impl ServerState {
                                 read_string(&mut input)?,
                                 read_string(&mut input)?,
                             )?,
+                            #[cfg(feature = "debug-diagnostics")]
+                            opcode @ (6 | 7 | 8) => {
+                                let request = read_string(&mut input)?;
+                                let run = read_string(&mut input)?;
+                                let epoch = read_u64(&mut input)?;
+                                let valid = epoch == state.debug.epoch;
+                                let action = match opcode {
+                                    6 => "status",
+                                    7 => "revoke",
+                                    _ => "timings",
+                                };
+                                let mut response = if opcode == 8 {
+                                    let mut value = [0];
+                                    input.read_exact(&mut value)?;
+                                    if value[0] > 2 {bail!("invalid debug timing mode")}
+                                    if valid {
+                                        diagnostics::set_enabled(value[0] == 1);
+                                        diagnostics::set_quiet(value[0] != 2);
+                                        *state.debug.run.lock().expect("debug run poisoned") =
+                                            if value[0]==2 {String::new()}else{run.clone()};
+                                        if value[0] == 2 {
+                                            state.debug.observed.lock().expect("debug observations poisoned").remove(&run);
+                                        }
+                                    }
+                                    serde_json::json!({"timings_enabled":diagnostics::enabled(),"reporting":!state.debug.run.lock().expect("debug run poisoned").is_empty(),"affects_new_spans":true})
+                                } else {
+                                    let count = read_u32(&mut input)?;
+                                    if count > 100 {
+                                        bail!("debug route count exceeds the requested experiment")
+                                    }
+                                    let mut tokens = Vec::with_capacity(count as usize);
+                                    for _ in 0..count {
+                                        let mut token = [0; 32];
+                                        input.read_exact(&mut token)?;
+                                        tokens.push(token);
+                                    }
+                                    // Capture work ownership before closing routes; publication can outlive subscriptions.
+                                    if valid && opcode == 7 {
+                                        let _ = state.debug_status(&run, &tokens);
+                                        for token in &tokens {
+                                            state.revoke_route(*token);
+                                        }
+                                    }
+                                    if valid {
+                                        state.debug_status(&run, &tokens)
+                                    } else {
+                                        serde_json::json!({})
+                                    }
+                                };
+                                response["request_id"] = serde_json::json!(request);
+                                response["run_id"] = serde_json::json!(run);
+                                response["epoch"] = serde_json::json!(state.debug.epoch);
+                                response["native_pid"] = serde_json::json!(std::process::id());
+                                response["native_identity"] =
+                                    serde_json::json!(state.debug.native_identity);
+                                response["action"] = serde_json::json!(action);
+                                response["ok"] = serde_json::json!(valid);
+                                if !valid {
+                                    response["error"] = serde_json::json!("native epoch mismatch");
+                                }
+                                eprintln!("VOXY_DEBUG_RESPONSE {response}");
+                            }
                             _ => bail!("unknown owned IPC opcode"),
                         }
                     }
@@ -454,6 +709,10 @@ struct Interest {
     dirty: bool,
     waiting_source: bool,
     queued: Option<QueueEntry>,
+    #[cfg(feature = "debug-diagnostics")]
+    debug_enqueued: Option<Instant>,
+    #[cfg(feature = "debug-diagnostics")]
+    debug_source: Option<Instant>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct QueueEntry {
@@ -565,7 +824,14 @@ impl Wants {
             }
             _ => unreachable!(),
         }
-        self.interests.get_mut(&key).unwrap().queued = Some(entry);
+        let interest = self.interests.get_mut(&key).unwrap();
+        interest.queued = Some(entry);
+        #[cfg(feature = "debug-diagnostics")]
+        {
+            if diagnostics::enabled() {
+                interest.debug_enqueued.get_or_insert_with(Instant::now);
+            }
+        }
     }
 }
 #[derive(Debug)]
@@ -589,6 +855,12 @@ struct Session {
     anchors: Mutex<HashMap<u32, (i32, i32)>>,
     metadata: tokio::sync::Mutex<PrimaryWriter>,
     catalogues: Mutex<HashSet<[u8; 32]>>,
+    #[cfg(feature = "debug-diagnostics")]
+    debug_bytes: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "debug-diagnostics")]
+    debug_records: [std::sync::atomic::AtomicU64; 6],
+    #[cfg(feature = "debug-diagnostics")]
+    debug_phase: [[std::sync::atomic::AtomicU64; 7]; 2],
 }
 #[derive(Clone, Copy)]
 struct Claim {
@@ -604,6 +876,19 @@ enum ClaimOutcome {
     Cancelled,
 }
 impl Session {
+    #[cfg(feature = "debug-diagnostics")]
+    fn phase(&self, lane: usize, phase: u64) {
+        let fields = &self.debug_phase[lane];
+        fields[0].store(phase, Ordering::Relaxed);
+        fields[1].store(
+            if phase == 0 || !diagnostics::enabled() {
+                0
+            } else {
+                diagnostics::now_ns()
+            },
+            Ordering::Relaxed,
+        );
+    }
     fn wake(&self) {
         self.available.notify_waiters();
     }
@@ -656,70 +941,76 @@ impl Session {
         Ok((region, ordinal))
     }
     fn apply(self: &Arc<Self>, desires: Vec<ScopedDesire>) -> Result<()> {
-        let settings = *self
-            .settings
-            .lock()
-            .expect("streaming policy owner poisoned");
-        let mut additions = Vec::new();
-        let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
-        for mut scoped in desires {
-            let scope = self.scope(scoped.dimension)?;
-            if scoped.expected_world != [0; 32] && scoped.expected_world != scope.world {
-                bail!("request world identity changed")
-            }
-            let key = ScopedKey {
-                dimension: scoped.dimension,
-                key: scoped.desire.key,
-            };
-            if let Some(anchor) = self
-                .anchors
+        crate::diagnostics::sync_result(crate::diagnostics::Stage::Apply, || {
+            let settings = *self
+                .settings
                 .lock()
-                .expect("spatial anchor owner poisoned")
-                .get(&scoped.dimension)
-                .copied()
-            {
-                scoped.desire.rank = geometric_rank(key.key, anchor)?;
+                .expect("streaming policy owner poisoned");
+            let mut additions = Vec::new();
+            let mut wants = self.wants.lock().expect("terrain desire owner poisoned");
+            for mut scoped in desires {
+                let scope = self.scope(scoped.dimension)?;
+                if scoped.expected_world != [0; 32] && scoped.expected_world != scope.world {
+                    bail!("request world identity changed")
+                }
+                let key = ScopedKey {
+                    dimension: scoped.dimension,
+                    key: scoped.desire.key,
+                };
+                if let Some(anchor) = self
+                    .anchors
+                    .lock()
+                    .expect("spatial anchor owner poisoned")
+                    .get(&scoped.dimension)
+                    .copied()
+                {
+                    scoped.desire.rank = geometric_rank(key.key, anchor)?;
+                }
+                let (region, ordinal) = self.coordinate(key)?;
+                if !wants.regions.contains_key(&region) {
+                    additions.push(region);
+                }
+                wants
+                    .regions
+                    .entry(region)
+                    .or_default()
+                    .insert(ordinal, key);
+                wants.remove_queue(key);
+                let old = wants.interests.remove(&key);
+                let revision = old.as_ref().map_or(0, |old| old.revision.wrapping_add(1));
+                let known = scoped.desire.have;
+                wants.interests.insert(
+                    key,
+                    Interest {
+                        desire: scoped.desire,
+                        known,
+                        active: old.as_ref().and_then(|old| old.active),
+                        revision,
+                        dirty: old.as_ref().is_some_and(|old| old.dirty)
+                            || (scoped.desire.purpose == 2 && known.is_some()),
+                        waiting_source: false,
+                        queued: None,
+                        #[cfg(feature = "debug-diagnostics")]
+                        debug_enqueued: old.as_ref().and_then(|old| old.debug_enqueued),
+                        #[cfg(feature = "debug-diagnostics")]
+                        debug_source: old.as_ref().and_then(|old| old.debug_source),
+                    },
+                );
+                wants.enqueue(key);
             }
-            let (region, ordinal) = self.coordinate(key)?;
-            if !wants.regions.contains_key(&region) {
-                additions.push(region);
+            drop(wants);
+            for region in additions {
+                self.scope(region.0)?
+                    .responder
+                    .subscribe_region(region.1, region.2)?;
+                self.state.register(self, region);
             }
-            wants
-                .regions
-                .entry(region)
-                .or_default()
-                .insert(ordinal, key);
-            wants.remove_queue(key);
-            let old = wants.interests.remove(&key);
-            let revision = old.as_ref().map_or(0, |old| old.revision.wrapping_add(1));
-            let known = scoped.desire.have;
-            wants.interests.insert(
-                key,
-                Interest {
-                    desire: scoped.desire,
-                    known,
-                    active: old.as_ref().and_then(|old| old.active),
-                    revision,
-                    dirty: old.as_ref().is_some_and(|old| old.dirty)
-                        || (scoped.desire.purpose == 2 && known.is_some()),
-                    waiting_source: false,
-                    queued: None,
-                },
-            );
-            wants.enqueue(key);
-        }
-        drop(wants);
-        for region in additions {
-            self.scope(region.0)?
-                .responder
-                .subscribe_region(region.1, region.2)?;
-            self.state.register(self, region);
-        }
-        self.state
-            .regional
-            .set_cadence(self.id, Some(settings.interval_millis))?;
-        self.wake();
-        Ok(())
+            self.state
+                .regional
+                .set_cadence(self.id, Some(settings.interval_millis))?;
+            self.wake();
+            Ok(())
+        })
     }
     fn drop_keys(&self, keys: Vec<ScopedKey>) -> Result<()> {
         let mut releases = Vec::new();
@@ -869,6 +1160,10 @@ impl Session {
             {
                 interest.revision += 1;
                 interest.waiting_source = false;
+                #[cfg(feature = "debug-diagnostics")]
+                if let Some(start) = interest.debug_source.take() {
+                    diagnostics::record(Stage::SourceWait, start.elapsed(), 0);
+                }
                 interest.dirty = interest.known.is_some() || interest.desire.purpose == 2;
                 wants.enqueue(key);
             }
@@ -894,7 +1189,7 @@ impl Session {
             .lock()
             .expect("active dimension owner poisoned") = active;
         self.route.ledger.update(settings.bandwidth_kbps);
-        if self.state.trace {
+        if self.state.tracing() {
             let (bytes, datagrams) = self.route.ledger.counters();
             eprintln!(
                 "VOXY_TOTAL_POLICY session={} route={} total_kbps={} interval_ms={} refresh_allowed={} active_dimension={} ip_bytes={} datagrams={}",
@@ -979,7 +1274,14 @@ impl Session {
                         revision: interest.revision,
                     };
                     wants.refresh.insert(entry);
-                    wants.interests.get_mut(&key).unwrap().queued = Some(entry);
+                    let interest = wants.interests.get_mut(&key).unwrap();
+                    interest.queued = Some(entry);
+                    #[cfg(feature = "debug-diagnostics")]
+                    {
+                        if diagnostics::enabled() {
+                            interest.debug_enqueued.get_or_insert_with(Instant::now);
+                        }
+                    }
                 }
                 wants.refresh_started = false;
             } else {
@@ -1028,6 +1330,18 @@ impl Session {
             .get_mut(&key)
             .expect("queued terrain has an owner");
         interest.active = Some((interest.desire.ticket, interest.revision));
+        #[cfg(feature = "debug-diagnostics")]
+        if let Some(start) = interest.debug_enqueued.take() {
+            diagnostics::record(
+                match entry.class {
+                    3 => Stage::QueuePrefetch,
+                    4 => Stage::QueueRefresh,
+                    _ => Stage::QueueVisible,
+                },
+                start.elapsed(),
+                0,
+            );
+        }
         let claim = Claim {
             scope: key,
             desire: interest.desire,
@@ -1064,6 +1378,12 @@ impl Session {
         }
         if interest.desire.ticket == claim.desire.ticket {
             interest.waiting_source = matches!(outcome, ClaimOutcome::NotReady);
+            #[cfg(feature = "debug-diagnostics")]
+            if interest.waiting_source {
+                if diagnostics::enabled() {
+                    interest.debug_source.get_or_insert_with(Instant::now);
+                }
+            }
             if let ClaimOutcome::Sent(binding) = outcome {
                 interest.known = Some(binding);
             }
@@ -1096,6 +1416,7 @@ impl Session {
         self.claim_valid(claim, &settings, &wants)
     }
     async fn begin_record(&self, send: &mut quinn::SendStream, claim: Claim) -> Result<bool> {
+        let admission = Span::new(Stage::Admission);
         loop {
             let changed = self.available.notified();
             tokio::pin!(changed);
@@ -1129,19 +1450,23 @@ impl Session {
             tokio::select! {
                 biased;
                 _ = &mut changed => {},
-                result = admitted => return result,
+                result = admitted => { admission.finish(result.is_ok(),0); return result },
             }
         }
     }
     async fn metadata(&self, message: &ControlMessage) -> Result<()> {
+        let lock = Span::new(Stage::MetadataLock);
         let mut writer = self.metadata.lock().await;
+        lock.finish(true, 0);
         if writer.failed {
             bail!("metadata writer closed")
         }
+        let write = Span::new(Stage::MetadataWrite);
         let result = writer
             .send
             .write_all(&encode_control_record(message)?)
             .await;
+        write.finish(result.is_ok(), 0);
         if result.is_err() {
             writer.failed = true;
         }
@@ -1153,7 +1478,9 @@ impl Session {
         world: [u8; 32],
         catalogue: &CatalogDefinition,
     ) -> Result<()> {
+        let lock = Span::new(Stage::MetadataLock);
         let mut writer = self.metadata.lock().await;
+        lock.finish(true, 0);
         if writer.failed {
             bail!("metadata writer closed")
         }
@@ -1166,6 +1493,7 @@ impl Session {
             return Ok(());
         }
         use tokio::io::AsyncWriteExt;
+        let write = Span::new(Stage::MetadataWrite);
         let result = async {
             writer.send.write_u8(0x83).await?;
             writer
@@ -1178,6 +1506,7 @@ impl Session {
             Ok::<(), anyhow::Error>(())
         }
         .await;
+        write.finish(result.is_ok(), catalogue.payload.len() as u64);
         if let Err(error) = result {
             writer.failed = true;
             return Err(error);
@@ -1186,7 +1515,7 @@ impl Session {
             .lock()
             .expect("catalogue owner poisoned")
             .insert(catalogue.fingerprint);
-        if self.state.trace {
+        if self.state.tracing() {
             eprintln!(
                 "VOXY_CATALOG_SENT session={} dimension={} fingerprint={} canonical_bytes={} compressed_bytes={}",
                 self.id,
@@ -1218,6 +1547,8 @@ pub async fn serve(
         .set(Network { mux, config })
         .map_err(|_| anyhow::anyhow!("UDP listener already initialized"))?;
     state.start_bridge()?;
+    #[cfg(feature = "debug-diagnostics")]
+    state.start_diagnostics();
     state.publication_loop();
     eprintln!(
         "VOXY_READY udp_port={} alpn={} cert_sha256={}",
@@ -1247,8 +1578,10 @@ async fn serve_connection(
     route: Arc<RouteOwner>,
     incoming: quinn::Incoming,
 ) -> Result<()> {
+    let tls = Span::new(Stage::Tls);
     let connection = incoming.await?;
-    if state.trace {
+    tls.finish(true, 0);
+    if state.tracing() {
         eprintln!(
             "VOXY_BOOTSTRAP stage=TLS_ESTABLISHED session={} route={} peer={}",
             connection.stable_id(),
@@ -1262,7 +1595,7 @@ async fn serve_connection(
     }
     let result = serve_established(state.clone(), route.clone(), &connection).await;
     connection.close(VarInt::from_u32(0), b"Voxy session ended");
-    if state.trace {
+    if state.tracing() {
         let (bytes, packets) = route.ledger.counters();
         eprintln!(
             "VOXY_QUIC_ENDED session={} route={} route_ip_bytes={bytes} route_datagrams={packets} success={}",
@@ -1278,12 +1611,13 @@ async fn serve_established(
     route: Arc<RouteOwner>,
     connection: &quinn::Connection,
 ) -> Result<()> {
+    let bootstrap = Span::new(Stage::Bootstrap);
     let (send, mut recv) = connection.accept_bi().await?;
     send.set_priority(3)?;
     if read_stream_role(&mut recv).await? != Some(STREAM_CONTROL) {
         bail!("first stream must be control")
     }
-    if state.trace {
+    if state.tracing() {
         eprintln!(
             "VOXY_BOOTSTRAP stage=FIRST_CONTROL session={} route={}",
             connection.stable_id(),
@@ -1295,7 +1629,7 @@ async fn serve_established(
     if supplied != route.token {
         bail!("authenticated route token mismatch")
     }
-    if state.trace {
+    if state.tracing() {
         eprintln!(
             "VOXY_BOOTSTRAP stage=TOKEN_VALID session={} route={}",
             connection.stable_id(),
@@ -1313,7 +1647,7 @@ async fn serve_established(
             old.close(VarInt::from_u32(0), b"QUIC reconnect");
         }
     }
-    let open = if state.trace {
+    let open = if state.tracing() {
         wire::read_control_traced(
             &mut recv,
             connection.stable_id() as u64,
@@ -1344,7 +1678,7 @@ async fn serve_established(
             ),
             _ => bail!("OPEN must be first"),
         };
-    if state.trace {
+    if state.tracing() {
         eprintln!(
             "VOXY_BOOTSTRAP stage=OPEN_READ session={} route={} dimension={} total_kbps={} initial_desires={} expected_world={} held_catalog={}",
             connection.stable_id(),
@@ -1383,6 +1717,14 @@ async fn serve_established(
             failed: false,
         }),
         catalogues: Mutex::new(catalogues),
+        #[cfg(feature = "debug-diagnostics")]
+        debug_bytes: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(feature = "debug-diagnostics")]
+        debug_records: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        #[cfg(feature = "debug-diagnostics")]
+        debug_phase: std::array::from_fn(|_| {
+            std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+        }),
     });
     state
         .sessions
@@ -1392,19 +1734,20 @@ async fn serve_established(
     let result = async {
         session.policy(settings, active, vec![DimensionAnchor { dimension:active, x:anchor_x, z:anchor_z }])?;
         session.metadata(&responder.hello(active)?).await?;
-        if state.trace {
+        if state.tracing() {
             eprintln!("VOXY_BOOTSTRAP stage=HELLO_SENT session={} route={}", session.id, hex(&session.route.token[..16]));
         }
         session.metadata(&state.regional.manifest_record()?).await?;
-        if state.trace {
+        if state.tracing() {
             eprintln!("VOXY_BOOTSTRAP stage=MANIFEST_SENT session={} route={}", session.id, hex(&session.route.token[..16]));
         }
         let definition = responder.catalogue()?;
         session.announce_catalogue(active, responder.world_identity(), &definition).await?;
+        bootstrap.finish(true,0);
         if matched {
             session.apply(desires.into_iter().map(|desire| ScopedDesire { dimension:active, expected_world, desire }).collect())?;
         }
-        if state.trace {
+        if state.tracing() {
             eprintln!("VOXY_STREAM_SESSION session={} peer={} dimension={} total_kbps={} held_catalog={}", session.id, connection.remote_address(), active, settings.bandwidth_kbps, blake3::Hash::from(held_catalog));
         }
         let mut tasks = tokio::task::JoinSet::new();
@@ -1484,7 +1827,7 @@ async fn serve_lane(
         }
         let (claim, deadline) = session.claim(lane);
         if let Some(claim) = claim {
-            let outcome = tokio::select! {result=send_claim(&session,&mut send,claim)=>result?,_=session.ended()=>return Ok(())};
+            let outcome = tokio::select! {result=send_claim(&session,&mut send,claim,lane)=>result?,_=session.ended()=>return Ok(())};
             session.finish(claim, outcome);
         } else {
             tokio::select! {_=notified=>{},_=async{if let Some(deadline)=deadline{tokio::time::sleep_until(deadline).await}else{std::future::pending::<()>().await}}=>{},_=session.ended()=>return Ok(())}
@@ -1514,48 +1857,154 @@ async fn send_claim(
     session: &Session,
     send: &mut quinn::SendStream,
     claim: Claim,
+    lane: usize,
 ) -> Result<ClaimOutcome> {
-    let scope = session.scope(claim.scope.dimension)?;
-    let responder = scope.responder.clone();
-    let desire = claim.desire;
-    let mut prepared: PreparedSection =
-        tokio::task::spawn_blocking(move || responder.prepare(desire.ticket, desire.key)).await??;
-    let descriptor = prepared.descriptor;
-    if !session.eligible(claim) {
-        return Ok(ClaimOutcome::Cancelled);
+    let request = Span::new(Stage::Request);
+    #[cfg(feature = "debug-diagnostics")]
+    let active = ActiveLane::new(session, lane, claim);
+    #[cfg(not(feature = "debug-diagnostics"))]
+    let _ = lane;
+    let result = async {
+        let scope = session.scope(claim.scope.dimension)?;
+        let responder = scope.responder.clone();
+        let desire = claim.desire;
+        // Debug lifecycle proof retains the route while detached blocking work can still run.
+        // A cancelled async waiter does not imply the executor closure has stopped.
+        #[cfg(feature = "debug-diagnostics")]
+        let work_owner = session.route.clone();
+        let mut prepared: PreparedSection = diagnostics::blocking(
+            Stage::PrepareQueue,
+            Stage::PrepareWork,
+            Stage::PrepareResume,
+            move || {
+                #[cfg(feature = "debug-diagnostics")]
+                let _owner = work_owner;
+                responder.prepare(desire.ticket, desire.key)
+            },
+        )
+        .await??;
+        let descriptor = prepared.descriptor;
+        if !session.eligible(claim) {
+            return Ok(ClaimOutcome::Cancelled);
+        }
+        if claim.refresh
+            && claim.known == Some(descriptor.binding)
+            && descriptor.status != RecordStatus::NotReady
+        {
+            return Ok(ClaimOutcome::Sent(descriptor.binding));
+        }
+        if descriptor.binding.catalog_fingerprint != [0; 32] {
+            #[cfg(feature = "debug-diagnostics")]
+            session.phase(lane, 2);
+            session
+                .announce_catalogue(claim.scope.dimension, scope.world, &prepared.catalog)
+                .await?;
+        }
+        if !session.eligible(claim) {
+            return Ok(ClaimOutcome::Cancelled);
+        }
+        if descriptor.status == RecordStatus::Data
+            && claim
+                .known
+                .is_some_and(|known| known.has_body() && known.same_body(descriptor.binding))
+        {
+            prepared.descriptor.status = RecordStatus::Reuse;
+        }
+        let descriptor = prepared.descriptor;
+        #[cfg(feature = "debug-diagnostics")]
+        {
+            session.phase(lane, 3);
+            session.debug_phase[lane][5].store(descriptor.generation, Ordering::Relaxed);
+        }
+        #[cfg(feature = "debug-diagnostics")]
+        let work_owner = session.route.clone();
+        let body = diagnostics::blocking(
+            Stage::BodyQueue,
+            Stage::BodyWork,
+            Stage::BodyResume,
+            move || {
+                #[cfg(feature = "debug-diagnostics")]
+                let _owner = work_owner;
+                prepared.body()
+            },
+        )
+        .await??;
+        #[cfg(feature = "debug-diagnostics")]
+        session.phase(lane, 4);
+        if !session.begin_record(send, claim).await? {
+            return Ok(ClaimOutcome::Cancelled);
+        }
+        #[cfg(feature = "debug-diagnostics")]
+        session.phase(lane, 5);
+        let write = Span::new(Stage::RecordWrite);
+        let written =
+            wire::write_record_body(send, claim.scope.dimension, scope.world, descriptor, &body)
+                .await;
+        write.finish(written.is_ok(), body.len() as u64);
+        written?;
+        #[cfg(feature = "debug-diagnostics")]
+        {
+            session.debug_records[descriptor.status as usize].fetch_add(1, Ordering::Relaxed);
+            session
+                .debug_bytes
+                .fetch_add(body.len() as u64, Ordering::Relaxed);
+        }
+        Ok(if descriptor.status == RecordStatus::NotReady {
+            ClaimOutcome::NotReady
+        } else {
+            ClaimOutcome::Sent(descriptor.binding)
+        })
     }
-    if claim.refresh
-        && claim.known == Some(descriptor.binding)
-        && descriptor.status != RecordStatus::NotReady
+    .await;
+    #[cfg(feature = "debug-diagnostics")]
     {
-        return Ok(ClaimOutcome::Sent(descriptor.binding));
+        active.completed.set(true);
+        if matches!(result, Ok(ClaimOutcome::Cancelled)) {
+            session.debug_records[5].fetch_add(1, Ordering::Relaxed);
+        }
     }
-    if descriptor.binding.catalog_fingerprint != [0; 32] {
-        session
-            .announce_catalogue(claim.scope.dimension, scope.world, &prepared.catalog)
-            .await?;
-    }
-    if !session.eligible(claim) {
-        return Ok(ClaimOutcome::Cancelled);
-    }
-    if descriptor.status == RecordStatus::Data
-        && claim
-            .known
-            .is_some_and(|known| known.has_body() && known.same_body(descriptor.binding))
-    {
-        prepared.descriptor.status = RecordStatus::Reuse;
-    }
-    let descriptor = prepared.descriptor;
-    let body = tokio::task::spawn_blocking(move || prepared.body()).await??;
-    if !session.begin_record(send, claim).await? {
-        return Ok(ClaimOutcome::Cancelled);
-    }
-    wire::write_record_body(send, claim.scope.dimension, scope.world, descriptor, &body).await?;
-    Ok(if descriptor.status == RecordStatus::NotReady {
-        ClaimOutcome::NotReady
+    if matches!(result, Ok(ClaimOutcome::Cancelled)) {
+        request.cancelled();
     } else {
-        ClaimOutcome::Sent(descriptor.binding)
-    })
+        request.finish(result.is_ok(), 0);
+    }
+    result
+}
+#[cfg(feature = "debug-diagnostics")]
+struct ActiveLane<'a> {
+    session: &'a Session,
+    lane: usize,
+    completed: std::cell::Cell<bool>,
+}
+#[cfg(feature = "debug-diagnostics")]
+impl<'a> ActiveLane<'a> {
+    fn new(session: &'a Session, lane: usize, claim: Claim) -> Self {
+        let fields = &session.debug_phase[lane];
+        for (index, value) in [
+            (2, claim.desire.ticket),
+            (3, claim.scope.key),
+            (4, claim.scope.dimension as u64),
+            (5, 0),
+            (6, claim.revision),
+        ] {
+            fields[index].store(value, Ordering::Relaxed);
+        }
+        session.phase(lane, 1);
+        Self {
+            session,
+            lane,
+            completed: std::cell::Cell::new(false),
+        }
+    }
+}
+#[cfg(feature = "debug-diagnostics")]
+impl Drop for ActiveLane<'_> {
+    fn drop(&mut self) {
+        if !self.completed.get() {
+            self.session.debug_records[5].fetch_add(1, Ordering::Relaxed);
+        }
+        self.session.phase(self.lane, 0);
+    }
 }
 async fn write_discovery(send: &mut quinn::SendStream, message: &ControlMessage) -> Result<()> {
     send.write_all(&encode_control_record(message)?)
@@ -1609,7 +2058,7 @@ async fn snapshot_inventory(
     };
     write_discovery(send, &record(if known { 0 } else { 5 }, 0, 0, [0; 16])).await?;
     if !known {
-        if session.state.trace {
+        if session.state.tracing() {
             eprintln!(
                 "VOXY_INVENTORY_SNAPSHOT session={} dimension={dimension} revision={revision} known=false rows=0",
                 session.id
@@ -1633,7 +2082,7 @@ async fn snapshot_inventory(
         after = Some(coordinate);
         rows += 1;
     }
-    if session.state.trace {
+    if session.state.tracing() {
         eprintln!(
             "VOXY_INVENTORY_SNAPSHOT session={} dimension={dimension} revision={revision} known=true rows={rows}",
             session.id
@@ -1690,7 +2139,7 @@ async fn discovery_loop(session: Arc<Session>, send: &mut quinn::SendStream) -> 
                         )
                         .await?;
                         pending_complete.remove(&dimension);
-                        if session.state.trace {
+                        if session.state.tracing() {
                             eprintln!(
                                 "VOXY_INVENTORY_COMPLETE session={} dimension={dimension} revision={revision}",
                                 session.id

@@ -22,6 +22,11 @@ sourceSets {
         java.srcDirs = ['src/debug/java', rootProject.file('shared/src/debug/java')]
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
     }
+    pressureChecks {
+        java.srcDirs = ['src/debugTest/java']
+        compileClasspath += sourceSets.debug.output + sourceSets.debug.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
 }
 
 repositories { mavenCentral() }
@@ -38,7 +43,7 @@ tasks.named('processResources') {
             neoforge: neoForgeVersion,
     ]
     inputs.properties(resourceProperties)
-    from(rootProject.file('rust-server/target/release/voxy-rust-server')) {
+    from(rootProject.file('rust-server/target/normal/release/voxy-rust-server')) {
         into 'native/linux-x86_64'
     }
     filesMatching('META-INF/neoforge.mods.toml') {
@@ -51,14 +56,19 @@ tasks.named('jar', Jar) {
 }
 
 tasks.register('debugJar', Jar) {
+    dependsOn rootProject.tasks.named('buildRustServerDebug')
     description = 'Build the server controller with QUIC diagnostics enabled'
     archiveClassifier.set('debug')
     manifest.attributes('Implementation-Version': modVersion)
     from(sourceSets.main.output) {
         exclude 'me/cortex/voxy/server/ServerDebug.class'
         exclude 'META-INF/neoforge.mods.toml'
+        exclude 'native/linux-x86_64/voxy-rust-server'
     }
     from sourceSets.debug.output
+    from(rootProject.file('rust-server/target/debug-diagnostics/release/voxy-rust-server')) {
+        into 'native/linux-x86_64'
+    }
     from('src/main/resources/META-INF/neoforge.mods.toml') {
         into 'META-INF'
         expand(version: project.version, minecraft: minecraftVersion, neoforge: neoForgeVersion)
@@ -69,6 +79,12 @@ tasks.register('debugJar', Jar) {
 
 tasks.named('assemble') {
     dependsOn tasks.named('debugJar')
+}
+
+tasks.register('pressureControlChecks', JavaExec) {
+    description = 'Focused pressure deadline, owned IPC framing and cleanup-acknowledgment checks'
+    classpath = sourceSets.pressureChecks.runtimeClasspath
+    mainClass.set('me.cortex.voxy.server.LivePressureRoutesChecks')
 }
 
 neoForge {

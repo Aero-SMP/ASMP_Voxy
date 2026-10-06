@@ -10,6 +10,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.BitSet;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Map;
@@ -34,6 +36,8 @@ final class ChunkSaveNotifications implements AutoCloseable {
     private final Map<String, String> changedExclusions = new HashMap<>();
     private final Map<String, Route> routes = new HashMap<>();
     private Map<String, byte[]> revoked = new HashMap<>();
+    private record Command(Process target, byte[] frame, CompletableFuture<Void> sent) {}
+    private final ArrayDeque<Command> commands = new ArrayDeque<>();
     private Process child;
     private boolean open = true;
     private final Thread drain = Thread.ofPlatform().daemon().name("Voxy native bridge").unstarted(this::run);
@@ -41,9 +45,12 @@ final class ChunkSaveNotifications implements AutoCloseable {
     void start() { drain.start(); }
 
     void attach(Process next) {
+        java.util.List<Command> abandoned;
         synchronized (wake) {
             if (child == next) return;
             child = next;
+            abandoned = commands.isEmpty() ? java.util.List.of() : new ArrayList<>(commands);
+            commands.clear();
             changedDimensions.putAll(dimensions);
             changedExclusions.putAll(excludedDimensions);
             for (Route route : routes.values()) {
@@ -51,6 +58,19 @@ final class ChunkSaveNotifications implements AutoCloseable {
                 if (route.ready.isDone()) route.ready = new CompletableFuture<>();
             }
             wake.notifyAll();
+        }
+        for (Command command : abandoned) command.sent.completeExceptionally(new IOException("native epoch changed"));
+    }
+
+    /** An owner-bound extension frame; never replay opaque commands after replacement. */
+    CompletableFuture<Void> command(Process target, byte[] frame) {
+        synchronized (wake) {
+            if (!open || target == null || child != target || !target.isAlive())
+                return CompletableFuture.failedFuture(new IOException("native owner unavailable"));
+            var sent = new CompletableFuture<Void>();
+            commands.addLast(new Command(target, frame.clone(), sent));
+            wake.notifyAll();
+            return sent;
         }
     }
 
@@ -122,7 +142,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
     }
 
     private boolean pending() {
-        return !dirty.isEmpty() || !changedDimensions.isEmpty() || !changedExclusions.isEmpty() || !revoked.isEmpty()
+        return !dirty.isEmpty() || !changedDimensions.isEmpty() || !changedExclusions.isEmpty() || !revoked.isEmpty() || !commands.isEmpty()
                 || routes.values().stream().anyMatch(route -> route.pending);
     }
 
@@ -133,6 +153,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
             Map<String, Dimension> definitions;
             Map<String, String> exclusions;
             Map<String, byte[]> removals;
+            java.util.List<Command> extensions;
             Map<String, Integer> registrations = new HashMap<>();
             synchronized (wake) {
                 while (open && (child == null || !pending())) {
@@ -144,6 +165,7 @@ final class ChunkSaveNotifications implements AutoCloseable {
                 definitions = new java.util.TreeMap<>(changedDimensions); changedDimensions.clear();
                 exclusions = new java.util.TreeMap<>(changedExclusions); changedExclusions.clear();
                 removals = revoked; revoked = new HashMap<>();
+                extensions = commands.isEmpty() ? java.util.List.of() : new ArrayList<>(commands); commands.clear();
                 for (var entry : routes.entrySet()) if (entry.getValue().pending) {
                     registrations.put(entry.getKey(), entry.getValue().rate);
                     entry.getValue().pending = false;
@@ -172,6 +194,10 @@ final class ChunkSaveNotifications implements AutoCloseable {
                     write(target, output, frame(41).put((byte) 2)
                             .put(HexFormat.of().parseHex(registration.getKey())).putLong(registration.getValue()));
                 }
+                for (Command extension : extensions) {
+                    if (extension.target != target) throw new IOException("extension owner changed");
+                    write(target, output, ByteBuffer.wrap(extension.frame));
+                }
                 for (var dimension : saves.entrySet()) {
                     byte[] name = utf8(dimension.getKey().location().toString());
                     int count = 0;
@@ -187,7 +213,9 @@ final class ChunkSaveNotifications implements AutoCloseable {
                     write(target, output, frame);
                 }
                 output.flush();
+                for (Command extension : extensions) extension.sent.complete(null);
             } catch (IOException | RuntimeException failure) {
+                for (Command extension : extensions) extension.sent.completeExceptionally(failure);
                 synchronized (wake) {
                     if (!open) return;
                     merge(saves);
@@ -230,7 +258,9 @@ final class ChunkSaveNotifications implements AutoCloseable {
         java.util.List<CompletableFuture<Void>> pending;
         synchronized (wake) {
             open = false; child = null;
-            pending = routes.values().stream().map(route -> route.ready).toList();
+            pending = new ArrayList<>(routes.values().stream().map(route -> route.ready).toList());
+            pending.addAll(commands.stream().map(Command::sent).toList());
+            commands.clear();
             routes.clear(); wake.notifyAll();
         }
         for (var ready : pending) ready.completeExceptionally(new IOException("native owner stopped"));
