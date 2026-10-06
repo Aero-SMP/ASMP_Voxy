@@ -1,0 +1,437 @@
+{
+  "plan": "project_audit/cache_mesher_startup_and_shared_locking_plan.md",
+  "sourceCommit": "7f798d60fcd3cae9cd76931595579cda8823c6ef",
+  "branch": "feature/cache-first-background-updates",
+  "clock": {
+    "utc_start": "2026-10-06T03:28:18.276502+00:00",
+    "monotonic_start": 480447.168829293,
+    "target_seconds": 300,
+    "limit_seconds": 600,
+    "status": "ended",
+    "boot_id": "9f129e1b-f8c2-444a-8dba-15679f924562",
+    "run": "9402476d-0d90-4634-8ee5-46d4dcd03f0a",
+    "utc_end": "2026-10-06T03:36:18.065670+00:00",
+    "elapsed_seconds": 479.789163362002,
+    "exceeded_limit": false,
+    "validation_utc_end": "2026-10-06T03:35:25.935702+00:00",
+    "validation_elapsed_seconds": 427.6592004520353,
+    "cleanupAfterPrematureClockClose": true
+  },
+  "testingScope": {
+    "realPcOnly": true,
+    "testSuitesRun": false,
+    "fakeClientsRun": false,
+    "cacheDeleted": false,
+    "matchedStartupAB": false,
+    "simultaneousCacheNetworkBenchmark": false,
+    "analysisAfterClosure": "frozen receipts and source only"
+  },
+  "run": {
+    "id": "9402476d-0d90-4634-8ee5-46d4dcd03f0a",
+    "harnessStatus": "PASS",
+    "harnessFailure": "NONE",
+    "finalizationResponse": "finalized 9402476d-0d90-4634-8ee5-46d4dcd03f0a as PASS",
+    "statusMeaning": "Scoped held-cache/resumed-view run; not exhaustive acceptance of rare paths"
+  },
+  "client": {
+    "host": "GIORKOSPC",
+    "profile": "C:\\Users\\USER\\AppData\\Roaming\\ModrinthApp\\profiles\\Aero SMP",
+    "version": 261,
+    "oldGamePid": 32192,
+    "gamePid": 23216,
+    "sha256": "b4f2b73b6c39704aa358761250ba3b568e05d2a8c0dfde199faa9ed732a0cc44",
+    "loadedIdentityEvidence": [
+      "installed jar SHA",
+      "current debug header",
+      "typed buildIdentity matching SHA"
+    ],
+    "backupHelperPids": [
+      19916,
+      22444
+    ],
+    "bothPinnedRoutesRespondedBeforeAndAfter": true,
+    "minecraftEndpoint": "play.aerosmp.com:25587",
+    "quicEndpoint": "95.164.127.81:25787",
+    "transportHoldRestored": true
+  },
+  "settings": {
+    "downloadKbps": 200,
+    "storageBytes": 9223372036854775807,
+    "entireWorld": true,
+    "counting": "cacheDiskBytes is actual-file-byte accounting from budget inventory and write extent; no independent final filesystem-byte scan was captured"
+  },
+  "server": {
+    "samePidsAndStartTicks": true,
+    "configHashesUnchanged": true,
+    "jarsUnchanged": true,
+    "otherModsUnchanged": true,
+    "javaHeap": {
+      "InitialHeapSize": 1073741824,
+      "MaxHeapSize": 4294967296
+    },
+    "rustCgroup": {
+      "memory.max": "999997440",
+      "memory.swap.max": "0",
+      "memory.current": "259072000",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+    },
+    "controllerVersion": 260,
+    "nativeVersion": 260,
+    "javaPid": 306308,
+    "javaStartTicks": 45505073,
+    "nativePid": 307526,
+    "nativeStartTicks": 45506585,
+    "nativeSha256": "c1352e54bfd0af7f5c7f03518970cd0a2e162715cc05b18e0eda42e315f40ea9",
+    "controllerSha256": "89ab21697970868d5289e43bb3bfc061f43fc4536d3534a84c9c40c6ce1d788c",
+    "beforeMemoryCurrentBytes": 188686336
+  },
+  "heldCache": {
+    "line": 38667,
+    "utc": "2026-10-06T03:32:51.951561Z",
+    "transportHeld": "true",
+    "helloAccepted": "false",
+    "localActivations": "32144",
+    "firstLocalNanos": "799078900",
+    "firstCachedNanosLod": [
+      1112098300,
+      977067500,
+      936004500,
+      835916800,
+      796420800
+    ],
+    "quicUdpSentBytesJvm": "0",
+    "quicUdpReceivedBytesJvm": "0",
+    "sectionWorkersAllocatedBytes": 634765056,
+    "workerAllocatedBytes": {
+      "-1": 389077776,
+      "0": 46669928,
+      "1": 47869584,
+      "2": 44662632,
+      "3": 45741672,
+      "4": 45542624,
+      "5": 45594752,
+      "6": 47798872,
+      "7": 46612872,
+      "8": 47226128,
+      "9": 45989000,
+      "10": 42842272,
+      "11": 42832920,
+      "12": 44159224,
+      "13": 41222576
+    },
+    "stages": {
+      "TASK": {
+        "completedCount": 32314,
+        "totalElapsedWorkerStageNs": 125338100,
+        "maxElapsedWorkerStageNs": 2548500
+      },
+      "METADATA": {
+        "completedCount": 6199,
+        "totalElapsedWorkerStageNs": 25208729100,
+        "maxElapsedWorkerStageNs": 81150600
+      },
+      "CACHE_READ": {
+        "completedCount": 32314,
+        "totalElapsedWorkerStageNs": 28584431000,
+        "maxElapsedWorkerStageNs": 390360300
+      },
+      "REQUEST_MODELS": {
+        "completedCount": 32145,
+        "totalElapsedWorkerStageNs": 72480600,
+        "maxElapsedWorkerStageNs": 1264100
+      },
+      "CHECK_MODELS": {
+        "completedCount": 32145,
+        "totalElapsedWorkerStageNs": 16577600,
+        "maxElapsedWorkerStageNs": 215700
+      },
+      "MESH": {
+        "completedCount": 32123,
+        "totalElapsedWorkerStageNs": 30859117000,
+        "maxElapsedWorkerStageNs": 26574000
+      },
+      "RESULT_READY": {
+        "completedCount": 38513,
+        "totalElapsedWorkerStageNs": 128785800,
+        "maxElapsedWorkerStageNs": 3210300
+      },
+      "WAIT_MODELS": {
+        "completedCount": 752,
+        "totalElapsedWorkerStageNs": 4920038600,
+        "maxElapsedWorkerStageNs": 131023000
+      }
+    },
+    "outcomes": {
+      "CACHE_HIT": 32145,
+      "CACHE_MISS": 0,
+      "CACHE_CORRUPT": 0,
+      "MODEL_WAIT": 752,
+      "FAILURE": 191,
+      "COMPRESSED_BYTES": 0,
+      "CANONICAL_BYTES": 0,
+      "MESH_BYTES": 716745464,
+      "MODEL_RECLAIM": 191,
+      "SAVE_SUCCESS": 0,
+      "SAVE_FAILURE": 0,
+      "SAVE_CANCELLED": 0
+    },
+    "journal": {
+      "recoveries": 5959,
+      "frameVisits": 645811,
+      "recoveryNs": 6306840600,
+      "reuses": 32314,
+      "commits": 0
+    }
+  },
+  "activationEventMilestones": {
+    "1000": {
+      "line": 1244,
+      "utc": "2026-10-06T03:31:44.559619Z",
+      "kind": 2
+    },
+    "10000": {
+      "line": 10447,
+      "utc": "2026-10-06T03:31:47.468299600Z",
+      "kind": 2
+    },
+    "20000": {
+      "line": 20742,
+      "utc": "2026-10-06T03:31:50.299405200Z",
+      "kind": 2
+    },
+    "30000": {
+      "line": 32408,
+      "utc": "2026-10-06T03:31:53.258292300Z",
+      "kind": 2
+    },
+    "31000": {
+      "line": 33504,
+      "utc": "2026-10-06T03:31:53.430781700Z",
+      "kind": 2
+    },
+    "32000": {
+      "line": 34540,
+      "utc": "2026-10-06T03:31:53.591721400Z",
+      "kind": 2
+    },
+    "32144": {
+      "line": 38416,
+      "utc": "2026-10-06T03:32:18.797361900Z",
+      "kind": 1
+    }
+  },
+  "allocation": {
+    "sectionWorkerLifetimeAllocatedBytesPerCacheHit": 19746.929724685022,
+    "scope": "All worker lifetime work; metadata allocation kept separate; not a matched speedup or dedicated mask allocation measurement",
+    "maskPrimitiveBytesPerWorker": 73856,
+    "maskArraysPerWorker": 4,
+    "workers": 14,
+    "maskPrimitiveBytesTotal": 1033984,
+    "estimatedMaskLayoutBytesTotal": 1035104,
+    "exactRetainedUtf8BytesMeasured": false
+  },
+  "sampledCpuDeltaTotalsNs": {
+    "-1": 8187499999,
+    "0": 3640624999,
+    "1": 3609374999,
+    "2": 3312499999,
+    "3": 3499999999,
+    "4": 3531249999,
+    "5": 3562499999,
+    "6": 3593749999,
+    "7": 3734374999,
+    "8": 3640624999,
+    "9": 3874999999,
+    "10": 3046874999,
+    "11": 2718749999,
+    "12": 2999999999,
+    "13": 2437499999
+  },
+  "finalNetworkAndPersistence": {
+    "timestamp": "2026-10-06T03:35:16.901520600Z",
+    "receivedTerrainPayloadBytes": 333358,
+    "freshDataActivationsByLod": [
+      53,
+      5,
+      1,
+      1,
+      0
+    ],
+    "localPatches": 2260,
+    "journalCommitEvents": 977,
+    "committedRegions": 513,
+    "saveSuccess": 2260,
+    "saveFailure": 0,
+    "saveCancelled": 0,
+    "cacheDiskBytes": 1551819712,
+    "cacheDiskGrowthAfterHelloBytes": 498970,
+    "cacheUnownedBytes": 0,
+    "cacheInventory": "READY",
+    "connectionFailure": "null",
+    "sessionFailure": "null",
+    "metadataFailure": "none",
+    "quicReceivedBytesJvm": 1295402,
+    "quicSentBytesJvm": 722308,
+    "prefetchCommitted": 0,
+    "prefetchFailures": 0
+  },
+  "finalSample": {
+    "line": 48584,
+    "utc": "2026-10-06T03:35:16.901520600Z",
+    "stages": {
+      "TASK": {
+        "completedCount": 32374,
+        "totalElapsedWorkerStageNs": 126522500,
+        "maxElapsedWorkerStageNs": 2548500
+      },
+      "METADATA": {
+        "completedCount": 8400,
+        "totalElapsedWorkerStageNs": 25225734900,
+        "maxElapsedWorkerStageNs": 81150600
+      },
+      "CACHE_READ": {
+        "completedCount": 32314,
+        "totalElapsedWorkerStageNs": 28584431000,
+        "maxElapsedWorkerStageNs": 390360300
+      },
+      "DECOMPRESS": {
+        "completedCount": 60,
+        "totalElapsedWorkerStageNs": 3991600,
+        "maxElapsedWorkerStageNs": 178600
+      },
+      "DECODE_VALIDATE": {
+        "completedCount": 60,
+        "totalElapsedWorkerStageNs": 20664500,
+        "maxElapsedWorkerStageNs": 4714300
+      },
+      "REQUEST_MODELS": {
+        "completedCount": 32205,
+        "totalElapsedWorkerStageNs": 72721700,
+        "maxElapsedWorkerStageNs": 1264100
+      },
+      "CHECK_MODELS": {
+        "completedCount": 32205,
+        "totalElapsedWorkerStageNs": 16710900,
+        "maxElapsedWorkerStageNs": 215700
+      },
+      "MESH": {
+        "completedCount": 32183,
+        "totalElapsedWorkerStageNs": 30895169900,
+        "maxElapsedWorkerStageNs": 26574000
+      },
+      "RESULT_READY": {
+        "completedCount": 40774,
+        "totalElapsedWorkerStageNs": 131588400,
+        "maxElapsedWorkerStageNs": 3210300
+      },
+      "WAIT_MODELS": {
+        "completedCount": 752,
+        "totalElapsedWorkerStageNs": 4920038600,
+        "maxElapsedWorkerStageNs": 131023000
+      },
+      "SAVE_ENCODE_WRITE": {
+        "completedCount": 2260,
+        "totalElapsedWorkerStageNs": 35055252700,
+        "maxElapsedWorkerStageNs": 71789500
+      },
+      "WAIT_REGION_WRITER": {
+        "completedCount": 2260,
+        "totalElapsedWorkerStageNs": 1706521000,
+        "maxElapsedWorkerStageNs": 58489800
+      }
+    },
+    "outcomes": {
+      "CACHE_HIT": 32145,
+      "CACHE_MISS": 0,
+      "CACHE_CORRUPT": 0,
+      "MODEL_WAIT": 752,
+      "FAILURE": 191,
+      "COMPRESSED_BYTES": 333358,
+      "CANONICAL_BYTES": 1642597,
+      "MESH_BYTES": 717976976,
+      "MODEL_RECLAIM": 191,
+      "SAVE_SUCCESS": 2260,
+      "SAVE_FAILURE": 0,
+      "SAVE_CANCELLED": 0
+    },
+    "journal": {
+      "recoveries": 6365,
+      "frameVisits": 645811,
+      "recoveryNs": 6307603500,
+      "reuses": 34242,
+      "commits": 977
+    }
+  },
+  "screenshots": [
+    {
+      "sequence": 1,
+      "state": "held",
+      "file": "project_audit/deployment/cache261/screenshots/voxy-test-9402476d-0d90-4634-8ee5-46d4dcd03f0a-1.png",
+      "sha256": "20f008b6b383a36fc1b53ce95362a40ebe1ffa6c845f27aa105be11f221a0215",
+      "bytes": 3733553,
+      "inspected": true
+    },
+    {
+      "sequence": 3,
+      "state": "resumed",
+      "file": "project_audit/deployment/cache261/screenshots/voxy-test-9402476d-0d90-4634-8ee5-46d4dcd03f0a-3.png",
+      "sha256": "54bf56e095b9e3b612e6dcfcab7eb779a75415ca3317cca43219eafe9d90c131",
+      "bytes": 3738764,
+      "inspected": true
+    }
+  ],
+  "visualLimit": "Both images contain a rectangular exposed area and dark vertical water curtain; origin/correctness not established. No matched260 view and no exhaustive geometry proof.",
+  "automationFailures": [
+    "BEGIN label rejected because plan SHA required; no run started",
+    "sandbox BEGIN ownership verification failed before delivery",
+    "FINISH extra argument rejected; observation clock prematurely closed; cleanup-only correct FINISH charged to original clock"
+  ],
+  "existingOrNonfatalWarnings": {
+    "pcStateBroadErrorFilter": "VOXY_PIPELINE null failure fields and FAILURE=0 labels match generic error filtering; these are false positives, not exception events",
+    "voxyCacheWorkerInventoryPolicyUploadErrorHeadersObserved": 0,
+    "workerFailureCounter": 191,
+    "modelReclaimCounter": 191,
+    "workerFailureInterpretation": "Matches model-reclaim cancellation count; no non-stale Regional worker warnings or session failure. Generic FAILURE is not a count of durable cache/write failures.",
+    "expiredDebugLeaseWarnings": "CACHE_TEST_IGNORED reason=invalid cache profile lease appears; rejected stale profile, no active alternate cache namespace",
+    "unrelatedLatestLogErrors": "Startup mod compatibility/missing access transformer and network profile/certificate/DNS errors exist; no Voxy/regional/cache ERROR header found",
+    "preexisting260PrefetchFailure": "6 before-update prefetch failures, java.io.IOException: missing canonical cache-only section payload; candidate prefetchFailures=0 and no cache-only jobs completed, so this preexisting path was not exercised"
+  },
+  "sourceReview": {
+    "EMPTY": "Initial READY_SOURCE EMPTY tasks carry no save. Newly received EMPTY/ABSENT tasks retain their own save obligation and current-revision supplier before geometry creation. Renderer/worker retry may reuse remote EMPTY content, so publishEmpty is not itself disk-presence proof; original retained remote save remains live across that retry. SAVE_FAILURE would remain optional persistence failure, not fabricated disk binding. No established corrective issue.",
+    "localPatches": "recordLocalCommitted runs on acknowledged successful remote worker saves, including identical bindings which need no new journal append; 2260 localPatches vs 977 actual commit events is expected, not redundant cached EMPTY saves.",
+    "spaceProbes": "FileStore calls outside cache/budget monitors; mutation/policy/pause epoch validated before admission; changed epoch retries without manufacturing disk-full. Cleanup/recovery defer safely on interruption.",
+    "retention": "Actual finite-file coordinate/index lifetime and whole-mode skip, visibility symmetric difference, exact moving-anchor ordering, pin/writer eligibility/wakeups reviewed. Finite switch rebuild is source-reviewed only."
+  },
+  "unverifiedLive": [
+    "finite storage allowance and whole-region eviction",
+    "disk-full pause baseline/recovery and delayed free-space observation races",
+    "finite-mode incremental visible-region ranking and exact anchor-movement tree rebuild",
+    "interrupted draining-pin and close ownership races",
+    "cache-only prefetch persistence",
+    "EMPTY/ABSENT persistence failures or cancellation",
+    "exhaustive custom-model geometry",
+    "matched260 startup performance",
+    "concurrent cache/network contention",
+    "exact retained UTF-8 bytes",
+    "newly written record reread after restart",
+    "FPS/p99.5",
+    "100-player pressure"
+  ],
+  "caveats": [
+    "Stage elapsed durations overlap across workers; not summed wall-clock completion time or CPU time.",
+    "Thread allocations cover all work on those worker threads; metadata allocation includes inventory, recovery and snapshots, not mesher masks.",
+    "Cache hits and activation counts need not count unique sections; retry/model-reclaim events occurred.",
+    "Pipeline snapshots may precede the timestamp of their formatted log line; activation-event timestamps are separate observations.",
+    "No matched startup A/B, p99.5 estimate, throughput pressure result or exact encoded-spelling first-use count is claimed.",
+    "Fresh DATA activated and network save/commit contexts observed, but no separate restart reread of those new records was performed."
+  ],
+  "sourceAndArtifactLedger": "project_audit/cache_mesher_startup_and_shared_locking_size_261.json",
+  "frozenEvidence": [
+    "project_audit/deployment/cache261/capture-480874729066480/voxy-client-debug.log",
+    "project_audit/deployment/cache261/pc-state-480854615299263.json",
+    "project_audit/deployment/cache261/server-before.json",
+    "project_audit/deployment/cache261/server-after.json",
+    "project_audit/deployment/cache261/live261-clock.json"
+  ],
+  "frozenLogSha256": "e5ee86307a4c55f973856371ab6599fcbaafd00dde2aa283ce8fa4960f4e63cf"
+}

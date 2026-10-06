@@ -1,6 +1,6 @@
 # Improve meshing, cache startup and shared cache coordination
 
-Status: plan only. Written 2026-10-06; no implementation or live verification performed for this plan.
+Status: implemented 2026-10-06 in client 261, source commit 7f798d60. Scoped real-PC verification finished within the ten-minute limit; broader correctness/performance claims remain unverified. See [implementation and results](cache_mesher_startup_and_shared_locking_implementation_261.md), [live receipt](cache_mesher_startup_and_shared_locking_live_261.json) and [size ledger](cache_mesher_startup_and_shared_locking_size_261.json).
 
 Repository: /home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates.
 Branch: feature/cache-first-background-updates.
