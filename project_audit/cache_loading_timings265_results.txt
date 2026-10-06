@@ -1,0 +1,180 @@
+Cache-loading diagnostics 265: measured results
+Written 2026-10-06. Diagnostics only; no throughput algorithm was changed.
+
+Result
+The measured throughput gate in this warm-cache load is turnover of the 14
+section-worker leases. Source work remained backlogged while completed jobs
+continued holding those leases. CACHE and EMPTY completed cohorts spent 59.79%
+of their combined reservation time after worker execution finished. This is
+measured resource retention, not proof that one CPU thread ran continuously at
+100%, or a controlled prediction of the speedup from any proposed fix.
+
+The clearest specific capacity sink is empty-result publication: tasks computed
+in about 13 microseconds but retained their slots about 54 milliseconds. The
+CACHE task cohort spent 51.61% of its lease residence after completion. Meshing
+was the largest useful worker service cost; file reading was much smaller.
+
+Deployed identity and scope
+Work stayed on feature/cache-first-background-updates. Instrumentation source
+commits 6115c6a4 and fb105ab8 were built and verified before publication. Actual
+running client on GIORKOSPC was 0.2.265-beta, PID 32408, process start
+2026-10-06T09:43:09.6829661Z. The installed debug artifact matched SHA-256:
+34ae355c6f171412b945f519e164078a443163558ea6f93a6e2dde8dd5d64b14
+Debug jar 4,111,611 bytes; normal jar 3,934,917 bytes with SHA-256:
+e69acb3c365c99f0a43d73795f9c9221e6d057ea4cd8af26c8147f1142693829
+
+Testing server 260 was deliberately retained: controller PID 306308 and native
+PID 307526, with the same start ticks, artifact/configuration hashes and zero
+OOM events before/after. No server restart occurred. Both independent PC backup
+helpers, request markers and settings remained intact. No cache deletion/reset,
+settings change, transport hold, synthetic pressure or namespace change occurred.
+Main, ASMP_Voxy and ASMP_Voxy_Restart were untouched. The ordinary automatic
+debug updater restarted only the target game client to install 265.
+
+The finite live run completed at 2026-10-06T09:46:51.330582Z in 263.424745 seconds,
+under the 300 second target and 600 second ceiling. Client 265 remains installed;
+there was no automatic client rollback. The final inspected client log contained
+no errors. Preservation/lifecycle receipts are saved with the external evidence.
+
+Observed cache fill
+Frozen log contains 129 distinct owner snapshots, header 0.2.265-beta, session 1,
+ACTIVE minecraft:overworld. The cache-completion span was 21.029434 seconds:
+73,631 cache hits and 72,977 cached activations, with zero incoming compressed
+network bytes. This is a warm cache/OS file-cache run, not a disk-cold benchmark.
+UTC render-log labels: 09:43:59.886649900Z through 09:44:20.416875900Z.
+Durations below use monotonic owner sample clocks; render emission can lag them.
+
+Sustained loading: one consistent paired cohort
+UTC labels 09:44:04.946716500Z through 09:44:14.436694900Z; monotonic 9.017296299 s.
+Source-ready backlog 20,924-35,950 throughout; 33,276 cache hits and 33,177 cached
+activations, about 3679 activations/second. For 33,365 completed CACHE leases:
+
+Stage                       Mean wall time       Share of lease residence
+Assignment -> worker begin     0.06785 ms                 2.18%
+Worker begin -> complete       1.43871 ms                46.21%
+Complete -> owner claim        0.53946 ms                17.33%
+Owner claim -> actual reuse    1.06708 ms                34.28%
+Total                         3.11310 ms               100.00%
+
+All four part counts match SLOT_LEASE, and the wall partition matches within 1 us.
+This is one additive exact-lease cohort, including unsuccessful/stale outcomes;
+it is not just activated meshes. CACHE task classification can include network
+REUSE and zero-vertex meshes. Do not rename this cohort nonempty cache hits.
+
+392 completed EMPTY leases averaged 54.061795 ms: execution 0.013438 ms and
+claim-to-reuse 53.765671 ms; 99.9164% of reservation was after execution. EMPTY
+residence 21.192224 worker-slot-seconds, 16.95% of combined CACHE+EMPTY residence,
+equivalent to about 2.35 reserved slots over this window. EMPTY can include local
+and network known-empty tasks; it is not an exclusive cache-hit classification.
+
+CACHE residence 103.868712 worker-slot-seconds; combined 125.060935, with 74.776817
+after completion. Completed-cohort residence is about 99.06% of 14*9.0173 seconds,
+supporting substantial pool pressure. It is not exact pool utilization: whole
+lease intervals are attributed when reuse occurs and can cross window edges.
+The separate metadata worker is excluded from the 14 section-worker capacity.
+
+Why empty results retain a compute slot
+ClientSession.java:899 builds BuiltSection.emptyWithChildren for EmptyWorkerTask.
+At ClientSession.java:3391, early admission release requires ref.bytes() > 0 and
+rendererAdmitted(). A zero-geometry publication retains its lease until the
+terminal upload outcome/activation; optional deferred saving can also delay
+actual reuse. Source and measured EMPTY residence identify a concrete sink.
+Releasing empty results earlier is a prospective ownership change, not part of
+this diagnostics patch, and would need lifecycle/cancellation/fence-safe tests.
+
+Owner work and useful worker service
+Overall owner CPU during this same sustained window was 74.86% of one logical
+core, 67.24% over the whole fill. This does not establish 100% CPU saturation.
+DETAIL_REFINE consumed 2.7288 s elapsed and PUBLICATIONS 1.7060 s. There were 608,916
+refinement actions, 608,874 reporting success, and 9,686,191 publication polls,
+9,652,622 still pending. Success means demand children were ensured, not that
+608,874 new meshes were built. These are concrete repeated-work targets.
+
+Source: ClientSession.drainDetailMailbox at 1613, addChildren at 2020 and
+pollPublications at 3379. Repeated refinement can reapply child demand/priority;
+publication polling revisits admitted entries waiting for terminal outcomes.
+These phase timings do not attribute every postcompletion delay to those loops.
+
+Existing handoff means, with different cohorts, were mesh->claim 0.53978 ms,
+claim->submit 0.63615 ms, submit->admission 0.07183 ms, admission->observe 0.36136 ms,
+observe->reuse 0.000879 ms. They are explanatory, not an additive lease partition.
+The latter admission stages exclude zero-geometry early admission releases.
+
+Exclusive CACHE service across workers: MESH 32.1087 worker-seconds, about 0.96553 ms
+per mesh; CACHE_DECODE 4.24943 s; NAME_RESOLUTION_WAIT 3.20818 s over 547 segments;
+FILE_OPEN 2.53026 s, about 75.9 us/open; DECOMPRESS 1.43448 s; FILE_READ 0.625057 s,
+about 18.7 us/read; CACHE_PIN 0.242252 s, about 7.3 us/pin. Worker totals overlap
+across threads and cannot be read as elapsed loading seconds. Reads are logical
+FileChannel traffic and can be served by the OS cache, not physical disk bytes.
+Paired CACHE execution allocated 620,957,880 bytes, about 18.6 KB/job. Exclusive
+name decoding allocated 375,494,984 bytes, another memory-efficiency opportunity.
+
+Main/model/renderer
+Whole main-thread CPU 49.21% of one core; model processor 0.69%. Software model
+bake elapsed 0.05086 s over 486 requests, main name service 0.03052 s and model
+upload 0.00964 s. Name wait includes scheduling, not just model service time.
+These overlapping process-wide service intervals are not added to worker times.
+
+Refinement queue->GPU median 4-16 ms bucket, p95 16-50 ms; GPU->active median 16-50 ms,
+p95 50-200 ms. GPU->active includes frame scheduling/fence polling, not pure GPU
+execution. Histograms bound percentiles; they do not give exact means. Nonempty
+worker leases are released at admission before this visual endpoint. Empty
+publication is the relevant exception. The renderer manager used 31 ms CPU during
+the 21 second fill, so that manager was not CPU-saturated. Later visual activation
+alone does not establish a GPU throughput bottleneck.
+
+After fill
+Latest 58.264534 s interval: zero cache hits/activations, sourceReady 0, no no-slot
+dispatches, 102 fresh activations, 459,931 network bytes; owner CPU 9.6006%. The
+final live client had caught up. Findings concern its measured warm loading burst.
+
+Measurement limits
+Windows CPU accounting here is quantized AND deferred. Sustained WAIT reported
+2.578125 s CPU over 1.7744 s elapsed, physically impossible for that single-thread
+phase. Analyzer marks COARSE_DEFERRED_OS_ACCOUNTING_UNRELIABLE. Raw phase CPU
+is retained but must not rank exact CPU consumers. Prefer long overall thread
+CPU spans and monotonic paired lease partitions. Missing CPU is not zero.
+
+Debug summary construction allocated 1.08-8.22 MB/capture and took 6.06-82.75 ms
+during startup; sustained 1.09-1.12 MB/capture and 9.35-28.97 ms. This is an
+instrumented run with overhead, not a calibrated comparison to 264. GC elapsed
+MXBean counters are not stop-the-world pause measurements. Conditional worker
+classifications at failed dispatches are point samples, not utilization time.
+Fixed histograms, counters and matrices retain no per-section timing history.
+Normal artifacts exclude debug telemetry classes, diagnostic clocks and fixtures.
+
+Validation
+All four new cacheLoadingTimingTest fixtures passed after final code changes:
+- deterministic owner phase/detail closure, clock validity and event accounting;
+- worker nested exclusive partition, paired leases, stale/duplicate callbacks,
+  old worker-end after new assignment, histograms/window reset and allocation-free
+  push/pop after initialization;
+- render concurrent producers, foreign-thread/null/duplicate scope handling,
+  live queued accounting and CPU availability;
+- actual completed journal/Zstd record decode/all 32768 cells, logical bytes,
+  corrupted-frame IOException quarantine, busy guard and exception stage restore.
+Existing normal/debug visibility/planner/publication/topology/lifecycle suites
+also passed, including renderer admission, shutdown and callback lock ordering.
+Final normal/debug jars built successfully; fixtures absent from both, telemetry
+classes present only in debug. logs/checks-first.log, logs/timing-final.log and
+logs/build-final265.log preserve outputs and known headless optional warnings.
+
+Evidence and reproduction
+External root:
+/home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/cache_loading_timings_265
+Frozen captures/final265/voxy-client-debug.log: 15,246,605 bytes, SHA-256:
+cdf3a3a454017fcc7ac3c2c82a5bd52c243f2e31943323d2c2257a9e90bc4da4
+captures/client265-analysis.json and client265-snapshots.json contain finite
+window counters/partition checks; client265-findings.txt is the detailed analysis.
+receipts/finished265.json, packaging265.json, server-before.json, server-after.json
+and pc-primary-1791279995379834449.json preserve lifecycle and artifact identities.
+The same frozen log was indexed successfully by Voxy MCP in external evidence
+bundle ef2e318db7874276ba73b88381f1484f, complete with no warnings.
+
+Read timing_analysis_instructions.txt and analyze a frozen file, without live
+controls, using the external analyze_timings265.py --log <saved-log> --output
+<new-json> --save-snapshots <new-snapshot-json> --window sustained:5:16.
+Inclusive filtering selects the10 available snapshots at offsets6.003525600
+through15.020821899 seconds, giving the canonical9.017296299 second interval.
+Deduplicate sessionId/sessionSampleNanos and honor advertised order arrays;
+never sum exclusive worker stages with overlapping lifecycle/JOB_TOTAL stages.

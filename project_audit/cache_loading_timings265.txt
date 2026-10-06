@@ -32,8 +32,10 @@ Measurement rules:
 - Deduplicate by sessionId/sessionSampleNanos, partition builds/sessions before deltas.
 - Worker times are summed worker-seconds and overlap across threads. They are not
   elapsed loading seconds. JOB_TOTAL and lifecycle stages overlap exclusive stages.
-- CPU availability requires both valid endpoints. Windows thread CPU is quantized;
-  aggregate substantial intervals. Missing CPU is not measured zero CPU.
+- CPU availability requires both valid endpoints. Windows CPU accounting is
+  quantized AND deferred: phase CPU can exceed its elapsed wall time. Fine phase
+  CPU attribution is unreliable on this PC and must not rank stages. Overall
+  thread CPU over substantial intervals remains usable; missing CPU is not zero.
 - Histograms report fixed bucket percentile upper bounds, not exact quantiles.
 - Reused debug work buffers retain bounded matrices, no per-section histories.
 - Normal facade reads no diagnostic clocks/MXBeans. Fixtures/debug telemetry are
@@ -43,7 +45,11 @@ Measurement rules:
 - Existing renderer/GPU publication metrics remain relevant for visible activation.
   Worker-slot reuse and on-screen activation are distinct endpoints.
 
+Verified: all four timing fixtures passed, actual journal/Zstd data and corruption
+quarantine passed, and both normal/debug publication/ownership suites passed.
+Debug265 and normal265 built; debug-only classes/fixtures packaging verified.
+
 Tests: ./gradlew --offline cacheLoadingTimingTest jar debugJar --console=plain
 External publication/lifecycle runner also exercises both normal/debug facades.
-Final results and actual loaded identities will be in cache_loading_timings265_results.txt.
+Final results and actual loaded identities are in cache_loading_timings265_results.txt.
 External evidence/operators: /home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/cache_loading_timings_265
