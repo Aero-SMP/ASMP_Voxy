@@ -1,0 +1,61 @@
+Incremental visibility264 — deployment and observed performance
+
+Code commit:1410abee (perf: maintain visibility membership incrementally).
+Tested normal/debug client264; retained server-controller260/native260.
+No server restart, cache reset, transport hold, bandwidth/quota change or pressure
+workload was performed. Both PC SSH backup helpers retained their process identities.
+
+Client process lifecycle
+Previous PC game:PID3372, start2026-10-06T06:37:45.4831580Z.
+Verified replacement:PID20484, start2026-10-06T08:43:39.9543674Z.
+Header:Voxy version0.2.264-beta. Installed debug SHA256:91ba1ae98f9fd5478f42b0d7af00657e5b5d574066451c7b4052731b3d78121c
+Normal SHA256:488ea7c52f32334298a59d12e86124f7c852456749f72f9aa82dea9b15f4bf79
+Updater publication was exclusive/atomic; previous JAR and settings were independently
+preserved under the real profile .voxy-updater/cache-first-live/coordinator264.
+Verified regional ACTIVE, installed artifact hash, cache reuse and no runtime errors
+in the inspected PC diagnostic tail. Final receipt COMPLETE after303.054seconds;
+the300-second target was exceeded by3.054seconds; the600-second hard limit was met.
+
+Server identity
+Java PID306308/start ticks45505073; native PID307526/start ticks45506585.
+Controller JAR SHA256:89ab21697970868d5289e43bb3bfc061f43fc4536d3534a84c9c40c6ce1d788c.
+Native SHA256:c1352e54bfd0af7f5c7f03518970cd0a2e162715cc05b18e0eda42e315f40ea9.
+Server mods/configuration identities were unchanged. Native cgroup memory.max
+999997440 and swap.max0 unchanged; no OOM events in post-rollout observation.
+
+Observed settled windows (60 deduplicated session snapshots each)
+metric | client263 | client264
+window_seconds | 60.344622 | 61.361547
+owner_CPU_percent_of_one_core | 47.281 | 15.049
+owner_turns | 8519 | 13337
+DOWNLOADS_elapsed_seconds | 21.780915 | 1.250866
+DEMAND_elapsed_seconds | 6.764134 | 7.201666
+WAIT_elapsed_seconds | 31.273625 | 52.085751
+observed_render_frames_per_second | 99.031 | 96.298
+render_selected_start/end | 50787/50787 -> 50894/50894 | 52114/52114 -> 52180/52180
+active_start/end | 66287 -> 66349 | 68842 -> 68918
+workers_observed | ['14/0/0'] | ['11/0/3', '14/0/0']
+
+These are observed windows across a restart, not a controlled identical-trace A/B
+or a whole-cache-loading/frame-rate speedup claim. Views/cache maturity differ;
+selected counters are renderer selections, not helper membership cardinality.
+Owner CPU is measured ThreadMXBean CPU; phase values are elapsed wall time.
+The independent32768-key replay verifies equivalent bookkeeping outputs and
+large stable/small-change time/allocation reductions; see incremental_visibility264.txt.
+DEMAND now dominates non-wait owner elapsed time. Its algorithm is unchanged.
+
+Offline runtime note
+The first external verification runner omitted LWJGL runtime dependencies and failed.
+Including schedulerTest.runtimeClasspath fixed the runner; both facades passed.
+A remaining headless warning was traced to optional jemalloc: core LWJGL and Zstd
+loaded successfully and LWJGL selected StdlibAllocator. Strongest planner fixture
+also passed job/drop/expansion/frontier assertions with native-loader tracing.
+
+Evidence (outside Git, unchanged raw logs/receipts)
+/home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/incremental_visibility_264
+baseline capture SHA256:5bb54b6c426baabc26ed8854c04c5e34bb2e38056bae3fa07fb420c67e77c187
+client264 debug-tail SHA256:5826d51e914802c1192c87370dd7d2b9494cae0e2b35108e9c22069dda7a498f
+receipts/finished264.json, server-before.json, server-after.json, packaging.json,
+benchmark-final.json, baseline263-metrics.json and client264-metrics.json.
+final-checks.log, final-lifecycle.log, planner-final-native-details.log.
+captures/frozen264/capture.json lists frozen log extents and hashes.
