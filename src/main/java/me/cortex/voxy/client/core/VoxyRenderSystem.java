@@ -58,6 +58,12 @@ import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
 
 public class VoxyRenderSystem {
+    private static final int PUBLICATION_COVERAGE_LANE = 0;
+    private static final int PUBLICATION_REFINEMENT_LANE = 1;
+    private static final int PUBLICATION_MESH_TO_QUEUE_STAGE = 0;
+    private static final int PUBLICATION_QUEUE_TO_GPU_STAGE = 1;
+    private static final int PUBLICATION_GPU_TO_ACTIVE_STAGE = 2;
+
     private static final AtomicLong RESOURCE_GENERATION = new AtomicLong();
     private static final AtomicLong RENDERER_IDENTITIES = new AtomicLong();
     private final long rendererIdentity = RENDERER_IDENTITIES.incrementAndGet();
@@ -348,17 +354,17 @@ public class VoxyRenderSystem {
     public String regionalPublicationLatencySnapshot() {
         AsyncNodeManager nodes = this.nodeManager;
         return "publishLatencyBuckets=<1ms,<4ms,<16ms,<50ms,<200ms,>=200ms"
-                + " publishCoverage=" + publicationLatencyLane(0)
-                + " publishRefinement=" + publicationLatencyLane(1)
+                + " publishCoverage=" + publicationLatencyLane(PUBLICATION_COVERAGE_LANE)
+                + " publishRefinement=" + publicationLatencyLane(PUBLICATION_REFINEMENT_LANE)
                 + (nodes == null ? " rendererBatches=STOPPED"
                         : ' ' + nodes.regionalPublicationBatchSnapshot())
                 + (this.renderDistanceTracker == null ? "" : this.renderDistanceTracker.submissionSnapshot());
     }
 
     private String publicationLatencyLane(int lane) {
-        return "meshToQueue:" + this.regionalPublicationLatencies[lane][0].snapshot()
-                + ";queueToGpu:" + this.regionalPublicationLatencies[lane][1].snapshot()
-                + ";gpuToActive:" + this.regionalPublicationLatencies[lane][2].snapshot();
+        return "meshToQueue:" + this.regionalPublicationLatencies[lane][PUBLICATION_MESH_TO_QUEUE_STAGE].snapshot()
+                + ";queueToGpu:" + this.regionalPublicationLatencies[lane][PUBLICATION_QUEUE_TO_GPU_STAGE].snapshot()
+                + ";gpuToActive:" + this.regionalPublicationLatencies[lane][PUBLICATION_GPU_TO_ACTIVE_STAGE].snapshot();
     }
 
     private SubmissionAttempt publishRegionalSections(AsyncNodeManager nodes, List<SectionSubmission> submissions) {
@@ -468,7 +474,7 @@ public class VoxyRenderSystem {
         @Override
         public void recordRendererQueued(long nowNanos) {
             this.rendererQueuedNanos = nowNanos;
-            regionalPublicationLatencies[this.coverage ? 0 : 1][0]
+            regionalPublicationLatencies[this.coverage ? PUBLICATION_COVERAGE_LANE : PUBLICATION_REFINEMENT_LANE][PUBLICATION_MESH_TO_QUEUE_STAGE]
                     .record(nowNanos - this.meshCompletedNanos);
         }
 
@@ -476,13 +482,13 @@ public class VoxyRenderSystem {
         public void recordGpuUploadSubmitted(long nowNanos) {
             if (this.rendererQueuedNanos == 0) return;
             this.gpuUploadSubmittedNanos = nowNanos;
-            regionalPublicationLatencies[this.coverage ? 0 : 1][1]
+            regionalPublicationLatencies[this.coverage ? PUBLICATION_COVERAGE_LANE : PUBLICATION_REFINEMENT_LANE][PUBLICATION_QUEUE_TO_GPU_STAGE]
                     .record(nowNanos - this.rendererQueuedNanos);
         }
 
         private void recordActivationFencePassed(long nowNanos) {
             if (this.gpuUploadSubmittedNanos == 0) return;
-            regionalPublicationLatencies[this.coverage ? 0 : 1][2]
+            regionalPublicationLatencies[this.coverage ? PUBLICATION_COVERAGE_LANE : PUBLICATION_REFINEMENT_LANE][PUBLICATION_GPU_TO_ACTIVE_STAGE]
                     .record(nowNanos - this.gpuUploadSubmittedNanos);
         }
 
