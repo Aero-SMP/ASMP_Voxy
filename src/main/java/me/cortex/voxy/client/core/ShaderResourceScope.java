@@ -22,7 +22,10 @@ public final class ShaderResourceScope implements AutoCloseable {
         this.closed = true;
         Throwable failure = null;
         while (!this.cleanup.isEmpty()) {
-            try { this.cleanup.removeFirst().run(); FREED.incrementAndGet(); }
+            try {
+                this.cleanup.removeFirst().run();
+                FREED.incrementAndGet();
+            }
             catch (Throwable problem) {
                 if (failure == null) failure = problem;
                 else failure.addSuppressed(problem);
@@ -32,9 +35,17 @@ public final class ShaderResourceScope implements AutoCloseable {
     }
 
     public void cleanupAfter(Throwable failure) {
-        try { this.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+        try {
+            this.close();
+        } catch (Throwable cleanup) {
+            failure.addSuppressed(cleanup);
+        }
     }
 
-    public static long created() { return CREATED.get(); }
-    public static long freed() { return FREED.get(); }
+    public static long created() {
+        return CREATED.get();
+    }
+    public static long freed() {
+        return FREED.get();
+    }
 }

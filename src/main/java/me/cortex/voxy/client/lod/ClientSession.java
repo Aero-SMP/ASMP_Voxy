@@ -553,31 +553,56 @@ public final class ClientSession {
         final class PendingInterests extends java.util.AbstractSet<Long> {
             final List<LinkedHashSet<Long>> buckets = List.of(new LinkedHashSet<>(), new LinkedHashSet<>(), new LinkedHashSet<>());
             final Map<Long, Integer> membership = new HashMap<>();
-            @Override public boolean add(Long key) {
+            @Override
+            public boolean add(Long key) {
                 var demand = demands.get(key);
                 int bucket = demand != null && demand.networkWanted && downloadVisible(key) ? demand.coverage ? 0 : 1 : 2;
                 Integer previous = membership.put(key, bucket);
                 if (previous != null && previous == bucket) return false;
                 if (previous != null) buckets.get(previous).remove(key);
-                buckets.get(bucket).add(key); return previous == null;
+                buckets.get(bucket).add(key);
+                return previous == null;
             }
-            @Override public boolean remove(Object key) {
+            @Override
+            public boolean remove(Object key) {
                 Integer bucket = membership.remove(key);
                 return bucket != null && buckets.get(bucket).remove(key);
             }
-            @Override public int size() { return membership.size(); }
-            @Override public boolean contains(Object key) { return membership.containsKey(key); }
-            @Override public void clear() { membership.clear(); buckets.forEach(Set::clear); }
-            @Override public java.util.Iterator<Long> iterator() { return iterator(false); }
+            @Override
+            public int size() {
+                return membership.size();
+            }
+            @Override
+            public boolean contains(Object key) {
+                return membership.containsKey(key);
+            }
+            @Override
+            public void clear() {
+                membership.clear();
+                buckets.forEach(Set::clear);
+            }
+            @Override
+            public java.util.Iterator<Long> iterator() {
+                return iterator(false);
+            }
             java.util.Iterator<Long> iterator(boolean urgentOnly) {
                 return new java.util.Iterator<>() {
-                    int bucket; long key; java.util.Iterator<Long> current = buckets.get(0).iterator();
+                    int bucket;
+                    long key;
+                    java.util.Iterator<Long> current = buckets.get(0).iterator();
                     public boolean hasNext() {
-                        while (!current.hasNext() && bucket < (urgentOnly ? 1 : 2)) current = buckets.get(++bucket).iterator();
+                        while (!current.hasNext() && bucket < (urgentOnly ? 1 : 2))
+                            current = buckets.get(++bucket).iterator();
                         return current.hasNext();
                     }
-                    public Long next() { if (!hasNext()) throw new java.util.NoSuchElementException(); return key = current.next(); }
-                    public void remove() { current.remove(); membership.remove(key); }
+                    public Long next() {
+                        if (!hasNext()) throw new java.util.NoSuchElementException();
+                        return key = current.next();
+                    }
+                    public void remove() {
+                        current.remove();
+                        membership.remove(key);
+                    }
                 };
             }
         }
@@ -3814,17 +3839,31 @@ public final class ClientSession {
                        VoxyRenderSystem.SectionPublication previous,
                        WorkerResource.Lease lease, long bytes, long meshCompletedNanos,
                        long submittedNanos) {
-            this.demand = demand; this.revision = revision;
-            this.publication = publication; this.previous = previous;
-            this.lease = lease; this.bytes = bytes;
-            this.meshCompletedNanos = meshCompletedNanos; this.submittedNanos = submittedNanos;
+            this.demand = demand;
+            this.revision = revision;
+            this.publication = publication;
+            this.previous = previous;
+            this.lease = lease;
+            this.bytes = bytes;
+            this.meshCompletedNanos = meshCompletedNanos;
+            this.submittedNanos = submittedNanos;
         }
 
-        Demand demand() { return this.demand; }
-        long revision() { return this.revision; }
-        VoxyRenderSystem.SectionPublication publication() { return this.publication; }
-        VoxyRenderSystem.SectionPublication previous() { return this.previous; }
-        long bytes() { return this.bytes; }
+        Demand demand() {
+            return this.demand;
+        }
+        long revision() {
+            return this.revision;
+        }
+        VoxyRenderSystem.SectionPublication publication() {
+            return this.publication;
+        }
+        VoxyRenderSystem.SectionPublication previous() {
+            return this.previous;
+        }
+        long bytes() {
+            return this.bytes;
+        }
     }
 
     private sealed interface Event permits Coarsened,
@@ -3922,7 +3961,8 @@ public final class ClientSession {
             }
             String propertyName = assignment.substring(0, equals);
             if (propertyName.compareTo(previousProperty) <= 0) throw new IllegalArgumentException("noncanonical property order");
-            previousProperty = propertyName; propertyCount++;
+            previousProperty = propertyName;
+            propertyCount++;
             Property<?> property = state.getBlock().getStateDefinition()
                     .getProperty(assignment.substring(0, equals));
             if (property == null) throw new IllegalArgumentException(
@@ -3936,7 +3976,9 @@ public final class ClientSession {
 
     private static <T extends Comparable<T>> BlockState setProperty(
             BlockState state, Property<T> property, String value) {
-        return property.getValue(value).filter(parsed -> property.getName(parsed).equals(value)).map(parsed -> state.setValue(property, parsed))
+        return property.getValue(value)
+                .filter(parsed -> property.getName(parsed).equals(value))
+                .map(parsed -> state.setValue(property, parsed))
                 .orElseThrow(() -> new IllegalArgumentException(
                         "server catalog names an unavailable property value: " + value));
     }
