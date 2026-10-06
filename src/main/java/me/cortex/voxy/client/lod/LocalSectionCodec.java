@@ -223,6 +223,14 @@ final class LocalSectionCodec implements AutoCloseable {
 
     /** Pulls one expanded name at a time, followed by compact palette/index bytes. */
     private static final class NamesInput extends InputStream {
+        private static final int PHASE_HEADER = 0;
+        private static final int PHASE_NAME_LENGTH = 1;
+        private static final int PHASE_NAME_BODY = 2;
+        private static final int PHASE_PALETTE = 3;
+        private static final int PHASE_PACKED_INDICES = 4;
+        private static final int TABLE_BLOCK_NAMES = 0;
+        private static final int TABLE_BIOME_NAMES = 1;
+
         final CatalogCodec.Source catalog;
         final byte[] canonical, palette;
         final int[] blocks, biomes;
@@ -280,7 +288,7 @@ final class LocalSectionCodec implements AutoCloseable {
             while (total < len && remaining() != 0) {
                 if (this.position == this.limit) advance();
                 int count = Math.min(len - total, this.limit - this.position);
-                if (this.phase == 2) this.encoded.copyTo(this.position, out, off + total, count);
+                if (this.phase == PHASE_NAME_BODY) this.encoded.copyTo(this.position, out, off + total, count);
                 else System.arraycopy(this.part, this.position, out, off + total, count);
                 this.position += count; this.consumed += count; total += count;
             }
@@ -289,22 +297,22 @@ final class LocalSectionCodec implements AutoCloseable {
 
         private void advance() throws IOException {
             this.position = 0;
-            if (this.phase == 1) {
-                this.phase = 2; this.limit = this.encoded.length();
-            } else if (this.phase == 0 || this.phase == 2) {
-                if (this.table == 0 && this.name == this.blocks.length) { this.table = 1; this.name = 0; }
-                if (this.table == 1 && this.name == this.biomes.length) {
-                    this.phase = 3; this.encoded = null;
+            if (this.phase == PHASE_NAME_LENGTH) {
+                this.phase = PHASE_NAME_BODY; this.limit = this.encoded.length();
+            } else if (this.phase == PHASE_HEADER || this.phase == PHASE_NAME_BODY) {
+                if (this.table == TABLE_BLOCK_NAMES && this.name == this.blocks.length) { this.table = TABLE_BIOME_NAMES; this.name = 0; }
+                if (this.table == TABLE_BIOME_NAMES && this.name == this.biomes.length) {
+                    this.phase = PHASE_PALETTE; this.encoded = null;
                     this.part = this.palette; this.position = HEADER_BYTES; this.limit = this.part.length;
                 } else {
-                    this.encoded = this.table == 0 ? this.catalog.blockName(this.blocks[this.name++])
+                    this.encoded = this.table == TABLE_BLOCK_NAMES ? this.catalog.blockName(this.blocks[this.name++])
                             : this.catalog.biomeName(this.biomes[this.name++]);
                     this.nameLength[0] = (byte) this.encoded.length();
                     this.nameLength[1] = (byte) (this.encoded.length() >>> 8);
-                    this.phase = 1; this.part = this.nameLength; this.limit = 2;
+                    this.phase = PHASE_NAME_LENGTH; this.part = this.nameLength; this.limit = 2;
                 }
             } else {
-                this.phase = 4; this.part = this.canonical; this.limit = this.part.length;
+                this.phase = PHASE_PACKED_INDICES; this.part = this.canonical; this.limit = this.part.length;
                 this.position = 2 + (this.palette.length - HEADER_BYTES) / 5 * 9;
             }
         }
