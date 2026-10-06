@@ -27,7 +27,8 @@ impl RegionIndex {
                 .iter()
                 .map(|entry| {
                     if entry.is_empty() {
-                        // Air lighting is server-only mip input, never a client payload.
+                        // EMPTY entries in this index omit payload metadata, retaining topology.
+                        // Section replies can still carry air lighting and biomes as DATA.
                         RegionSectionEntry {
                             flags: entry.flags,
                             non_empty_children: entry.non_empty_children,

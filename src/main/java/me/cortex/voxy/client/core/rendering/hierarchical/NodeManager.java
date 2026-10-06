@@ -11,7 +11,6 @@ import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.HierarchicalBitSet;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;

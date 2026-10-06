@@ -3,11 +3,9 @@ package me.cortex.voxy.client.lod;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
-import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.config.ServerDownloadSettings;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.rendering.hierarchical.AsyncNodeManager;
-import me.cortex.voxy.client.core.model.CatalogMapper;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
@@ -31,7 +29,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -514,6 +511,8 @@ public final class ClientSession {
         }
     }
 
+    // The owner thread manages demand and subscription state. Other threads hand off
+    // through mailboxes/queues and the explicitly synchronized or volatile inputs below.
     static final class Session implements AutoCloseable {
         private boolean hasTop(long top) {
             synchronized (LIFECYCLE) { return topRenderer == this.renderer && TOP_LEVEL.contains(top); }
@@ -528,9 +527,11 @@ public final class ClientSession {
         final AtomicBoolean resetRequested = new AtomicBoolean();
         final SectionDemandTable<Demand> demands;
         final ConcurrentLinkedQueue<Event> events = new ConcurrentLinkedQueue<>();
+        // This monitor protects wakePending; signalling does not execute owner work.
         final Object wakeupLock = new Object();
         boolean wakePending;
         final WorkerSlot[] sectionWorkers;
+        // Constructed before the remaining constructor assignments; started by start().
         final WorkerSlot metadataWorker;
         final int sectionWorkerCount;
         final ConcurrentLinkedQueue<NetworkReply> networkReplies =
@@ -548,7 +549,7 @@ public final class ClientSession {
         final Set<Long> emptyTopologyKeys = new HashSet<>();
         final Map<Long, LinkedHashSet<Long>> emptyTopologyDependents = new HashMap<>();
         final PendingInterests interestChanges = new PendingInterests();
-        /** O(1) membership and reprioritization; no rescanning cached watches per control packet. */
+        /** Owner-only interests: O(1) membership/reprioritization, FIFO within each bucket. */
         final class PendingInterests extends java.util.AbstractSet<Long> {
             final List<LinkedHashSet<Long>> buckets = List.of(new LinkedHashSet<>(), new LinkedHashSet<>(), new LinkedHashSet<>());
             final Map<Long, Integer> membership = new HashMap<>();
@@ -622,11 +623,13 @@ public final class ClientSession {
         final Long2ObjectOpenHashMap<DormantRoot> dormantRoots =
                 new Long2ObjectOpenHashMap<>();
         final Long2LongOpenHashMap pendingDormantEvictions = new Long2LongOpenHashMap();
+        // Guards batched publication and subtree-coarsening handoffs.
         final Object publicationLock = new Object();
         final ArrayDeque<PublicationRef> publicationQueue = new ArrayDeque<>();
         final AtomicLong rendererProgressGeneration = new AtomicLong();
         long lastPublicationGeneration;
         boolean publicationDirty = true;
+        // Retain this callback's identity for matching registration and unregistration.
         final Runnable rendererWake = () -> {
             this.rendererProgressGeneration.incrementAndGet();
             this.signal();

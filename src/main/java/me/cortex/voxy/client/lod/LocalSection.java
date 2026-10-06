@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.lod;
 
 import me.cortex.voxy.client.core.rendering.SectionKey;
-import java.io.IOException;
 
 /** Immutable decoding identity, independent of server index generations and worker authority. */
 record LocalSection(long key, int kind, int children, int compressedBytes, int canonicalBytes,

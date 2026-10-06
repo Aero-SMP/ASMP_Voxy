@@ -190,7 +190,9 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         }
     }
 
-    /** Latest-value mailbox; its memory is bounded by distinct identities, not event count. */
+    /** Latest-value mailbox; its memory is bounded by distinct identities, not event count.
+     * Its own monitor protects pending values and overwrite counts. take() transfers the
+     * detached map to the owner, so processing it does not hold the mailbox monitor. */
     private static final class CoalescingMailbox<V> {
         private final boolean ordered;
         private Map<Long, V> pending;
@@ -232,6 +234,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     private int readyRegions;
     private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>(true);
     private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>(false);
+    // The detail mailbox monitor protects this scope together with its queued feedback.
     private long detailInputGeneration;
     private final ReadyGroup[][][] ready;
 
@@ -263,6 +266,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         }
     }
 
+    /** Caller holds detailMailbox; GPU batches and owner retries use the same merge rules. */
     private boolean offerDetailLocked(long key, int action, int bucket, int epoch) {
         if (action != HierarchicalOcclusionTraverser.ACTION_REFINE
                 && action != HierarchicalOcclusionTraverser.ACTION_DORMANT
@@ -281,6 +285,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         synchronized (this.detailMailbox) { return this.detailInputGeneration; }
     }
 
+    /** Scope invalidation and removal of queued feedback form one mailbox transition. */
     void invalidateDetailInput() {
         synchronized (this.detailMailbox) {
             this.detailInputGeneration++;
@@ -288,6 +293,8 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         }
     }
 
+    /** Scope checks and input decoding run synchronously under detailMailbox. The caller
+     * signals after releasing the monitor; the owner processes detached feedback outside it. */
     void offerDetailBatch(long inputGeneration, BooleanSupplier scopeCurrent,
                          HierarchicalOcclusionTraverser.DetailActionReader reader,
                          DetailBatchMerge result) {

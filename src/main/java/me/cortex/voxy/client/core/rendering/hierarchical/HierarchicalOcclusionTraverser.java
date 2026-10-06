@@ -13,7 +13,6 @@ import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
 import me.cortex.voxy.client.core.rendering.util.HiZBuffer;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
-import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 import org.lwjgl.system.MemoryUtil;
 
