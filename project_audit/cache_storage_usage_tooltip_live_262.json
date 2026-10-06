@@ -1,0 +1,118 @@
+{
+  "sourceCommit": "7e871af8def04c053e6643da3b948c831a47cfef",
+  "branch": "feature/cache-first-background-updates",
+  "clock": {
+    "utc_start": "2026-10-06T03:48:27.004859+00:00",
+    "monotonic_start": 481655.897185899,
+    "target_seconds": 300,
+    "limit_seconds": 600,
+    "status": "ended",
+    "boot_id": "9f129e1b-f8c2-444a-8dba-15679f924562",
+    "run": "aace1c32-d7a1-4fa5-8495-ad52502613f1",
+    "utc_end": "2026-10-06T03:51:16.299411+00:00",
+    "elapsed_seconds": 169.29455359495478,
+    "exceeded_limit": false
+  },
+  "client": {
+    "host": "GIORKOSPC",
+    "gamePidBefore": 23216,
+    "gamePidAfter": 5608,
+    "artifacts": [
+      {
+        "sha256": "ad0f501329f7b2c7ef8b4c8c623d4199e5a3f5f7c4dcc4f5c8bc679974ce69f4",
+        "name": "ASMP_voxy-0.2.262-beta+1.21.1-neoforge-debug.jar"
+      }
+    ],
+    "loadedHeader": "Voxy version 0.2.262-beta",
+    "backupHelpers": [
+      19916,
+      22444
+    ],
+    "bothRoutesRespondedBeforeAndAfter": true
+  },
+  "selectedPoliciesBeforeAndAfter": {
+    "play.aerosmp.com:25587": {
+      "downloadKbps": 20000,
+      "storageBytes": 9223372036854775807
+    }
+  },
+  "generalConfigHashUnchanged": "c2641d7c4b1cdaa658e46b5a03ac047954746d6616b21ca79c69749c95bbec11",
+  "policyFileNote": "World estimate and last-player anchors updated normally; selected bandwidth/storage preserved.",
+  "cache": {
+    "preserved": true,
+    "preflightFilesBytes": 1556481695,
+    "finalInventory": "READY",
+    "finalAllAccountsFileBytes": 1560978839,
+    "finalUnownedBytes": 0,
+    "noCacheResetRequested": true,
+    "transportHoldExists": false
+  },
+  "pipeline": {
+    "regional": "ACTIVE",
+    "sessionId": "1",
+    "helloAccepted": "true",
+    "failure": "null",
+    "metadataFailure": "none"
+  },
+  "server": {
+    "pidsStartTicksBeforeAndAfter": [
+      {
+        "pid": 306308,
+        "startTicks": "45505073"
+      },
+      {
+        "pid": 307526,
+        "startTicks": "45506585"
+      }
+    ],
+    "controllerVersion": "0.2.260-beta+1.21.1-neoforge",
+    "jarsUnchanged": [
+      {
+        "native_sha256": "c1352e54bfd0af7f5c7f03518970cd0a2e162715cc05b18e0eda42e315f40ea9",
+        "path": "/home/aerosmp/Desktop/Voxy_Testing/mods/voxy-server-0.2.260-beta+1.21.1-neoforge-debug.jar",
+        "sha256": "89ab21697970868d5289e43bb3bfc061f43fc4536d3534a84c9c40c6ce1d788c",
+        "version": "0.2.260-beta+1.21.1-neoforge"
+      }
+    ],
+    "configsUnchanged": true,
+    "otherModsUnchanged": true,
+    "javaHeap": {
+      "InitialHeapSize": 1073741824,
+      "MaxHeapSize": 4294967296
+    },
+    "nativeMemory": {
+      "memory.max": "999997440",
+      "memory.swap.max": "0",
+      "memory.current": "474636288",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0"
+    }
+  },
+  "artifacts": [
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.262-beta+1.21.1-neoforge-debug.jar",
+      "sha256": "ad0f501329f7b2c7ef8b4c8c623d4199e5a3f5f7c4dcc4f5c8bc679974ce69f4",
+      "bytes": 4080496
+    },
+    {
+      "path": "/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates/build/libs/ASMP_voxy-0.2.262-beta+1.21.1-neoforge.jar",
+      "sha256": "ea6f2252022dd99775bd7133abc22ae902dff6ea1d5f1e130526b0e0b801a118",
+      "bytes": 3925094
+    }
+  ],
+  "verification": {
+    "build": "jar debugJar --offline; final BUILD SUCCESSFUL in4s",
+    "sourceReview": "Per-server maintained actual-byte counter, READY/nonambiguous sentinel, volatile owner publication, mutable Component.copy and no disk I/O reviewed independently.",
+    "sodiumBytecode": "Installed0.8.12 invokes tooltip provider in getTooltip; hover render regenerates tooltip content.",
+    "liveScope": "Updated PC identity/startup/settings/cache/backups/server preservation only",
+    "noIntegrationUnitSyntheticFakeLaptopOr100ClientTests": true,
+    "noActualTooltipHoverOrScreenshotVerification": true,
+    "noPerformanceBenchmark": true
+  },
+  "attempts": {
+    "firstCompile": "FAILED: Component has no append(String). Corrected by copy() to MutableComponent; rebuild succeeded.",
+    "finalCommentCorrection": "Replaced unrelated old registry Javadoc above the new cache accessor; rebuilt before publication.",
+    "clockReset": false,
+    "liveFailures": []
+  },
+  "localReceiptsDirectory": "project_audit/deployment/cache262"
+}
