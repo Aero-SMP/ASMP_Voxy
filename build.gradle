@@ -242,6 +242,17 @@ tasks.register('debugHarnessJavaTest', JavaExec) {
     mainClass.set('me.cortex.voxy.debugtest.DebugHarnessBehaviorTest')
 }
 
+tasks.register('cacheLoadingCodecTest', JavaExec) {
+    group = 'verification'
+    description = 'Run the production regional codec and cache-integrity hash fixtures'
+    dependsOn tasks.named('schedulerTestClasses')
+    classpath = sourceSets.schedulerTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.client.lod.RegionalSectionCodecBehaviorTest')
+    def scratch = layout.buildDirectory.dir('cleanup-codec-test-tmp')
+    doFirst { scratch.get().asFile.mkdirs() }
+    jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
+}
+
 [
     visibilityMembershipTest: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest',
     worldCacheVisibilityTest: 'me.cortex.voxy.client.lod.WorldCacheVisibilityBehaviorTest',

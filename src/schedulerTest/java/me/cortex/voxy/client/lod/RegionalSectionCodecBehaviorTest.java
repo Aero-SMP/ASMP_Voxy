@@ -10,6 +10,11 @@ import java.util.Arrays;
 import java.util.HexFormat;
 
 final class RegionalSectionCodecBehaviorTest {
+    public static void main(String[] args) throws Exception {
+        Blake3BehaviorTest.run();
+        run();
+    }
+
     static void run() throws Exception {
         int[] blocks = java.util.stream.IntStream.range(0, 32769).toArray();
         int[] biomes = java.util.stream.IntStream.range(0, 17).toArray();
