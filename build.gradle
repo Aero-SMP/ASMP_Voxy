@@ -332,3 +332,28 @@ tasks.register('testLiveHarness') {
     dependsOn tasks.named('debugHarnessJavaTest'), tasks.named('debugHarnessPythonTest'),
             tasks.named('verifyDebugHarnessArtifacts')
 }
+
+// Debug-only measurement fixtures never enter either client artifact.
+sourceSets {
+    loadingTimingTest {
+        java.srcDirs = ['src/debugTest/java']
+        compileClasspath += sourceSets.debug.output + sourceSets.schedulerTest.compileClasspath
+        runtimeClasspath += sourceSets.debug.output + sourceSets.schedulerTest.runtimeClasspath + output
+    }
+}
+['cacheLoadingOwnerTimingTest': 'OwnerLoadingTelemetryBehaviorTest',
+ 'cacheLoadingWorkerTimingTest': 'WorkerDebugTelemetryBehaviorTest',
+ 'cacheLoadingRenderTimingTest': 'RenderLoadingTelemetryBehaviorTest',
+ 'cacheLoadingJournalTimingTest': 'WorkerCacheReadTimingBehaviorTest'].each { taskName, entry ->
+    tasks.register(taskName, JavaExec) {
+        dependsOn tasks.named('loadingTimingTestClasses'), tasks.named('compileDebugJava')
+        classpath = sourceSets.loadingTimingTest.runtimeClasspath
+        mainClass.set('me.cortex.voxy.client.lod.' + entry)
+        def scratch = layout.buildDirectory.dir('loading-timing-test-tmp')
+        doFirst { scratch.get().asFile.mkdirs() }
+        jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
+    }
+}
+tasks.register('cacheLoadingTimingTest') {
+    dependsOn 'cacheLoadingOwnerTimingTest', 'cacheLoadingWorkerTimingTest', 'cacheLoadingRenderTimingTest', 'cacheLoadingJournalTimingTest'
+}

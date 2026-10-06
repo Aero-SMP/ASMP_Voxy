@@ -1,0 +1,49 @@
+Cache-loading diagnostics265
+
+Scope: diagnostics only, feature/cache-first-background-updates. Server260 retained.
+Preserve existing PC cache, settings, identity, unrelated mods and both backup routes.
+No worker-count, scheduling, publication, storage or network contract change.
+
+Questions answered over a real warm-start loading interval:
+1. Is each occupied cache worker computing or waiting? Source-separated exclusive
+   stages give wall, worker CPU and allocation totals. CACHE sources include local
+   foreground and network REUSE reads; EMPTY and fresh network work are separate.
+2. Where does a cache worker lease spend time? All five lifecycle counters commit
+   together at exact lease reuse: assignment-to-begin, begin-to-complete,
+   complete-to-claim, claim-to-reuse, and total. This paired cohort closes at reuse,
+   including failures/cancellations; it is not only successfully activated meshes.
+3. Is disk read expensive, or did CACHE_READ hide decode/name/model waits? Nested
+   streaming hooks pause/resume exclusive cache pin/journal/open/read/Zstd/decode/
+   names/integrity and NAME_RESOLUTION_WAIT. No double-counted enclosing read span.
+4. What does the owner spend CPU on? Existing phase order gains CPU totals and valid
+   sample counts; details split demand reset/top/collection/dormancy/eviction/refine,
+   publication submission, model checks, source dispatch, refresh checks, retention,
+   visibility updates and download view/control. Details overlap their parent phases.
+5. Why is cache dispatch blocked? Count explicit scheduler outcomes and point
+   worker-slot classifications only when no slot is available. These points are not
+   worker utilization. localReadyRegions and metadata worker state expose serial
+   local directory admission. Selected subtree scan counters measure the specified
+   passes, not every scan in the owner.
+6. Which model operations are expensive? Process-scoped render name resolution,
+   dedicated software model bake/biome construction, and render model uploads have
+   wall/CPU/call/event totals. Queued counts avoid traversing concurrent queues.
+
+Measurement rules:
+- Deduplicate by sessionId/sessionSampleNanos, partition builds/sessions before deltas.
+- Worker times are summed worker-seconds and overlap across threads. They are not
+  elapsed loading seconds. JOB_TOTAL and lifecycle stages overlap exclusive stages.
+- CPU availability requires both valid endpoints. Windows thread CPU is quantized;
+  aggregate substantial intervals. Missing CPU is not measured zero CPU.
+- Histograms report fixed bucket percentile upper bounds, not exact quantiles.
+- Reused debug work buffers retain bounded matrices, no per-section histories.
+- Normal facade reads no diagnostic clocks/MXBeans. Fixtures/debug telemetry are
+  excluded from normal artifact. Debug instrumentation adds work; debug sample
+  elapsed/CPU/allocation counters expose summary overhead. Hot-path hook overhead
+  is included in adjacent measurements, not calibrated away.
+- Existing renderer/GPU publication metrics remain relevant for visible activation.
+  Worker-slot reuse and on-screen activation are distinct endpoints.
+
+Tests: ./gradlew --offline cacheLoadingTimingTest jar debugJar --console=plain
+External publication/lifecycle runner also exercises both normal/debug facades.
+Final results and actual loaded identities will be in cache_loading_timings265_results.txt.
+External evidence/operators: /home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/cache_loading_timings_265

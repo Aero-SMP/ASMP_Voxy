@@ -260,13 +260,17 @@ final class CompletedSectionJournal implements AutoCloseable {
         } finally { synchronized (this) { this.readers--; } }
     }
     RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names) throws IOException {
+        return get(section, codec, names, null);
+    }
+    RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names,
+                                        Object debugWork) throws IOException {
         Payload payload;
         synchronized (this) {
             checkOpen(); payload = this.payloads.get(token(section));
             if (payload == null) return null;
             this.readers++;
         }
-        try (var file = FileChannel.open(this.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+        try (var file = openRead(debugWork)) {
             var crc = new CRC32C(); var hash = codec.readHash();
             var input = new InputStream() {
                 long consumed;
@@ -274,16 +278,27 @@ final class CompletedSectionJournal implements AutoCloseable {
                 @Override public int read(byte[] bytes, int offset, int length) throws IOException {
                     if (length == 0) return 0;
                     if (this.consumed == payload.compressed()) return -1;
-                    int count = file.read(ByteBuffer.wrap(bytes, offset, (int) Math.min(length, payload.compressed() - this.consumed)),
-                            payload.offset() + this.consumed);
+                    int previous = ClientLodDebug.workerPush(debugWork, "CACHE_FILE_READ");
+                    int count;
+                    try {
+                        count = file.read(ByteBuffer.wrap(bytes, offset, (int) Math.min(length, payload.compressed() - this.consumed)),
+                                payload.offset() + this.consumed);
+                    } finally { ClientLodDebug.workerPop(debugWork, previous); }
                     if (count <= 0) throw new IOException("truncated local payload");
-                    this.consumed += count; crc.update(bytes, offset, count); hash.update(bytes, offset, count);
+                    this.consumed += count;
+                    ClientLodDebug.workerOutcome(debugWork, "CACHE_FILE_BYTES", count);
+                    previous = ClientLodDebug.workerPush(debugWork, "CACHE_INTEGRITY");
+                    try { crc.update(bytes, offset, count); hash.update(bytes, offset, count); }
+                    finally { ClientLodDebug.workerPop(debugWork, previous); }
                     return count;
                 }
             };
-            var decoded = codec.decode(section.key(), section.children(), input, payload.compressed(), payload.canonical(), names);
-            if ((int) crc.getValue() != payload.crc() || !fingerprint(hash).equals(payload.local()))
-                throw new IOException("local payload integrity mismatch");
+            var decoded = codec.decode(section.key(), section.children(), input, payload.compressed(), payload.canonical(), names, debugWork);
+            int previous = ClientLodDebug.workerPush(debugWork, "CACHE_INTEGRITY");
+            try {
+                if ((int) crc.getValue() != payload.crc() || !fingerprint(hash).equals(payload.local()))
+                    throw new IOException("local payload integrity mismatch");
+            } finally { ClientLodDebug.workerPop(debugWork, previous); }
             return decoded; // Journal integrity AND format validation before publication.
         } catch (IOException invalid) {
             if (!(invalid instanceof java.nio.channels.AsynchronousCloseException)
@@ -291,6 +306,11 @@ final class CompletedSectionJournal implements AutoCloseable {
                 synchronized (this) { this.payloads.remove(token(section), payload); }
             throw invalid; // A late reader cannot quarantine a concurrently repaired payload.
         } finally { synchronized (this) { this.readers--; } }
+    }
+    private FileChannel openRead(Object debugWork) throws IOException {
+        int previous = ClientLodDebug.workerPush(debugWork, "CACHE_FILE_OPEN");
+        try { return FileChannel.open(this.path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS); }
+        finally { ClientLodDebug.workerPop(debugWork, previous); }
     }
     synchronized Append begin(LocalSection section, Source encoder, Space space,
                               BooleanSupplier current) throws IOException {

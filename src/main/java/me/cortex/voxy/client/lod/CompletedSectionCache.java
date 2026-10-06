@@ -101,11 +101,21 @@ final class CompletedSectionCache implements AutoCloseable {
         } finally { released(); }
     }
     RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names) throws IOException {
-        var acquired = acquire(section.region());
+        return get(section, codec, names, null);
+    }
+    RegionalSectionCodec.SectionData get(LocalSection section, LocalSectionCodec codec, LocalSectionCodec.Names names,
+                                        Object debugWork) throws IOException {
+        int previous = ClientLodDebug.workerPush(debugWork, "CACHE_PIN");
+        RegionalDiskBudget.Pin acquired;
+        try { acquired = acquire(section.region()); }
+        finally { ClientLodDebug.workerPop(debugWork, previous); }
         try (var pin = acquired) {
-            var journal = this.budget.journal(path(section.region()), this.world, section.region(), false);
+            previous = ClientLodDebug.workerPush(debugWork, "CACHE_JOURNAL");
+            CompletedSectionJournal journal;
+            try { journal = this.budget.journal(path(section.region()), this.world, section.region(), false); }
+            finally { ClientLodDebug.workerPop(debugWork, previous); }
             if (journal == null) return null;
-            try { return journal.get(section, codec, names); }
+            try { return journal.get(section, codec, names, debugWork); }
             catch (IOException invalid) {
                 if (!journal.hasPayload(section)) this.budget.invalidateDirectory(path(section.region()));
                 throw invalid;

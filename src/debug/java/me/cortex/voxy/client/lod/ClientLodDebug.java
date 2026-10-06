@@ -35,6 +35,11 @@ import static org.lwjgl.opengl.GL45C.glGetNamedBufferSubData;
 
 /** Regional-pipeline diagnostics compiled only into debug client JARs. */
 public final class ClientLodDebug {
+    public static Object renderLoadingBegin(int stage) { return RenderLoadingTelemetry.begin(stage); }
+    public static Object renderLoadingCurrent(int stage) { return RenderLoadingTelemetry.current(stage); }
+    public static void renderLoadingEvent(Object timing, int event, long count) { RenderLoadingTelemetry.event(timing, event, count); }
+    public static void renderLoadingEnd(Object timing) { RenderLoadingTelemetry.end(timing); }
+    public static void modelLoadingQueued(int stage) { RenderLoadingTelemetry.queued(stage); }
     private static final Logger LOGGER = LoggerFactory.getLogger("Voxy Client Debug");
     private static final Path LOG = Path.of("logs", "voxy-client-debug.log").toAbsolutePath();
     private static final ExecutorService WRITER = Executors.newSingleThreadExecutor(
@@ -163,6 +168,9 @@ public final class ClientLodDebug {
     static Object ownerCreated(ClientSession.Session session) { return SessionDebugTelemetry.ownerCreated(session); }
     static void ownerTurn(Object timing) { SessionDebugTelemetry.ownerTurn(timing); }
     static void ownerPhase(Object timing, int nextPhase) { SessionDebugTelemetry.ownerPhase(timing, nextPhase); }
+    static void ownerDetail(Object timing, int detail) { SessionDebugTelemetry.ownerDetail(timing, detail); }
+    static void ownerEvent(Object timing, int event, long count) { SessionDebugTelemetry.ownerEvent(timing, event, count); }
+    static void ownerNoSlot(Object timing, ClientSession.Session session) { SessionDebugTelemetry.ownerNoSlot(timing, session); }
     static void ownerFinished(Object timing) { SessionDebugTelemetry.ownerFinished(timing); }
     static void handoff(ClientSession.Session session, int stage, long nanos) { SessionDebugTelemetry.handoff(session, stage, nanos); }
     public static long publicationClock() { return System.nanoTime(); }
@@ -177,8 +185,28 @@ public final class ClientLodDebug {
     static void workerBegin(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {
         WorkerDebugTelemetry.begin((WorkerDebugTelemetry.Work) state, task, lease);
     }
+    static void workerAssigned(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {
+        if (state instanceof WorkerDebugTelemetry.Work work) WorkerDebugTelemetry.assigned(work, task, lease);
+    }
+    static void workerCompleted(Object state, WorkerResource.Lease lease) {
+        if (state instanceof WorkerDebugTelemetry.Work work) work.completed(lease.generation());
+    }
+    static void workerClaimed(Object state, WorkerResource.Lease lease) {
+        if (state instanceof WorkerDebugTelemetry.Work work) work.claimed(lease.generation());
+    }
+    static void workerReusable(Object state, WorkerResource.Lease lease) {
+        if (state instanceof WorkerDebugTelemetry.Work work) work.reusable(lease.generation());
+    }
+    static int workerPush(Object state, String stage) {
+        return state instanceof WorkerDebugTelemetry.Work work ? work.push(stage) : -1;
+    }
+    static void workerPop(Object state, int previous) {
+        if (state instanceof WorkerDebugTelemetry.Work work) work.pop(previous);
+    }
     static void workerStage(Object state, String stage) { if (state != null) ((WorkerDebugTelemetry.Work) state).stage(stage); }
-    static void workerOutcome(Object state, String outcome, long bytes) { ((WorkerDebugTelemetry.Work) state).outcome(outcome, bytes); }
+    static void workerOutcome(Object state, String outcome, long bytes) {
+        if (state instanceof WorkerDebugTelemetry.Work work) work.outcome(outcome, bytes);
+    }
     static void workerEnd(Object state, LocalSectionCodec codec) {
         var work = (WorkerDebugTelemetry.Work) state;
         work.nativeHighWater = Math.max(work.nativeHighWater, codec.nativeContextBytes());
@@ -307,7 +335,7 @@ public final class ClientLodDebug {
         long now = System.nanoTime();
         if (now < nextSampleNanos) return;
         nextSampleNanos = now + SAMPLE_INTERVAL_NANOS;
-        emit("VOXY_PIPELINE " + ClientSession.debugSnapshot() + ' ' + renderSnapshot()
+        emit("VOXY_PIPELINE " + ClientSession.debugSnapshot() + ' ' + renderSnapshot() + RenderLoadingTelemetry.snapshot()
                 + " journalIndex={recoveries=" + JOURNAL_RECOVERIES.get() + " frameVisits=" + JOURNAL_FRAMES.get()
                 + " recoveryNs=" + JOURNAL_RECOVERY_NANOS.get() + " reuses=" + JOURNAL_REUSES.get()
                 + " commits=" + JOURNAL_COMMITS.get() + '}');

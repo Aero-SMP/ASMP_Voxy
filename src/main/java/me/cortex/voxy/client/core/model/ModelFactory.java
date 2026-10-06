@@ -286,6 +286,7 @@ public class ModelFactory implements SectionMesher.Models {
                 return false;
             }
             this.bakeQueue.add(new BlockBake(blockId, blockState));
+            me.cortex.voxy.client.lod.ClientLodDebug.modelLoadingQueued(1);
             return true;
 
         } finally {
@@ -296,97 +297,109 @@ public class ModelFactory implements SectionMesher.Models {
     private boolean processModelResult() {
         var bake = this.bakeQueue.poll();
         if (bake == null) return false;
-        ColourDepthTextureData[] textureData = new ColourDepthTextureData[6];
+        Object timing = me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingBegin(1);
+        try {
+            ColourDepthTextureData[] textureData = new ColourDepthTextureData[6];
 
-        int flags = this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer);
+            int flags = this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer);
 
 
-        {//Create texture data
-            long ptr = this.bakeScratchBuffer;
-            final int FACE_SIZE = MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
-            for (int face = 0; face < 6; face++) {
-                long faceDataPtr = ptr + (FACE_SIZE * 4) * face * 2;
-                int[] colour = new int[FACE_SIZE];
-                int[] depth = new int[FACE_SIZE];
+            {//Create texture data
+                long ptr = this.bakeScratchBuffer;
+                final int FACE_SIZE = MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
+                for (int face = 0; face < 6; face++) {
+                    long faceDataPtr = ptr + (FACE_SIZE * 4) * face * 2;
+                    int[] colour = new int[FACE_SIZE];
+                    int[] depth = new int[FACE_SIZE];
 
-                //Copy out colour
-                for (int i = 0; i < FACE_SIZE; i++) {
-                    ////De-interpolate results
-                    //colour[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2));
-                    //depth[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2) + 4);
+                    //Copy out colour
+                    for (int i = 0; i < FACE_SIZE; i++) {
+                        ////De-interpolate results
+                        //colour[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2));
+                        //depth[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2) + 4);
 
-                    long value = MemoryUtil.memGetLong(faceDataPtr+i*8);
-                    colour[i] = (int)value;
-                    depth[i] = (int) (value>>>32);
+                        long value = MemoryUtil.memGetLong(faceDataPtr+i*8);
+                        colour[i] = (int)value;
+                        depth[i] = (int) (value>>>32);
+                    }
+                    textureData[face] = new ColourDepthTextureData(colour, depth, MODEL_TEXTURE_SIZE, MODEL_TEXTURE_SIZE);
                 }
-                textureData[face] = new ColourDepthTextureData(colour, depth, MODEL_TEXTURE_SIZE, MODEL_TEXTURE_SIZE);
             }
-        }
 
 
-        boolean hasDarkenedTextures = (flags&2)!=0;
-        boolean isShaded = (flags&1)!=0;
-        RenderType layer = null;
-        if (layer==null && (flags&4)!=0) {
-            //we do an extra check here to be sure texture is translucent
+            boolean hasDarkenedTextures = (flags&2)!=0;
+            boolean isShaded = (flags&1)!=0;
+            RenderType layer = null;
+            if (layer==null && (flags&4)!=0) {
+                //we do an extra check here to be sure texture is translucent
 
-            //TODO: check this is right
-            boolean anyTranslucent = false;
-            for (var face : textureData) {
-                anyTranslucent|=TextureUtils.hasTranslucentPixel(face);
-                if (anyTranslucent) break;
-            }
-            if (anyTranslucent) {
-                layer = RenderType.translucent();
-            } else {
-                boolean solid = true;
+                //TODO: check this is right
+                boolean anyTranslucent = false;
                 for (var face : textureData) {
-                    solid&=TextureUtils.isSolidWhereDrawn(face);
-                    if (!solid) break;
+                    anyTranslucent|=TextureUtils.hasTranslucentPixel(face);
+                    if (anyTranslucent) break;
                 }
-                if (solid) {
-                    layer = RenderType.solid();
+                if (anyTranslucent) {
+                    layer = RenderType.translucent();
                 } else {
-                    layer = RenderType.cutout();
+                    boolean solid = true;
+                    for (var face : textureData) {
+                        solid&=TextureUtils.isSolidWhereDrawn(face);
+                        if (!solid) break;
+                    }
+                    if (solid) {
+                        layer = RenderType.solid();
+                    } else {
+                        layer = RenderType.cutout();
+                    }
                 }
             }
-        }
-        if (layer==null && (flags&8)!=0) {
-            layer = RenderType.cutout();
-        }
-        if (bake.state.is(BlockTags.LEAVES)) {
-            layer = RenderType.solid();
-        }
-        if (layer == null) {
-            layer = RenderType.solid();
-        }
+            if (layer==null && (flags&8)!=0) {
+                layer = RenderType.cutout();
+            }
+            if (bake.state.is(BlockTags.LEAVES)) {
+                layer = RenderType.solid();
+            }
+            if (layer == null) {
+                layer = RenderType.solid();
+            }
 
 
-        var bakeResult = this.processTextureBakeResult(bake.blockId, bake.state, textureData, isShaded, hasDarkenedTextures, layer);
-        if (bakeResult!=null) {
-            this.uploadResults.add(bakeResult);
-        }
-        return !this.bakeQueue.isEmpty();
+            var bakeResult = this.processTextureBakeResult(bake.blockId, bake.state, textureData, isShaded, hasDarkenedTextures, layer);
+            if (bakeResult!=null) {
+                this.uploadResults.add(bakeResult);
+                me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEvent(timing, 7, 1);
+            } else {
+                me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEvent(timing, 6, 1);
+            }
+            me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEvent(timing, 5, 1);
+            return !this.bakeQueue.isEmpty();
+        } finally { me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEnd(timing); }
     }
 
     private final ConcurrentLinkedDeque<CatalogMapper.BiomeEntry> biomeQueue = new ConcurrentLinkedDeque<>();
     public void addBiome(CatalogMapper.BiomeEntry biome) {
         this.biomeQueue.add(biome);
+        me.cortex.voxy.client.lod.ClientLodDebug.modelLoadingQueued(2);
     }
 
     public boolean processOneThing() {
         var biomeEntry = this.biomeQueue.poll();
         if (biomeEntry != null) {
-            var biomeRegistry = Minecraft.getInstance().level.registryAccess().registryOrThrow(Registries.BIOME);
-            var mcbiomeEntry = biomeRegistry.getOptional(ResourceLocation.parse(biomeEntry.biome));
-            if (!mcbiomeEntry.isPresent()) {
-                Logger.error("Could not find biome: " + biomeEntry.biome + " using default");
-            }
-            var res = this.addBiome0(biomeEntry.id, mcbiomeEntry.orElse(DEFAULT_BIOME));
-            if (res != null) {
-                this.uploadResults.add(res);
-            }
-            return true;
+            Object timing = me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingBegin(2);
+            try {
+                var biomeRegistry = Minecraft.getInstance().level.registryAccess().registryOrThrow(Registries.BIOME);
+                var mcbiomeEntry = biomeRegistry.getOptional(ResourceLocation.parse(biomeEntry.biome));
+                if (!mcbiomeEntry.isPresent()) {
+                    Logger.error("Could not find biome: " + biomeEntry.biome + " using default");
+                }
+                var res = this.addBiome0(biomeEntry.id, mcbiomeEntry.orElse(DEFAULT_BIOME));
+                if (res != null) {
+                    this.uploadResults.add(res);
+                }
+                me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEvent(timing, 8, 1);
+                return true;
+            } finally { me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEnd(timing); }
         }
 
         return this.processModelResult() || (this.blockStatesInFlight.size()!=0)
@@ -409,6 +422,8 @@ public class ModelFactory implements SectionMesher.Models {
                         this.modelEntriesById[model.modelId].materialId);
             }
             upload.upload(this.storage);
+            me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingEvent(
+                    me.cortex.voxy.client.lod.ClientLodDebug.renderLoadingCurrent(3), pendingModelId >= 0 ? 9 : 10, 1);
             if (pendingModelId >= 0) this.modelIdsPendingUpload.remove(pendingModelId);
             upload.free();
             upload = this.uploadResults.poll();

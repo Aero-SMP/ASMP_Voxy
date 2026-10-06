@@ -517,6 +517,7 @@ public final class ClientSession {
         final Set<Long> missingInterests = new HashSet<>();
         final Set<Long> unactivatedRequired = new HashSet<>();
         final Set<Long> unavailableSourceRegions = new HashSet<>();
+        Object debugOwnerTiming;
         boolean sourceSnapshotStarted;
         final Set<Long> emptyTopologyKeys = new HashSet<>();
         final Map<Long, LinkedHashSet<Long>> emptyTopologyDependents = new HashMap<>();
@@ -809,14 +810,34 @@ public final class ClientSession {
                     default -> 0;
                 };
                 this.taskLease = lease;
+                ClientLodDebug.workerAssigned(this.debugWork, task, lease);
                 this.notifyAll();
                 return lease;
             }
             boolean idle() { return this.resource.state() == WorkerResource.State.IDLE; }
-            void releaseCompletion(WorkerResource.Lease lease) {
-                if (this.resource.release(lease)) this.reusable();
+            /** Debug caller is the owner. State is a point observation, not elapsed occupancy. */
+            int diagnosticSlotKind() {
+                synchronized (this.resource) {
+                    var state = this.resource.state();
+                    if (state == WorkerResource.State.IDLE) return 0;
+                    if (state == WorkerResource.State.CLOSED) return 9;
+                    if (state == WorkerResource.State.RUNNING)
+                        return this.nameWait != null ? 2 : this.modelWait != null ? 3 : 1;
+                    if (this.resource.pendingResult() != null) return 4;
+                    if (this.resource.releaseRequested() && this.resource.savePending()) return 7;
+                    Demand demand = demands.get(this.operationKey);
+                    if (demand != null && this.resource.matches(demand.workLease)) {
+                        if (demand.completedGeometry != null) return 5;
+                        if (demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED) return 6;
+                    }
+                    return 8;
+                }
             }
-            private void reusable() {
+            void releaseCompletion(WorkerResource.Lease lease) {
+                if (this.resource.release(lease)) this.reusable(lease);
+            }
+            private void reusable(WorkerResource.Lease lease) {
+                ClientLodDebug.workerReusable(this.debugWork, lease);
                 if (this.admissionObservedNanos != 0 && Thread.currentThread() == Session.this.thread) {
                     ClientLodDebug.handoff(Session.this, 4,
                             ClientLodDebug.publicationClock() - this.admissionObservedNanos);
@@ -908,6 +929,7 @@ public final class ClientSession {
                         try {
                             ClientLodDebug.workerStage(this.debugWork, "RESULT_READY");
                             if (completion instanceof WorkerGeometry) this.geometryPublishedNanos = System.nanoTime();
+                            ClientLodDebug.workerCompleted(this.debugWork, lease);
                             this.resource.complete(lease, completion);
                             // The mesh and original compressed task leave this scope BEFORE saving.
                             completion = null;
@@ -935,7 +957,7 @@ public final class ClientSession {
                 var names = (LocalSectionCodec.Names) (name, biome) -> this.resolveName(name, biome, task.current());
                 if (cacheHit) {
                     ClientLodDebug.workerStage(this.debugWork, "CACHE_READ");
-                    try { section = task.cache() == null ? null : task.cache().get(task.content(), this.localCodec, names); }
+                    try { section = task.cache() == null ? null : task.cache().get(task.content(), this.localCodec, names, this.debugWork); }
                     catch (IOException corrupt) { return this.cacheMiss(task, true); }
                     if (section == null) return this.cacheMiss(task, false);
                     ClientLodDebug.workerOutcome(this.debugWork, "CACHE_HIT", 0);
@@ -978,21 +1000,24 @@ public final class ClientSession {
                 var cache = biome ? biomeNames : blockNames;
                 Integer known = cache.get(name);
                 if (known != null) return known;
-                synchronized (this) {
-                    var wait = new NameWait(name, biome);
-                    this.nameWait = wait;
-                    signal();
-                    try {
-                        while (!wait.done && current.getAsBoolean() && this.resource.state() != WorkerResource.State.CLOSED) this.wait();
-                        if (!current.getAsBoolean() || this.resource.state() == WorkerResource.State.CLOSED)
-                            throw new java.util.concurrent.CancellationException("name resolution superseded");
-                        if (wait.failure != null) throw wait.failure;
-                        return wait.id;
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw new java.util.concurrent.CancellationException("name resolution interrupted");
-                    } finally { this.nameWait = null; }
-                }
+                int prior = ClientLodDebug.workerPush(this.debugWork, "NAME_RESOLUTION_WAIT");
+                try {
+                    synchronized (this) {
+                        var wait = new NameWait(name, biome);
+                        this.nameWait = wait;
+                        signal();
+                        try {
+                            while (!wait.done && current.getAsBoolean() && this.resource.state() != WorkerResource.State.CLOSED) this.wait();
+                            if (!current.getAsBoolean() || this.resource.state() == WorkerResource.State.CLOSED)
+                                throw new java.util.concurrent.CancellationException("name resolution superseded");
+                            if (wait.failure != null) throw wait.failure;
+                            return wait.id;
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new java.util.concurrent.CancellationException("name resolution interrupted");
+                        } finally { this.nameWait = null; }
+                    }
+                } finally { ClientLodDebug.workerPop(this.debugWork, prior); }
             }
 
             private void save() {
@@ -1158,6 +1183,7 @@ public final class ClientSession {
             Object ownerTiming = null;
             try {
                 ownerTiming = ClientLodDebug.ownerCreated(this);
+                this.debugOwnerTiming = ownerTiming;
                 while (this.open.get()) {
                     ClientLodDebug.ownerTurn(ownerTiming);
                     try {
@@ -1559,13 +1585,16 @@ public final class ClientSession {
         }
 
         void drainDemand() {
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 0);
             if (this.resetRequested.getAndSet(false)) {
                 for (long key : List.copyOf(this.demands.keySet())) this.retireDemand(key);
                 this.dormantRoots.clear();
                 this.dormantGeometryBytes = 0;
                 this.demands.clear();
             }
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 1);
             this.demands.drainTop((key, add) -> {
+                ClientLodDebug.ownerEvent(this.debugOwnerTiming, add ? 0 : 1, 1);
                 if (add) {
                     this.addDemand(key);
                 } else {
@@ -1582,6 +1611,7 @@ public final class ClientSession {
         }
 
         void drainDetailMailbox() {
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 2);
             @SuppressWarnings("unchecked")
             ArrayDeque<DetailEvent>[] buckets = new ArrayDeque[
                     HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT];
@@ -1590,32 +1620,41 @@ public final class ClientSession {
             }
             this.demands.drainDetail((key, update) -> buckets[update.bucket()].addLast(
                     new DetailEvent(key, update.action(), update.epoch())));
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 3);
             for (int bucket = 0; bucket < buckets.length; bucket++) {
                 int retained = buckets[bucket].size();
                 while (retained-- > 0) {
                     DetailEvent event = buckets[bucket].removeFirst();
                     if (event.action == HierarchicalOcclusionTraverser.ACTION_DORMANT) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 2, 1);
                         this.markDormant(event.key, bucket, event.epoch);
                     } else if (event.action == HierarchicalOcclusionTraverser.ACTION_WAKE) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 3, 1);
                         this.wakeDormant(event.key, event.epoch);
                     } else {
                         buckets[bucket].addLast(event);
                     }
                 }
             }
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 4);
             this.evictDormant(this.dormantGeometryBytes - this.dormantCapBytes(), false);
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 5);
             for (int bucket = HierarchicalOcclusionTraverser.DETAIL_BUCKET_COUNT - 1;
                  bucket >= 0; bucket--) {
                 ArrayDeque<DetailEvent> pending = buckets[bucket];
                 while (!pending.isEmpty()) {
                     DetailEvent event = pending.removeFirst();
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 4, 1);
                     long parent = event.key;
                     int epoch = event.epoch;
                     Demand demand = this.demands.get(parent);
                     if (demand == null || !demand.installed
                             || SectionKey.level(parent) == 0 || this.isCoarsening(parent)
-                            || !newerEpoch(epoch, demand.latestRefinementEpoch)) continue;
+                            || !newerEpoch(epoch, demand.latestRefinementEpoch)) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 5, 1); continue;
+                    }
                     if (demand.activeContent == null) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 6, 1);
                         this.ensureRegion(parent);
                         this.demands.offerDetail(parent,
                                 HierarchicalOcclusionTraverser.ACTION_REFINE, bucket, epoch);
@@ -1623,11 +1662,13 @@ public final class ClientSession {
                     }
                     this.demands.setPriority(demand, bucket);
                     if (!this.addChildren(parent, bucket)) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 7, 1);
                         this.demands.offerDetail(parent,
                                 HierarchicalOcclusionTraverser.ACTION_REFINE, bucket, epoch);
                         break;
                     }
                     demand.latestRefinementEpoch = epoch;
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 8, 1);
                 }
             }
         }
@@ -1707,6 +1748,7 @@ public final class ClientSession {
         long descendantActiveBytes(long parent) {
             Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
             long bytes = 0;
+            ClientLodDebug.ownerEvent(this.debugOwnerTiming, 19, owned == null ? 0 : owned.size());
             if (owned != null) for (long key : owned) {
                 Demand child = this.demands.get(key);
                 if (key != parent && child != null && contains(parent, key)) {
@@ -1723,6 +1765,7 @@ public final class ClientSession {
         }
 
         void removeDormantDescendants(long parent) {
+            ClientLodDebug.ownerEvent(this.debugOwnerTiming, 20, this.dormantRoots.size());
             var iterator = this.dormantRoots.long2ObjectEntrySet().fastIterator();
             while (iterator.hasNext()) {
                 DormantRoot root = iterator.next().getValue();
@@ -1834,6 +1877,7 @@ public final class ClientSession {
         long coarsen(long parent) {
             Set<Long> owned = this.demandsByTop.get(topAncestor(parent));
             long bytes = 0;
+            ClientLodDebug.ownerEvent(this.debugOwnerTiming, 21, owned == null ? 0 : owned.size());
             boolean hasWork = false;
             if (owned != null) for (long key : owned) {
                 Demand child = this.demands.get(key);
@@ -2165,7 +2209,12 @@ public final class ClientSession {
         }
 
         void processStages() throws Exception {
-            this.scheduleReadyPublications(); this.processWaitingModels(); this.scheduleSourceWork();
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 6);
+            this.scheduleReadyPublications();
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 7);
+            this.processWaitingModels();
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 8);
+            this.scheduleSourceWork();
         }
         void ensureRegion(long key) { this.queueRegion(regionFor(key)); this.interestChanges.add(key); }
         void queueRegion(long region) { this.demands.readyRegion(this.demands.region(region)); }
@@ -2275,13 +2324,16 @@ public final class ClientSession {
         }
         void processRegions() throws IOException {
             if (this.quic == null || this.policy == null) return;
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 9);
             this.reclassifyMissingInterests();
             if (this.checkedFrame != this.renderedFrames) {
                 this.checkedFrame = this.renderedFrames; this.interestChanges.addAll(this.frameInterests); this.frameInterests.clear();
             }
             long interval = RegionalProtocol.UPDATE_INTERVAL_MILLIS;
             long bandwidth = this.policy.available() ? this.policy.downloadKbps() : this.sentBandwidthKbps;
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 10);
             boolean refresh = this.helloAccepted && (this.metadata == null || this.metadata.canDownload()) && this.refreshAllowed();
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 11);
             if (this.openSent && this.dimensionId >= 0 && (bandwidth != this.sentBandwidthKbps
                     || refresh != this.sentRefreshAllowed || this.dimensionId != this.sentDimensionId || this.cameraBlockX != this.sentAnchorX || this.cameraBlockZ != this.sentAnchorZ)) {
                 var anchors = this.networkOwner.downloads == null ? List.of(new RegionalProtocol.DimensionAnchor(this.dimensionId, this.cameraBlockX, this.cameraBlockZ))
@@ -2357,6 +2409,7 @@ public final class ClientSession {
                 if (downloads != null) downloads.policyChanged();
                 this.sentStorageBytes = this.policy.storageBytes();
             }
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 12);
             var cut = this.visibleInput;
             if (cut != null && this.visibility.update(cut.epoch(), cut.keys())) {
                 this.visibleEpoch = cut.epoch();
@@ -2367,6 +2420,7 @@ public final class ClientSession {
                 // Membership can stay unchanged while the renderer reports fresh areas/order.
                 this.visibleCutKeys = cut.keys(); this.visibleAreas = cut.areas();
             }
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 13);
             if (this.retentionView != this.viewRevision || this.retentionEpoch != this.visibleEpoch
                     || this.retentionX != this.cameraBlockX || this.retentionZ != this.cameraBlockZ) {
                 this.metadata.updateRetention(this.dimension, this.cameraBlockX, this.cameraBlockZ, this.visibleRegions);
@@ -2374,7 +2428,9 @@ public final class ClientSession {
                 this.retentionX = this.cameraBlockX; this.retentionZ = this.cameraBlockZ;
             }
             if (downloads == null || !this.helloAccepted) return;
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 14);
             downloads.view(this.dimensionId, this.cameraBlockX, this.cameraBlockZ, this.visibility);
+            ClientLodDebug.ownerDetail(this.debugOwnerTiming, 15);
             if (this.quic == null || !this.openSent) return;
             // A key-only cancellation must reach the writer before its replacement desire.
             if (!this.interestDrops.isEmpty() || !this.networkOwner.detachedDrops.isEmpty()) return;
@@ -2447,30 +2503,39 @@ public final class ClientSession {
 
         /** Render-thread seam; each unresolved name stays in its existing worker, never a queue. */
         void resolveNames(LocalSectionCodec.Names resolver) {
-            long deadline = System.nanoTime() + 2_000_000;
-            boolean progress;
-            do {
-                progress = false;
-                for (var worker : this.sectionWorkers) {
-                    var wait = worker.nameWait;
-                    if (wait == null) continue;
-                    synchronized (worker) {
-                        if (worker.nameWait != wait || wait.done) continue;
-                        try {
-                            var names = wait.biome ? this.biomeNames : this.blockNames;
-                            Integer id = names.get(wait.canonical);
-                            if (id == null) {
-                                id = resolver.resolve(wait.canonical, wait.biome);
-                                names.put(wait.canonical, id);
-                                this.resolvedNameCharacters += wait.canonical.length();
-                            }
-                            wait.id = id;
-                        } catch (IOException | RuntimeException failure) { wait.failure = new IOException("Cannot resolve canonical name", failure); }
-                        wait.done = true; worker.notifyAll(); progress = true;
+            Object timing = ClientLodDebug.renderLoadingBegin(0);
+            try {
+                long deadline = System.nanoTime() + 2_000_000;
+                boolean progress;
+                do {
+                    progress = false;
+                    for (var worker : this.sectionWorkers) {
+                        var wait = worker.nameWait;
+                        if (wait == null) continue;
+                        synchronized (worker) {
+                            if (worker.nameWait != wait || wait.done) continue;
+                            try {
+                                var names = wait.biome ? this.biomeNames : this.blockNames;
+                                Integer id = names.get(wait.canonical);
+                                ClientLodDebug.renderLoadingEvent(timing, 0, 1);
+                                if (id == null) {
+                                    id = resolver.resolve(wait.canonical, wait.biome);
+                                    names.put(wait.canonical, id);
+                                    ClientLodDebug.renderLoadingEvent(timing, 1, 1);
+                                    this.resolvedNameCharacters += wait.canonical.length();
+                                }
+                                else ClientLodDebug.renderLoadingEvent(timing, 2, 1);
+                                wait.id = id;
+                            } catch (IOException | RuntimeException failure) { ClientLodDebug.renderLoadingEvent(timing, 4, 1); wait.failure = new IOException("Cannot resolve canonical name", failure); }
+                            wait.done = true; worker.notifyAll(); progress = true;
+                        }
+                        if (System.nanoTime() >= deadline) {
+                            ClientLodDebug.renderLoadingEvent(timing, 3, 1); return;
+                        }
                     }
-                    if (System.nanoTime() >= deadline) return;
-                }
-            } while (progress && System.nanoTime() < deadline);
+                } while (progress && System.nanoTime() < deadline);
+                if (progress && System.nanoTime() >= deadline) ClientLodDebug.renderLoadingEvent(timing, 3, 1);
+            } finally { ClientLodDebug.renderLoadingEnd(timing); }
         }
 
         long retainedSaveBytes() {
@@ -2610,6 +2675,8 @@ public final class ClientSession {
             state.localIncarnation = ready.incarnation();
             ready.sections().putAll(state.localCommits);
             state.localCommits.clear();
+            ClientLodDebug.ownerEvent(this.debugOwnerTiming, 22, 1);
+            ClientLodDebug.ownerEvent(this.debugOwnerTiming, 23, ready.sections().size());
             state.localLoaded = true;
             state.localSections = ready.sections();
             state.localCoverage.clear();
@@ -2706,7 +2773,7 @@ public final class ClientSession {
                         var demand = this.demands.get(outcome.ticket().key());
                         if (demand != null && demand.revision == outcome.ticket().demandRevision()) this.recordCommitted(outcome.content(), outcome.incarnation());
                     }
-                    if (worker.resource.finishSave(outcome.lease())) worker.reusable();
+                    if (worker.resource.finishSave(outcome.lease())) worker.reusable(outcome.lease());
                     if (outcome.failure() instanceof IOException io) this.lastPersistenceFailure = io.toString();
                     else if (outcome.failure() != null && !(outcome.failure() instanceof java.util.concurrent.CancellationException)) {
                         throw new IllegalStateException("Section persistence invariant failed after geometry handoff", outcome.failure());
@@ -2715,6 +2782,7 @@ public final class ClientSession {
                 WorkerResource.Completion<WorkerResult> completion = worker.resource.claim();
                 if (completion == null) return;
                 WorkerResource.Lease lease = completion.lease();
+                ClientLodDebug.workerClaimed(worker.debugWork, lease);
                 WorkerResult result = completion.value();
                 long ownerClaimedNanos = result instanceof WorkerGeometry
                         ? ClientLodDebug.publicationClock() : 0;
@@ -2988,11 +3056,15 @@ public final class ClientSession {
             for (WorkerSlot worker : this.sectionWorkers) {
                 ModelWait wait = worker.modelWait;
                 if (wait == null) continue;
+                ClientLodDebug.ownerEvent(this.debugOwnerTiming, 16, 1);
                 boolean current = this.demands.current(wait.task().ticket());
                 boolean ready = current && this.mesher.modelsReady(wait.section());
                 if (current) this.demands.get(wait.task().ticket().key()).candidate = ready
                         ? SectionDemandTable.CandidateState.WORKER_OWNED : SectionDemandTable.CandidateState.WAIT_MODELS;
-                if (!current || ready) synchronized (worker) { worker.notifyAll(); }
+                if (!current || ready) {
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, current ? 17 : 18, 1);
+                    synchronized (worker) { worker.notifyAll(); }
+                }
             }
         }
 
@@ -3017,17 +3089,28 @@ public final class ClientSession {
             while (remaining-- > 0) {
                 Demand demand = this.demands.poll(SectionDemandTable.ReadyKind.SOURCE);
                 if (demand == null) return;
-                if (demand.candidate != SectionDemandTable.CandidateState.READY_SOURCE) continue;
-                if (demand.preservedPublication != null) { this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE); continue; }
+                ClientLodDebug.ownerEvent(this.debugOwnerTiming, 9, 1);
+                if (demand.candidate != SectionDemandTable.CandidateState.READY_SOURCE) {
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 10, 1); continue;
+                }
+                if (demand.preservedPublication != null) {
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 11, 1);
+                    this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE); continue;
+                }
                 if (demand.content.kind() == LocalSection.EMPTY) {
                     if (!this.publishEmpty(demand)) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 14, 1);
+                        ClientLodDebug.ownerNoSlot(this.debugOwnerTiming, this);
                         this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                         return;
                     }
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 12, 1);
                     continue;
                 }
                 WorkerSlot worker = this.idleWorker(demand);
                 if (worker == null) {
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 14, 1);
+                    ClientLodDebug.ownerNoSlot(this.debugOwnerTiming, this);
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                     return;
                 }
@@ -3040,11 +3123,13 @@ public final class ClientSession {
                 demand.workLease = worker.assign(task);
                 this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
                 if (demand.workLease == null) {
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 15, 1);
                     demand.workLease = null;
                     demand.candidate = SectionDemandTable.CandidateState.READY_SOURCE;
                     this.demands.ready(demand, SectionDemandTable.ReadyKind.SOURCE);
                     return;
                 }
+                ClientLodDebug.ownerEvent(this.debugOwnerTiming, 13, 1);
             }
         }
 
@@ -3161,6 +3246,7 @@ public final class ClientSession {
 
         void publishReadyBatch(List<ReadyPublication> ready) {
             if (ready.isEmpty()) return;
+            ClientLodDebug.ownerEvent(this.debugOwnerTiming, 24, 1);
             synchronized (this.publicationLock) {
                 ArrayList<PreparedPublication> prepared = new ArrayList<>(ready.size());
                 ArrayList<VoxyRenderSystem.SectionSubmission> submissions =
@@ -3210,8 +3296,10 @@ public final class ClientSession {
                     this.restorePrepared(prepared);
                     this.busyHandoff = observed.handoff();
                     this.handoffBusy++;
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 26, 1);
                     return;
                 }
+                ClientLodDebug.ownerEvent(this.debugOwnerTiming, 25, prepared.size());
                 for (int index = 0; index < prepared.size(); index++) {
                     PreparedPublication item = prepared.get(index);
                     Demand demand = item.demand();
@@ -3293,6 +3381,7 @@ public final class ClientSession {
             while (remaining-- > 0) {
                 PublicationRef ref = this.publicationQueue.pollFirst();
                 if (ref == null) break;
+                ClientLodDebug.ownerEvent(this.debugOwnerTiming, 27, 1);
                 Demand demand = this.demands.get(ref.demand().key);
                 boolean current = demand == ref.demand() && demand.revision == ref.revision()
                         && demand.candidate == SectionDemandTable.CandidateState.RENDERER_OWNED
@@ -3302,6 +3391,7 @@ public final class ClientSession {
                 if (ref.bytes() > 0 && ref.publication().rendererAdmitted()) {
                     WorkerResource.Lease lease = this.detachPublicationLease(ref);
                     if (lease != null) {
+                        ClientLodDebug.ownerEvent(this.debugOwnerTiming, 29, 1);
                         long observedNanos = ClientLodDebug.publicationClock();
                         if (observedNanos != 0) {
                             long admittedNanos = ref.publication().rendererAdmittedNanos();
@@ -3318,6 +3408,7 @@ public final class ClientSession {
                 }
                 Optional<VoxyRenderSystem.UploadOutcome> outcome = ref.publication().takeUploadOutcome();
                 if (outcome.isEmpty()) {
+                    ClientLodDebug.ownerEvent(this.debugOwnerTiming, 28, 1);
                     this.publicationQueue.addLast(ref);
                     continue;
                 }

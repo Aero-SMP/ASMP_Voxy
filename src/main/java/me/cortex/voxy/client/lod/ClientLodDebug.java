@@ -5,6 +5,11 @@ import net.neoforged.bus.api.IEventBus;
 /** No-op facade replaced by the compile-time debug implementation in debug client JARs. */
 public final class ClientLodDebug {
     private ClientLodDebug() {}
+    public static Object renderLoadingBegin(int stage) { return null; }
+    public static Object renderLoadingCurrent(int stage) { return null; }
+    public static void renderLoadingEvent(Object timing, int event, long count) {}
+    public static void renderLoadingEnd(Object timing) {}
+    public static void modelLoadingQueued(int stage) {}
     public static void shutdownPhase(me.cortex.voxy.client.core.VoxyRenderSystem renderer,
                                      String phase, String outcome, long nanos) {}
     public static void shutdownWork(int nodeManager, int transactions, int publications,
@@ -33,12 +38,21 @@ public final class ClientLodDebug {
     static Object ownerCreated(ClientSession.Session session) { return null; }
     static void ownerTurn(Object timing) {}
     static void ownerPhase(Object timing, int nextPhase) {}
+    static void ownerDetail(Object timing, int detail) {}
+    static void ownerEvent(Object timing, int event, long count) {}
+    static void ownerNoSlot(Object timing, ClientSession.Session session) {}
     static void ownerFinished(Object timing) {}
     static void handoff(ClientSession.Session session, int stage, long nanos) {}
     public static long publicationClock() { return 0; }
     static String sessionSnapshot(ClientSession.Session session) { return ""; }
     static Object workerCreated(ClientSession.Session session, int slot, Thread thread) { return null; }
     static void workerBegin(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {}
+    static void workerAssigned(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {}
+    static void workerCompleted(Object state, WorkerResource.Lease lease) {}
+    static void workerClaimed(Object state, WorkerResource.Lease lease) {}
+    static void workerReusable(Object state, WorkerResource.Lease lease) {}
+    static int workerPush(Object state, String stage) { return -1; }
+    static void workerPop(Object state, int previous) {}
     static void workerStage(Object state, String stage) {}
     static void workerOutcome(Object state, String outcome, long bytes) {}
     static void workerEnd(Object state, LocalSectionCodec codec) {}

@@ -21,10 +21,12 @@ final class SessionDebugTelemetry {
     private static final class OwnerTiming {
         final long thread = Thread.currentThread().threadId(), start = System.nanoTime();
         final long[] counts = new long[17], totals = new long[17], maxima = new long[17];
+        final OwnerLoadingTelemetry loading = new OwnerLoadingTelemetry();
         long loops, busy, phaseStart, priorCpu = -1, priorCpuSample;
         int phase = -1;
 
         void transition(int next, long now) {
+            this.loading.phase(next, now);
             if (this.phase >= 0) {
                 long elapsed = Math.max(0, now - this.phaseStart);
                 this.counts[this.phase]++;
@@ -121,6 +123,16 @@ final class SessionDebugTelemetry {
     static void ownerPhase(Object state, int nextPhase) {
         if (state instanceof OwnerTiming timing && nextPhase >= 0 && nextPhase <= WAIT_PHASE)
             timing.transition(nextPhase, System.nanoTime());
+    }
+
+    static void ownerDetail(Object state, int detail) {
+        if (state instanceof OwnerTiming timing) timing.loading.detail(detail);
+    }
+    static void ownerEvent(Object state, int event, long count) {
+        if (state instanceof OwnerTiming timing) timing.loading.event(event, count);
+    }
+    static void ownerNoSlot(Object state, ClientSession.Session session) {
+        if (state instanceof OwnerTiming timing) timing.loading.noSlot(session);
     }
 
     static void ownerFinished(Object state) {
@@ -266,7 +278,7 @@ final class SessionDebugTelemetry {
                 + " handoffCount=" + Arrays.toString(stats.handoffCounts)
                 + " handoffNanos=" + Arrays.toString(stats.handoffNanos)
                 + " handoffMaxNanos=" + Arrays.toString(stats.handoffMaxNanos)
-                + (stats.owner == null ? " ownerTiming=NOT_STARTED" : stats.owner.sample(now));
+                + (stats.owner == null ? " ownerTiming=NOT_STARTED" : stats.owner.sample(now) + stats.owner.loading.summary(session));
         // No shared debug monitor is held while scanning, reading renderer counters or formatting.
         String workers = WorkerDebugTelemetry.sample(session, now);
         String summary = session.snapshot(startup) + workers + " pendingRefresh=" + pendingRefresh

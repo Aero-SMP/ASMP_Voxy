@@ -133,24 +133,34 @@ final class LocalSectionCodec implements AutoCloseable {
     RegionalSectionCodec.SectionData decode(long key, int children, InputStream compressed,
                                             long compressedBytes, long canonicalBytes,
                                             Names resolver) throws IOException {
+        return decode(key, children, compressed, compressedBytes, canonicalBytes, resolver, null);
+    }
+    RegionalSectionCodec.SectionData decode(long key, int children, InputStream compressed,
+                                            long compressedBytes, long canonicalBytes,
+                                            Names resolver, Object debugWork) throws IOException {
         if (compressedBytes < 1 || compressedBytes > MAX_COMPRESSED_BYTES
                 || canonicalBytes < HEADER_BYTES || canonicalBytes > MAX_CANONICAL_BYTES
                 || compressedBytes > compressedBound(canonicalBytes) || (children & ~255) != 0)
             throw new IOException("invalid local section extent");
         claim();
+        int previous = ClientLodDebug.workerPush(debugWork, "CACHE_DECODE");
         try {
             if (this.decoder == 0) this.decoder = ZSTD_createDCtx();
             if (this.decoder == 0) throw new IOException("no local Zstd decoder");
             check(ZSTD_DCtx_reset(this.decoder, ZSTD_reset_session_and_parameters));
             // Streaming API rejects oversized windows before allocating its history buffer.
             check(ZSTD_DCtx_setParameter(this.decoder, ZSTD_d_windowLogMax, WINDOW_LOG));
-            try (var input = new DecodedInput(compressed, compressedBytes, canonicalBytes)) {
+            try (var input = new DecodedInput(compressed, compressedBytes, canonicalBytes, debugWork)) {
                 int count = u16(input), blocks = u16(input), biomes = u16(input);
                 if (count < 1 || count > CELLS || blocks < 1 || blocks > count
                         || biomes < 1 || biomes > Math.min(count, CatalogCodec.MAX_BIOMES))
                     throw new IOException("invalid local name table counts");
-                int[] blockIds = names(input, blocks, false, resolver);
-                int[] biomeIds = names(input, biomes, true, resolver);
+                int namePrevious = ClientLodDebug.workerPush(debugWork, "CACHE_NAMES");
+                int[] blockIds, biomeIds;
+                try {
+                    blockIds = names(input, blocks, false, resolver);
+                    biomeIds = names(input, biomes, true, resolver);
+                } finally { ClientLodDebug.workerPop(debugWork, namePrevious); }
                 long[] palette = new long[count];
                 int nextBlock = 0, nextBiome = 0;
                 // Validate remote table identities, not translated aliases (including air).
@@ -186,9 +196,10 @@ final class LocalSectionCodec implements AutoCloseable {
                 }
                 if (next != count || input.read() != -1) throw new IOException("unused palette or trailing local data");
                 this.decodedBytes = compressedBytes;
+                ClientLodDebug.workerOutcome(debugWork, "CACHE_CANONICAL_BYTES", canonicalBytes);
                 return new RegionalSectionCodec.SectionData(key, children, cells, used.toIntArray());
             }
-        } finally { this.busy = false; }
+        } finally { this.busy = false; ClientLodDebug.workerPop(debugWork, previous); }
     }
 
     private int[] names(DecodedInput input, int count, boolean biome, Names resolver) throws IOException {
@@ -301,12 +312,13 @@ final class LocalSectionCodec implements AutoCloseable {
 
     private final class DecodedInput extends InputStream {
         final InputStream source;
+        final Object debugWork;
         final Buffers buffers = LocalSectionCodec.this.buffers();
         long sourceLeft, canonicalLeft, nameBytes;
         int at, size;
         boolean ended;
-        DecodedInput(InputStream source, long compressed, long canonical) {
-            this.source = source; this.sourceLeft = compressed; this.canonicalLeft = canonical;
+        DecodedInput(InputStream source, long compressed, long canonical, Object debugWork) {
+            this.source = source; this.sourceLeft = compressed; this.canonicalLeft = canonical; this.debugWork = debugWork;
         }
         @Override public int read() throws IOException {
             if (this.at == this.size && !fill()) return -1;
@@ -328,17 +340,20 @@ final class LocalSectionCodec implements AutoCloseable {
                     readFully(this.source, b.heap, count); this.sourceLeft -= count;
                     b.input.clear().put(b.heap, 0, count).flip(); b.in.set(b.input, 0);
                 }
-                b.output.clear(); b.out.set(b.output, 0);
+                int previous = ClientLodDebug.workerPush(debugWork, "CACHE_DECOMPRESS");
                 long before = b.in.pos();
-                long result = ZSTD_decompressStream(LocalSectionCodec.this.decoder, b.out, b.in);
-                check(result);
-                this.size = Math.toIntExact(b.out.pos()); this.at = 0;
-                this.canonicalLeft -= this.size;
-                if (this.canonicalLeft < 0) throw new IOException("local expanded length overflow");
-                this.ended = result == 0;
-                if (this.ended && (this.sourceLeft != 0 || b.in.pos() != b.in.size() || this.canonicalLeft != 0))
-                    throw new IOException("local frame length mismatch or trailing frame");
-                b.output.get(0, b.heap, 0, this.size);
+                try {
+                    b.output.clear(); b.out.set(b.output, 0);
+                    long result = ZSTD_decompressStream(LocalSectionCodec.this.decoder, b.out, b.in);
+                    check(result);
+                    this.size = Math.toIntExact(b.out.pos()); this.at = 0;
+                    this.canonicalLeft -= this.size;
+                    if (this.canonicalLeft < 0) throw new IOException("local expanded length overflow");
+                    this.ended = result == 0;
+                    if (this.ended && (this.sourceLeft != 0 || b.in.pos() != b.in.size() || this.canonicalLeft != 0))
+                        throw new IOException("local frame length mismatch or trailing frame");
+                    b.output.get(0, b.heap, 0, this.size);
+                } finally { ClientLodDebug.workerPop(debugWork, previous); }
                 if (this.size != 0) return true;
                 if (!this.ended && before == b.in.pos() && this.sourceLeft == 0)
                     throw new IOException("truncated local Zstd frame");
