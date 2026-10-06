@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import operator as _operators
 import os
 from pathlib import Path
 import statistics
@@ -40,6 +41,14 @@ _ALLOWED_STEP_FIELDS = {
 }
 VALID_STEPS = set(_ALLOWED_STEP_FIELDS)
 COMPARISONS = {"==", "!=", "<", "<=", ">", ">="}
+_COMPARISON_OPERATORS = {
+    "==": _operators.eq,
+    "!=": _operators.ne,
+    "<": _operators.lt,
+    "<=": _operators.le,
+    ">": _operators.gt,
+    ">=": _operators.ge,
+}
 RESULT_KINDS = {
     "pose": "POSE_REACHED",
     "hold": "CHECKPOINT_RESULT",
@@ -234,14 +243,7 @@ class EvidenceReader:
 
 
 def compare(actual: Any, operator: str, expected: Any) -> bool:
-    return {
-        "==": lambda: actual == expected,
-        "!=": lambda: actual != expected,
-        "<": lambda: actual < expected,
-        "<=": lambda: actual <= expected,
-        ">": lambda: actual > expected,
-        ">=": lambda: actual >= expected,
-    }[operator]()
+    return _COMPARISON_OPERATORS[operator](actual, expected)
 
 
 def snapshot_from(event: dict[str, Any]) -> dict[str, Any]:

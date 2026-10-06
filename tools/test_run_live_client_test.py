@@ -241,6 +241,231 @@ class ScenarioValidationTest(unittest.TestCase):
             self.assertEqual(SCENARIO_HASHES[name], digest)
 
 
+class _ComparisonResult:
+    def __init__(self, events, label, truth):
+        self.events, self.label, self.truth = events, label, truth
+
+    def __bool__(self):
+        self.events.append((self.label, "bool"))
+        if isinstance(self.truth, Exception):
+            raise self.truth
+        return self.truth
+
+    def __repr__(self):
+        return self.label
+
+
+class _ComparisonOperand:
+    def __init__(self, events, label, outcome):
+        self.events, self.label, self.outcome = events, label, outcome
+
+    def _apply(self, method, other):
+        self.events.append((self.label, method, getattr(other, "label", other)))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+    def __eq__(self, other): return self._apply("eq", other)
+    def __ne__(self, other): return self._apply("ne", other)
+    def __lt__(self, other): return self._apply("lt", other)
+    def __le__(self, other): return self._apply("le", other)
+    def __gt__(self, other): return self._apply("gt", other)
+    def __ge__(self, other): return self._apply("ge", other)
+
+    def __repr__(self):
+        return self.label
+
+
+class _DerivedComparisonOperand(_ComparisonOperand):
+    pass
+
+
+class ComparisonTest(unittest.TestCase):
+    # Independent operation and method order; do not derive these from dispatch.
+    operations = ("==", "!=", "<", "<=", ">", ">=")
+    methods = ("eq", "ne", "lt", "le", "gt", "ge")
+    reflected = ("eq", "ne", "gt", "ge", "lt", "le")
+
+    def make_run(self, snapshots=()):
+        run = object.__new__(runner.ScenarioRun)
+        run.step, run.run_id = 7, "comparison-test"
+        run.checkpoints = {"before": {"active": 2}, "after": {"active": 3}}
+        run.reader = mock.Mock(events=[])
+        run.report = runner.RunReport(run.run_id, False, snapshots=list(snapshots))
+        run.command_and_wait = mock.Mock()
+        return run
+
+    def test_scalar_comparisons_and_keyword_contract(self):
+        less = (False, True, True, True, False, False)
+        equal = (True, False, False, True, False, True)
+        cases = [(2, 3, less), (3, 2, (False, True, False, False, True, True)),
+                 (3, 3, equal), (True, 1, equal), (False, 0, equal),
+                 (2**100, 2**100 + 1, less),
+                 (math.nan, math.nan, (False, True, False, False, False, False)),
+                 (math.inf, math.inf, equal), (-math.inf, math.inf, less),
+                 ([1], [2], less), ((1,), (1,), equal), ("a", "b", less),
+                 ({1}, {1, 2}, less)]
+        self.assertEqual({"==", "!=", "<", "<=", ">", ">="}, runner.COMPARISONS)
+        for actual, expected, results in cases:
+            for operation, result in zip(self.operations, results):
+                with self.subTest(actual=actual, expected=expected, operation=operation):
+                    self.assertIs(result, runner.compare(actual=actual, operator=operation, expected=expected))
+
+    def test_scalar_comparison_errors_preserve_messages(self):
+        for actual, expected, equal in ((1, "1", False), (None, 0, False),
+                                       (1j, 2j, False), ({}, {}, True), ({1}, [1], False)):
+            self.assertIs(equal, runner.compare(actual, "==", expected))
+            self.assertIs(not equal, runner.compare(actual, "!=", expected))
+            for operation in self.operations[2:]:
+                with self.subTest(actual=actual, expected=expected, operation=operation):
+                    with self.assertRaises(TypeError) as caught:
+                        runner.compare(actual, operation, expected)
+                    self.assertEqual(f"'{operation}' not supported between instances of "
+                                     f"'{type(actual).__name__}' and '{type(expected).__name__}'", str(caught.exception))
+
+    def test_rich_comparisons_return_identity_without_boolean_coercion(self):
+        for operation, method in zip(self.operations, self.methods):
+            with self.subTest(operation=operation):
+                events = []
+                result = _ComparisonResult(events, "result", AssertionError("unexpected coercion"))
+                actual = _ComparisonOperand(events, "left", result)
+                expected = _ComparisonOperand(events, "right", AssertionError("unexpected reflection"))
+                self.assertIs(result, runner.compare(actual, operation, expected))
+                self.assertEqual([("left", method, "right")], events)
+
+    def test_reflected_subclass_and_not_implemented_order(self):
+        for operation, method, reflected in zip(self.operations, self.methods, self.reflected):
+            for subclass in (False, True):
+                with self.subTest(operation=operation, subclass=subclass):
+                    events = []
+                    result = object()
+                    actual = _ComparisonOperand(events, "left", NotImplemented)
+                    right_type = _DerivedComparisonOperand if subclass else _ComparisonOperand
+                    expected = right_type(events, "right", result)
+                    self.assertIs(result, runner.compare(actual, operation, expected))
+                    wanted = [("right", reflected, "left")] if subclass else [
+                        ("left", method, "right"), ("right", reflected, "left")]
+                    self.assertEqual(wanted, events)
+            events = []
+            actual = _ComparisonOperand(events, "left", NotImplemented)
+            expected = _ComparisonOperand(events, "right", NotImplemented)
+            if operation in ("==", "!="):
+                self.assertIs(operation == "!=", runner.compare(actual, operation, expected))
+            else:
+                with self.assertRaises(TypeError) as caught:
+                    runner.compare(actual, operation, expected)
+                self.assertEqual(f"'{operation}' not supported between instances of "
+                                 "'_ComparisonOperand' and '_ComparisonOperand'", str(caught.exception))
+            self.assertEqual([("left", method, "right"), ("right", reflected, "left")], events)
+
+    def test_lookup_errors_precede_comparison_and_selected_errors_propagate(self):
+        for operation in ("unsupported", None, 1, [], {}, set()):
+            events = []
+            actual = _ComparisonOperand(events, "left", AssertionError("operand evaluated"))
+            error = TypeError if isinstance(operation, (list, dict, set)) else KeyError
+            with self.assertRaises(error) as caught:
+                runner.compare(actual, operation, object())
+            message = f"unhashable type: '{type(operation).__name__}'" if error is TypeError else repr(operation)
+            self.assertEqual(message, str(caught.exception))
+            self.assertEqual([], events)
+        for operation, method in zip(self.operations, self.methods):
+            events = []
+            failure = RuntimeError("selected operand failure")
+            actual = _ComparisonOperand(events, "left", failure)
+            with self.assertRaises(RuntimeError) as caught:
+                runner.compare(actual, operation, "right")
+            self.assertIs(failure, caught.exception)
+            self.assertEqual([("left", method, "right")], events)
+
+    def test_assert_caller_retains_rich_result_and_failure_order(self):
+        for truth in (True, False, RuntimeError("truth failure")):
+            with self.subTest(truth=truth):
+                events = []
+                result = _ComparisonResult(events, "result", truth)
+                actual = _ComparisonOperand(events, "actual", result)
+                run = self.make_run([{"active": actual}])
+                operation = {"op": "assert", "field": "active", "comparison": "<", "value": 4}
+                if truth is True:
+                    run.execute_step(operation, 2)
+                else:
+                    error = RuntimeError if isinstance(truth, Exception) else runner.RunFailure
+                    with self.assertRaises(error) as caught:
+                        run.execute_step(operation, 2)
+                    self.assertEqual("truth failure" if isinstance(truth, Exception) else "assert[2] failed: actual",
+                                     str(caught.exception))
+                    if error is runner.RunFailure: self.assertEqual("ASSERTION", caught.exception.category)
+                self.assertIs(actual, run.report.assertions[0]["actual"])
+                self.assertIs(result, run.report.assertions[0]["passed"])
+                self.assertEqual([("actual", "lt", 4), ("result", "bool")], events)
+                run.command_and_wait.assert_not_called()
+                self.assertEqual(7, run.step)
+        events = []
+        actual = _ComparisonOperand(events, "actual", RuntimeError("comparison failure"))
+        run = self.make_run([{"active": actual}])
+        with self.assertRaisesRegex(RuntimeError, "^comparison failure$"):
+            run.assert_step({"field": "active", "comparison": "<", "value": 4}, 2)
+        self.assertEqual([], run.report.assertions)
+        self.assertEqual([("actual", "lt", 4)], events)
+
+    def test_assert_caller_delta_and_missing_values(self):
+        run = self.make_run()
+        run.assert_step({"mode": "delta", "field": "active", "from": "before", "to": "after",
+                         "comparison": "==", "value": 1}, 3)
+        self.assertEqual([{"index": 3, "mode": "delta", "actual": 1, "passed": True}], run.report.assertions)
+        for snapshots, message, appended in (([], "assert[3] has no snapshot", False),
+                                              ([{}], "assert[3] failed: None", True)):
+            run = self.make_run(snapshots)
+            with self.assertRaises(runner.RunFailure) as caught:
+                run.assert_step({"field": "active", "comparison": "unsupported", "value": object()}, 3)
+            self.assertEqual("ASSERTION", caught.exception.category)
+            self.assertEqual(message, str(caught.exception))
+            self.assertEqual(1 if appended else 0, len(run.report.assertions))
+
+    def test_wait_caller_missing_false_then_true_uses_fake_endpoints(self):
+        events = []
+        cold = _ComparisonOperand(events, "cold", _ComparisonResult(events, "false", False))
+        ready = _ComparisonOperand(events, "ready", _ComparisonResult(events, "true", True))
+        run = self.make_run()
+        run.command_and_wait.side_effect = [{"result": {"snapshot": {"active": value}}}
+                                           for value in (cold, None, ready)]
+        operation = {"op": "wait_until", "field": "active", "comparison": ">=", "value": 3,
+                     "timeout_ms": 1000, "cadence_ms": 100}
+        with mock.patch.object(runner.time, "monotonic", side_effect=(0, 0, 0.1, 0.2)), \
+                mock.patch.object(runner.time, "sleep") as sleep:
+            run.execute_step(operation, 4)
+        self.assertEqual([("cold", "ge", 3), ("false", "bool"),
+                          ("ready", "ge", 3), ("true", "bool")], events)
+        self.assertEqual([mock.call("voxytest checkpoint comparison-test " + str(step),
+                                    {"CHECKPOINT_RESULT"}, 30, "wait_until[4]")
+                          for step in (8, 9, 10)], run.command_and_wait.call_args_list)
+        self.assertEqual([mock.call(0.1), mock.call(0.1)], sleep.call_args_list)
+        self.assertEqual(10, run.step)
+        self.assertEqual([], run.report.assertions)
+
+    def test_wait_caller_timeout_and_comparison_failure_preserve_order(self):
+        for outcome in (False, RuntimeError("comparison failure")):
+            events = []
+            actual = _ComparisonOperand(events, "cold", outcome)
+            run = self.make_run()
+            run.command_and_wait.return_value = {"result": {"snapshot": {"active": actual}}}
+            with mock.patch.object(runner.time, "monotonic", side_effect=(0, 0, 1)), \
+                    mock.patch.object(runner.time, "sleep") as sleep:
+                error = RuntimeError if isinstance(outcome, Exception) else runner.RunFailure
+                with self.assertRaises(error) as caught:
+                    run.wait_until({"field": "active", "comparison": ">=", "value": 3,
+                                    "timeout_ms": 1000}, 4)
+            self.assertEqual("comparison failure" if isinstance(outcome, Exception) else "wait_until[4] ended with cold",
+                             str(caught.exception))
+            self.assertEqual([("cold", "ge", 3)], events)
+            run.command_and_wait.assert_called_once_with("voxytest checkpoint comparison-test 8",
+                                                        {"CHECKPOINT_RESULT"}, 30, "wait_until[4]")
+            if isinstance(outcome, Exception): sleep.assert_not_called()
+            else:
+                sleep.assert_called_once_with(0.25)
+                self.assertEqual("ASSERTION", caught.exception.category)
+            self.assertEqual(8, run.step)
+
+
 class EvidenceTest(unittest.TestCase):
     def test_atomic_json_replaces_complete_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
