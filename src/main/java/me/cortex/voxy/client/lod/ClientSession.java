@@ -350,8 +350,15 @@ public final class ClientSession {
         }
     }
 
-    /** First registry/mapper access stays on the render thread. Pending names belong to the
-     * existing worker slots; successful spelling-to-ID entries share this renderer epoch. */
+    /** Actual bytes across this server's dimensions, or -1 while ownership/inventory is unknown. */
+    public static long cacheStorageUsedBytes(String serverId) {
+        var session = active;
+        if (session == null || !session.open.get() || session.policy == null
+                || !session.policy.serverId().equals(serverId)) return -1;
+        var metadata = session.metadata;
+        return metadata == null ? -1 : metadata.budget.usedBytes(serverId);
+    }
+
     public static void streamingSettingsChanged() {
         var session = active; if (session != null) session.signal();
     }
@@ -624,7 +631,7 @@ public final class ClientSession {
         long[] visibleCutKeys = new long[0];
         Path cacheRoot;
         String serverKey;
-        RegionalMetadataStore metadata;
+        volatile RegionalMetadataStore metadata;
         volatile long viewRevision;
         final java.util.concurrent.ConcurrentHashMap<String, Integer> blockNames = new java.util.concurrent.ConcurrentHashMap<>();
         final java.util.concurrent.ConcurrentHashMap<String, Integer> biomeNames = new java.util.concurrent.ConcurrentHashMap<>();

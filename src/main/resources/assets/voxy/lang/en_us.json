@@ -31,6 +31,8 @@
   "voxy.config.streaming.bandwidth.tooltip": "Voxy download limit for this server, across all dimensions.",
   "voxy.config.streaming.storage": "Cache Storage",
   "voxy.config.streaming.storage.tooltip": "Terrain cache space for this server, across all dimensions.",
+  "voxy.config.streaming.storage.used": "Cache used: %s",
+  "voxy.config.streaming.storage.used_unavailable": "Cache used: unavailable",
   "voxy.config.streaming.entire_world": "Entire world",
   "voxy.config.streaming.no_server": "Join a server to change these settings."
 }

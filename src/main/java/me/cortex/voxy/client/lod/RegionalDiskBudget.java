@@ -606,6 +606,10 @@ final class RegionalDiskBudget {
         refreshRecovery(account, false);
         synchronized (this) { return account == null ? 0 : account.admissionGeneration; }
     }
+    synchronized long usedBytes(String serverId) {
+        var account = this.accounts.get(serverId);
+        return ready() && account != null && !account.ambiguous ? account.bytes : -1;
+    }
     StorageState storage(Account account) {
         refreshRecovery(account, false);
         synchronized (this) {

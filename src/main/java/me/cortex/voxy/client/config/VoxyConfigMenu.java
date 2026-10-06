@@ -207,7 +207,15 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                 .setValueFormatter(values::label)
                 .setEnabledProvider(state -> values.available() && voxyEnabled(state),
                         ENABLED, ConfigState.UPDATE_ON_REBUILD);
-        storage.setTooltip(value -> serverPolicyTooltip("voxy.config.streaming.storage.tooltip"));
+        storage.setTooltip(value -> {
+            var tooltip = serverPolicyTooltip("voxy.config.streaming.storage.tooltip");
+            var policy = ServerDownloadSettings.current();
+            if (policy == null || !policy.available()) return tooltip;
+            long used = ClientSession.cacheStorageUsedBytes(policy.serverId());
+            return tooltip.copy().append("\n\n").append(used < 0
+                    ? Component.translatable("voxy.config.streaming.storage.used_unavailable")
+                    : Component.translatable("voxy.config.streaming.storage.used", storageLabel(used)));
+        });
         storage.setDefaultProvider(state -> values.defaultIndex(), ConfigState.UPDATE_ON_REBUILD);
         storage.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
         group.addOption(bandwidth);
