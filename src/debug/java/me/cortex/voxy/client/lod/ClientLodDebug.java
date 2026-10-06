@@ -160,6 +160,13 @@ public final class ClientLodDebug {
         SessionDebugTelemetry.capture(session, System.nanoTime(), !connectionAllowed());
     }
 
+    static Object ownerCreated(ClientSession.Session session) { return SessionDebugTelemetry.ownerCreated(session); }
+    static void ownerTurn(Object timing) { SessionDebugTelemetry.ownerTurn(timing); }
+    static void ownerPhase(Object timing, int nextPhase) { SessionDebugTelemetry.ownerPhase(timing, nextPhase); }
+    static void ownerFinished(Object timing) { SessionDebugTelemetry.ownerFinished(timing); }
+    static void handoff(ClientSession.Session session, int stage, long nanos) { SessionDebugTelemetry.handoff(session, stage, nanos); }
+    public static long publicationClock() { return System.nanoTime(); }
+
     static String sessionSnapshot(ClientSession.Session session) {
         return SessionDebugTelemetry.read(session, System.nanoTime());
     }

@@ -1,5 +1,9 @@
 package me.cortex.voxy.client.lod;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
+import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.TimeUnit;
@@ -8,6 +12,69 @@ import java.util.concurrent.TimeUnit;
 final class SessionDebugTelemetry {
     static final long INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final Map<ClientSession.Session, Stats> SESSIONS = new WeakHashMap<>();
+    private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
+    private static final int WAIT_PHASE = 16;
+    private static final String OWNER_PHASE_ORDER = "CONNECT,WINDOW,WORKERS,CONTROLS,NETWORK_REPLIES,EVENTS,DEMAND,METADATA,CATALOGS,REGIONS,DOWNLOADS,PUBLICATIONS,STAGES,DEBUG_SAMPLE,HEALTH,RESET,WAIT";
+    private static final String HANDOFF_ORDER = "MESH_TO_CLAIM,CLAIM_TO_SUBMIT,SUBMIT_TO_ADMISSION,ADMISSION_TO_OBSERVE,OBSERVE_TO_REUSE";
+
+    /** Mutated only by the owner. No session, worker, task or buffer reference is retained. */
+    private static final class OwnerTiming {
+        final long thread = Thread.currentThread().threadId(), start = System.nanoTime();
+        final long[] counts = new long[17], totals = new long[17], maxima = new long[17];
+        long loops, busy, phaseStart, priorCpu = -1, priorCpuSample;
+        int phase = -1;
+
+        void transition(int next, long now) {
+            if (this.phase >= 0) {
+                long elapsed = Math.max(0, now - this.phaseStart);
+                this.counts[this.phase]++;
+                this.totals[this.phase] += elapsed;
+                this.maxima[this.phase] = Math.max(this.maxima[this.phase], elapsed);
+                if (this.phase != WAIT_PHASE) this.busy += elapsed;
+            }
+            this.phase = next;
+            this.phaseStart = now;
+        }
+
+        String sample(long now) {
+            long cpu = -1;
+            long cpuSampleNanos = System.nanoTime();
+            String status = "UNAVAILABLE";
+            try {
+                if (!THREADS.isThreadCpuTimeSupported()) status = "UNSUPPORTED";
+                else if (!THREADS.isThreadCpuTimeEnabled()) status = "DISABLED";
+                else {
+                    cpu = THREADS.getThreadCpuTime(this.thread);
+                    status = cpu < 0 ? "UNAVAILABLE" : "AVAILABLE";
+                }
+            } catch (UnsupportedOperationException | SecurityException ignored) { }
+            boolean deltaValid = cpu >= 0 && this.priorCpu >= 0 && cpu >= this.priorCpu
+                    && cpuSampleNanos > this.priorCpuSample;
+            StringBuilder text = new StringBuilder(" ownerThread=").append(this.thread)
+                    .append(" ownerLoops=").append(this.loops)
+                    .append(" ownerBusyNanos=").append(this.busy)
+                    .append(" ownerWallNanos=").append(Math.max(0, now - this.start))
+                    .append(" ownerPhaseOrder=").append(OWNER_PHASE_ORDER)
+                    .append(" ownerPhaseCount=").append(Arrays.toString(this.counts))
+                    .append(" ownerPhaseNanos=").append(Arrays.toString(this.totals))
+                    .append(" ownerPhaseMaxNanos=").append(Arrays.toString(this.maxima))
+                    .append(" ownerActivePhase=").append(this.phase)
+                    .append(" ownerActivePhaseAgeNanos=").append(this.phase < 0 ? 0 : Math.max(0, now - this.phaseStart))
+                    .append(" ownerCpu=").append(status)
+                    // Thread CPU time is cumulative from this dedicated thread's start.
+                    .append(" ownerCpuNanos=").append(cpu)
+                    .append(" ownerCpuSample=").append(cpu < 0 ? "UNAVAILABLE" : deltaValid ? "DELTA" : "BASELINE");
+            if (deltaValid) {
+                long elapsed = cpuSampleNanos - this.priorCpuSample, delta = cpu - this.priorCpu;
+                text.append(" ownerCpuDeltaNanos=").append(delta)
+                        .append(" ownerCpuSampleWallNanos=").append(elapsed)
+                        .append(" ownerOneCorePercent=").append(String.format(Locale.ROOT, "%.3f", 100.0 * delta / elapsed));
+            }
+            this.priorCpu = cpu;
+            this.priorCpuSample = cpu < 0 ? 0 : cpuSampleNanos;
+            return text.toString();
+        }
+    }
 
     private static final class Stats {
         final long start = System.nanoTime();
@@ -22,6 +89,8 @@ final class SessionDebugTelemetry {
         final long[] cachedActivations = new long[5], freshActivations = new long[5], firstCachedNanos = new long[5];
         final long[] discoveredBindings = new long[5];
         long discoveredRoots;
+        OwnerTiming owner;
+        final long[] handoffCounts = new long[5], handoffNanos = new long[5], handoffMaxNanos = new long[5];
         volatile Summary latest;
     }
 
@@ -34,6 +103,37 @@ final class SessionDebugTelemetry {
 
     private static synchronized Stats state(ClientSession.Session session) {
         return SESSIONS.computeIfAbsent(session, ignored -> new Stats());
+    }
+
+    static Object ownerCreated(ClientSession.Session session) {
+        if (Thread.currentThread() != session.thread) {
+            throw new IllegalStateException("debug owner timing must start on the session owner");
+        }
+        var timing = new OwnerTiming();
+        state(session).owner = timing;
+        return timing;
+    }
+
+    static void ownerTurn(Object state) {
+        if (state instanceof OwnerTiming timing) timing.loops++;
+    }
+
+    static void ownerPhase(Object state, int nextPhase) {
+        if (state instanceof OwnerTiming timing && nextPhase >= 0 && nextPhase <= WAIT_PHASE)
+            timing.transition(nextPhase, System.nanoTime());
+    }
+
+    static void ownerFinished(Object state) {
+        if (state instanceof OwnerTiming timing) timing.transition(-1, System.nanoTime());
+    }
+
+    static void handoff(ClientSession.Session session, int stage, long nanos) {
+        // Terminal cleanup may release a resource outside the owner; omit that cohort.
+        if (Thread.currentThread() != session.thread || stage < 0 || stage >= 5 || nanos < 0) return;
+        var stats = state(session);
+        stats.handoffCounts[stage]++;
+        stats.handoffNanos[stage] += nanos;
+        stats.handoffMaxNanos[stage] = Math.max(stats.handoffMaxNanos[stage], nanos);
     }
 
     static void event(ClientSession.Session session, String event, long bytes) {
@@ -161,7 +261,12 @@ final class SessionDebugTelemetry {
                 + " maxPublishedToReusableNanos=" + stats.maxPublishedToReusableNanos
                 + " admittedPending=" + admittedPending
                 + " meshToLeaseReleaseNanos=" + stats.meshToLeaseReleaseNanos
-                + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos;
+                + " maxMeshToLeaseReleaseNanos=" + stats.maxMeshToLeaseReleaseNanos
+                + " handoffOrder=" + HANDOFF_ORDER
+                + " handoffCount=" + Arrays.toString(stats.handoffCounts)
+                + " handoffNanos=" + Arrays.toString(stats.handoffNanos)
+                + " handoffMaxNanos=" + Arrays.toString(stats.handoffMaxNanos)
+                + (stats.owner == null ? " ownerTiming=NOT_STARTED" : stats.owner.sample(now));
         // No shared debug monitor is held while scanning, reading renderer counters or formatting.
         String workers = WorkerDebugTelemetry.sample(session, now);
         String summary = session.snapshot(startup) + workers + " pendingRefresh=" + pendingRefresh

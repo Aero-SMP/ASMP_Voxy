@@ -11,6 +11,7 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
             });
     private VoxyRenderSystem.UploadStatus status;
     private boolean admitted;
+    private long admittedNanos;
     private boolean closed;
     private boolean retired;
     private boolean retirementRequested;
@@ -20,6 +21,7 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
 
     public synchronized boolean acceptsUpload() { return !this.closed; }
     @Override public synchronized boolean rendererAdmitted() { return this.admitted; }
+    @Override public synchronized long rendererAdmittedNanos() { return this.admittedNanos; }
 
     /** Allocation, hierarchy commit and completion registration have all succeeded.
      * This acknowledges ownership, not activation; closure must not erase that fact. */
@@ -29,6 +31,7 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
             if (this.status == VoxyRenderSystem.UploadStatus.RETURNED) {
                 throw new IllegalStateException("returned geometry cannot be renderer admitted");
             }
+            this.admittedNanos = me.cortex.voxy.client.lod.ClientLodDebug.publicationClock();
             this.admitted = true;
         }
         this.stateChanged();

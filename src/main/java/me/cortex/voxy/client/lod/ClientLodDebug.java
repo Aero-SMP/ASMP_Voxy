@@ -30,6 +30,12 @@ public final class ClientLodDebug {
     static void startupEvent(ClientSession.Session session, String event, long bytes) {}
     static void admissionReleased(ClientSession.Session session, long meshCompletedNanos) {}
     static void captureSession(ClientSession.Session session) {}
+    static Object ownerCreated(ClientSession.Session session) { return null; }
+    static void ownerTurn(Object timing) {}
+    static void ownerPhase(Object timing, int nextPhase) {}
+    static void ownerFinished(Object timing) {}
+    static void handoff(ClientSession.Session session, int stage, long nanos) {}
+    public static long publicationClock() { return 0; }
     static String sessionSnapshot(ClientSession.Session session) { return ""; }
     static Object workerCreated(ClientSession.Session session, int slot, Thread thread) { return null; }
     static void workerBegin(Object state, ClientSession.Session.WorkerTask task, WorkerResource.Lease lease) {}

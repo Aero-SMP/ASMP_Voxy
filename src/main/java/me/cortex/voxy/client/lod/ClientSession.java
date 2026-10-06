@@ -779,6 +779,8 @@ public final class ClientSession {
             private volatile SaveInput saveInput;
             private volatile SaveOutcome saveOutcome;
             private long geometryPublishedNanos;
+            // Diagnostic timestamps belong to this slot's current exact lease.
+            private long ownerClaimedNanos, admissionObservedNanos;
             final WorkerResource<WorkerResult> resource;
             private WorkerTask task;
             private WorkerResource.Lease taskLease;
@@ -798,6 +800,7 @@ public final class ClientSession {
             synchronized WorkerResource.Lease assign(WorkerTask task) {
                 WorkerResource.Lease lease = this.resource.acquire();
                 if (lease == null) return null;
+                this.ownerClaimedNanos = this.admissionObservedNanos = 0;
                 this.task = Objects.requireNonNull(task);
                 this.sectionOperation = task instanceof SectionWorkerTask || task instanceof EmptyWorkerTask;
                 this.operationKey = switch (task) {
@@ -814,6 +817,11 @@ public final class ClientSession {
                 if (this.resource.release(lease)) this.reusable();
             }
             private void reusable() {
+                if (this.admissionObservedNanos != 0 && Thread.currentThread() == Session.this.thread) {
+                    ClientLodDebug.handoff(Session.this, 4,
+                            ClientLodDebug.publicationClock() - this.admissionObservedNanos);
+                }
+                this.ownerClaimedNanos = this.admissionObservedNanos = 0;
                 if (this.geometryPublishedNanos != 0) ClientLodDebug.startupEvent(Session.this,
                         "workerReusable", Math.max(0, System.nanoTime() - this.geometryPublishedNanos));
                 this.geometryPublishedNanos = 0;
@@ -1147,40 +1155,63 @@ public final class ClientSession {
         }
 
         void run() {
+            Object ownerTiming = null;
             try {
+                ownerTiming = ClientLodDebug.ownerCreated(this);
                 while (this.open.get()) {
+                    ClientLodDebug.ownerTurn(ownerTiming);
                     try {
+                        ClientLodDebug.ownerPhase(ownerTiming, 0); // CONNECT
                         this.connect();
+                        ClientLodDebug.ownerPhase(ownerTiming, 1); // WINDOW
                         this.reconcileWindow();
+                        ClientLodDebug.ownerPhase(ownerTiming, 2); // WORKERS
                         this.drainWorkers();
+                        ClientLodDebug.ownerPhase(ownerTiming, 3); // CONTROLS
                         if (this.quic != null) this.drainControls();
+                        ClientLodDebug.ownerPhase(ownerTiming, 4); // NETWORK_REPLIES
                         this.drainNetworkReplies();
+                        ClientLodDebug.ownerPhase(ownerTiming, 5); // EVENTS
                         this.drainEvents();
+                        ClientLodDebug.ownerPhase(ownerTiming, 6); // DEMAND
                         this.drainDemand();
+                        ClientLodDebug.ownerPhase(ownerTiming, 7); // METADATA
                         this.processMetadata();
+                        ClientLodDebug.ownerPhase(ownerTiming, 8); // CATALOGS
                         this.drainNetworkCatalogs();
+                        ClientLodDebug.ownerPhase(ownerTiming, 9); // REGIONS
                         this.processRegions();
+                        ClientLodDebug.ownerPhase(ownerTiming, 10); // DOWNLOADS
                         this.processCacheDownloads();
+                        ClientLodDebug.ownerPhase(ownerTiming, 11); // PUBLICATIONS
                         this.pollPublications();
+                        ClientLodDebug.ownerPhase(ownerTiming, 12); // STAGES
                         this.processStages();
+                        ClientLodDebug.ownerPhase(ownerTiming, 13); // DEBUG_SAMPLE
                         ClientLodDebug.captureSession(this);
+                        ClientLodDebug.ownerPhase(ownerTiming, 14); // HEALTH
                         if (this.quic != null && !this.quic.isOpen()) {
                             throw new IOException("regional QUIC connection ended",
                                     this.quic.failure());
                         }
                     } catch (IOException failure) {
+                        ClientLodDebug.ownerPhase(ownerTiming, 15); // RESET
                         if (this.open.get()) this.resetConnection(failure);
                     }
+                    ClientLodDebug.ownerPhase(ownerTiming, 16); // WAIT
                     this.awaitWake(10);
                 }
             } catch (InterruptedException interrupted) {
+                ClientLodDebug.ownerPhase(ownerTiming, 15); // RESET
                 Thread.currentThread().interrupt();
             } catch (Throwable failure) {
+                ClientLodDebug.ownerPhase(ownerTiming, 15); // RESET
                 if (this.open.get()) {
                     this.failure = failure;
                     Logger.warn("Regional Voxy session stopped", failure);
                 }
             } finally {
+                ClientLodDebug.ownerFinished(ownerTiming);
                 this.open.set(false);
                 try { this.release(); }
                 catch (RuntimeException | Error cleanup) {
@@ -2693,6 +2724,8 @@ public final class ClientSession {
                 if (completion == null) return;
                 WorkerResource.Lease lease = completion.lease();
                 WorkerResult result = completion.value();
+                long ownerClaimedNanos = result instanceof WorkerGeometry
+                        ? ClientLodDebug.publicationClock() : 0;
                 switch (result) {
                     case WorkerBootstrap boot -> {
                         this.metadata = boot.metadata();
@@ -2768,6 +2801,9 @@ public final class ClientSession {
                         }
                         this.recordWorkerSource(geometry.cacheHit(), geometry.compressedBytes(),
                                 true);
+                        worker.ownerClaimedNanos = ownerClaimedNanos;
+                        if (ownerClaimedNanos != 0) ClientLodDebug.handoff(this, 0,
+                                ownerClaimedNanos - geometry.completedNanos());
                         demand.candidateCacheHit = geometry.cacheHit();
                         // Once observed, the demand is the sole owner of the mesh buffer. The
                         // worker remains reserved until renderer admission completes, but must
@@ -3169,6 +3205,9 @@ public final class ClientSession {
                 }
                 AsyncNodeManager.PublicationProgress observed = this.publisher.progress();
                 VoxyRenderSystem.SubmissionAttempt attempt;
+                // Admission can happen before tryPublishBatch returns. Freeze the attempt's
+                // start, retaining it only if accepted; BUSY attempts contribute no sample.
+                long submittedNanos = ClientLodDebug.publicationClock();
                 try {
                     attempt = this.publisher.tryPublishBatch(submissions);
                 } catch (RuntimeException | Error failure) {
@@ -3187,8 +3226,13 @@ public final class ClientSession {
                     this.transferGeometryAccounting(demand);
                     demand.previousPublication = item.previous();
                     demand.publication = attempt.publications().get(index);
+                    if (demand.workLease != null && submittedNanos != 0) {
+                        long claimed = this.sectionWorkers[demand.workLease.slot()].ownerClaimedNanos;
+                        if (claimed != 0) ClientLodDebug.handoff(this, 1, submittedNanos - claimed);
+                    }
                     this.publicationQueue.addLast(new PublicationRef(demand, item.revision(),
-                            demand.publication, item.previous(), demand.workLease, demand.geometryBytes));
+                            demand.publication, item.previous(), demand.workLease, demand.geometryBytes,
+                            demand.meshCompletedNanos, submittedNanos));
                 }
             }
         }
@@ -3266,8 +3310,18 @@ public final class ClientSession {
                 if (ref.bytes() > 0 && ref.publication().rendererAdmitted()) {
                     WorkerResource.Lease lease = this.detachPublicationLease(ref);
                     if (lease != null) {
+                        long observedNanos = ClientLodDebug.publicationClock();
+                        if (observedNanos != 0) {
+                            long admittedNanos = ref.publication().rendererAdmittedNanos();
+                            if (admittedNanos != 0 && ref.submittedNanos != 0) {
+                                ClientLodDebug.handoff(this, 2, admittedNanos - ref.submittedNanos);
+                                ClientLodDebug.handoff(this, 3, observedNanos - admittedNanos);
+                            }
+                            WorkerSlot worker = this.sectionWorkers[lease.slot()];
+                            if (worker.resource.matches(lease)) worker.admissionObservedNanos = observedNanos;
+                        }
                         this.releaseRendererSlot(lease);
-                        ClientLodDebug.admissionReleased(this, ref.demand().meshCompletedNanos);
+                        ClientLodDebug.admissionReleased(this, ref.meshCompletedNanos);
                     }
                 }
                 Optional<VoxyRenderSystem.UploadOutcome> outcome = ref.publication().takeUploadOutcome();
@@ -3593,15 +3647,18 @@ public final class ClientSession {
         private final long revision;
         private final VoxyRenderSystem.SectionPublication publication, previous;
         private final long bytes;
+        private final long meshCompletedNanos, submittedNanos;
         private WorkerResource.Lease lease;
 
         PublicationRef(Demand demand, long revision,
                        VoxyRenderSystem.SectionPublication publication,
                        VoxyRenderSystem.SectionPublication previous,
-                       WorkerResource.Lease lease, long bytes) {
+                       WorkerResource.Lease lease, long bytes, long meshCompletedNanos,
+                       long submittedNanos) {
             this.demand = demand; this.revision = revision;
             this.publication = publication; this.previous = previous;
             this.lease = lease; this.bytes = bytes;
+            this.meshCompletedNanos = meshCompletedNanos; this.submittedNanos = submittedNanos;
         }
 
         Demand demand() { return this.demand; }

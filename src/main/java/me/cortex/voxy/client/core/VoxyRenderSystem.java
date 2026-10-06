@@ -252,6 +252,8 @@ public class VoxyRenderSystem {
 
     public interface SectionPublication extends AutoCloseable {
         boolean rendererAdmitted();
+        /** Debug clock at the actual admission transition; zero when diagnostics are disabled. */
+        default long rendererAdmittedNanos() { return 0; }
         boolean activationFencePassed();
         Optional<UploadOutcome> takeUploadOutcome();
         void abandon(Runnable resolved);
