@@ -130,6 +130,7 @@ public final class SectionMesher {
             maxX = Math.max(maxX, x + 1);
             maxY = Math.max(maxY, y + 1);
             maxZ = Math.max(maxZ, z + 1);
+            prepareFaceMasks(workspace, model, metadata, x, y, z);
             if (ModelQueries.containsFluid(metadata) && !ModelQueries.isFluid(metadata)) {
                 // Face axes are Y, Z, X, matching cellIndex() and neighbor strides.
                 workspace.overlayDepths[0] |= 1 << y;
@@ -140,6 +141,32 @@ public final class SectionMesher {
         if (minX == EDGE) return -1;
         return minX | minY << 5 | minZ << 10 | (maxX - minX - 1) << 15
                 | (maxY - minY - 1) << 20 | (maxZ - minZ - 1) << 25;
+    }
+
+    private static void prepareFaceMasks(Workspace workspace, int model, long metadata,
+                                         int x, int y, int z) {
+        for (int axis = 0; axis < 3; axis++) {
+            // Match cellIndex(): depth/row are y/z, z/y and x/z respectively.
+            int row = switch (axis) {
+                case 0 -> y * EDGE + z;
+                case 1 -> z * EDGE + y;
+                default -> x * EDGE + z;
+            };
+            int bit = 1 << (axis == 2 ? y : x);
+            for (int face = axis * 2; face < axis * 2 + 2; face++) {
+                int index = face * PLANE + row;
+                // Air metadata alone is insufficient: faceExists(0, face) is true.
+                if (model != 0 && ModelQueries.faceExists(metadata, face)) {
+                    workspace.faceExists[index] |= bit;
+                }
+                if (ModelQueries.faceCanBeOccluded(metadata, face)) {
+                    workspace.faceCanBeOccluded[index] |= bit;
+                }
+                if (ModelQueries.faceOccludes(metadata, face)) {
+                    workspace.faceOccludes[index] |= bit;
+                }
+            }
+        }
     }
 
     private void fillPlane(long[] cells, Workspace workspace, int face, int depth,
@@ -155,12 +182,29 @@ public final class SectionMesher {
         };
         // Zero denotes an outside plane; every interior neighbor has a nonzero stride.
         if (depth == ((face & 1) == 0 ? 0 : EDGE - 1)) delta = 0;
+        int ownRows = face * PLANE + depth * EDGE;
+        int neighborRows = (face ^ 1) * PLANE
+                + (depth + ((face & 1) == 0 ? -1 : 1)) * EDGE;
         for (int v = 0; v < EDGE; v++) {
-            for (int u = 0; u < EDGE; u++) {
-                int cell = cellIndex(face >>> 1, depth, u, v);
-                workspace.plane[u + v * EDGE] = faceData(cell, face, cells,
-                        workspace.modelIds, workspace.metadata, fluidLayer, delta);
+            // Fluid overlays use different models and retain their own eligibility rules.
+            int candidates = fluidLayer ? -1 : workspace.faceExists[ownRows + v];
+            if (!fluidLayer && delta != 0) {
+                candidates &= ~(workspace.faceCanBeOccluded[ownRows + v]
+                        & workspace.faceOccludes[neighborRows + v]);
             }
+            int rowMask = 0;
+            while (candidates != 0) {
+                int u = Integer.numberOfTrailingZeros(candidates);
+                candidates &= candidates - 1;
+                int cell = cellIndex(face >>> 1, depth, u, v);
+                long data = faceData(cell, face, cells,
+                        workspace.modelIds, workspace.metadata, fluidLayer, delta);
+                if (data != 0) {
+                    workspace.plane[u + v * EDGE] = data;
+                    rowMask |= 1 << u;
+                }
+            }
+            workspace.planeRows[v] = rowMask;
         }
     }
 
@@ -218,16 +262,21 @@ public final class SectionMesher {
 
     private void mergePlane(Workspace workspace, int face, int depth) {
         long[] plane = workspace.plane;
+        int[] rows = workspace.planeRows;
         for (int v = 0; v < EDGE; v++) {
-            for (int u = 0; u < EDGE; u++) {
+            while (rows[v] != 0) {
+                int u = Integer.numberOfTrailingZeros(rows[v]);
                 int origin = u + v * EDGE;
                 long data = plane[origin];
-                if (data == 0) continue;
                 int width = 1;
                 while (width < MAX_QUAD_EDGE && u + width < EDGE
+                        && (rows[v] & (1 << (u + width))) != 0
                         && plane[origin + width] == data) width++;
+                // Width is at most 16, so neither shift can use Java's shift-by-32 rule.
+                int run = ((1 << width) - 1) << u;
                 int height = 1;
                 heightLoop: while (height < MAX_QUAD_EDGE && v + height < EDGE) {
+                    if ((rows[v + height] & run) != run) break;
                     int row = origin + height * EDGE;
                     for (int offset = 0; offset < width; offset++) {
                         if (plane[row + offset] != data) break heightLoop;
@@ -235,8 +284,7 @@ public final class SectionMesher {
                     height++;
                 }
                 for (int row = 0; row < height; row++) {
-                    Arrays.fill(plane, origin + row * EDGE,
-                            origin + row * EDGE + width, 0);
+                    rows[v + row] &= ~run;
                 }
                 int model = (int) (data >>> 26) & 0xfffff;
                 long metadata = this.models.getModelMetadataFromClientId(model);
@@ -270,6 +318,10 @@ public final class SectionMesher {
         final int[] modelIds = new int[CELLS];
         final long[] metadata = new long[CELLS];
         final long[] plane = new long[PLANE];
+        final int[] faceExists = new int[6 * PLANE];
+        final int[] faceCanBeOccluded = new int[6 * PLANE];
+        final int[] faceOccludes = new int[6 * PLANE];
+        final int[] planeRows = new int[EDGE];
         final int[] overlayDepths = new int[3];
         final LongArrayList[] buckets = new LongArrayList[BUCKETS];
 
@@ -280,6 +332,10 @@ public final class SectionMesher {
         }
 
         void reset() {
+            Arrays.fill(this.faceExists, 0);
+            Arrays.fill(this.faceCanBeOccluded, 0);
+            Arrays.fill(this.faceOccludes, 0);
+            Arrays.fill(this.planeRows, 0);
             Arrays.fill(this.overlayDepths, 0);
             for (LongArrayList bucket : this.buckets) bucket.clear();
         }

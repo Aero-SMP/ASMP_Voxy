@@ -78,10 +78,14 @@ final class CompletedSectionJournal implements AutoCloseable {
     private long recover(FileChannel file) throws IOException {
         this.end = HEADER_BYTES;
         long extent = file.size(), frames = 0;
+        var frame = buffer(FRAME_BYTES);
+        var metadata = buffer(BINDING_BYTES);
+        var footer = buffer(FOOTER_BYTES);
+        var checksum = new CRC32C();
         while (this.end + FRAME_BYTES + FOOTER_BYTES <= extent) {
             long at = this.end;
             frames++;
-            var frame = read(file, at, FRAME_BYTES);
+            read(file, at, frame, FRAME_BYTES);
             if (frame.getInt() != FRAME_MAGIC) break;
             int kind = frame.getInt(), length = frame.getInt(), crc = frame.getInt();
             int size = kind == PAYLOAD ? PAYLOAD_METADATA_BYTES : kind == BINDING ? BINDING_BYTES
@@ -89,9 +93,12 @@ final class CompletedSectionJournal implements AutoCloseable {
             if (size < 0 || length < size || length > LocalSectionCodec.MAX_COMPRESSED_BYTES + PAYLOAD_METADATA_BYTES
                     || kind != PAYLOAD && length != size
                     || at + FRAME_BYTES + (long) length + FOOTER_BYTES > extent) break;
-            var metadata = read(file, at + FRAME_BYTES, size);
-            if (RegionalProtocol.crc32c(metadata.array()) != crc
-                    || read(file, at + FRAME_BYTES + length, FOOTER_BYTES).getLong() != commit(kind, length, crc)) break;
+            read(file, at + FRAME_BYTES, metadata, size);
+            checksum.reset();
+            checksum.update(metadata.array(), 0, size);
+            if ((int) checksum.getValue() != crc) break;
+            read(file, at + FRAME_BYTES + length, footer, FOOTER_BYTES);
+            if (footer.getLong() != commit(kind, length, crc)) break;
             try {
                 if (kind == PAYLOAD) {
                     var token = new Token(RegionalProtocol.Hash32.read(metadata), RegionalProtocol.Fingerprint.read(metadata));
@@ -454,7 +461,10 @@ final class CompletedSectionJournal implements AutoCloseable {
     private static ByteBuffer buffer(int bytes) { return ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN); }
     private static ByteBuffer buffer(byte[] bytes) { return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN); }
     private static ByteBuffer read(FileChannel file, long at, int bytes) throws IOException {
-        var result = buffer(bytes);
+        return read(file, at, buffer(bytes), bytes);
+    }
+    private static ByteBuffer read(FileChannel file, long at, ByteBuffer result, int bytes) throws IOException {
+        result.clear().limit(bytes);
         while (result.hasRemaining()) { int n = file.read(result, at); if (n <= 0) throw new IOException("truncated journal"); at += n; }
         return result.flip();
     }

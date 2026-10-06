@@ -15,7 +15,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 
 import static org.lwjgl.util.zstd.Zstd.*;
 
@@ -217,7 +216,9 @@ final class LocalSectionCodec implements AutoCloseable {
         final byte[] canonical, palette;
         final int[] blocks, biomes;
         final long length;
-        private int table, name, position, phase;
+        private int table, name, position, phase, limit;
+        private final byte[] nameLength = new byte[2];
+        private CatalogCodec.EncodedName encoded;
         private byte[] part;
         private long consumed;
 
@@ -251,11 +252,11 @@ final class LocalSectionCodec implements AutoCloseable {
                     .putShort(4, (short) this.biomes.length);
             this.palette = packed.array();
             long names = 0;
-            for (int id : this.blocks) names = Math.addExact(names, 2L + utf8Length(catalog.blocks().get(id).canonical()));
-            for (int id : this.biomes) names = Math.addExact(names, 2L + utf8Length(catalog.biomes().get(id)));
+            for (int id : this.blocks) names = Math.addExact(names, 2L + catalog.blockName(id).length());
+            for (int id : this.biomes) names = Math.addExact(names, 2L + catalog.biomeName(id).length());
             if (names > CatalogCodec.MAX_BYTES - 40L) throw new IOException("local names exceed source catalog extent");
             this.length = Math.addExact(names, HEADER_BYTES + count * 5L + CELLS * bits / 8);
-            this.part = Arrays.copyOf(this.palette, HEADER_BYTES);
+            this.part = this.palette; this.limit = HEADER_BYTES;
         }
 
         long remaining() { return this.length - this.consumed; }
@@ -266,31 +267,35 @@ final class LocalSectionCodec implements AutoCloseable {
             if (remaining() == 0) return -1;
             int total = 0;
             while (total < len && remaining() != 0) {
-                if (this.position == this.part.length) {
-                    this.position = 0;
-                    if (this.phase == 0) {
-                        if (this.table == 0 && this.name == this.blocks.length) { this.table = 1; this.name = 0; }
-                        if (this.table == 1 && this.name == this.biomes.length) {
-                            this.phase = 1; this.part = this.palette; this.position = HEADER_BYTES;
-                        } else {
-                            String value = this.table == 0 ? this.catalog.blocks().get(this.blocks[this.name++]).canonical()
-                                    : this.catalog.biomes().get(this.biomes[this.name++]);
-                            // Immutable source names were strictly checked while deriving length.
-                            byte[] nameBytes = value.getBytes(StandardCharsets.UTF_8);
-                            this.part = new byte[2 + nameBytes.length];
-                            this.part[0] = (byte) nameBytes.length; this.part[1] = (byte) (nameBytes.length >>> 8);
-                            System.arraycopy(nameBytes, 0, this.part, 2, nameBytes.length);
-                        }
-                    } else {
-                        this.phase = 2; this.part = this.canonical;
-                        this.position = 2 + (this.palette.length - HEADER_BYTES) / 5 * 9;
-                    }
-                }
-                int count = Math.min(len - total, this.part.length - this.position);
-                System.arraycopy(this.part, this.position, out, off + total, count);
+                if (this.position == this.limit) advance();
+                int count = Math.min(len - total, this.limit - this.position);
+                if (this.phase == 2) this.encoded.copyTo(this.position, out, off + total, count);
+                else System.arraycopy(this.part, this.position, out, off + total, count);
                 this.position += count; this.consumed += count; total += count;
             }
             return total;
+        }
+
+        private void advance() throws IOException {
+            this.position = 0;
+            if (this.phase == 1) {
+                this.phase = 2; this.limit = this.encoded.length();
+            } else if (this.phase == 0 || this.phase == 2) {
+                if (this.table == 0 && this.name == this.blocks.length) { this.table = 1; this.name = 0; }
+                if (this.table == 1 && this.name == this.biomes.length) {
+                    this.phase = 3; this.encoded = null;
+                    this.part = this.palette; this.position = HEADER_BYTES; this.limit = this.part.length;
+                } else {
+                    this.encoded = this.table == 0 ? this.catalog.blockName(this.blocks[this.name++])
+                            : this.catalog.biomeName(this.biomes[this.name++]);
+                    this.nameLength[0] = (byte) this.encoded.length();
+                    this.nameLength[1] = (byte) (this.encoded.length() >>> 8);
+                    this.phase = 1; this.part = this.nameLength; this.limit = 2;
+                }
+            } else {
+                this.phase = 4; this.part = this.canonical; this.limit = this.part.length;
+                this.position = 2 + (this.palette.length - HEADER_BYTES) / 5 * 9;
+            }
         }
     }
 
@@ -376,23 +381,6 @@ final class LocalSectionCodec implements AutoCloseable {
     private void claim() throws IOException {
         if (this.closed || this.busy) throw new IOException("local codec is closed or already owned");
         this.busy = true;
-    }
-    private static int utf8Length(String name) throws IOException {
-        int bytes = 0;
-        for (int i = 0; i < name.length(); i++) {
-            char c = name.charAt(i);
-            if (c < 128) bytes++;
-            else if (c < 2048) bytes += 2;
-            else if (Character.isHighSurrogate(c)) {
-                if (++i >= name.length() || !Character.isLowSurrogate(name.charAt(i)))
-                    throw new IOException("unpaired source name surrogate");
-                bytes += 4;
-            } else if (Character.isLowSurrogate(c)) throw new IOException("unpaired source name surrogate");
-            else bytes += 3;
-            if (bytes > MAX_NAME_BYTES) throw new IOException("invalid source name length");
-        }
-        if (bytes == 0) throw new IOException("empty source name");
-        return bytes;
     }
     private static int required(InputStream input) throws IOException {
         int value = input.read(); if (value < 0) throw new IOException("truncated local section"); return value;

@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.lod;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.CharacterCodingException;
@@ -24,8 +25,8 @@ public final class CatalogCodec {
     public record Block(String canonical, int opacity, boolean authoritative) {
         public Block {
             Objects.requireNonNull(canonical, "canonical");
-            if (canonical.isEmpty() || canonical.getBytes(StandardCharsets.UTF_8).length
-                    > MAX_NAME_BYTES || opacity < 0 || opacity > 15) {
+            validateName(canonical);
+            if (opacity < 0 || opacity > 15) {
                 throw new IllegalArgumentException("invalid canonical catalog block");
             }
         }
@@ -37,14 +38,16 @@ public final class CatalogCodec {
         long mipGeneration();
         List<Block> blocks();
         List<String> biomes();
+        EncodedName blockName(int index) throws IOException;
+        EncodedName biomeName(int index) throws IOException;
     }
 
     public record Catalog(long catalogId, long generation, long mipGeneration,
                           List<Block> blocks, List<String> biomes) implements Source {
         public Catalog {
             if (catalogId == 0) throw new IllegalArgumentException("catalog identity zero is reserved");
-            blocks = List.copyOf(Objects.requireNonNull(blocks, "blocks"));
-            biomes = List.copyOf(Objects.requireNonNull(biomes, "biomes"));
+            blocks = new CatalogNames<>(List.copyOf(Objects.requireNonNull(blocks, "blocks")), true);
+            biomes = new CatalogNames<>(List.copyOf(Objects.requireNonNull(biomes, "biomes")), false);
             if (blocks.isEmpty() || blocks.size() > MAX_BLOCKS
                     || biomes.isEmpty() || biomes.size() > MAX_BIOMES) {
                 throw new IllegalArgumentException("catalog entry counts are outside bounds");
@@ -57,12 +60,15 @@ public final class CatalogCodec {
             var biomeNames = new java.util.HashSet<String>();
             for (String biome : biomes) {
                 Objects.requireNonNull(biome, "biome");
-                int bytes = biome.getBytes(StandardCharsets.UTF_8).length;
-                if (biome.isEmpty() || bytes > MAX_NAME_BYTES) {
-                    throw new IllegalArgumentException("invalid canonical biome name");
-                }
+                validateName(biome);
                 if (!biomeNames.add(biome)) throw new IllegalArgumentException("duplicate canonical biome name");
             }
+        }
+        @Override public EncodedName blockName(int index) throws IOException {
+            return ((CatalogNames<Block>) this.blocks).encoded(index);
+        }
+        @Override public EncodedName biomeName(int index) throws IOException {
+            return ((CatalogNames<String>) this.biomes).encoded(index);
         }
     }
 
@@ -71,6 +77,8 @@ public final class CatalogCodec {
         private long catalogId;
         private final List<Block> blocks = new ArrayList<>();
         private final List<String> biomes = new ArrayList<>();
+        private final List<EncodedName> blockNames = new ArrayList<>();
+        private final List<EncodedName> biomeNames = new ArrayList<>();
 
         public synchronized Source bind(Catalog snapshot) throws DecodeException {
             Objects.requireNonNull(snapshot, "snapshot");
@@ -84,31 +92,117 @@ public final class CatalogCodec {
                     throw new DecodeException("catalog biome prefix changed");
             // Validate both prefixes before changing either table. A rejected snapshot is atomic.
             this.catalogId = snapshot.catalogId();
-            for (int index = this.blocks.size(); index < snapshot.blocks().size(); index++)
+            for (int index = this.blocks.size(); index < snapshot.blocks().size(); index++) {
                 this.blocks.add(snapshot.blocks().get(index));
-            for (int index = this.biomes.size(); index < snapshot.biomes().size(); index++)
+                this.blockNames.add(null);
+            }
+            for (int index = this.biomes.size(); index < snapshot.biomes().size(); index++) {
                 this.biomes.add(snapshot.biomes().get(index));
+                this.biomeNames.add(null);
+            }
             return new Prefix(snapshot.catalogId(), snapshot.generation(), snapshot.mipGeneration(),
-                    new PrefixList<>(this, this.blocks, snapshot.blocks().size()),
-                    new PrefixList<>(this, this.biomes, snapshot.biomes().size()));
+                    new PrefixList<>(this, this.blocks, this.blockNames, snapshot.blocks().size(), true),
+                    new PrefixList<>(this, this.biomes, this.biomeNames, snapshot.biomes().size(), false));
         }
     }
 
     private record Prefix(long catalogId, long generation, long mipGeneration,
-                          List<Block> blocks, List<String> biomes) implements Source {}
+                          List<Block> blocks, List<String> biomes) implements Source {
+        @Override public EncodedName blockName(int index) throws IOException {
+            return ((PrefixList<Block>) this.blocks).encoded(index);
+        }
+        @Override public EncodedName biomeName(int index) throws IOException {
+            return ((PrefixList<String>) this.biomes).encoded(index);
+        }
+    }
 
     private static final class PrefixList<T> extends AbstractList<T> implements RandomAccess {
         private final SharedNames owner;
         private final List<T> entries;
+        private final List<EncodedName> names;
         private final int length;
-        private PrefixList(SharedNames owner, List<T> entries, int length) {
-            this.owner = owner; this.entries = entries; this.length = length;
+        private final boolean blocks;
+        private PrefixList(SharedNames owner, List<T> entries, List<EncodedName> names, int length, boolean blocks) {
+            this.owner = owner; this.entries = entries; this.names = names;
+            this.length = length; this.blocks = blocks;
         }
         @Override public int size() { return this.length; }
         @Override public T get(int index) {
             Objects.checkIndex(index, this.length);
             synchronized (this.owner) { return this.entries.get(index); }
         }
+        EncodedName encoded(int index) throws IOException {
+            Objects.checkIndex(index, this.length);
+            synchronized (this.owner) {
+                EncodedName name = this.names.get(index);
+                if (name == null) {
+                    name = new EncodedName(spelling(this.entries.get(index), this.blocks));
+                    this.names.set(index, name);
+                }
+                return name;
+            }
+        }
+    }
+
+    /** List equality remains canonical; derived byte identities never enter record equality. */
+    private static final class CatalogNames<T> extends AbstractList<T> implements RandomAccess {
+        private final List<T> entries;
+        private final boolean blocks;
+        private EncodedName[] names;
+        CatalogNames(List<T> entries, boolean blocks) { this.entries = entries; this.blocks = blocks; }
+        @Override public int size() { return this.entries.size(); }
+        @Override public T get(int index) { return this.entries.get(index); }
+        synchronized EncodedName encoded(int index) throws IOException {
+            Objects.checkIndex(index, this.entries.size());
+            if (this.names == null) this.names = new EncodedName[this.entries.size()];
+            EncodedName name = this.names[index];
+            if (name == null) {
+                name = new EncodedName(spelling(this.entries.get(index), this.blocks));
+                this.names[index] = name;
+            }
+            return name;
+        }
+    }
+
+    private static String spelling(Object entry, boolean block) {
+        return block ? ((Block) entry).canonical() : (String) entry;
+    }
+
+    /** Accepted-name ownership retains these bytes; callers can copy but cannot mutate them. */
+    public static final class EncodedName {
+        private final byte[] bytes;
+        private EncodedName(String name) throws IOException {
+            int length = utf8Length(name);
+            this.bytes = name.getBytes(StandardCharsets.UTF_8);
+            if (this.bytes.length != length) throw new IOException("source name UTF-8 length changed");
+        }
+        public int length() { return this.bytes.length; }
+        void copyTo(int position, byte[] destination, int offset, int length) {
+            System.arraycopy(this.bytes, position, destination, offset, length);
+        }
+    }
+
+    private static void validateName(String name) {
+        try { utf8Length(name); }
+        catch (IOException failure) { throw new IllegalArgumentException("invalid canonical catalog name", failure); }
+    }
+
+    private static int utf8Length(String name) throws IOException {
+        int bytes = 0;
+        for (int index = 0; index < name.length(); index++) {
+            char value = name.charAt(index);
+            if (value < 128) bytes++;
+            else if (value < 2048) bytes += 2;
+            else if (Character.isHighSurrogate(value)) {
+                if (++index >= name.length() || !Character.isLowSurrogate(name.charAt(index)))
+                    throw new IOException("unpaired source name surrogate");
+                bytes += 4;
+            } else if (Character.isLowSurrogate(value)) throw new IOException("unpaired source name surrogate");
+            else bytes += 3;
+            if (bytes > MAX_NAME_BYTES) throw new IOException("invalid source name length");
+        }
+        if (bytes == 0) throw new IOException("empty source name");
+        return bytes;
     }
 
     public static Catalog decode(byte[] canonical) throws DecodeException {

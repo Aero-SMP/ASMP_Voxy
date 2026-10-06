@@ -39,9 +39,14 @@ final class CompletedSectionCache implements AutoCloseable {
             return journal == null ? null : journal.binding(key);
         } finally { released(); }
     }
-    private synchronized RegionalDiskBudget.Pin acquire(long region) throws IOException {
-        if (this.closed) throw new IOException("closed section cache");
-        var pin = this.budget.pin(path(region)); this.operations++; return pin;
+    private RegionalDiskBudget.Pin acquire(long region) throws IOException {
+        synchronized (this) {
+            if (this.closed) throw new IOException("closed section cache");
+            this.operations++;
+        }
+        // Accepted operations retain the budget through close, including a draining-pin wait.
+        try { return this.budget.pin(path(region)); }
+        catch (Throwable failure) { released(); throw failure; }
     }
     private synchronized void released() {
         if (--this.operations < 0) throw new IllegalStateException("cache operation underflow");
@@ -69,15 +74,22 @@ final class CompletedSectionCache implements AutoCloseable {
         if (this.retained.remove(region) != null) this.budget.releaseDirectory(path(region));
     }
     Map<Long, LocalSection> directorySnapshot(long region) throws IOException {
-        return inspectDirectory(region).sections();
+        return snapshotDirectory(region).sections();
     }
     record Directory(Map<Long, LocalSection> sections, long namedBytes, long incarnation) {}
+    /** Foreground snapshots do not need the downloader's deduplicated byte estimate. */
+    Directory snapshotDirectory(long region) throws IOException { return inspectDirectory(region, false); }
     Directory inspectDirectory(long region) throws IOException {
+        return inspectDirectory(region, true);
+    }
+    private Directory inspectDirectory(long region, boolean accounting) throws IOException {
         var acquired = acquire(region);
         try (var pin = acquired) {
             var journal = this.budget.journal(path(region), this.world, region, false);
             if (journal == null) return new Directory(new java.util.HashMap<>(), 0, pin.incarnation());
-            synchronized (journal) { return new Directory(journal.directory(), journal.currentNamedBytes(), pin.incarnation()); }
+            synchronized (journal) {
+                return new Directory(journal.directory(), accounting ? journal.currentNamedBytes() : 0, pin.incarnation());
+            }
         } finally { released(); }
     }
     record Fallback(LocalSection section, long incarnation) {}

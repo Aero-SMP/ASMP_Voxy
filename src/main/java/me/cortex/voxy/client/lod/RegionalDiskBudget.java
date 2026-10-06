@@ -32,7 +32,9 @@ final class RegionalDiskBudget {
     private int mutations;
     private boolean diskPaused, policyProbe;
     private long pausedFree = -1, requiredGrowth = 1, physicalRecovery;
+    private long spaceEpoch; // Invalidates observations when pause/policy/mutation ownership changes.
     private final Map<Path, Ranked> ranked = new HashMap<>();
+    private final Map<Path, RegionalFile> regionalFiles = new HashMap<>();
     private final Map<Path, Region> regions = new HashMap<>();
     private long regionIncarnations;
     private final ReentrantLock changes = new ReentrantLock();
@@ -61,12 +63,14 @@ final class RegionalDiskBudget {
         }
     }
     Writer writer(Path path, java.util.function.BooleanSupplier current) throws IOException {
+        refreshRecovery(path);
         Region region;
         synchronized (this) {
             requireMutation(path);
             region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
             if (region.pins == 0 && region.writers == 0) region.rejectedBeforeBusy = owner(path).rejections;
-            region.writers++; this.mutations++; rekey(path);
+            if (region.writers++ == 0 && region.pins == 0) eligibility(path);
+            beginMutation();
         }
         boolean locked = false, acquired = false;
         try {
@@ -96,13 +100,27 @@ final class RegionalDiskBudget {
             this.path = path; this.region = region;
             synchronized (RegionalDiskBudget.this) { this.beforeBytes = files.getOrDefault(path, 0L); }
         }
-        boolean fits(long growth) { synchronized (RegionalDiskBudget.this) { return physicalSpace(growth); } }
+        boolean fits(long growth) {
+            for (;;) {
+                var observation = probeSpace();
+                synchronized (RegionalDiskBudget.this) {
+                    if (observation.epoch != spaceEpoch) continue;
+                    return physicalSpace(growth, observation);
+                }
+            }
+        }
         void expect(long growth) throws IOException {
             if (growth < 0) throw new IOException("invalid cache write extent");
             this.growth = growth;
-            synchronized (RegionalDiskBudget.this) {
-                requireMutation(this.path);
-                if (!physicalSpace(growth)) { pauseDisk(growth); throw new Capacity(Admission.DISK_FULL); }
+            for (;;) {
+                synchronized (RegionalDiskBudget.this) { requireMutation(this.path); }
+                var observation = probeSpace();
+                synchronized (RegionalDiskBudget.this) {
+                    if (observation.epoch != spaceEpoch) continue;
+                    requireMutation(this.path);
+                    if (!physicalSpace(growth, observation)) { pauseDisk(growth, observation); throw new Capacity(Admission.DISK_FULL); }
+                    return;
+                }
             }
         }
         void completed() { this.completed = true; this.rejected = false; }
@@ -175,16 +193,17 @@ final class RegionalDiskBudget {
     }
     private void releaseWriter(Path path, Region region, boolean reclaimed, boolean mutation, boolean eligible) {
         synchronized (this) {
-            region.writers--; rekey(path);
+            if (--region.writers < 0) throw new IllegalStateException("cache writer underflow");
+            if (region.writers == 0 && region.pins == 0) eligibility(path);
             Account account = owner(path);
             if (account != null && safety(account) == Admission.READY && (reclaimed
-                    || eligible && region.writers == 0 && region.pins == 0 && rank(path) != null
+                    || eligible && region.writers == 0 && region.pins == 0 && this.ranked.containsKey(path)
                     && account.rejections > region.rejectedBeforeBusy)) eligibilityChanged(account);
-            if (mutation) finishMutation();
             if (mutation && region.writers == 0 && region.pins == 0 && account != null
                     && safety(account) == Admission.READY && account.bytes > account.limit)
                 requestReconcile();
         }
+        if (mutation) finishMutation();
         forgetUnused(path);
     }
 
@@ -220,7 +239,7 @@ final class RegionalDiskBudget {
         synchronized (this) {
             if (this.owners <= 0) throw new IllegalStateException("cache owner underflow");
             if (--this.owners != 0) return;
-            this.state = InventoryState.CLOSED;
+            this.state = InventoryState.CLOSED; this.spaceEpoch++;
             this.notifyAll();
             if (this.maintenance != null) { this.maintenance.interrupt(); return; }
         }
@@ -287,31 +306,30 @@ final class RegionalDiskBudget {
             try {
                 for (var entry : observed) if (entry.getKey().toString().endsWith(".pending")) {
                     checkInventory();
-                    synchronized (this) {
-                        Account account = owner(entry.getKey());
-                        if (!this.policyAvailable || account == null || account.ambiguous || this.diskPaused) continue;
-                        if (!physicalSpace(1)) { pauseDisk(1); continue; }
-                        this.mutations++;
-                    }
+                    if (!beginInventoryCleanup(entry.getKey())) continue;
                     try {
                         LocalCacheOwnership.rejectLinks(entry.getKey());
                         Files.deleteIfExists(entry.getKey()); resized(entry.getKey(), -entry.getValue().size());
                     } catch (IOException failure) {
                         writeFailure(entry.getKey(), failure); throw failure;
-                    } finally { synchronized (this) { finishMutation(); } }
+                    } finally { finishMutation(); }
                 }
             } finally { this.changes.unlock(); }
             ServerDownloadSettings resolvedPolicy = null;
             synchronized (this) {
-                checkInventory(); this.state = InventoryState.READY;
+                checkInventory(); this.state = InventoryState.READY; this.spaceEpoch++;
+                boolean rerank = false;
                 for (var account : this.accounts.values()) {
                     if (account.defaultPolicy != null) {
                         long resolved = account.defaultPolicy.retainStorageBytes(account.persistedAllowance ? account.limit : -1, true);
-                        if (resolved >= ServerDownloadSettings.MIN_STORAGE_BYTES) account.limit = resolved;
+                        if (resolved >= ServerDownloadSettings.MIN_STORAGE_BYTES) {
+                            rerank |= account.limit != resolved; account.limit = resolved;
+                        }
                         resolvedPolicy = account.defaultPolicy;
                     }
                     eligibilityChanged(account);
                 }
+                if (rerank) recount();
             }
             if (resolvedPolicy != null) resolvedPolicy.save();
             reconcile();
@@ -332,6 +350,18 @@ final class RegionalDiskBudget {
             if (closed) closeOwnership();
         }
     }
+    private boolean beginInventoryCleanup(Path path) {
+        for (;;) {
+            var observation = probeSpace();
+            synchronized (this) {
+                if (observation.epoch != this.spaceEpoch) continue;
+                Account account = owner(path);
+                if (!this.policyAvailable || account == null || account.ambiguous || this.diskPaused) return false;
+                if (!physicalSpace(1, observation)) { pauseDisk(1, observation); return false; }
+                beginMutation(); return true;
+            }
+        }
+    }
     private void checkInventory() throws IOException {
         if (this.state == InventoryState.CLOSED || Thread.currentThread().isInterrupted()) throw new IOException("cache inventory cancelled");
     }
@@ -345,19 +375,29 @@ final class RegionalDiskBudget {
         try { this.ownership.close(); } catch (IOException failure) { me.cortex.voxy.common.Logger.warn("Closing cache ownership", failure); }
         finally { this.disposed.countDown(); }
     }
-    synchronized Pin pin(Path path) throws IOException {
-        if (this.state == InventoryState.CLOSED) throw new IOException("cache file unavailable");
-        Region region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
-        while (region.draining) try { this.wait(); }
-        catch (InterruptedException stopped) {
-            Thread.currentThread().interrupt(); throw new InterruptedIOException("cache replacement wait interrupted");
+    Pin pin(Path path) throws IOException {
+        Pin pin;
+        synchronized (this) {
+            if (this.state == InventoryState.CLOSED) throw new IOException("cache file unavailable");
+            Region region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
+            if (region.pins == 0 && region.writers == 0) {
+                Account account = owner(path); region.rejectedBeforeBusy = account == null ? 0 : account.rejections;
+            }
+            // Count a waiting reader too: deletion must not forget its Region before it wakes.
+            if (region.pins++ == 0 && region.writers == 0) eligibility(path);
+            pin = new Pin(path, region);
         }
-        if (this.state == InventoryState.CLOSED) throw new IOException("cache file unavailable");
-        if (region.pins == 0 && region.writers == 0) {
-            Account account = owner(path); region.rejectedBeforeBusy = account == null ? 0 : account.rejections;
-        }
-        region.pins++; rekey(path);
-        return new Pin(path, region);
+        boolean acquired = false;
+        try {
+            synchronized (this) {
+                while (pin.region.draining) try { this.wait(); }
+                catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt(); throw new InterruptedIOException("cache replacement wait interrupted");
+                }
+                if (this.state == InventoryState.CLOSED) throw new IOException("cache file unavailable");
+                acquired = true; return pin;
+            }
+        } finally { if (!acquired) pin.close(); }
     }
     final class Pin implements AutoCloseable {
         private final Path path; private final Region region; private boolean closed;
@@ -368,10 +408,10 @@ final class RegionalDiskBudget {
                 if (this.closed) return;
                 this.closed = true;
                 if (--this.region.pins < 0) throw new IllegalStateException("cache pin underflow");
-                rekey(this.path);
                 if (this.region.pins == 0) {
+                    if (this.region.writers == 0) eligibility(this.path);
                     Account account = owner(this.path);
-                    if (this.region.writers == 0 && rank(this.path) != null && account != null && safety(account) == Admission.READY) {
+                    if (this.region.writers == 0 && ranked.containsKey(this.path) && account != null && safety(account) == Admission.READY) {
                         boolean needed = account.rejections > this.region.rejectedBeforeBusy;
                         if (needed) eligibilityChanged(account);
                         if (needed || account.bytes > account.limit) requestReconcile();
@@ -433,6 +473,7 @@ final class RegionalDiskBudget {
         final Set<Path> links = new HashSet<>();
         final Set<NamespaceClaim> claims = new HashSet<>();
         final Map<String, Anchor> anchors = new HashMap<>();
+        final Map<String, Map<Long, Set<Path>>> spatialFiles = new HashMap<>();
         long limit, bytes;
         boolean persistedAllowance;
         ServerDownloadSettings defaultPolicy;
@@ -449,6 +490,8 @@ final class RegionalDiskBudget {
     private record Anchor(long x, long z, Set<Long> visible) {}
     private record Namespace(Account owner, String dimension) {}
     private record NamespaceClaim(Path path, String dimension) {}
+    private record Coordinates(int x, int z, long key) {}
+    private record RegionalFile(Coordinates coordinates, Namespace namespace) {}
     private record Ranked(Path path, Account owner, Rank rank) {}
     private record Rank(boolean visible, long distance) {
         boolean better(Rank other) { return this.visible != other.visible ? this.visible : this.distance < other.distance; }
@@ -475,13 +518,15 @@ final class RegionalDiskBudget {
             this.policyAvailable = available;
             this.policyFailure = reason == null || reason.isBlank() ? "Server download settings unavailable" : reason;
             if (available && (created || account.limit != limit)) { account.limit = limit; account.dirty = true; account.revision++; }
-            this.metadataOwners.put(account.record, account);
+            Account oldOwner = this.metadataOwners.put(account.record, account);
+            boolean ownershipChanged = oldOwner != account || this.sharedOwner == null;
             if (this.sharedOwner == null) this.sharedOwner = account;
             if (changed) {
                 if (this.diskPaused && available) this.policyProbe = true;
                 for (var value : this.accounts.values()) eligibilityChanged(value);
             }
-            recount(); requestReconcile(); return account;
+            if (created || ownershipChanged || changed) { this.spaceEpoch++; recount(); }
+            requestReconcile(); return account;
         } } finally { this.changes.unlock(); }
     }
     void claim(Account account, Path namespace, String dimension, Path link) throws IOException {
@@ -513,7 +558,7 @@ final class RegionalDiskBudget {
                     }
                 }
             }
-            if (changed) { account.dirty = account.claimsDirty = true; account.revision++; eligibilityChanged(account); }
+            if (changed) { account.dirty = account.claimsDirty = true; account.revision++; this.spaceEpoch++; eligibilityChanged(account); }
             requestReconcile();
         } } finally { this.changes.unlock(); }
     }
@@ -525,11 +570,26 @@ final class RegionalDiskBudget {
         try { synchronized (this) {
             Anchor before = account.anchors.get(dimension);
             if (before != null && before.x == x && before.z == z && before.visible.equals(visible)) return;
-            account.anchors.put(dimension, new Anchor(x, z, Set.copyOf(visible)));
+            Set<Long> nextVisible = Set.copyOf(visible);
+            account.anchors.put(dimension, new Anchor(x, z, nextVisible));
             if (before == null) { account.dirty = true; account.revision++; }
-            for (var namespace : this.namespaces.entrySet()) if (namespace.getValue().owner == account
-                    && namespace.getValue().dimension.equals(dimension))
-                for (var path : this.directoryFiles.getOrDefault(namespace.getKey(), Set.of())) rekey(path);
+            if (account.limit != Long.MAX_VALUE) {
+                if (before == null || before.x != x || before.z != z) {
+                    // Exact distances all change when the anchor moves.
+                    for (var namespace : this.namespaces.entrySet()) if (namespace.getValue().owner == account
+                            && namespace.getValue().dimension.equals(dimension))
+                        for (var path : this.directoryFiles.getOrDefault(namespace.getKey(), Set.of())) rekey(path, true);
+                } else {
+                    var indexed = account.spatialFiles.get(dimension);
+                    if (indexed != null) {
+                        // Two set passes compute the symmetric difference, with no namespace/key Cartesian scan.
+                        for (long key : before.visible) if (!nextVisible.contains(key))
+                            for (var path : indexed.getOrDefault(key, Set.of())) rekey(path, true);
+                        for (long key : nextVisible) if (!before.visible.contains(key))
+                            for (var path : indexed.getOrDefault(key, Set.of())) rekey(path, true);
+                    }
+                }
+            }
             eligibilityChanged(account); requestReconcile();
         } } finally { this.changes.unlock(); }
     }
@@ -540,36 +600,66 @@ final class RegionalDiskBudget {
     private void admissionBlocked(Account account) {
         if (account != null) account.rejections++;
     }
-    synchronized long admissionGeneration(String serverKey) {
-        Account account = this.accounts.get(serverKey); status(account);
-        return account == null ? 0 : account.admissionGeneration;
+    long admissionGeneration(String serverKey) {
+        Account account;
+        synchronized (this) { account = this.accounts.get(serverKey); }
+        refreshRecovery(account, false);
+        synchronized (this) { return account == null ? 0 : account.admissionGeneration; }
     }
-    synchronized StorageState storage(Account account) {
-        long assigned = this.accounts.values().stream().mapToLong(value -> value.bytes).sum();
-        Admission status = status(account);
-        return new StorageState(account == null || !ready() ? -1 : account.bytes,
-                account == null ? -1 : account.limit, ready() ? this.bytes - assigned : -1,
-                ready(), status != Admission.READY, status == Admission.READY ? ""
-                : status == Admission.POLICY ? this.policyFailure : status.name());
+    StorageState storage(Account account) {
+        refreshRecovery(account, false);
+        synchronized (this) {
+            long assigned = this.accounts.values().stream().mapToLong(value -> value.bytes).sum();
+            Admission status = status(account);
+            return new StorageState(account == null || !ready() ? -1 : account.bytes,
+                    account == null ? -1 : account.limit, ready() ? this.bytes - assigned : -1,
+                    ready(), status != Admission.READY, status == Admission.READY ? ""
+                    : status == Admission.POLICY ? this.policyFailure : status.name());
+        }
     }
-    synchronized long recoveryGeneration(String serverKey) { status(this.accounts.get(serverKey)); return this.physicalRecovery; }
-    /** This shared predicate is also used at the actual deletion/publication boundary. */
+    long recoveryGeneration(String serverKey) {
+        Account account;
+        synchronized (this) { account = this.accounts.get(serverKey); }
+        refreshRecovery(account, false);
+        synchronized (this) { return this.physicalRecovery; }
+    }
+    /** Pure monitor-held predicate; probes and recovery happen before entering the monitor. */
     private Admission safety(Account account) { return safety(account, false); }
     private Admission safety(Account account, boolean ownershipRecord) {
+        Admission base = policySafety(account, ownershipRecord);
+        return base != Admission.READY ? base : this.diskPaused ? Admission.DISK_FULL : Admission.READY;
+    }
+    private Admission policySafety(Account account, boolean ownershipRecord) {
         if (!ready()) return Admission.INVENTORY;
         if (!this.policyAvailable || account != null && account.limit < ServerDownloadSettings.MIN_STORAGE_BYTES) return Admission.POLICY;
         if (account == null || account.ambiguous && !ownershipRecord) return Admission.OWNERSHIP;
-        if (this.diskPaused) {
-            long free = usableSpace();
-            if (this.pausedFree < 0 && this.mutations == 0 && free >= 0) this.pausedFree = free;
-            if (this.mutations != 0 || this.pausedFree < 0 || free < this.requiredGrowth
-                    || !this.policyProbe && free <= this.pausedFree) return Admission.DISK_FULL;
+        return Admission.READY;
+    }
+    private void refreshRecovery(Path path) {
+        Account account; boolean preserving;
+        synchronized (this) { account = owner(path); preserving = preservingClaims(path, account); }
+        refreshRecovery(account, preserving);
+    }
+    private void refreshRecovery(Account account, boolean ownershipRecord) {
+        synchronized (this) {
+            if (!this.diskPaused || this.mutations != 0 || policySafety(account, ownershipRecord) != Admission.READY) return;
+        }
+        SpaceObservation observation;
+        try { observation = probeSpace(); }
+        catch (java.util.concurrent.CancellationException stopped) { return; }
+        synchronized (this) {
+            if (!this.diskPaused || observation.epoch != this.spaceEpoch || this.mutations != 0
+                    || policySafety(account, ownershipRecord) != Admission.READY || observation.free < 0) return;
+            if (this.pausedFree < 0) {
+                this.pausedFree = observation.free;
+                if (!this.policyProbe) return;
+            }
+            if (observation.free < this.requiredGrowth || !this.policyProbe && observation.free <= this.pausedFree) return;
             this.diskPaused = false; this.policyProbe = false; this.pausedFree = -1;
-            this.requiredGrowth = 1; this.physicalRecovery++;
+            this.requiredGrowth = 1; this.physicalRecovery++; this.spaceEpoch++;
             for (var value : this.accounts.values()) eligibilityChanged(value);
             requestReconcile();
         }
-        return Admission.READY;
     }
     private Admission status(Account account) {
         Admission state = safety(account);
@@ -590,49 +680,83 @@ final class RegionalDiskBudget {
     private boolean preservingClaims(Path path, Account account) {
         return account != null && account.ambiguous && account.claimsDirty && ownershipRecord(path, account);
     }
-    synchronized Admission admission(Path path, long added) {
-        if (added < 0) return Admission.QUOTA;
-        if (!this.files.containsKey(path)) {
-            if (added > Long.MAX_VALUE - CompletedSectionJournal.HEADER_BYTES) return Admission.QUOTA;
-            added += CompletedSectionJournal.HEADER_BYTES;
+    Admission admission(Path path, long added) {
+        refreshRecovery(path);
+        for (;;) {
+            synchronized (this) {
+                Account account = owner(path); Admission state = status(account);
+                long growth = added;
+                if (growth < 0 || !this.files.containsKey(path) && growth > Long.MAX_VALUE - CompletedSectionJournal.HEADER_BYTES)
+                    return Admission.QUOTA;
+                if (!this.files.containsKey(path)) growth += CompletedSectionJournal.HEADER_BYTES;
+                if (state == Admission.READY && (growth > account.limit || victims(account, path, growth, false) == null)) state = Admission.QUOTA;
+                if (state != Admission.READY) { admissionBlocked(account); return state; }
+            }
+            var observation = probeSpace();
+            synchronized (this) {
+                if (observation.epoch != this.spaceEpoch) continue;
+                if (added < 0) return Admission.QUOTA;
+                long growth = added;
+                if (!this.files.containsKey(path)) {
+                    if (growth > Long.MAX_VALUE - CompletedSectionJournal.HEADER_BYTES) return Admission.QUOTA;
+                    growth += CompletedSectionJournal.HEADER_BYTES;
+                }
+                Account account = owner(path); Admission state = status(account);
+                if (state == Admission.READY) {
+                    if (growth > account.limit || victims(account, path, growth, false) == null) state = Admission.QUOTA;
+                    else if (!physicalSpace(growth, observation)) { pauseDisk(growth, observation); state = Admission.DISK_FULL; }
+                }
+                if (state != Admission.READY) admissionBlocked(account);
+                return state;
+            }
         }
-        Account account = owner(path); Admission state = status(account);
-        if (state == Admission.READY) {
-            if (added > account.limit || victims(account, path, added, false) == null) state = Admission.QUOTA;
-            else if (!physicalSpace(added)) { pauseDisk(added); state = Admission.DISK_FULL; }
-        }
-        if (state != Admission.READY) admissionBlocked(account);
-        return state;
     }
     void reserve(Path path, long added) throws IOException {
         lock(this.changes);
         try {
+            refreshRecovery(path);
             List<Path> selected; Account account; boolean preserveClaims;
-            synchronized (this) {
-                requireMutation(path); account = owner(path);
-                preserveClaims = preservingClaims(path, account);
-                if (added < 0 || !preserveClaims && added > account.limit) { admissionBlocked(account); throw new Capacity(Admission.QUOTA); }
-                if (!physicalSpace(added)) { pauseDisk(added); throw new Capacity(Admission.DISK_FULL); }
-                // Conflict evidence is preservation metadata, never permission to evict terrain.
-                selected = preserveClaims ? List.of() : victims(account, path, added, false);
-                if (selected == null) { admissionBlocked(account); throw new Capacity(Admission.QUOTA); }
+            for (;;) {
+                synchronized (this) { requireMutation(path); }
+                var observation = probeSpace();
+                synchronized (this) {
+                    if (observation.epoch != this.spaceEpoch) continue;
+                    requireMutation(path); account = owner(path);
+                    preserveClaims = preservingClaims(path, account);
+                    if (added < 0 || !preserveClaims && added > account.limit) { admissionBlocked(account); throw new Capacity(Admission.QUOTA); }
+                    if (!physicalSpace(added, observation)) { pauseDisk(added, observation); throw new Capacity(Admission.DISK_FULL); }
+                    // Conflict evidence is preservation metadata, never permission to evict terrain.
+                    selected = preserveClaims ? List.of() : victims(account, path, added, false);
+                    if (selected == null) { admissionBlocked(account); throw new Capacity(Admission.QUOTA); }
+                    if (selected.isEmpty()) { charge(path, account, added, preserveClaims); return; }
+                    break;
+                }
             }
             for (var victim : selected) {
                 synchronized (this) { if (added <= account.limit - account.bytes) break; }
                 if (!delete(victim, account, path, false)) throw new Capacity(Admission.QUOTA);
             }
-            synchronized (this) {
-                requireMutation(path);
-                if (!preserveClaims && added > account.limit - account.bytes) { admissionBlocked(account); throw new Capacity(Admission.QUOTA); }
-                this.bytes = Math.addExact(this.bytes, added); this.files.merge(path, added, Math::addExact);
-                this.directoryFiles.computeIfAbsent(path.getParent(), ignored -> new HashSet<>()).add(path);
-                account.bytes = Math.addExact(account.bytes, added); rekey(path);
+            for (;;) {
+                var observation = probeSpace();
+                synchronized (this) {
+                    if (observation.epoch != this.spaceEpoch) continue;
+                    requireMutation(path);
+                    if (!physicalSpace(added, observation)) { pauseDisk(added, observation); throw new Capacity(Admission.DISK_FULL); }
+                    charge(path, account, added, preserveClaims); break;
+                }
             }
         } finally { this.changes.unlock(); }
     }
+    private void charge(Path path, Account account, long added, boolean preserveClaims) throws Capacity {
+        requireMutation(path);
+        if (!preserveClaims && added > account.limit - account.bytes) { admissionBlocked(account); throw new Capacity(Admission.QUOTA); }
+        this.bytes = Math.addExact(this.bytes, added); this.files.merge(path, added, Math::addExact);
+        this.directoryFiles.computeIfAbsent(path.getParent(), ignored -> new HashSet<>()).add(path);
+        account.bytes = Math.addExact(account.bytes, added); this.spaceEpoch++; rekey(path);
+    }
     void commit(Path path, CompletedSectionJournal.IOAction action) throws IOException {
         lock(this.changes);
-        try { synchronized (this) { requireMutation(path); } action.run(); }
+        try { refreshRecovery(path); synchronized (this) { requireMutation(path); } action.run(); }
         finally { this.changes.unlock(); }
     }
     void replace(Path temporary, Path path, long length, long before, long chargedTemporary,
@@ -643,31 +767,67 @@ final class RegionalDiskBudget {
             resized(temporary, -chargedTemporary); resized(path, length - before);
         });
     }
-    synchronized void writeFailure(Path path, IOException failure) { writeFailure(path, failure, 1); }
-    synchronized void writeFailure(Path path, IOException failure, long growth) {
-        if (outOfSpace(failure)) pauseDisk(Math.max(1, growth));
+    void writeFailure(Path path, IOException failure) { writeFailure(path, failure, 1); }
+    void writeFailure(Path path, IOException failure, long growth) {
+        if (!outOfSpace(failure)) return;
+        synchronized (this) { pauseDisk(Math.max(1, growth), null); }
+        establishPausedBaseline();
     }
     static boolean outOfSpace(Throwable failure) {
         if (failure instanceof Capacity capacity) return capacity.reason == Admission.DISK_FULL;
         String message = failure.toString().toLowerCase(Locale.ROOT);
         return message.contains("no space") || message.contains("disk full") || message.contains("not enough space");
     }
-    private long usableSpace() {
-        try { return Files.getFileStore(this.root).getUsableSpace(); }
-        catch (IOException unavailable) { return -1; }
+    private record SpaceObservation(long epoch, long free) {}
+    private SpaceObservation probeSpace() {
+        // Reprobing on mutation churn must remain cancellable without manufacturing a disk-full pause.
+        if (Thread.currentThread().isInterrupted()) throw new java.util.concurrent.CancellationException("cache disk observation interrupted");
+        long epoch;
+        synchronized (this) { epoch = this.spaceEpoch; }
+        long free;
+        try { free = Files.getFileStore(this.root).getUsableSpace(); }
+        catch (IOException unavailable) { free = -1; }
+        if (Thread.currentThread().isInterrupted()) throw new java.util.concurrent.CancellationException("cache disk observation interrupted");
+        return new SpaceObservation(epoch, free);
     }
-    private boolean physicalSpace(long added) { return usableSpace() >= added; }
-    private void pauseDisk(long growth) {
-        if (!this.diskPaused) { this.diskPaused = true; this.pausedFree = -1; this.requiredGrowth = 1; this.policyProbe = false; }
+    private boolean physicalSpace(long added, SpaceObservation observation) {
+        // Policy, mutation and pause identity must still match at the admission boundary.
+        return observation.epoch == this.spaceEpoch && observation.free >= added;
+    }
+    private void pauseDisk(long growth, SpaceObservation observation) {
+        if (!this.diskPaused) {
+            this.diskPaused = true; this.pausedFree = -1; this.requiredGrowth = 1; this.policyProbe = false;
+        }
         this.requiredGrowth = Math.max(this.requiredGrowth, growth);
-        if (this.mutations == 0 && this.pausedFree < 0) this.pausedFree = usableSpace();
+        if (this.mutations == 0 && this.pausedFree < 0 && observation != null
+                && observation.epoch == this.spaceEpoch && observation.free >= 0) this.pausedFree = observation.free;
+        this.spaceEpoch++;
     }
+    private void beginMutation() { this.mutations++; this.spaceEpoch++; }
     private void finishMutation() {
-        if (--this.mutations < 0) throw new IllegalStateException("cache transaction underflow");
-        if (this.diskPaused && this.mutations == 0) this.pausedFree = usableSpace();
+        synchronized (this) {
+            if (--this.mutations < 0) throw new IllegalStateException("cache transaction underflow");
+            this.spaceEpoch++;
+            if (this.diskPaused && this.mutations == 0) this.pausedFree = -1;
+        }
+        establishPausedBaseline();
+    }
+    private void establishPausedBaseline() {
+        synchronized (this) { if (!this.diskPaused || this.mutations != 0 || this.pausedFree >= 0) return; }
+        SpaceObservation observation;
+        try { observation = probeSpace(); }
+        catch (java.util.concurrent.CancellationException stopped) {
+            // Cleanup still releases ownership; a later fresh probe establishes baseline.
+            return;
+        }
+        synchronized (this) {
+            if (this.diskPaused && this.mutations == 0 && this.pausedFree < 0
+                    && observation.epoch == this.spaceEpoch && observation.free >= 0) this.pausedFree = observation.free;
+        }
     }
     synchronized void resized(Path path, long delta) {
         if (this.bytes < 0 || delta == 0) return;
+        this.spaceEpoch++;
         Account account = owner(path);
         this.bytes = Math.addExact(this.bytes, delta);
         long result = Math.addExact(this.files.getOrDefault(path, 0L), delta);
@@ -694,40 +854,87 @@ final class RegionalDiskBudget {
     }
     private void recount() {
         if (this.bytes < 0) return;
-        for (var account : this.accounts.values()) { account.bytes = 0; account.victims.clear(); }
+        for (var account : this.accounts.values()) { account.bytes = 0; account.victims.clear(); account.spatialFiles.clear(); }
         this.ranked.clear();
+        // Keep coordinates across rebuilds; reset only namespace attribution and spatial membership.
+        this.regionalFiles.replaceAll((path, file) -> new RegionalFile(file.coordinates, null));
+        this.regionalFiles.keySet().removeIf(path -> !this.files.containsKey(path));
         for (var entry : this.files.entrySet()) {
             Account account = owner(entry.getKey());
             if (account != null) account.bytes = Math.addExact(account.bytes, entry.getValue());
             rekey(entry.getKey());
         }
     }
-    private void rekey(Path path) {
-        Ranked old = this.ranked.remove(path);
-        if (old != null) old.owner.victims.remove(old);
-        if (!this.files.containsKey(path) || !path.getFileName().toString().endsWith(".vxlocal")) return;
-        Account account = owner(path); Rank rank = rank(path);
-        if (account == null || rank == null) return;
-        var entry = new Ranked(path, account, rank); this.ranked.put(path, entry);
-        Region region = this.regions.get(path);
-        if (region == null || region.pins == 0 && !region.draining && region.writers == 0) account.victims.add(entry);
-    }
-    private Rank rank(Path path) {
+    private boolean indexFile(Path path) {
+        RegionalFile old = this.regionalFiles.get(path);
         Namespace namespace = this.namespaces.get(path.getParent());
-        if (namespace == null) return null;
+        Account account = owner(path);
+        boolean present = this.files.containsKey(path) && path.getFileName().toString().endsWith(".vxlocal")
+                && account != null && account.limit != Long.MAX_VALUE;
+        if (old != null && present && Objects.equals(old.namespace, namespace)) return false;
+        if (old != null && old.namespace != null) {
+            var byDimension = old.namespace.owner.spatialFiles.get(old.namespace.dimension);
+            var paths = byDimension == null ? null : byDimension.get(old.coordinates.key);
+            if (paths != null) {
+                paths.remove(path);
+                if (paths.isEmpty()) byDimension.remove(old.coordinates.key);
+                if (byDimension.isEmpty()) old.namespace.owner.spatialFiles.remove(old.namespace.dimension);
+            }
+        }
+        if (!present) { this.regionalFiles.remove(path); return old != null; }
+        Coordinates coordinates = old == null ? parseCoordinates(path) : old.coordinates;
+        if (coordinates == null) return false;
+        this.regionalFiles.put(path, new RegionalFile(coordinates, namespace));
+        if (namespace != null) namespace.owner.spatialFiles.computeIfAbsent(namespace.dimension, ignored -> new HashMap<>())
+                .computeIfAbsent(coordinates.key, ignored -> new HashSet<>()).add(path);
+        return true;
+    }
+    private void rekey(Path path) { rekey(path, false); }
+    private void rekey(Path path, boolean inputsChanged) {
+        inputsChanged |= indexFile(path);
+        Ranked old = this.ranked.get(path);
+        Account account = owner(path);
+        if (!inputsChanged && old != null && old.owner == account) return;
+        Rank rank = account == null || account.limit == Long.MAX_VALUE || !this.regionalFiles.containsKey(path) ? null : calculateRank(path);
+        if (old != null && old.owner == account && old.rank.equals(rank)) { eligibility(path); return; }
+        if (old != null) { this.ranked.remove(path); old.owner.victims.remove(old); }
+        if (rank == null) return;
+        var entry = new Ranked(path, account, rank); this.ranked.put(path, entry);
+        eligibility(path);
+    }
+    private void eligibility(Path path) {
+        Ranked entry = this.ranked.get(path);
+        if (entry == null) return;
+        Region region = this.regions.get(path);
+        if (region == null || region.pins == 0 && !region.draining && region.writers == 0) entry.owner.victims.add(entry);
+        else entry.owner.victims.remove(entry);
+    }
+    private static Coordinates parseCoordinates(Path path) {
         String[] name = path.getFileName().toString().split("\\.");
         if (name.length < 4 || !name[0].equals("r") || !name[3].equals("vxlocal")) return null;
         try {
             int x = Integer.parseInt(name[1]), z = Integer.parseInt(name[2]);
-            Anchor anchor = namespace.owner.anchors.get(namespace.dimension);
-            if (anchor == null) return null;
-            long minX = Math.multiplyExact((long) x, 512), minZ = Math.multiplyExact((long) z, 512);
+            return new Coordinates(x, z, Integer.toUnsignedLong(x) | (long) z << 32);
+        } catch (NumberFormatException invalid) { return null; }
+    }
+    private Rank rank(Path path) {
+        Ranked existing = this.ranked.get(path);
+        return existing == null ? calculateRank(path) : existing.rank;
+    }
+    private Rank calculateRank(Path path) {
+        RegionalFile file = this.regionalFiles.get(path);
+        Namespace namespace = file == null ? this.namespaces.get(path.getParent()) : file.namespace;
+        if (namespace == null) return null;
+        Coordinates coordinates = file == null ? parseCoordinates(path) : file.coordinates;
+        Anchor anchor = namespace.owner.anchors.get(namespace.dimension);
+        if (coordinates == null || anchor == null) return null;
+        try {
+            long minX = (long) coordinates.x * 512, minZ = (long) coordinates.z * 512;
             long dx = Math.max(0, Math.max(minX - anchor.x, anchor.x - (minX + 512)));
             long dz = Math.max(0, Math.max(minZ - anchor.z, anchor.z - (minZ + 512)));
             long distance = Math.addExact(Math.multiplyExact(dx, dx), Math.multiplyExact(dz, dz));
-            long key = Integer.toUnsignedLong(x) | (long) z << 32;
-            return new Rank(anchor.visible.contains(key), distance);
-        } catch (IllegalArgumentException | ArithmeticException invalid) { return null; }
+            return new Rank(anchor.visible.contains(coordinates.key), distance);
+        } catch (ArithmeticException invalid) { return null; }
     }
     private List<Path> victims(Account account, Path destination, long added, boolean reduction) {
         if (added <= account.limit - account.bytes) return List.of();
@@ -780,6 +987,7 @@ final class RegionalDiskBudget {
             List<Account> current;
             synchronized (this) { current = List.copyOf(this.accounts.values()); }
             for (var account : current) {
+                refreshRecovery(account, false);
                 List<Path> remove;
                 synchronized (this) {
                     remove = safety(account) == Admission.READY ? victims(account, null, 0, true) : null;
@@ -864,10 +1072,16 @@ final class RegionalDiskBudget {
             }
         }
         Path pending = account.record.resolveSibling(account.record.getFileName() + ".pending");
-        synchronized (this) {
-            requireMutation(account.record);
-            if (!physicalSpace(bytes.size())) { pauseDisk(bytes.size()); throw new Capacity(Admission.DISK_FULL); }
-            this.mutations++;
+        refreshRecovery(account.record);
+        for (;;) {
+            synchronized (this) { requireMutation(account.record); }
+            var observation = probeSpace();
+            synchronized (this) {
+                if (observation.epoch != this.spaceEpoch) continue;
+                requireMutation(account.record);
+                if (!physicalSpace(bytes.size(), observation)) { pauseDisk(bytes.size(), observation); throw new Capacity(Admission.DISK_FULL); }
+                beginMutation(); break;
+            }
         }
         long before = size(account.record), oldPending = size(pending), charged = oldPending;
         boolean installed = false, touched = false;
@@ -895,7 +1109,7 @@ final class RegionalDiskBudget {
                 if (!installed && touched) { try { LocalCacheOwnership.rejectLinks(pending); Files.deleteIfExists(pending); }
                     catch (IOException failure) { writeFailure(pending, failure, bytes.size()); throw failure; }
                     finally { resized(pending, size(pending) - charged); } }
-            } finally { synchronized (this) { finishMutation(); } }
+            } finally { finishMutation(); }
         }
     }
     private boolean delete(Path path, Account account, Path destination, boolean reduction) throws IOException {
@@ -903,23 +1117,31 @@ final class RegionalDiskBudget {
         Region region;
         synchronized (this) {
             region = this.regions.computeIfAbsent(path, ignored -> new Region(++this.regionIncarnations));
-            region.writers++; rekey(path);
+            if (region.writers++ == 0 && region.pins == 0) eligibility(path);
         }
         // Never wait for another region while reserve owns the capacity-change lock.
         boolean locked = region.writer.tryLock();
         try {
             if (!locked) return false;
-            synchronized (this) {
-                if (safety(account) != Admission.READY || owner(path) != account || region.pins != 0
-                        || region.draining || !ClientLodDebug.cacheDeletionAllowed(path)) return false;
-                Rank outgoing = rank(path), incoming = destination == null ? null : rank(destination);
-                if (!reduction && (outgoing == null || outgoing.visible || incoming == null || !incoming.better(outgoing))) return false;
-                if (!physicalSpace(1)) { pauseDisk(1); return false; }
-                region.draining = true; this.mutations++;
+            refreshRecovery(account, false);
+            for (;;) {
+                var observation = probeSpace();
+                synchronized (this) {
+                    if (observation.epoch != this.spaceEpoch) continue;
+                    if (safety(account) != Admission.READY || owner(path) != account || region.pins != 0
+                            || region.draining || !ClientLodDebug.cacheDeletionAllowed(path)) return false;
+                    Rank outgoing = rank(path), incoming = destination == null ? null : rank(destination);
+                    if (!reduction && (outgoing == null || outgoing.visible || incoming == null || !incoming.better(outgoing))) return false;
+                    if (!physicalSpace(1, observation)) { pauseDisk(1, observation); return false; }
+                    region.draining = true; beginMutation(); break;
+                }
             }
             try { remove(path, region); return true; }
             catch (IOException failure) { writeFailure(path, failure); throw failure; }
-            finally { synchronized (this) { finishMutation(); region.draining = false; this.notifyAll(); } }
+            finally {
+                synchronized (this) { region.draining = false; this.notifyAll(); }
+                finishMutation();
+            }
         } finally {
             if (locked) region.writer.unlock();
             releaseWriter(path, region, false, false, false);

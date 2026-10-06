@@ -1034,7 +1034,7 @@ public final class ClientSession {
             private WorkerResult loadMetadata(LoadMetadataTask task) {
                 try {
                     task.cache().retain(task.region());
-                    var directory = task.cache().inspectDirectory(task.region());
+                    var directory = task.cache().snapshotDirectory(task.region());
                     return new WorkerMetadata(task, directory.sections(), directory.incarnation());
                 } catch (IOException invalid) { return new WorkerMetadata(task, new HashMap<>(), task.cache().incarnation(task.region())); }
             }
@@ -3082,9 +3082,8 @@ public final class ClientSession {
             if (worker == null) return false;
             var ticket = demand.ticket(this.id, worker.index);
             demand.networkWork = false;
-            demand.workLease = worker.assign(new EmptyWorkerTask(ticket,
-                    (byte) demand.content.children(), demand.content, this.cache,
-                    () -> this.open.get() && demand.revision == ticket.demandRevision()));
+            // This binding already came from cache; only a network reply needs a save.
+            demand.workLease = worker.assign(new EmptyWorkerTask(ticket, (byte) demand.content.children()));
             if (demand.workLease == null) return false;
             this.demands.owned(demand, SectionDemandTable.CandidateState.WORKER_OWNED);
             return true;
