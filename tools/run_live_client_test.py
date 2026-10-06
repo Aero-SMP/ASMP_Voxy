@@ -18,7 +18,27 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-VALID_STEPS = {"pose", "hold", "trace", "wait_until", "checkpoint", "screenshot", "assert", "reconnect_quic", "hold_quic", "resume_quic", "shader_reload", "shaders_on", "shaders_off", "shader_reload_all_changed", "shader_option", "zoom_in", "zoom_out", "zoom_max"}
+_ALLOWED_STEP_FIELDS = {
+    "pose": {"op", "dimension", "x", "y", "z", "yaw", "pitch", "timeout_ms"},
+    "hold": {"op", "duration_ms", "cadence_ms"},
+    "trace": {"op", "duration_ms", "cadence_ms"},
+    "wait_until": {"op", "field", "comparison", "value", "timeout_ms", "cadence_ms"},
+    "checkpoint": {"op", "name"},
+    "screenshot": {"op"},
+    "reconnect_quic": {"op"},
+    "hold_quic": {"op"},
+    "resume_quic": {"op"},
+    "zoom_in": {"op"},
+    "zoom_out": {"op"},
+    "zoom_max": {"op"},
+    "shader_reload": {"op"},
+    "shaders_on": {"op"},
+    "shaders_off": {"op"},
+    "shader_reload_all_changed": {"op"},
+    "shader_option": {"op", "option", "value"},
+    "assert": {"op", "mode", "field", "comparison", "value", "from", "to", "direction"},
+}
+VALID_STEPS = set(_ALLOWED_STEP_FIELDS)
 COMPARISONS = {"==", "!=", "<", "<=", ">", ">="}
 RESULT_KINDS = {
     "pose": "POSE_REACHED",
@@ -95,26 +115,7 @@ def validate_scenario(scenario: Any) -> None:
                 raise ScenarioError(f"step {index} has invalid shader value")
         elif operation == "assert":
             validate_assertion(step, index)
-        allowed = {
-            "pose": {"op", "dimension", "x", "y", "z", "yaw", "pitch", "timeout_ms"},
-            "hold": {"op", "duration_ms", "cadence_ms"},
-            "trace": {"op", "duration_ms", "cadence_ms"},
-            "wait_until": {"op", "field", "comparison", "value", "timeout_ms", "cadence_ms"},
-            "checkpoint": {"op", "name"},
-            "screenshot": {"op"},
-            "reconnect_quic": {"op"},
-            "hold_quic": {"op"},
-            "resume_quic": {"op"},
-            "zoom_in": {"op"},
-            "zoom_out": {"op"},
-            "zoom_max": {"op"},
-            "shader_reload": {"op"},
-            "shaders_on": {"op"},
-            "shaders_off": {"op"},
-            "shader_reload_all_changed": {"op"},
-            "shader_option": {"op", "option", "value"},
-            "assert": {"op", "mode", "field", "comparison", "value", "from", "to", "direction"},
-        }[operation]
+        allowed = _ALLOWED_STEP_FIELDS[operation]
         extras = set(step) - allowed
         if extras:
             raise ScenarioError(f"step {index} has unsupported fields: {sorted(extras)}")
