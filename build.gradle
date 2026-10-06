@@ -253,6 +253,17 @@ tasks.register('cacheLoadingCodecTest', JavaExec) {
     jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
 }
 
+tasks.register('cubeIndexWriterTest', JavaExec) {
+    group = 'verification'
+    description = 'Verify native cube winding, pointer advancement and guard bytes without GL'
+    dependsOn tasks.named('schedulerTestClasses')
+    classpath = sourceSets.schedulerTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.client.core.rendering.util.CubeIndexWriterBehaviorTest')
+    def scratch = layout.buildDirectory.dir('cube-index-test-tmp')
+    doFirst { scratch.get().asFile.mkdirs() }
+    jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
+}
+
 [
     visibilityMembershipTest: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest',
     worldCacheVisibilityTest: 'me.cortex.voxy.client.lod.WorldCacheVisibilityBehaviorTest',

@@ -54,53 +54,7 @@ public class SharedIndexBuffer {
         long ptr = buffer.address;
         MemoryUtil.memSet(ptr, 0, 6*2*3 );
 
-        //Bottom face
-        MemoryUtil.memPutByte(ptr++, (byte) 0);
-        MemoryUtil.memPutByte(ptr++, (byte) 1);
-        MemoryUtil.memPutByte(ptr++, (byte) 2);
-        MemoryUtil.memPutByte(ptr++, (byte) 3);
-        MemoryUtil.memPutByte(ptr++, (byte) 2);
-        MemoryUtil.memPutByte(ptr++, (byte) 1);
-
-        //top face
-        MemoryUtil.memPutByte(ptr++, (byte) 6);
-        MemoryUtil.memPutByte(ptr++, (byte) 5);
-        MemoryUtil.memPutByte(ptr++, (byte) 4);
-        MemoryUtil.memPutByte(ptr++, (byte) 5);
-        MemoryUtil.memPutByte(ptr++, (byte) 6);
-        MemoryUtil.memPutByte(ptr++, (byte) 7);
-
-        //north face
-        MemoryUtil.memPutByte(ptr++, (byte) 0);
-        MemoryUtil.memPutByte(ptr++, (byte) 4);
-        MemoryUtil.memPutByte(ptr++, (byte) 1);
-        MemoryUtil.memPutByte(ptr++, (byte) 5);
-        MemoryUtil.memPutByte(ptr++, (byte) 1);
-        MemoryUtil.memPutByte(ptr++, (byte) 4);
-
-        //south face
-        MemoryUtil.memPutByte(ptr++, (byte) 3);
-        MemoryUtil.memPutByte(ptr++, (byte) 6);
-        MemoryUtil.memPutByte(ptr++, (byte) 2);
-        MemoryUtil.memPutByte(ptr++, (byte) 6);
-        MemoryUtil.memPutByte(ptr++, (byte) 3);
-        MemoryUtil.memPutByte(ptr++, (byte) 7);
-
-        //west face
-        MemoryUtil.memPutByte(ptr++, (byte) 2);
-        MemoryUtil.memPutByte(ptr++, (byte) 4);
-        MemoryUtil.memPutByte(ptr++, (byte) 0);
-        MemoryUtil.memPutByte(ptr++, (byte) 4);
-        MemoryUtil.memPutByte(ptr++, (byte) 2);
-        MemoryUtil.memPutByte(ptr++, (byte) 6);
-
-        //east face
-        MemoryUtil.memPutByte(ptr++, (byte) 1);
-        MemoryUtil.memPutByte(ptr++, (byte) 5);
-        MemoryUtil.memPutByte(ptr++, (byte) 3);
-        MemoryUtil.memPutByte(ptr++, (byte) 7);
-        MemoryUtil.memPutByte(ptr++, (byte) 3);
-        MemoryUtil.memPutByte(ptr++, (byte) 5);
+        ptr = CubeIndexWriter.write(ptr, 0);
 
         return buffer;
     }
@@ -113,53 +67,7 @@ public class SharedIndexBuffer {
         for (int i = 0; i < cnt; i++) {
             int j = i*8;
 
-            //Bottom face
-            MemoryUtil.memPutByte(ptr++, (byte) (0+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (1+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (2+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (3+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (2+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (1+j));
-
-            //top face
-            MemoryUtil.memPutByte(ptr++, (byte) (6+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (5+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (4+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (5+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (6+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (7+j));
-
-            //north face
-            MemoryUtil.memPutByte(ptr++, (byte) (0+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (4+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (1+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (5+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (1+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (4+j));
-
-            //south face
-            MemoryUtil.memPutByte(ptr++, (byte) (3+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (6+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (2+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (6+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (3+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (7+j));
-
-            //west face
-            MemoryUtil.memPutByte(ptr++, (byte) (2+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (4+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (0+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (4+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (2+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (6+j));
-
-            //east face
-            MemoryUtil.memPutByte(ptr++, (byte) (1+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (5+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (3+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (7+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (3+j));
-            MemoryUtil.memPutByte(ptr++, (byte) (5+j));
+            ptr = CubeIndexWriter.write(ptr, j);
         }
 
         return buffer;
