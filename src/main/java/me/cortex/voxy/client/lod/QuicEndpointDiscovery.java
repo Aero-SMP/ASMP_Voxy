@@ -50,7 +50,7 @@ final class QuicEndpointDiscovery {
     static RegionalQuicClient connect(ClientPacketListener listener) throws IOException {
         var settings = ServerDownloadSettings.current();
         if (settings == null) throw new IOException("Voxy QUIC requires a Minecraft server identity");
-        return connect(listener, settings.downloadKbps());
+        return connect(listener, settings.effectiveDownloadKbps());
     }
 
     static RegionalQuicClient connect(ClientPacketListener listener, int bandwidthKbps) throws IOException {

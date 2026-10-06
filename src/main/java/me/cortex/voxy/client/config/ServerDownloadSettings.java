@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
 import me.cortex.voxy.client.VoxyClient;
+import me.cortex.voxy.client.lod.ClientLodDebug;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.network.QuicEndpointPayload;
 import net.minecraft.client.Minecraft;
@@ -37,6 +38,7 @@ public final class ServerDownloadSettings {
     public record Anchor(int x, int z) {}
     private static final class Policy {
         int downloadKbps = DEFAULT_KBPS;
+        boolean debugUncappedBandwidth;
         long storageBytes = DEFAULT_STORAGE_BYTES, estimatedWorldBytes;
         Map<String, Anchor> anchors = new HashMap<>();
         transient boolean storageSelected, storageResolved;
@@ -103,6 +105,22 @@ public final class ServerDownloadSettings {
         return store.servers.computeIfAbsent(this.serverId, ignored -> new Policy());
     }
     public int downloadKbps() { synchronized (LOCK) { return store == null ? DEFAULT_KBPS : policy().downloadKbps; } }
+    public int effectiveDownloadKbps() {
+        synchronized (LOCK) {
+            if (store == null) return DEFAULT_KBPS;
+            var policy = policy();
+            return ClientLodDebug.uncappedBandwidthSupported() && policy.debugUncappedBandwidth ? 0 : policy.downloadKbps;
+        }
+    }
+    public boolean uncappedBandwidth() {
+        synchronized (LOCK) {
+            return ClientLodDebug.uncappedBandwidthSupported() && store != null && policy().debugUncappedBandwidth;
+        }
+    }
+    public void setUncappedBandwidth(boolean uncapped) {
+        if (!ClientLodDebug.uncappedBandwidthSupported()) throw new IllegalStateException("uncapped bandwidth is debug-only");
+        synchronized (LOCK) { policy().debugUncappedBandwidth = uncapped; }
+    }
     public void setDownloadKbps(int kbps) {
         if (kbps < MIN_KBPS || kbps > MAX_KBPS) throw new IllegalArgumentException("download bandwidth outside 100–20000 kbps");
         synchronized (LOCK) { policy().downloadKbps = kbps; }
@@ -186,6 +204,9 @@ public final class ServerDownloadSettings {
             for (var entry : document.getAsJsonObject("servers").entrySet()) {
                 if (!entry.getValue().isJsonObject()) throw new IOException("invalid server download policy");
                 var policy = entry.getValue().getAsJsonObject();
+                var uncapped = policy.get("debugUncappedBandwidth");
+                if (uncapped != null && (!uncapped.isJsonPrimitive() || !uncapped.getAsJsonPrimitive().isBoolean()))
+                    throw new IOException("invalid debug download policy");
                 for (String field : new String[]{"downloadKbps", "storageBytes", "estimatedWorldBytes"}) {
                     var value = policy.get(field);
                     if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())

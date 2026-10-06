@@ -156,6 +156,8 @@ final class RustBackend {
         builder.environment().put("MALLOC_ARENA_MAX", "2");
         builder.environment().put("VOXY_NETWORK_TRACE",
                 ServerDebug.networkTrace() || Boolean.getBoolean("voxy.network.trace") ? "1" : "0");
+        builder.environment().put("VOXY_DEBUG_UNCAPPED_BANDWIDTH",
+                ServerDebug.uncappedBandwidthSupported() ? "1" : "0");
         return builder.start();
     }
 
@@ -386,6 +388,10 @@ final class RustBackend {
     }
 
     static java.util.concurrent.CompletableFuture<Void> register(byte[] token, int rate) {
+        if (rate == 0 && !ServerDebug.uncappedBandwidthSupported()) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IOException("uncapped Voxy bandwidth requires the debug server"));
+        }
         Owner current = owner;
         return current == null || !current.wanted
                 ? java.util.concurrent.CompletableFuture.failedFuture(new IOException("native owner unavailable"))

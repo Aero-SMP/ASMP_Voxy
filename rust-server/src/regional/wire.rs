@@ -36,6 +36,7 @@ impl TryFrom<u8> for PriorityLane {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamingSettings {
     pub interval_millis: u64,
+    /// Zero is uncapped; the authenticated server separately requires debug capability.
     pub bandwidth_kbps: u64,
     pub refresh_allowed: bool,
 }
@@ -44,8 +45,8 @@ impl StreamingSettings {
         if self.interval_millis < 1000 {
             bail!("terrain update interval must be at least one second");
         }
-        if !(100..=20_000).contains(&self.bandwidth_kbps) {
-            bail!("total download rate must be 100 through 20000 kbps");
+        if self.bandwidth_kbps != 0 && !(100..=20_000).contains(&self.bandwidth_kbps) {
+            bail!("total download rate must be 100 through 20000 kbps, or debug uncapped");
         }
         if self.interval_millis > u64::MAX / 1_000_000 {
             bail!("terrain interval overflow");
@@ -852,5 +853,42 @@ fn take_bool(input: &mut &[u8]) -> Result<bool> {
         0 => Ok(false),
         1 => Ok(true),
         _ => bail!("invalid boolean"),
+    }
+}
+
+#[cfg(test)]
+mod bandwidth_tests {
+    use super::*;
+
+    #[test]
+    fn uncapped_settings_round_trip_without_relaxing_other_bounds() {
+        for bandwidth_kbps in [0, 100, 5_000, 20_000] {
+            let settings = StreamingSettings {
+                interval_millis: 2_000,
+                bandwidth_kbps,
+                refresh_allowed: true,
+            };
+            let mut bytes = Vec::new();
+            put_settings(&mut bytes, settings).unwrap();
+            let mut input = bytes.as_slice();
+            assert_eq!(take_settings(&mut input).unwrap(), settings);
+            assert!(input.is_empty());
+        }
+        for bandwidth_kbps in [1, 99, 20_001, u64::MAX] {
+            assert!(
+                StreamingSettings {
+                    interval_millis: 2_000,
+                    bandwidth_kbps,
+                    refresh_allowed: true,
+                }.validate().is_err()
+            );
+        }
+        assert!(
+            StreamingSettings {
+                interval_millis: 999,
+                bandwidth_kbps: 0,
+                refresh_allowed: true,
+            }.validate().is_err()
+        );
     }
 }

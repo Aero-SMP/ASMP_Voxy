@@ -29,6 +29,8 @@
   "voxy.config.streaming.settings_unavailable": "These settings are unavailable.",
   "voxy.config.streaming.bandwidth": "Download Bandwidth",
   "voxy.config.streaming.bandwidth.tooltip": "Voxy download limit for this server, across all dimensions.",
+  "voxy.config.streaming.uncapped_bandwidth": "Unlimited Download Bandwidth",
+  "voxy.config.streaming.uncapped_bandwidth.tooltip": "Remove Voxy's download cap for this server. Debug only.",
   "voxy.config.streaming.storage": "Cache Storage",
   "voxy.config.streaming.storage.tooltip": "Terrain cache space for this server, across all dimensions.",
   "voxy.config.streaming.storage.used": "Cache used: %s",

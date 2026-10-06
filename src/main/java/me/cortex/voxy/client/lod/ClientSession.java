@@ -1179,7 +1179,7 @@ public final class ClientSession {
                     || connectionOwner.minecraftConnection != this.minecraftConnection))
                 ServerDownloadSettings.reloadUnavailable();
             this.policy = this.serverKey == null ? null : ServerDownloadSettings.forServer(this.serverKey);
-            this.connector = () -> QuicEndpointDiscovery.connect(listener, this.policy == null ? ServerDownloadSettings.DEFAULT_KBPS : this.policy.downloadKbps());
+            this.connector = () -> QuicEndpointDiscovery.connect(listener, this.policy == null ? ServerDownloadSettings.DEFAULT_KBPS : this.policy.effectiveDownloadKbps());
         }
 
         Session(long id, String dimension, VoxyRenderSystem renderer,
@@ -2382,7 +2382,7 @@ public final class ClientSession {
                 this.checkedFrame = this.renderedFrames; this.interestChanges.addAll(this.frameInterests); this.frameInterests.clear();
             }
             long interval = RegionalProtocol.UPDATE_INTERVAL_MILLIS;
-            long bandwidth = this.policy.available() ? this.policy.downloadKbps() : this.sentBandwidthKbps;
+            long bandwidth = this.policy.available() ? this.policy.effectiveDownloadKbps() : this.sentBandwidthKbps;
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 10);
             boolean refresh = this.helloAccepted && (this.metadata == null || this.metadata.canDownload()) && this.refreshAllowed();
             ClientLodDebug.ownerDetail(this.debugOwnerTiming, 11);

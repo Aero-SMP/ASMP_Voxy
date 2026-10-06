@@ -35,6 +35,7 @@ import static org.lwjgl.opengl.GL45C.glGetNamedBufferSubData;
 
 /** Regional-pipeline diagnostics compiled only into debug client JARs. */
 public final class ClientLodDebug {
+    public static boolean uncappedBandwidthSupported() { return true; }
     public static Object renderLoadingBegin(int stage) { return RenderLoadingTelemetry.begin(stage); }
     public static Object renderLoadingCurrent(int stage) { return RenderLoadingTelemetry.current(stage); }
     public static void renderLoadingEvent(Object timing, int event, long count) { RenderLoadingTelemetry.event(timing, event, count); }

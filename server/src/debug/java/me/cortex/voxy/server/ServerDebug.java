@@ -13,6 +13,7 @@ final class ServerDebug {
     private ServerDebug() {}
 
     static boolean networkTrace() { return true; }
+    static boolean uncappedBandwidthSupported() { return true; }
 
     static void initialize(IEventBus modBus) {
         String version = VoxyServer.class.getPackage().getImplementationVersion();

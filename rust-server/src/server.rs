@@ -65,6 +65,32 @@ impl RouteOwner {
             .close(VarInt::from_u32(0), b"Minecraft session ended");
     }
 }
+fn validate_bandwidth(kbps: u64, debug_uncapped: bool) -> Result<()> {
+    if !(100..=20_000).contains(&kbps) && !(kbps == 0 && debug_uncapped) {
+        bail!("invalid authenticated route policy")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod bandwidth_tests {
+    use super::validate_bandwidth;
+
+    #[test]
+    fn uncapped_policy_requires_debug_server_capability() {
+        assert!(validate_bandwidth(0, false).is_err());
+        assert!(validate_bandwidth(0, true).is_ok());
+        for debug in [false, true] {
+            for rate in [100, 5_000, 20_000] {
+                assert!(validate_bandwidth(rate, debug).is_ok());
+            }
+            for rate in [1, 99, 20_001, u64::MAX] {
+                assert!(validate_bandwidth(rate, debug).is_err());
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     server_instance: u64,
@@ -75,6 +101,7 @@ pub struct ServerState {
     routes: Mutex<HashMap<[u8; 32], Arc<RouteOwner>>>,
     bridge_stopped: Notify,
     trace: bool,
+    uncapped_bandwidth: bool,
 }
 impl ServerState {
     pub fn new(
@@ -99,12 +126,14 @@ impl ServerState {
             routes: Mutex::new(HashMap::new()),
             bridge_stopped: Notify::new(),
             trace: std::env::var("VOXY_NETWORK_TRACE").as_deref() == Ok("1"),
+            uncapped_bandwidth: std::env::var("VOXY_DEBUG_UNCAPPED_BANDWIDTH").as_deref() == Ok("1"),
         }
     }
     fn register_route(self: &Arc<Self>, token: [u8; 32], kbps: u64) -> Result<()> {
-        if token == [0; 32] || !(100..=20_000).contains(&kbps) {
+        if token == [0; 32] {
             bail!("invalid authenticated route policy")
         }
+        validate_bandwidth(kbps, self.uncapped_bandwidth)?;
         let mut routes = self.routes.lock().expect("Minecraft route owner poisoned");
         if let Some(route) = routes.get(&token) {
             route.ledger.update(kbps);
@@ -854,6 +883,7 @@ impl Session {
         anchors: Vec<DimensionAnchor>,
     ) -> Result<()> {
         settings.validate()?;
+        validate_bandwidth(settings.bandwidth_kbps, self.state.uncapped_bandwidth)?;
         self.scope(active)?;
         *self
             .settings

@@ -5,6 +5,7 @@ import net.neoforged.bus.api.IEventBus;
 /** No-op facade replaced by the compile-time debug implementation in debug client JARs. */
 public final class ClientLodDebug {
     private ClientLodDebug() {}
+    public static boolean uncappedBandwidthSupported() { return false; }
     public static Object renderLoadingBegin(int stage) { return null; }
     public static Object renderLoadingCurrent(int stage) { return null; }
     public static void renderLoadingEvent(Object timing, int event, long count) {}

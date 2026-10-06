@@ -145,7 +145,9 @@ final class RegionalProtocol {
         return control(C_SETTINGS, payload.toByteArray());
     }
     private static void settings(ByteArrayOutputStream payload, long intervalMillis, long bandwidthKbps) throws IOException {
-        if (intervalMillis < 1000 || bandwidthKbps < 100 || bandwidthKbps > 20_000) throw new IOException("invalid download settings");
+        boolean uncapped = bandwidthKbps == 0 && ClientLodDebug.uncappedBandwidthSupported();
+        if (intervalMillis < 1000 || !uncapped && (bandwidthKbps < 100 || bandwidthKbps > 20_000))
+            throw new IOException("invalid download settings");
         Math.multiplyExact(bandwidthKbps, 125L);
         putLong(payload, intervalMillis); putLong(payload, bandwidthKbps);
     }

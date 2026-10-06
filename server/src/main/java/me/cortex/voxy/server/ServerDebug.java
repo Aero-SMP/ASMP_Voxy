@@ -8,6 +8,7 @@ final class ServerDebug {
 
     static void initialize(IEventBus modBus) {}
     static boolean networkTrace() { return false; }
+    static boolean uncappedBandwidthSupported() { return false; }
     static void rustState(RustBackend.Status status) {}
     static void endpointAdvertised(String player, String host, int port, String alpn) {}
 }

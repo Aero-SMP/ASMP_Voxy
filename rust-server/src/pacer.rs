@@ -260,7 +260,11 @@ impl RateLedger {
         let rate = kbps * 125;
         // Retain existing pacing debt when changing a live finite rate; never grant idle credit.
         let remaining = clock.next.saturating_duration_since(now).as_nanos();
-        let debt = remaining * clock.rate as u128 / rate as u128;
+        let debt = if rate == 0 || clock.rate == 0 {
+            0 // Uncapped transitions neither retain old debt nor accumulate idle credit.
+        } else {
+            remaining * clock.rate as u128 / rate as u128
+        };
         clock.rate = rate;
         clock.next = now + Duration::from_nanos(debt.min(u64::MAX as u128) as u64);
         drop(clock);
@@ -298,7 +302,7 @@ impl AsyncUdpSocket for PacedSocket {
             .lock()
             .expect("download rate owner poisoned");
         let now = Instant::now();
-        if now < clock.next {
+        if clock.rate != 0 && now < clock.next {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         // max_transmit_segments=1: exactly one unfragmented IP/UDP datagram per submission.
@@ -311,7 +315,11 @@ impl AsyncUdpSocket for PacedSocket {
         self.inner.try_send(transmit)?;
         clock.bytes = clock.bytes.saturating_add(cost);
         clock.datagrams = clock.datagrams.saturating_add(1);
-        let nanos = (cost as u128 * 1_000_000_000).div_ceil(clock.rate as u128);
+        let nanos = if clock.rate == 0 {
+            0
+        } else {
+            (cost as u128 * 1_000_000_000).div_ceil(clock.rate as u128)
+        };
         clock.next = now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
         Ok(())
     }
@@ -352,16 +360,16 @@ impl UdpPoller for PacedPoller {
                 self.changed = Box::pin(self.socket.ledger.changed.clone().notified_owned());
                 continue;
             }
-            let next = {
+            let (rate, next) = {
                 let clock = self
                     .socket
                     .ledger
                     .clock
                     .lock()
                     .expect("download rate owner poisoned");
-                clock.next
+                (clock.rate, clock.next)
             };
-            if Instant::now() >= next {
+            if rate == 0 || Instant::now() >= next {
                 return self.inner.as_mut().poll_writable(cx);
             }
             self.timer.as_mut().reset(next);
@@ -369,5 +377,102 @@ impl UdpPoller for PacedPoller {
                 return Poll::Pending;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Socket {
+        sends: AtomicUsize,
+    }
+    #[derive(Debug)]
+    struct Writable;
+    impl UdpPoller for Writable {
+        fn poll_writable(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncUdpSocket for Socket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(Writable)
+        }
+        fn try_send(&self, _: &quinn::udp::Transmit) -> io::Result<()> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn poll_recv(
+            &self,
+            _: &mut Context<'_>,
+            _: &mut [IoSliceMut<'_>],
+            _: &mut [quinn::udp::RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+        fn max_transmit_segments(&self) -> usize { 1 }
+        fn max_receive_segments(&self) -> usize { 1 }
+        fn may_fragment(&self) -> bool { false }
+    }
+
+    #[tokio::test]
+    async fn uncapped_transitions_release_pacing_and_preserve_wire_counters() {
+        let inner = Arc::new(Socket::default());
+        let ledger = RateLedger::new(100);
+        let socket = PacedSocket::new(inner.clone(), ledger.clone());
+        let transmission = quinn::udp::Transmit {
+            destination: "127.0.0.1:9".parse().unwrap(),
+            ecn: None,
+            contents: &[0; 64],
+            segment_size: None,
+            src_ip: None,
+        };
+        ledger.clock.lock().unwrap().next = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            socket.try_send(&transmission).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut poller = socket.clone().create_io_poller();
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(poller.as_mut().poll_writable(&mut context).is_pending());
+
+        ledger.update(0);
+        assert!(matches!(
+            poller.as_mut().poll_writable(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        {
+            let clock = ledger.clock.lock().unwrap();
+            assert_eq!(clock.rate, 0);
+            assert!(clock.next <= Instant::now());
+        }
+        // Even a future stale timer must not throttle an uncapped socket.
+        ledger.clock.lock().unwrap().next = Instant::now() + Duration::from_secs(60);
+        socket.try_send(&transmission).unwrap();
+        socket.try_send(&transmission).unwrap();
+        assert_eq!(ledger.counters(), (2 * (64 + ENVELOPE_BYTES as u64 + 28), 2));
+        assert_eq!(inner.sends.load(Ordering::Relaxed), 2);
+
+        ledger.update(100);
+        {
+            let clock = ledger.clock.lock().unwrap();
+            assert_eq!(clock.rate, 12_500);
+            assert!(clock.next <= Instant::now());
+        }
+        socket.try_send(&transmission).unwrap();
+        ledger.clock.lock().unwrap().next = Instant::now() + Duration::from_secs(60);
+        ledger.update(200); // Changing a finite rate must still retain finite pacing debt.
+        assert!(ledger.clock.lock().unwrap().next > Instant::now());
+        assert_eq!(
+            socket.try_send(&transmission).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(ledger.counters(), (3 * (64 + ENVELOPE_BYTES as u64 + 28), 3));
+        assert_eq!(RateLedger::new(0).clock.lock().unwrap().rate, 0);
     }
 }

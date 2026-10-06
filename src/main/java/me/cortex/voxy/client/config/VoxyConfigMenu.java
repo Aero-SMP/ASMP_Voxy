@@ -6,6 +6,7 @@ import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.client.iris.IrisUtil;
 import me.cortex.voxy.client.lod.ClientSession;
+import me.cortex.voxy.client.lod.ClientLodDebug;
 import me.cortex.voxy.common.Logger;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPointForge;
@@ -39,6 +40,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
     private static final ResourceLocation GEOMETRY_MEMORY = id("geometry_memory");
     private static final ResourceLocation RENDER_DISTANCE = id("render_distance");
     private static final ResourceLocation STREAMING_SETTINGS = id("streaming_settings");
+    private static final ResourceLocation UNCAPPED_BANDWIDTH = id("uncapped_bandwidth");
     private static final ResourceLocation RENDER_RELOAD = OptionFlag.REQUIRES_RENDERER_RELOAD.getId();
 
     @Override
@@ -199,6 +201,25 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         bandwidth.setTooltip(value -> serverPolicyTooltip("voxy.config.streaming.bandwidth.tooltip"));
         bandwidth.setDefaultValue(ServerDownloadSettings.DEFAULT_KBPS);
         bandwidth.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
+
+        if (ClientLodDebug.uncappedBandwidthSupported()) {
+            var uncapped = option(builder.createBooleanOption(UNCAPPED_BANDWIDTH),
+                    "voxy.config.streaming.uncapped_bandwidth", () -> {
+                        var policy = ServerDownloadSettings.current();
+                        return policy != null && policy.uncappedBandwidth();
+                    }, value -> {
+                        var policy = ServerDownloadSettings.current();
+                        if (policy != null && policy.available()) policy.setUncappedBandwidth(value);
+                    }, STREAMING_SETTINGS)
+                    .setEnabledProvider(state -> ServerDownloadSettings.current() != null
+                            && !unavailablePolicy() && voxyEnabled(state), ENABLED, ConfigState.UPDATE_ON_REBUILD);
+            uncapped.setDefaultValue(false);
+            uncapped.setStorageHandler(VoxyConfigMenu::saveCurrentServerPolicy);
+            bandwidth.setEnabledProvider(state -> ServerDownloadSettings.current() != null
+                            && !unavailablePolicy() && voxyEnabled(state) && !state.readBooleanOption(UNCAPPED_BANDWIDTH),
+                    ENABLED, UNCAPPED_BANDWIDTH, ConfigState.UPDATE_ON_REBUILD);
+            group.addOption(uncapped);
+        }
 
         var values = new CacheStorageOptions();
         var storage = option(builder.createIntegerOption(id("cache_storage")),

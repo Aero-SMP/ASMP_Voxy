@@ -60,7 +60,9 @@ public record QuicEndpointPayload(String host, int udpPort, String alpn,
             throw new IllegalArgumentException("invalid Voxy QUIC certificate fingerprint");
         }
         routeToken = routeToken == null ? null : routeToken.clone();
-        if (routeToken == null || routeToken.length != 32 || bandwidthKbps < 100 || bandwidthKbps > 20_000)
+        // Zero is a debug uncapped request. The authenticated server gates its acceptance.
+        if (routeToken == null || routeToken.length != 32
+                || bandwidthKbps != 0 && (bandwidthKbps < 100 || bandwidthKbps > 20_000))
             throw new IllegalArgumentException("invalid Voxy QUIC route or download bandwidth");
 
         if (udpPort == 0) {
