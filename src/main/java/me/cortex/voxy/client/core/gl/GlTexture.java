@@ -25,15 +25,6 @@ public class GlTexture extends TrackedObject {
         this.type = type;
     }
 
-    private GlTexture(int type, boolean useGenTypes) {
-        if (useGenTypes) {
-            this.id = glGenTextures();
-        } else {
-            this.id = glCreateTextures(type);
-        }
-        this.type = type;
-    }
-
     public GlTexture store(int format, int levels, int width, int height) {
         if (this.hasAllocated) {
             throw new IllegalStateException("Texture already allocated");
