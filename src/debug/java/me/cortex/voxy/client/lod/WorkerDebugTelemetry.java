@@ -227,7 +227,9 @@ final class WorkerDebugTelemetry {
             long now = wallClock.getAsLong();
             var copy = new Copy(lease, key, revision, regionVersion, jobStart, stageStart, lastEnd, jobs,
                     sequence, repeats, kind, source, stage, closing, counts.clone(), totals.clone(), maxima.clone(), outcomes.clone(),
-                    lifetime.copy(), window.copy(), Math.max(0, now - windowStart), assignedLease < 0 ? 0 : Math.max(0, now - assignedStart));
+                    lifetime.copy(), window.copy(), Math.max(0, now - windowStart), assignedLease < 0 ? 0 : Math.max(0, now - assignedStart),
+                    assignedLease, assignedSource, assignedLease < 0 ? "IDLE" : assignedBegin < 0 ? "ASSIGNED"
+                            : assignedCompleted < 0 ? "RUNNING" : assignedClaimed < 0 ? "COMPLETED" : "CLAIMED");
             window.clear(); windowStart = now; return copy;
         }
     }
@@ -235,7 +237,8 @@ final class WorkerDebugTelemetry {
     record Copy(long lease, long key, long revision, long regionVersion, long jobStart, long stageStart,
                 long lastEnd, long jobs, long sequence, long repeats, String kind, String source, Stage stage,
                 boolean closing, long[] counts, long[] totals, long[] maxima, long[] outcomes,
-                Metrics lifetime, Metrics window, long windowNanos, long assignedAgeNanos) {}
+                Metrics lifetime, Metrics window, long windowNanos, long assignedAgeNanos,
+                long assignedLease, Source assignedSource, String assignedState) {}
 
     private static Source source(ClientSession.Session.WorkerTask task) {
         if (task instanceof ClientSession.Session.SectionWorkerTask section) return Source.valueOf(section.source().name());
@@ -313,6 +316,7 @@ final class WorkerDebugTelemetry {
                 + " closing=" + copy.closing + " jobAgeNs=" + (copy.stage == Stage.IDLE ? 0 : Math.max(0, now - copy.jobStart))
                 + " stageAgeNs=" + (copy.stage == Stage.IDLE ? 0 : Math.max(0, now - copy.stageStart))
                 + " assignedAgeNs=" + copy.assignedAgeNanos
+                + " assignedLease=" + copy.assignedLease + " assignedSource=" + copy.assignedSource + " assignedState=" + copy.assignedState
                 + " lastCompletionNs=" + copy.lastEnd + " completedTotal=" + copy.jobs + " completedDelta=" + completedDelta
                 + " repeatedTask=" + copy.repeats + " cpu=" + cpuStatus + " cpuDeltaNs=" + cpuDelta
                 + " cpuSameStage=" + sameStage + " sampleWallNs=" + wallDelta
