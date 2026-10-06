@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.lod;
 
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
@@ -62,9 +63,10 @@ public final class ClientLodClient {
         ClientSession.subscriptionWindowChanged(renderer, window);
     }
 
-    /** Accepts the final-HZB pass's scored residency action without allocating per action. */
-    public static void detailAction(long key, int action, int bucket, int epoch) {
-        ClientSession.detailAction(key, action, bucket, epoch);
+    /** Captures one target for the final-HZB readback before it crosses the GPU fence. */
+    public static HierarchicalOcclusionTraverser.DetailBatchConsumer captureDetailBatch(
+            me.cortex.voxy.client.core.VoxyRenderSystem renderer) {
+        return ClientSession.captureDetailBatch(renderer);
     }
 
     public static void visibleSections(me.cortex.voxy.client.core.VoxyRenderSystem renderer,

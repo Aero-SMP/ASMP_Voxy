@@ -20,6 +20,7 @@ public final class DebugHarnessBehaviorTest {
         codecRoundTrips();
         snapshotCountersRoundTripIndividually();
         everyCommandRoundTrips();
+        downloadPolicyRejectsInvalidValues();
         malformedVersionIsRejected();
         orderingRejectsStaleAndFutureResults();
         yawWrapsAtTheSignedBoundary();
@@ -53,16 +54,49 @@ public final class DebugHarnessBehaviorTest {
 
     private static void everyCommandRoundTrips() {
         for (var kind : DebugTestProtocol.CommandKind.values()) {
+            String option = switch (kind) {
+                case SHADER_OPTION -> "TAA";
+                case DOWNLOAD_POLICY -> "bandwidth";
+                default -> "";
+            };
+            String value = switch (kind) {
+                case SHADER_OPTION -> "true";
+                case DOWNLOAD_POLICY -> "5000";
+                default -> "";
+            };
             var command = new DebugTestCommandPayload(kind, UUID.randomUUID(), 1, 1, "",
-                    0, 0, 0, 0, 0, 0, 0, 0,
-                    kind == DebugTestProtocol.CommandKind.SHADER_OPTION ? "TAA" : "",
-                    kind == DebugTestProtocol.CommandKind.SHADER_OPTION ? "true" : "");
+                    0, 0, 0, 0, 0, 0, 0, 0, option, value);
             var bytes = buffer();
             DebugTestCommandPayload.CODEC.encode(bytes, command);
             check(command.equals(DebugTestCommandPayload.CODEC.decode(bytes)) && !bytes.isReadable(),
-                    "new shader command did not round trip");
+                    "debug command did not round trip: " + kind);
             bytes.release();
         }
+    }
+
+    private static void downloadPolicyRejectsInvalidValues() {
+        for (String[] fields : List.of(new String[]{"", ""}, new String[]{"unknown", "5000"},
+                new String[]{"bandwidth", "99"}, new String[]{"bandwidth", "20001"},
+                new String[]{"bandwidth", "5.0"}, new String[]{"bandwidth", "-1"},
+                new String[]{"storage", "99999999"}, new String[]{"render_distance", "21"},
+                new String[]{"render_distance", "2050"}, new String[]{"bandwidth", "entire"})) {
+            expectFailure(() -> new DebugTestCommandPayload(DebugTestProtocol.CommandKind.DOWNLOAD_POLICY,
+                            UUID.randomUUID(), 1, 1, "", 0, 0, 0, 0, 0, 0, 0, 0, fields[0], fields[1]),
+                    "invalid download policy accepted: " + String.join("=", fields));
+        }
+        for (String[] fields : List.of(new String[]{"bandwidth", "100"}, new String[]{"bandwidth", "20000"},
+                new String[]{"storage", "500000000"}, new String[]{"storage", "entire"},
+                new String[]{"render_distance", "20"}, new String[]{"render_distance", "2048"})) {
+            var command = new DebugTestCommandPayload(DebugTestProtocol.CommandKind.DOWNLOAD_POLICY,
+                    UUID.randomUUID(), 1, 1, "", 0, 0, 0, 0, 0, 0, 0, 0, fields[0], fields[1]);
+            var bytes = buffer(); DebugTestCommandPayload.CODEC.encode(bytes, command);
+            check(command.equals(DebugTestCommandPayload.CODEC.decode(bytes)) && !bytes.isReadable(),
+                    "valid download policy did not round trip: " + String.join("=", fields));
+            bytes.release();
+        }
+        expectFailure(() -> new DebugTestCommandPayload(DebugTestProtocol.CommandKind.DOWNLOAD_POLICY,
+                        UUID.randomUUID(), 1, 1, "minecraft:overworld", 0, 0, 0, 0, 0, 0, 0, 0, "bandwidth", "5000"),
+                "download policy accepted an unused dimension field");
     }
 
     private static void malformedVersionIsRejected() {

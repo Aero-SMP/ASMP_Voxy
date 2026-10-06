@@ -357,3 +357,54 @@ sourceSets {
 tasks.register('cacheLoadingTimingTest') {
     dependsOn 'cacheLoadingOwnerTimingTest', 'cacheLoadingWorkerTimingTest', 'cacheLoadingRenderTimingTest', 'cacheLoadingJournalTimingTest'
 }
+
+// Execute the production owner/mailbox/publication contracts in both client modes.
+['Normal', 'Debug'].each { mode ->
+    ['OwnerEfficiency', 'DetailBatch', 'PublicationShutdown'].each { fixture ->
+        tasks.register('cacheLoading' + fixture + mode + 'Test', JavaExec) {
+            group = 'verification'
+            description = 'Verify cache-loading ownership in the ' + mode.toLowerCase() + ' client'
+            dependsOn tasks.named('schedulerTestClasses')
+            if (mode == 'Debug') dependsOn tasks.named('compileDebugJava')
+            classpath = mode == 'Debug'
+                    ? sourceSets.debug.output + sourceSets.schedulerTest.runtimeClasspath
+                    : sourceSets.schedulerTest.runtimeClasspath
+            def packageName = fixture == 'PublicationShutdown'
+                    ? 'me.cortex.voxy.client.core.rendering.hierarchical.'
+                    : 'me.cortex.voxy.client.lod.'
+            mainClass.set(packageName + fixture + 'BehaviorTest')
+            def scratch = layout.buildDirectory.dir('owner-efficiency-test-tmp')
+            doFirst { scratch.get().asFile.mkdirs() }
+            jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
+        }
+    }
+}
+tasks.register('cacheLoadingOwnerEfficiencyTest') {
+    group = 'verification'
+    description = 'Run cache-loading owner, batch and publication contracts and timing checks'
+    dependsOn 'cacheLoadingTimingTest'
+    ['Normal', 'Debug'].each { mode ->
+        ['OwnerEfficiency', 'DetailBatch', 'PublicationShutdown'].each { fixture ->
+            dependsOn 'cacheLoading' + fixture + mode + 'Test'
+        }
+    }
+}
+tasks.register('verifyClientOwnershipArtifacts') {
+    dependsOn 'jar', 'debugJar'
+    doLast {
+        [tasks.named('jar', Jar).get(), tasks.named('debugJar', Jar).get()].each { task ->
+            def artifact = task.archiveFile.get().asFile
+            if (!zipTree(artifact).matching {
+                include '**/*BehaviorTest*', '**/OwnerEfficiencyBehaviorTest*', '**/DetailBatchBehaviorTest*'
+            }.files.empty) throw new GradleException('Ownership fixtures leaked into ' + artifact)
+        }
+        def normal = tasks.named('jar', Jar).get().archiveFile.get().asFile
+        if (!zipTree(normal).matching {
+            include '**/OwnerLoadingTelemetry*', '**/SessionDebugTelemetry*', '**/LiveClientTestHarness*'
+        }.files.empty) throw new GradleException('Debug telemetry leaked into ' + normal)
+    }
+}
+// Keep the reviewed toolkit harness preset an executable gate for these contracts.
+tasks.named('debugHarnessJavaTest') {
+    dependsOn 'cacheLoadingOwnerEfficiencyTest', 'verifyClientOwnershipArtifacts'
+}

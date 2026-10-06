@@ -40,6 +40,7 @@ public final class ClientLodDebug {
     static void ownerPhase(Object timing, int nextPhase) {}
     static void ownerDetail(Object timing, int detail) {}
     static void ownerEvent(Object timing, int event, long count) {}
+    static void detailBatchFinished(Object timing, int inspected, int accepted, boolean signaled, long elapsedNanos) {}
     static void ownerNoSlot(Object timing, ClientSession.Session session) {}
     static void ownerFinished(Object timing) {}
     static void handoff(ClientSession.Session session, int stage, long nanos) {}

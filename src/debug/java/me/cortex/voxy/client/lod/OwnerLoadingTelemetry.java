@@ -4,7 +4,8 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
 import java.util.Arrays;
 
-/** Owner-confined counters. Parent CPU and detail CPU are inclusive/exclusive alternatives. */
+/** Owner-confined counters plus a synchronized render-thread batch aggregate.
+ * Parent CPU and detail CPU are inclusive/exclusive alternatives. */
 final class OwnerLoadingTelemetry {
     interface Clock { long wall(); long cpu(); }
     private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
@@ -17,12 +18,15 @@ final class OwnerLoadingTelemetry {
         }
     };
     static final String DETAILS = "DEMAND_RESET,TOP_MAILBOX,DETAIL_COLLECT,DETAIL_DORMANCY,DORMANT_EVICT,DETAIL_REFINE,PUBLICATION_SCHEDULE,MODEL_CHECK,SOURCE_SCHEDULE,REGION_CLASSIFY,REFRESH_ELIGIBILITY,REGION_CONTROL,VISIBILITY_MEMBERSHIP,RETENTION,DOWNLOAD_VIEW,DOWNLOAD_CONTROL";
-    static final String EVENTS = "TOP_ADD,TOP_DROP,DETAIL_DORMANT,DETAIL_WAKE,DETAIL_REFINE,REFINE_REJECTED,REFINE_NO_CONTENT,REFINE_NO_CHILDREN,REFINE_SUCCEEDED,SOURCE_POLLED,SOURCE_STALE,SOURCE_PRESERVED,SOURCE_EMPTY_ASSIGNED,SOURCE_CACHE_ASSIGNED,SOURCE_NO_SLOT,SOURCE_ASSIGN_REJECTED,MODEL_WAIT_CHECK,MODEL_READY_NOTICE,MODEL_OBSOLETE_NOTICE,DESCENDANT_BYTES_VISITS,DORMANT_DESCENDANT_VISITS,COARSEN_ACCOUNT_VISITS,LOCAL_METADATA_APPLIED,LOCAL_METADATA_ENTRIES,PUBLICATION_BATCH,PUBLICATION_SUBMITTED,PUBLICATION_BUSY,PUBLICATION_POLLED,PUBLICATION_PENDING,PUBLICATION_ADMISSION";
+    static final String EVENTS = "TOP_ADD,TOP_DROP,DETAIL_DORMANT,DETAIL_WAKE,DETAIL_REFINE,REFINE_REJECTED,REFINE_NO_CONTENT,REFINE_NO_CHILDREN,REFINE_SUCCEEDED,SOURCE_POLLED,SOURCE_STALE,SOURCE_PRESERVED,SOURCE_EMPTY_ASSIGNED,SOURCE_CACHE_ASSIGNED,SOURCE_NO_SLOT,SOURCE_ASSIGN_REJECTED,MODEL_WAIT_CHECK,MODEL_READY_NOTICE,MODEL_OBSOLETE_NOTICE,DESCENDANT_BYTES_VISITS,DORMANT_DESCENDANT_VISITS,COARSEN_ACCOUNT_VISITS,LOCAL_METADATA_APPLIED,LOCAL_METADATA_ENTRIES,PUBLICATION_BATCH,PUBLICATION_SUBMITTED,PUBLICATION_BUSY,PUBLICATION_POLLED,PUBLICATION_PENDING,PUBLICATION_ADMISSION,TOPOLOGY_NOTIFIED,TOPOLOGY_UNCHANGED,PUBLICATION_SCAN,PUBLICATION_SCAN_SKIPPED,PUBLICATION_DIRTY";
     static final String SLOT_PRESSURE = "IDLE,RUNNING_COMPUTE,RUNNING_NAMES,RUNNING_MODELS,COMPLETED_UNCLAIMED,READY_PUBLICATION,SUBMITTED_PUBLICATION,SAVE_AFTER_RELEASE,OTHER,CLOSED";
     final long[] phaseCpu = new long[17], phaseCpuCount = new long[17];
     final long[] detailCount = new long[16], detailWall = new long[16], detailMax = new long[16];
     final long[] detailCpu = new long[16], detailCpuCount = new long[16];
-    final long[] events = new long[30], pressure = new long[10];
+    final long[] events = new long[35], pressure = new long[10];
+    private final Object batchLock = new Object();
+    private long detailBatchCount, detailBatchInspected, detailBatchAccepted, detailBatchSignals;
+    private long detailBatchNanos, detailBatchMaxNanos;
     private final Clock clock;
     private int phase = -1, detail = -1;
     private long phaseCpuStart = -1, detailStart, detailCpuStart = -1;
@@ -59,6 +63,31 @@ final class OwnerLoadingTelemetry {
     void event(int event, long count) {
         if (event >= 0 && event < this.events.length && count >= 0) this.events[event] += count;
     }
+    void detailBatchFinished(int inspected, int accepted, boolean signaled, long elapsedNanos) {
+        if (inspected < 0 || accepted < 0 || accepted > inspected || elapsedNanos < 0
+                || (signaled && accepted == 0)) return;
+        synchronized (this.batchLock) {
+            this.detailBatchCount++;
+            this.detailBatchInspected += inspected;
+            this.detailBatchAccepted += accepted;
+            if (signaled) this.detailBatchSignals++;
+            this.detailBatchNanos += elapsedNanos;
+            this.detailBatchMaxNanos = Math.max(this.detailBatchMaxNanos, elapsedNanos);
+        }
+    }
+    record DetailBatchSnapshot(long count, long inspected, long accepted, long signals, long nanos, long maxNanos) {
+        String summary() {
+            return " detailBatchCount=" + this.count + " detailBatchInspected=" + this.inspected
+                    + " detailBatchAccepted=" + this.accepted + " detailBatchSignals=" + this.signals
+                    + " detailBatchNanos=" + this.nanos + " detailBatchMaxNanos=" + this.maxNanos;
+        }
+    }
+    DetailBatchSnapshot detailBatchSnapshot() {
+        synchronized (this.batchLock) {
+            return new DetailBatchSnapshot(this.detailBatchCount, this.detailBatchInspected,
+                    this.detailBatchAccepted, this.detailBatchSignals, this.detailBatchNanos, this.detailBatchMaxNanos);
+        }
+    }
     void noSlot(ClientSession.Session session) {
         // Point observations at a failed admission, not duration or a utilization estimate.
         for (var worker : session.sectionWorkers) this.pressure[worker.diagnosticSlotKind()]++;
@@ -73,6 +102,7 @@ final class OwnerLoadingTelemetry {
                 + " ownerDetailCpuCount=" + Arrays.toString(this.detailCpuCount)
                 + " loadingEventOrder=" + EVENTS + " loadingEventCount=" + Arrays.toString(this.events)
                 + " slotPressureOrder=" + SLOT_PRESSURE + " slotPressureCount=" + Arrays.toString(this.pressure)
+                + this.detailBatchSnapshot().summary()
                 + " localReadyRegions=" + session.demands.readyRegionCount()
                 + " localMetadataWorkerState=" + session.metadataWorker.resource.state();
     }

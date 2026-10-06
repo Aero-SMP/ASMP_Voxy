@@ -1,6 +1,8 @@
 package me.cortex.voxy.client.core.rendering.hierarchical;
 
 import me.cortex.voxy.client.core.VoxyRenderSystem.*;
+import me.cortex.voxy.client.core.rendering.building.BuiltSection;
+import me.cortex.voxy.common.util.MemoryBuffer;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.CountDownLatch;
@@ -8,7 +10,16 @@ import java.util.concurrent.TimeUnit;
 
 /** Exercises the production publication state used by renderer teardown, without an OpenGL context. */
 public final class PublicationShutdownBehaviorTest {
+    public static void main(String[] args) {
+        run();
+        // This entrypoint also runs admission and lookup fixtures through the topology suite.
+        PublicationTopologyBehaviorTest.run();
+    }
+
     public static void run() {
+        repeatedCloseNotifications();
+        concurrentCloseAndActivation();
+        repeatedPublicationAbandonment();
         concurrentRetirementAndRendererInspection();
         admissionInterleavings();
         for (boolean closeBeforeUpload : new boolean[]{false, true}) {
@@ -49,6 +60,119 @@ public final class PublicationShutdownBehaviorTest {
                     "abandoned upload released ownership more than once");
         }
         System.out.println("renderer shutdown and publication callback lock-order tests passed");
+    }
+
+    private static void repeatedCloseNotifications() {
+        State state = new State();
+        state.close(); state.close(); state.close();
+        check(state.notifications.get() == 1 && state.requests == 0 && !state.acceptsUpload(),
+                "unchanged closure notified or scheduled retirement");
+        state.markRendererAdmitted(); state.markRendererAdmitted(); state.close();
+        check(state.notifications.get() == 2 && state.rendererAdmitted(),
+                "late admission did not notify exactly once");
+        state.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null));
+        state.close(); state.close();
+        check(state.notifications.get() == 3 && state.requests == 1 && !state.retirementFencePassed(),
+                "late activation lost retirement or repeated closure notification");
+        state.markRetired(); state.close();
+        check(state.notifications.get() == 4 && state.requests == 1 && state.retirementFencePassed(),
+                "retirement completion changed close idempotence");
+        check(state.takeUploadOutcome().orElseThrow().status() == UploadStatus.ACTIVATED
+                && state.takeUploadOutcome().isEmpty(), "late activation outcome delivered twice");
+
+        for (UploadStatus status : UploadStatus.values()) {
+            State completed = new State();
+            completed.completeUpload(new UploadOutcome(status, null, null));
+            completed.close(); completed.close(); completed.close();
+            check(completed.notifications.get() == 2
+                    && completed.requests == (status == UploadStatus.ACTIVATED ? 1 : 0),
+                    "completed publication repeated close notification or retirement: " + status);
+            completed.rendererStopped();
+            int stoppedNotifications = completed.notifications.get();
+            completed.close(); completed.close();
+            check(completed.notifications.get() == stoppedNotifications && completed.retirementFencePassed(),
+                    "shutdown publication needed another closure notification");
+            check(completed.takeUploadOutcome().orElseThrow().status() == status,
+                    "shutdown overwrote completed outcome");
+        }
+    }
+
+    private static void concurrentCloseAndActivation() {
+        for (int iteration = 0; iteration < 64; iteration++) {
+            State state = new State();
+            runConcurrently(state::close, state::close,
+                    () -> state.completeUpload(new UploadOutcome(UploadStatus.ACTIVATED, null, null)));
+            state.close();
+            check(state.notifications.get() == 2 && state.requests == 1
+                    && state.activationFencePassed() && !state.retirementFencePassed(),
+                    "racing closure/activation duplicated notifications or lost fenced retirement");
+            check(state.takeUploadOutcome().orElseThrow().status() == UploadStatus.ACTIVATED
+                    && state.takeUploadOutcome().isEmpty(), "racing activation delivered outcome twice");
+        }
+        State pending = new State();
+        runConcurrently(pending::close, pending::close, pending::close);
+        check(pending.notifications.get() == 1 && pending.requests == 0,
+                "concurrent pending closure notified more than once");
+        pending.rendererStopped();
+        pending.close();
+        check(pending.notifications.get() == 3 && pending.retirementFencePassed()
+                && pending.takeUploadOutcome().orElseThrow().status() == UploadStatus.CANCELLED,
+                "closed pending publication did not complete during shutdown");
+    }
+
+    private static void repeatedPublicationAbandonment() {
+        for (boolean abandonedFirst : new boolean[]{false, true}) {
+            State state = new State();
+            var buffer = new MemoryBuffer(16) {
+                int frees;
+                @Override public void free() {
+                    check(!Thread.holdsLock(state), "native disposal retained publication monitor");
+                    check(++this.frees == 1, "abandoned publication disposed geometry twice");
+                    super.free();
+                }
+            };
+            var mesh = new BuiltSection(0, (byte) 0, 0, buffer, new int[8]);
+            var result = new UploadOutcome(UploadStatus.RETURNED,
+                    new AllocationBlock(mesh, AllocationStatus.STALE, 0, 0, 0, null), null);
+            AtomicInteger released = new AtomicInteger();
+            Runnable resolved = () -> {
+                check(!Thread.holdsLock(state), "abandonment release retained publication monitor");
+                released.incrementAndGet();
+            };
+            try {
+                if (abandonedFirst) state.abandon(resolved);
+                state.completeUpload(result);
+                state.abandon(resolved); state.abandon(resolved);
+                check(buffer.isFreed() && buffer.frees == 1 && released.get() == 1
+                        && state.notifications.get() == 2 && state.takeUploadOutcome().isEmpty(),
+                        "repeated abandonment changed closure or terminal ownership");
+            } finally {
+                if (!buffer.isFreed()) buffer.free();
+            }
+        }
+    }
+
+    private static void runConcurrently(Runnable... actions) {
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        Thread[] threads = new Thread[actions.length];
+        for (int i = 0; i < actions.length; i++) {
+            Runnable action = actions[i];
+            threads[i] = Thread.ofPlatform().daemon().unstarted(() -> {
+                try { start.await(); action.run(); }
+                catch (Throwable failure) { error.compareAndSet(null, failure); }
+            });
+            threads[i].start();
+        }
+        start.countDown();
+        for (Thread thread : threads) {
+            try { thread.join(5_000); }
+            catch (InterruptedException failure) {
+                Thread.currentThread().interrupt(); throw new AssertionError(failure);
+            }
+            check(!thread.isAlive(), "concurrent publication lifecycle deadlocked");
+        }
+        if (error.get() != null) throw new AssertionError(error.get());
     }
 
     private static void admissionInterleavings() {
@@ -133,12 +257,14 @@ public final class PublicationShutdownBehaviorTest {
 
     private static final class State extends SectionPublicationState {
         int requests;
+        final AtomicInteger notifications = new AtomicInteger();
         @Override protected void requestRetirement() {
             check(!Thread.holdsLock(this), "publication-to-renderer lock inversion");
             requests++;
         }
         @Override protected void stateChanged() {
             check(!Thread.holdsLock(this), "publication callback retained monitor");
+            this.notifications.incrementAndGet();
         }
     }
     private static void check(boolean value, String message) { if (!value) throw new AssertionError(message); }

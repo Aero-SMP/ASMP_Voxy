@@ -66,15 +66,16 @@ public abstract class SectionPublicationState implements VoxyRenderSystem.Sectio
     }
 
     @Override public void close() {
-        boolean retire;
+        boolean changed, retire;
         synchronized (this) {
+            changed = !this.closed;
             this.closed = true;
             retire = this.claimRetirement();
         }
         // Renderer submission takes its own lock and can inspect other publications. Never
         // call it while holding this publication's monitor (including failure callbacks).
         if (retire) this.requestRetirement();
-        this.stateChanged();
+        if (changed || retire) this.stateChanged();
     }
 
     /** Terminal ownership when the entire renderer is being destroyed, not a reusable slot.

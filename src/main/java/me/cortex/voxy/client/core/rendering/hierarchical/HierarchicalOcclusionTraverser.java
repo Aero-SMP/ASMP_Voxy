@@ -45,10 +45,97 @@ public class HierarchicalOcclusionTraverser {
     private final AsyncNodeManager nodeManager;
     private final NodeCleaner nodeCleaner;
     @FunctionalInterface
-    public interface DetailActionListener {
+    public interface DetailActionConsumer {
         void accept(long key, int action, int bucket, int epoch);
     }
-    private DetailActionListener detailActionListener = (key, action, bucket, epoch) -> {};
+    @FunctionalInterface
+    public interface DetailActionReader {
+        void read(DetailActionConsumer consumer);
+    }
+    @FunctionalInterface
+    public interface DetailBatchConsumer {
+        void accept(DetailActionReader reader);
+    }
+    @FunctionalInterface
+    public interface DetailBatchListener {
+        DetailBatchConsumer capture();
+    }
+
+    /** Scheduling captures a registration and target; delivery never redirects to a new one. */
+    public static final class DetailReadback {
+        private record Registration(long generation, DetailBatchListener listener) {}
+        private volatile Registration registration = new Registration(0, null);
+
+        public synchronized void setListener(DetailBatchListener listener) {
+            this.registration = new Registration(this.registration.generation + 1,
+                    Objects.requireNonNull(listener, "listener"));
+        }
+
+        public synchronized void stop() {
+            this.registration = new Registration(this.registration.generation + 1, null);
+        }
+
+        public DownloadStream.DownloadResultConsumer capture() {
+            Registration captured = this.registration;
+            DetailBatchConsumer target = captured.listener == null ? null : captured.listener.capture();
+            return (ptr, size) -> {
+                if (target == null || this.registration != captured) return;
+                var reader = new BorrowedDetailActions(ptr, size, this, captured);
+                try {
+                    target.accept(reader);
+                } finally {
+                    reader.invalidate();
+                }
+            };
+        }
+    }
+
+    /** The address exists only for this synchronous DownloadStream callback. */
+    private static final class BorrowedDetailActions implements DetailActionReader {
+        private static final long REQUIRED_BYTES = DETAIL_BUCKET_COUNT * 4L
+                + DETAIL_BUCKET_COUNT * ACTIONS_PER_BUCKET * 16L;
+        private final Thread thread = Thread.currentThread();
+        private final DetailReadback owner;
+        private final DetailReadback.Registration registration;
+        private long address;
+
+        BorrowedDetailActions(long address, long size, DetailReadback owner,
+                              DetailReadback.Registration registration) {
+            if (address == 0 || size < REQUIRED_BYTES
+                    || Long.compareUnsigned(address + REQUIRED_BYTES, address) < 0) {
+                throw new IllegalArgumentException("truncated detail readback");
+            }
+            this.address = address;
+            this.owner = owner;
+            this.registration = registration;
+        }
+
+        @Override public void read(DetailActionConsumer consumer) {
+            if (this.address == 0 || Thread.currentThread() != this.thread) {
+                throw new IllegalStateException("detail readback escaped its callback");
+            }
+            Objects.requireNonNull(consumer, "consumer");
+            // Recheck when the target starts reading, after its mailbox acquisition.
+            if (this.owner.registration != this.registration) return;
+            long actions = this.address + DETAIL_BUCKET_COUNT * 4L;
+            for (int bucket = 0; bucket < DETAIL_BUCKET_COUNT; bucket++) {
+                int count = (int) Math.min(Integer.toUnsignedLong(
+                        MemoryUtil.memGetInt(this.address + bucket * 4L)), ACTIONS_PER_BUCKET);
+                for (int index = 0; index < count; index++) {
+                    long record = actions + ((long) bucket * ACTIONS_PER_BUCKET + index) * 16L;
+                    int action = MemoryUtil.memGetInt(record + 8);
+                    if (action != ACTION_REFINE && action != ACTION_DORMANT && action != ACTION_WAKE) continue;
+                    long key = (long) MemoryUtil.memGetInt(record) << 32
+                            | Integer.toUnsignedLong(MemoryUtil.memGetInt(record + 4));
+                    consumer.accept(key, action, bucket, MemoryUtil.memGetInt(record + 12));
+                }
+            }
+        }
+
+        void invalidate() { this.address = 0; }
+    }
+
+    private final DetailReadback detailReadback = new DetailReadback();
     @FunctionalInterface
     public interface VisibleSectionListener {
         void accept(long epoch, long[] keys, float[] areas, int[] buckets);
@@ -320,9 +407,9 @@ public class HierarchicalOcclusionTraverser {
         glBindTextureUnit(0, 0);
     }
 
-    public void setDetailActionListener(DetailActionListener listener) {
-        this.detailActionListener = Objects.requireNonNull(listener, "listener");
-    }
+    public void setDetailBatchListener(DetailBatchListener listener) { this.detailReadback.setListener(listener); }
+
+    public void stopDetailActions() { this.detailReadback.stop(); }
 
     public void setVisibleSectionListener(VisibleSectionListener listener, GlBuffer renderList) {
         this.visibleSectionListener = Objects.requireNonNull(listener, "listener");
@@ -434,26 +521,10 @@ public class HierarchicalOcclusionTraverser {
 
     private void downloadResetDetailActions() {
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        DownloadStream.INSTANCE.download(this.detailActionBuffer, this::forwardDownloadResult);
+        DownloadStream.INSTANCE.download(this.detailActionBuffer, this.detailReadback.capture());
         nglClearNamedBufferSubData(this.detailActionBuffer.id, GL_R32UI, 0,
                 DETAIL_BUCKET_COUNT * 4L,
                 GL_RED_INTEGER, GL_UNSIGNED_INT, 0);
-    }
-
-    private void forwardDownloadResult(long ptr, long size) {
-        long actions = ptr + DETAIL_BUCKET_COUNT * 4L;
-        for (int bucket = 0; bucket < DETAIL_BUCKET_COUNT; bucket++) {
-            int count = (int) Math.min(Integer.toUnsignedLong(
-                    MemoryUtil.memGetInt(ptr + bucket * 4L)), ACTIONS_PER_BUCKET);
-            for (int index = 0; index < count; index++) {
-                long address = actions + ((long) bucket * ACTIONS_PER_BUCKET + index) * 16L;
-                long position = (long) MemoryUtil.memGetInt(address) << 32
-                        | Integer.toUnsignedLong(MemoryUtil.memGetInt(address + 4));
-                int action = MemoryUtil.memGetInt(address + 8);
-                int epoch = MemoryUtil.memGetInt(address + 12);
-                this.detailActionListener.accept(position, action, bucket, epoch);
-            }
-        }
     }
 
     public GlBuffer getNodeBuffer() {
@@ -461,6 +532,7 @@ public class HierarchicalOcclusionTraverser {
     }
 
     public void free() {
+        this.stopDetailActions();
         this.stopVisibleObservations();
         this.traversal = null;
         this.pipeline = null;

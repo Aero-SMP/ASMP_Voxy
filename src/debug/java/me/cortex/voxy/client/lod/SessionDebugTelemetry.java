@@ -17,7 +17,8 @@ final class SessionDebugTelemetry {
     private static final String OWNER_PHASE_ORDER = "CONNECT,WINDOW,WORKERS,CONTROLS,NETWORK_REPLIES,EVENTS,DEMAND,METADATA,CATALOGS,REGIONS,DOWNLOADS,PUBLICATIONS,STAGES,DEBUG_SAMPLE,HEALTH,RESET,WAIT";
     private static final String HANDOFF_ORDER = "MESH_TO_CLAIM,CLAIM_TO_SUBMIT,SUBMIT_TO_ADMISSION,ADMISSION_TO_OBSERVE,OBSERVE_TO_REUSE";
 
-    /** Mutated only by the owner. No session, worker, task or buffer reference is retained. */
+    /** Owner counters are confined; detail readbacks use loading's separate synchronized aggregate.
+     * No session, worker, task or buffer reference is retained. */
     private static final class OwnerTiming {
         final long thread = Thread.currentThread().threadId(), start = System.nanoTime();
         final long[] counts = new long[17], totals = new long[17], maxima = new long[17];
@@ -130,6 +131,10 @@ final class SessionDebugTelemetry {
     }
     static void ownerEvent(Object state, int event, long count) {
         if (state instanceof OwnerTiming timing) timing.loading.event(event, count);
+    }
+    static void detailBatchFinished(Object state, int inspected, int accepted, boolean signaled, long elapsedNanos) {
+        if (state instanceof OwnerTiming timing)
+            timing.loading.detailBatchFinished(inspected, accepted, signaled, elapsedNanos);
     }
     static void ownerNoSlot(Object state, ClientSession.Session session) {
         if (state instanceof OwnerTiming timing) timing.loading.noSlot(session);

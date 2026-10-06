@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.lod;
 
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import me.cortex.voxy.client.core.rendering.hierarchical.HierarchicalOcclusionTraverser;
 
 import java.util.AbstractMap;
 import java.util.HashMap;
@@ -9,6 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Owner-thread authority for regional section demand.
@@ -30,6 +32,14 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
                   int resourceSlot) {}
 
     record DetailUpdate(int action, int bucket, int epoch) {}
+
+    /** Retains only counts, including an accepted prefix when its reader throws. */
+    static final class DetailBatchMerge {
+        int inspected;
+        int accepted;
+        boolean measureTime;
+        long elapsedNanos;
+    }
 
     static final class RegionDemand {
         final long key;
@@ -222,6 +232,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
     private int readyRegions;
     private final CoalescingMailbox<Boolean> topMailbox = new CoalescingMailbox<>(true);
     private final CoalescingMailbox<DetailUpdate> detailMailbox = new CoalescingMailbox<>(false);
+    private long detailInputGeneration;
     private final ReadyGroup[][][] ready;
 
     SectionDemandTable(int pixelBuckets) { this(pixelBuckets, 1); }
@@ -247,12 +258,53 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
 
     void offerTop(long key, boolean entered) { this.topMailbox.offer(key, entered); }
     void offerDetail(long key, int action, int bucket, int epoch) {
-        int bounded = Math.max(0, Math.min(this.pixelBuckets - 1, bucket));
         synchronized (this.detailMailbox) {
-            // Preserve the newest unsigned GPU epoch even if producers race.
-            DetailUpdate previous = this.detailMailbox.pending.get(key);
-            if (previous != null && Integer.compareUnsigned(epoch, previous.epoch()) <= 0) return;
-            this.detailMailbox.offer(key, new DetailUpdate(action, bounded, epoch));
+            this.offerDetailLocked(key, action, bucket, epoch);
+        }
+    }
+
+    private boolean offerDetailLocked(long key, int action, int bucket, int epoch) {
+        if (action != HierarchicalOcclusionTraverser.ACTION_REFINE
+                && action != HierarchicalOcclusionTraverser.ACTION_DORMANT
+                && action != HierarchicalOcclusionTraverser.ACTION_WAKE) return false;
+        // Preserve the newest unsigned GPU epoch even when an older retry races a producer.
+        DetailUpdate previous = this.detailMailbox.pending.get(key);
+        if (previous != null && Integer.compareUnsigned(epoch, previous.epoch()) <= 0) return false;
+        int bounded = Math.max(0, Math.min(this.pixelBuckets - 1, bucket));
+        if (this.detailMailbox.pending.put(key, new DetailUpdate(action, bounded, epoch)) != null) {
+            this.detailMailbox.overwritten++;
+        }
+        return true;
+    }
+
+    long detailInputGeneration() {
+        synchronized (this.detailMailbox) { return this.detailInputGeneration; }
+    }
+
+    void invalidateDetailInput() {
+        synchronized (this.detailMailbox) {
+            this.detailInputGeneration++;
+            this.detailMailbox.pending.clear();
+        }
+    }
+
+    void offerDetailBatch(long inputGeneration, BooleanSupplier scopeCurrent,
+                         HierarchicalOcclusionTraverser.DetailActionReader reader,
+                         DetailBatchMerge result) {
+        Objects.requireNonNull(scopeCurrent, "scopeCurrent");
+        Objects.requireNonNull(reader, "reader");
+        Objects.requireNonNull(result, "result");
+        synchronized (this.detailMailbox) {
+            long started = result.measureTime ? System.nanoTime() : 0;
+            try {
+                if (inputGeneration != this.detailInputGeneration || !scopeCurrent.getAsBoolean()) return;
+                reader.read((key, action, bucket, epoch) -> {
+                    result.inspected++;
+                    if (this.offerDetailLocked(key, action, bucket, epoch)) result.accepted++;
+                });
+            } finally {
+                if (result.measureTime) result.elapsedNanos = Math.max(0, System.nanoTime() - started);
+            }
         }
     }
 
@@ -484,7 +536,7 @@ final class SectionDemandTable<D extends SectionDemandTable.Demand>
         this.demands.clear();
         this.regions.clear();
         this.topMailbox.clear();
-        this.detailMailbox.clear();
+        this.invalidateDetailInput();
     }
 
     void checkInvariants() {

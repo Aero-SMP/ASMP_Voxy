@@ -635,7 +635,7 @@ public class VoxyRenderSystem {
                 this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData);
                 this.nodeCleaner = new NodeCleaner(this.nodeManager);
                 this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner);
-                this.traversal.setDetailActionListener(ClientLodClient::detailAction);
+                this.traversal.setDetailBatchListener(() -> ClientLodClient.captureDetailBatch(this));
 
                 Arrays.stream(this.mapper.getBiomeEntries()).forEach(this.modelService::addBiome);
                 this.mapper.setBiomeCallback(this.modelService::addBiome);
@@ -866,7 +866,7 @@ public class VoxyRenderSystem {
         if (this.nodeManager != null) this.nodeManager.beginStopping();
         if (this.modelService != null) this.modelService.beginStopping();
         if (this.traversal != null) {
-            this.traversal.setDetailActionListener((key, action, bucket, epoch) -> {});
+            this.traversal.stopDetailActions();
             this.traversal.stopVisibleObservations();
         }
         ClientLodClient.stopRenderer(this);

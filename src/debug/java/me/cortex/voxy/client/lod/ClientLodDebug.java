@@ -170,6 +170,9 @@ public final class ClientLodDebug {
     static void ownerPhase(Object timing, int nextPhase) { SessionDebugTelemetry.ownerPhase(timing, nextPhase); }
     static void ownerDetail(Object timing, int detail) { SessionDebugTelemetry.ownerDetail(timing, detail); }
     static void ownerEvent(Object timing, int event, long count) { SessionDebugTelemetry.ownerEvent(timing, event, count); }
+    static void detailBatchFinished(Object timing, int inspected, int accepted, boolean signaled, long elapsedNanos) {
+        SessionDebugTelemetry.detailBatchFinished(timing, inspected, accepted, signaled, elapsedNanos);
+    }
     static void ownerNoSlot(Object timing, ClientSession.Session session) { SessionDebugTelemetry.ownerNoSlot(timing, session); }
     static void ownerFinished(Object timing) { SessionDebugTelemetry.ownerFinished(timing); }
     static void handoff(ClientSession.Session session, int stage, long nanos) { SessionDebugTelemetry.handoff(session, stage, nanos); }
