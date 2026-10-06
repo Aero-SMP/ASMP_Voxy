@@ -36,6 +36,11 @@ public class HierarchicalOcclusionTraverser {
     public static final int ACTION_WAKE = 2;
     public static final int MAX_QUEUE_SIZE = 200_000;
 
+    private static final long DETAIL_COUNTER_STRIDE_BYTES = 4L;
+    private static final long DETAIL_COUNTER_HEADER_BYTES = DETAIL_BUCKET_COUNT * DETAIL_COUNTER_STRIDE_BYTES;
+    private static final long DETAIL_RECORD_STRIDE_BYTES = 16L;
+    private static final long DETAIL_ACTION_BUFFER_BYTES = DETAIL_COUNTER_HEADER_BYTES
+            + DETAIL_BUCKET_COUNT * ACTIONS_PER_BUCKET * DETAIL_RECORD_STRIDE_BYTES;
 
     private static final int MAX_ITERATIONS = SectionKey.MAX_LOD_LAYER+1;
     private static final int LOCAL_WORK_SIZE_BITS = 5;
@@ -91,8 +96,7 @@ public class HierarchicalOcclusionTraverser {
 
     /** The address exists only for this synchronous DownloadStream callback. */
     private static final class BorrowedDetailActions implements DetailActionReader {
-        private static final long REQUIRED_BYTES = DETAIL_BUCKET_COUNT * 4L
-                + DETAIL_BUCKET_COUNT * ACTIONS_PER_BUCKET * 16L;
+        private static final long REQUIRED_BYTES = DETAIL_ACTION_BUFFER_BYTES;
         private final Thread thread = Thread.currentThread();
         private final DetailReadback owner;
         private final DetailReadback.Registration registration;
@@ -116,12 +120,12 @@ public class HierarchicalOcclusionTraverser {
             Objects.requireNonNull(consumer, "consumer");
             // Recheck when the target starts reading, after its mailbox acquisition.
             if (this.owner.registration != this.registration) return;
-            long actions = this.address + DETAIL_BUCKET_COUNT * 4L;
+            long actions = this.address + DETAIL_COUNTER_HEADER_BYTES;
             for (int bucket = 0; bucket < DETAIL_BUCKET_COUNT; bucket++) {
                 int count = (int) Math.min(Integer.toUnsignedLong(
-                        MemoryUtil.memGetInt(this.address + bucket * 4L)), ACTIONS_PER_BUCKET);
+                        MemoryUtil.memGetInt(this.address + bucket * DETAIL_COUNTER_STRIDE_BYTES)), ACTIONS_PER_BUCKET);
                 for (int index = 0; index < count; index++) {
-                    long record = actions + ((long) bucket * ACTIONS_PER_BUCKET + index) * 16L;
+                    long record = actions + ((long) bucket * ACTIONS_PER_BUCKET + index) * DETAIL_RECORD_STRIDE_BYTES;
                     int action = MemoryUtil.memGetInt(record + 8);
                     if (action != ACTION_REFINE && action != ACTION_DORMANT && action != ACTION_WAKE) continue;
                     long key = (long) MemoryUtil.memGetInt(record) << 32
@@ -185,8 +189,7 @@ public class HierarchicalOcclusionTraverser {
     public HierarchicalOcclusionTraverser(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner) {
         this.nodeCleaner = nodeCleaner;
         this.nodeManager = nodeManager;
-        this.detailActionBuffer = new GlBuffer(DETAIL_BUCKET_COUNT * 4L
-                + DETAIL_BUCKET_COUNT * ACTIONS_PER_BUCKET * 16L).zero();
+        this.detailActionBuffer = new GlBuffer(DETAIL_ACTION_BUFFER_BYTES).zero();
         this.nodeBuffer = new GlBuffer(nodeManager.maxNodeCount*16L).fill(-1);
 
 
@@ -522,7 +525,7 @@ public class HierarchicalOcclusionTraverser {
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         DownloadStream.INSTANCE.download(this.detailActionBuffer, this.detailReadback.capture());
         nglClearNamedBufferSubData(this.detailActionBuffer.id, GL_R32UI, 0,
-                DETAIL_BUCKET_COUNT * 4L,
+                DETAIL_COUNTER_HEADER_BYTES,
                 GL_RED_INTEGER, GL_UNSIGNED_INT, 0);
     }
 
