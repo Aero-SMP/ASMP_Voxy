@@ -96,9 +96,9 @@ public class AsyncNodeManager {
 
 
     //locals for during iteration
-    private final IntOpenHashSet tlnIdChange = new IntOpenHashSet();//"Encoded" add/remove id, first bit indicates if its add or remove, 1 is add
+    private final IntOpenHashSet pendingTopLevelNodeOperations = new IntOpenHashSet();//"Encoded" add/remove id, first bit indicates if its add or remove, 1 is add
     //Top bit indicates clear or reset
-    private final IntOpenHashSet cleanerIdResetClear = new IntOpenHashSet();//Tells the cleaner if it needs to clear the id to 0, or reset the id to the current frame
+    private final IntOpenHashSet pendingVisibilityOperations = new IntOpenHashSet();//Tells the cleaner if it needs to clear the id to 0, or reset the id to the current frame
 
     private boolean needsWaitForSync = false;
     private volatile boolean waitingForRenderSync;
@@ -166,21 +166,21 @@ public class AsyncNodeManager {
 
         //Dont do the move... is just to much effort
         this.manager.setClear(id -> {
-            this.cleanerIdResetClear.remove(id);//Remove clear
-            this.cleanerIdResetClear.add(id|(1<<31));//Add reset
+            this.pendingVisibilityOperations.remove(id);//Remove clear
+            this.pendingVisibilityOperations.add(id|(1<<31));//Add reset
         }, id -> {
-            this.cleanerIdResetClear.remove(id|(1<<31));//Remove reset
-            this.cleanerIdResetClear.add(id);//Add clear
+            this.pendingVisibilityOperations.remove(id|(1<<31));//Remove reset
+            this.pendingVisibilityOperations.add(id);//Add clear
         });
         this.manager.setTLNCallbacks(id->{
-            if (!this.tlnIdChange.remove(id)) {
-                if (!this.tlnIdChange.add(id|(1<<31))) {
+            if (!this.pendingTopLevelNodeOperations.remove(id)) {
+                if (!this.pendingTopLevelNodeOperations.add(id|(1<<31))) {
                     throw new IllegalStateException();
                 }
             }
         }, id -> {
-            if (!this.tlnIdChange.remove(id|(1<<31))) {
-                if (!this.tlnIdChange.add(id)) {
+            if (!this.pendingTopLevelNodeOperations.remove(id|(1<<31))) {
+                if (!this.pendingTopLevelNodeOperations.add(id)) {
                     throw new IllegalStateException();
                 }
             }
@@ -393,8 +393,8 @@ public class AsyncNodeManager {
             results = this.getMakeResultObject();
             this.assemblingResult = results;
             //Clear old data (if it exists), create a new result set
-            results.tlnDelta.addAll(this.tlnIdChange);
-            this.tlnIdChange.clear();
+            results.topLevelNodeOperations.addAll(this.pendingTopLevelNodeOperations);
+            this.pendingTopLevelNodeOperations.clear();
 
             if (!this.geometryManager.getUploads().isEmpty()){//Put in new data into sync set
                 var iter = this.geometryManager.getUploads().int2ObjectEntrySet().fastIterator();
@@ -408,31 +408,31 @@ public class AsyncNodeManager {
             }
 
             this.geometryManager.getHeapRemovals().clear();//We dont do removals on new data (as there is "none")
-            results.cleanerOperations.addAll(this.cleanerIdResetClear); this.cleanerIdResetClear.clear();
+            results.cleanerOperations.addAll(this.pendingVisibilityOperations); this.pendingVisibilityOperations.clear();
         } else {
             results = prev;
             this.assemblingResult = results;
             // merge with the previous result set
 
-            if (!this.tlnIdChange.isEmpty()) {//Merge top level node id changes
-                var iter = this.tlnIdChange.intIterator();
+            if (!this.pendingTopLevelNodeOperations.isEmpty()) {//Merge top level node id changes
+                var iter = this.pendingTopLevelNodeOperations.intIterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
-                    if (!results.tlnDelta.remove(val ^ (1 << 31))) {//Remove opposite
-                        results.tlnDelta.add(val);//Add this if not added
+                    if (!results.topLevelNodeOperations.remove(val ^ (1 << 31))) {//Remove opposite
+                        results.topLevelNodeOperations.add(val);//Add this if not added
                     }
                 }
-                this.tlnIdChange.clear();
+                this.pendingTopLevelNodeOperations.clear();
             }
 
-            if (!this.cleanerIdResetClear.isEmpty()) {//Merge top level node id changes
-                var iter = this.cleanerIdResetClear.intIterator();
+            if (!this.pendingVisibilityOperations.isEmpty()) {//Merge top level node id changes
+                var iter = this.pendingVisibilityOperations.intIterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
                     results.cleanerOperations.remove(val^(1<<31));//Remove opposite
                     results.cleanerOperations.add(val);//Add this
                 }
-                this.cleanerIdResetClear.clear();
+                this.pendingVisibilityOperations.clear();
             }
 
             if (!this.geometryManager.getHeapRemovals().isEmpty()) {//Remove and free all the removed geometry uploads
@@ -506,7 +506,7 @@ public class AsyncNodeManager {
         this.needsWaitForSync |= results.geometryUpload.currentElemCopyAmount*8L > 2L<<20;//2mb limit per frame
         this.needsWaitForSync |= results.cleanerOperations.size() > 1024;
         this.needsWaitForSync |= results.scatterWriteLocationMap.size() > 4096;
-        this.needsWaitForSync |= results.tlnDelta.size() > 10;
+        this.needsWaitForSync |= results.topLevelNodeOperations.size() > 10;
         this.needsWaitForSync |= regionalBatchLimited;
 
         if (!RESULT_HANDLE.compareAndSet(this, null, results)) {
@@ -651,8 +651,8 @@ public class AsyncNodeManager {
         if (this.waitingForRenderSync) LockSupport.unpark(this.thread);
 
         //top level node add/remove
-        if (!results.tlnDelta.isEmpty()) {
-            var iter = results.tlnDelta.intIterator();
+        if (!results.topLevelNodeOperations.isEmpty()) {
+            var iter = results.topLevelNodeOperations.intIterator();
             while (iter.hasNext()) {
                 int val = iter.nextInt();
                 if ((val&(1<<31))!=0) {//Add node
@@ -1320,7 +1320,7 @@ public class AsyncNodeManager {
         private int currentMaxNodeId;// the id of the ending of the node ids
 
         //TLN add/rem
-        private final IntOpenHashSet tlnDelta = new IntOpenHashSet();
+        private final IntOpenHashSet topLevelNodeOperations = new IntOpenHashSet();
 
         //Deltas for geometry store
         private int geometrySectionCount;
@@ -1356,7 +1356,7 @@ public class AsyncNodeManager {
             this.cleanerOperations.clear();
             this.scatterWriteLocationMap.clear();
             this.currentMaxNodeId = 0;
-            this.tlnDelta.clear();
+            this.topLevelNodeOperations.clear();
             this.geometrySectionCount = 0;
             this.usedGeometry = 0;
             this.geometryUpload.reset();
