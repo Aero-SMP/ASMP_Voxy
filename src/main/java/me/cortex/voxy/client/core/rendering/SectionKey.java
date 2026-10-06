@@ -29,6 +29,14 @@ public final class SectionKey {
         return (int) ((id << 12) >> 40);
     }
 
+    public static boolean contains(long ancestor, long descendant) {
+        int shift = SectionKey.level(ancestor) - SectionKey.level(descendant);
+        return shift >= 0
+                && SectionKey.x(ancestor) == SectionKey.x(descendant) >> shift
+                && SectionKey.y(ancestor) == SectionKey.y(descendant) >> shift
+                && SectionKey.z(ancestor) == SectionKey.z(descendant) >> shift;
+    }
+
     public static String describe(long position) {
         return level(position) + "@[" + x(position) + ", " + y(position)
                 + ", " + z(position) + ']';

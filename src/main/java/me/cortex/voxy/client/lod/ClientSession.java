@@ -3910,11 +3910,7 @@ public final class ClientSession {
     }
 
     private static boolean contains(long ancestor, long descendant) {
-        int shift = SectionKey.level(ancestor) - SectionKey.level(descendant);
-        return shift >= 0
-                && SectionKey.x(ancestor) == SectionKey.x(descendant) >> shift
-                && SectionKey.y(ancestor) == SectionKey.y(descendant) >> shift
-                && SectionKey.z(ancestor) == SectionKey.z(descendant) >> shift;
+        return SectionKey.contains(ancestor, descendant);
     }
 
     private static int regionX(long key) {

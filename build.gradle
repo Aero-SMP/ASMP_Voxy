@@ -264,6 +264,17 @@ tasks.register('cubeIndexWriterTest', JavaExec) {
     jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
 }
 
+tasks.register('sectionKeyContainmentTest', JavaExec) {
+    group = 'verification'
+    description = 'Verify section ancestry through the production helper and both forwarding wrappers'
+    dependsOn tasks.named('schedulerTestClasses')
+    classpath = sourceSets.schedulerTest.runtimeClasspath
+    mainClass.set('me.cortex.voxy.client.core.rendering.SectionKeyContainmentBehaviorTest')
+    def scratch = layout.buildDirectory.dir('section-key-test-tmp')
+    doFirst { scratch.get().asFile.mkdirs() }
+    jvmArgs '-Djava.io.tmpdir=' + scratch.get().asFile.absolutePath
+}
+
 [
     visibilityMembershipTest: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest',
     worldCacheVisibilityTest: 'me.cortex.voxy.client.lod.WorldCacheVisibilityBehaviorTest',
