@@ -148,7 +148,7 @@ mod tests {
             let file: FileConfig =
                 toml::from_str(&format!("[quic]\nadvertise = '{advertise}'")).unwrap();
             assert_eq!(
-                Config::from_file(file, false, 25586).unwrap().listen,
+                Config::from_file(file, 25586).unwrap().listen,
                 SocketAddr::from(([0, 0, 0, 0], 25786))
             );
         }
