@@ -622,9 +622,9 @@ public final class ClientSession {
         volatile DownloadFrustum downloadFrustum;
         DownloadFrustum classifiedFrustum;
         long visibleEpoch = -1;
-        final Set<Long> visibleKeys = new HashSet<>();
-        final Set<Long> visibleWatchKeys = new HashSet<>();
-        final Set<Long> visibleRegions = new HashSet<>();
+        final VisibleSectionState visibility = new VisibleSectionState();
+        final Set<Long> visibleWatchKeys = this.visibility.watchKeys();
+        final Set<Long> visibleRegions = this.visibility.regions();
         int retentionX = Integer.MIN_VALUE, retentionZ = Integer.MIN_VALUE;
         long retentionEpoch = -1, retentionView = -1;
         float[] visibleAreas = new float[0];
@@ -2358,21 +2358,13 @@ public final class ClientSession {
                 this.sentStorageBytes = this.policy.storageBytes();
             }
             var cut = this.visibleInput;
-            if (cut != null && cut.epoch() > this.visibleEpoch) {
+            if (cut != null && this.visibility.update(cut.epoch(), cut.keys())) {
                 this.visibleEpoch = cut.epoch();
-                var previous = new HashSet<>(this.visibleWatchKeys);
-                this.visibleKeys.clear(); this.visibleWatchKeys.clear(); this.visibleRegions.clear();
-                for (long key : cut.keys()) {
-                    this.visibleKeys.add(key); this.visibleRegions.add(regionFor(key));
-                    long ancestor = key;
-                    while (true) {
-                        this.visibleWatchKeys.add(ancestor);
-                        if (SectionKey.level(ancestor) == SectionKey.MAX_LOD_LAYER) break;
-                        ancestor = parent(ancestor);
-                    }
-                }
-                for (long key : this.visibleWatchKeys) if (!previous.remove(key)) this.interestChanges.add(key);
-                for (long key : previous) this.interestChanges.add(key);
+                var added = this.visibility.addedWatchKeys();
+                for (int i = 0; i < added.size(); i++) this.interestChanges.add(added.getLong(i));
+                var removed = this.visibility.removedWatchKeys();
+                for (int i = 0; i < removed.size(); i++) this.interestChanges.add(removed.getLong(i));
+                // Membership can stay unchanged while the renderer reports fresh areas/order.
                 this.visibleCutKeys = cut.keys(); this.visibleAreas = cut.areas();
             }
             if (this.retentionView != this.viewRevision || this.retentionEpoch != this.visibleEpoch
@@ -2382,7 +2374,7 @@ public final class ClientSession {
                 this.retentionX = this.cameraBlockX; this.retentionZ = this.cameraBlockZ;
             }
             if (downloads == null || !this.helloAccepted) return;
-            downloads.view(this.dimensionId, this.cameraBlockX, this.cameraBlockZ, this.visibleKeys, this.visibleEpoch);
+            downloads.view(this.dimensionId, this.cameraBlockX, this.cameraBlockZ, this.visibility);
             if (this.quic == null || !this.openSent) return;
             // A key-only cancellation must reach the writer before its replacement desire.
             if (!this.interestDrops.isEmpty() || !this.networkOwner.detachedDrops.isEmpty()) return;

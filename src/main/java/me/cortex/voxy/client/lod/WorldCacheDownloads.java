@@ -1,6 +1,9 @@
 package me.cortex.voxy.client.lod;
 
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import me.cortex.voxy.client.config.ServerDownloadSettings;
 import me.cortex.voxy.client.core.rendering.SectionKey;
 
@@ -38,8 +41,8 @@ final class WorldCacheDownloads implements AutoCloseable {
     private long diskStamp, diskRecovery, diskAdmission, sourceSections, sampledSections, sampledNamedBytes;
     private int activeDimension = -1;
     private Dimension viewedDimension;
-    private Set<Long> viewedVisible;
-    private long viewedEpoch = Long.MIN_VALUE;
+    private VisibleSectionState viewedVisibility;
+    private long viewedGeneration = Long.MIN_VALUE;
     private volatile boolean closed;
     long committed, receivedBytes, skipped, failures;
     String lastFailure;
@@ -140,7 +143,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         final Long2IntOpenHashMap occupancy = new Long2IntOpenHashMap();
         final Set<Long> sourceBlocked = new HashSet<>(), admissionBlocked = new HashSet<>();
         final Set<Long> unpublishedRegions = new HashSet<>(), parkedRegions = new HashSet<>();
-        final Set<Long> visibleRoots = new HashSet<>(), visibleRegions = new HashSet<>();
+        final LongSet visibleRoots = new LongOpenHashSet(), visibleRegions = new LongOpenHashSet();
         final Map<Long, Set<Long>> spaceBlocked = new HashMap<>();
         final Set<Long> unreadableRegions = new HashSet<>();
         final Map<Position, Node> queued = new HashMap<>();
@@ -334,6 +337,7 @@ final class WorldCacheDownloads implements AutoCloseable {
     }
     private void retire(Dimension dimension) {
         this.dimensions.remove(dimension.info.id(), dimension);
+        if (this.viewedDimension == dimension) invalidateView();
         for (var job : List.copyOf(this.jobs.values())) if (job.dimension == dimension) remove(job, true);
         if (dimension.catalogueTask != null) dimension.catalogueTask.cancel(true);
         invalidateDirectories(dimension); clearCoverage(dimension);
@@ -413,37 +417,77 @@ final class WorldCacheDownloads implements AutoCloseable {
         int last = Math.floorDiv(dimension.info.minSectionY() + dimension.info.sectionCount() - 1, 16);
         for (int y = first; y <= last; y++) dimension.offer(new Node(dimension, 4, (int) region, y, (int) (region >> 32)));
     }
-    void view(int dimensionId, int x, int z, Set<Long> visible, long visibleEpoch) {
+    void view(int dimensionId, int x, int z, VisibleSectionState visibility) {
         drainDirectory();
         var dimension = this.dimensions.get(dimensionId);
         boolean changedDimension = this.activeDimension != dimensionId || this.viewedDimension != dimension;
-        if (!changedDimension && dimension != null && dimension.x == x && dimension.z == z
-                && this.viewedVisible == visible && this.viewedEpoch == visibleEpoch) return;
+        boolean sameScope = !changedDimension && this.viewedVisibility == visibility;
+        boolean sameMembership = sameScope && this.viewedGeneration == visibility.generation();
+        if (sameMembership && dimension != null && dimension.x == x && dimension.z == z) return;
         if (this.activeDimension != dimensionId) {
             var previous = this.dimensions.get(this.activeDimension);
-            if (previous != null) setVisible(previous, Set.of());
+            if (previous != null) clearVisible(previous);
             this.activeDimension = dimensionId;
         }
-        if (dimension == null) { this.viewedDimension = null; this.viewedVisible = null; return; }
+        if (dimension == null) { invalidateView(); return; }
         boolean changedAnchor = dimension.x != x || dimension.z != z;
         if (changedAnchor) dimension.anchor(x, z);
         if (changedDimension || changedAnchor) this.settings.rememberDimension(dimension.info.name(), x, z);
-        if (!dimension.visibleRoots.equals(visible)) setVisible(dimension, visible);
-        else if (changedDimension || changedAnchor)
+        boolean changedMembership = false;
+        if (!sameMembership) {
+            if (sameScope && visibility.baseGeneration() == this.viewedGeneration)
+                changedMembership = applyVisibleDelta(dimension, visibility);
+            else changedMembership = resyncVisible(dimension, visibility);
+        }
+        if (!changedMembership && (changedDimension || changedAnchor))
             this.metadata.updateRetention(dimension.info.name(), x, z, dimension.visibleRegions);
-        this.viewedDimension = dimension; this.viewedVisible = visible; this.viewedEpoch = visibleEpoch;
+        this.viewedDimension = dimension; this.viewedVisibility = visibility;
+        this.viewedGeneration = visibility.generation();
     }
-    private void setVisible(Dimension dimension, Set<Long> visible) {
-        Set<Long> added = new HashSet<>(visible); added.removeAll(dimension.visibleRoots);
-        dimension.visibleRoots.clear(); dimension.visibleRoots.addAll(visible); dimension.visibleRegions.clear();
-        for (long key : visible) dimension.visibleRegions.add(regionFor(key));
+    private void invalidateView() {
+        this.viewedDimension = null; this.viewedVisibility = null; this.viewedGeneration = Long.MIN_VALUE;
+    }
+    private void clearVisible(Dimension dimension) {
+        dimension.visibleRoots.clear(); dimension.visibleRegions.clear();
+        visibleChanged(dimension);
+    }
+    private boolean resyncVisible(Dimension dimension, VisibleSectionState visibility) {
+        var added = new LongArrayList();
+        for (var keys = visibility.keys().iterator(); keys.hasNext();) {
+            long key = keys.nextLong();
+            if (!dimension.visibleRoots.contains(key)) added.add(key);
+        }
+        boolean changed = !added.isEmpty() || dimension.visibleRoots.size() != visibility.keys().size()
+                || !dimension.visibleRegions.equals(visibility.regions());
+        dimension.visibleRoots.clear(); dimension.visibleRoots.addAll(visibility.keys());
+        dimension.visibleRegions.clear(); dimension.visibleRegions.addAll(visibility.regions());
+        if (!changed) return false;
+        visibleChanged(dimension);
+        for (int index = 0; index < added.size(); index++) dimension.expand(dimension.node(added.getLong(index)));
+        return true;
+    }
+    private boolean applyVisibleDelta(Dimension dimension, VisibleSectionState visibility) {
+        boolean changed = false;
+        var added = visibility.addedKeys();
+        for (int index = 0; index < added.size(); index++) changed |= dimension.visibleRoots.add(added.getLong(index));
+        var removed = visibility.removedKeys();
+        for (int index = 0; index < removed.size(); index++) changed |= dimension.visibleRoots.remove(removed.getLong(index));
+        var addedRegions = visibility.addedRegions();
+        for (int index = 0; index < addedRegions.size(); index++) changed |= dimension.visibleRegions.add(addedRegions.getLong(index));
+        var removedRegions = visibility.removedRegions();
+        for (int index = 0; index < removedRegions.size(); index++) changed |= dimension.visibleRegions.remove(removedRegions.getLong(index));
+        if (!changed) return false;
+        visibleChanged(dimension);
+        for (int index = 0; index < added.size(); index++) dimension.expand(dimension.node(added.getLong(index)));
+        return true;
+    }
+    private void visibleChanged(Dimension dimension) {
         dimension.reheap(); trimCoverage(dimension);
         this.metadata.updateRetention(dimension.info.name(), dimension.x, dimension.z, dimension.visibleRegions);
         for (var job : List.copyOf(this.jobs.values())) if (job.dimension == dimension && job.purpose == 3
                 && !dimension.node(job.key).visible() && !job.processing) {
             remove(job, true); dimension.offer(dimension.node(job.key));
         }
-        for (long key : added) dimension.expand(dimension.node(key));
     }
     RegionalProtocol.DimensionInfo dimension(String name) {
         for (var dimension : this.dimensions.values()) if (dimension.info.name().equals(name)) return dimension.info;
@@ -794,7 +838,7 @@ final class WorldCacheDownloads implements AutoCloseable {
         if (!sameConnection) this.drops.clear();
         cancelDirectory(); this.directoryRequests.clear();
         this.activeDimension = -1;
-        this.viewedDimension = null; this.viewedVisible = null; this.viewedEpoch = Long.MIN_VALUE;
+        invalidateView();
         for (var dimension : this.dimensions.values()) {
             if (!sameConnection) { dimension.inventoryReady = false; dimension.inventoryComplete = false; }
             dimension.visibleRoots.clear(); dimension.visibleRegions.clear(); dimension.admissionBlocked.clear(); dimension.spaceBlocked.clear();

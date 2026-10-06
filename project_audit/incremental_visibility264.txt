@@ -1,0 +1,67 @@
+Incremental visibility bookkeeping — debug client264
+
+Scope: approach1 only. Feature branch feature/cache-first-background-updates.
+Renderer/GPU reports, raw key/area ordering, revision checks, retention API/calls,
+storage/disk-exhaustion protection, publication protocol and worker count remain unchanged.
+
+Implementation
+VisibleSectionState is coordinator-owned. A primitive key/index map plus dense key/
+seen-epoch arrays detects unique additions and removals from complete reports.
+Ancestor and region reference counts emit only zero/nonzero membership transitions.
+All additions precede removals. Reordered/duplicate keys do not change membership.
+Raw report epochs and key/area arrays still advance when membership is unchanged.
+
+WorldCacheDownloads consumes guarded membership deltas. Helper identity, current
+Dimension identity and base generation must match; otherwise it copies current
+membership. HELLO delays, skipped owner deltas, new helpers, detach/reconnect and
+manifest/dimension replacement resync without retaining history. Existing directory
+draining, lifecycle retention clears, cancellation before expansion and required
+frontier rebuilds remain.
+
+Reports are inspected in O(incoming entries + previous visible keys). Ordinary
+derived work is expected O(delta * at-most-five ancestor levels). No-new-report
+membership checks are O(1). Frontier/job/coverage and budget costs remain separate.
+A >=512-key shrink leaving <=25% survivors rebuilds references from survivors and
+trims the original maps once to avoid repeated per-removal rehashing.
+
+Memory
+Primitive state and reusable delta arrays are bounded by peak keys/watches/regions
+and deltas; arrays may retain peak capacity after shrink. Fewer allocated bytes do
+not establish reduced retained heap. Total memory and full-report inspection are
+not O(1).
+
+Validation
+Independent full-rebuild oracle: exact memberships and transition sets, duplicate
+zero, coordinate boundaries, shared ancestors/regions, parent-child replacement,
+stale/skipped epochs, 3000 random reports, shrink/grow cycles and read-only views.
+Real planner: first sync, deltas, missed generation/empty delta, helper identity,
+detach/reconnect, dimension/manifest change, unknown dimension, anchor movement,
+shared retention clearing, job cancellation/drop acknowledgment, processing/other
+dimension preservation, added-root expansion and exact frontier comparator order.
+Existing normal/debug shutdown, callback lock-order, admission, allocator/topology
+and stale-fence fixtures passed. Normal/debug JARs exclude offline test classes.
+
+Replay benchmark
+OpenJDK21, 32768 unique input keys, six warmup rounds, five samples, three repetitions.
+Legacy is the actual boxed HashSet clone/clear/rebuild loop; input generation and
+oracle checks are excluded. Interest enqueue uses HashSet on both paths. Medians:
+scenario | legacy ms/report | incremental ms/report | legacy bytes | incremental bytes
+unchanged | 6.001 | 0.240 | 13547447 | 0
+reorder | 9.710 | 0.270 | 14226311 | 0
+one-percent-churn-327-removed-and-added | 9.897 | 0.424 | 14313363 | 81309
+shrink-to-one-percent | 2.579 | 3.227 | 6216776 | 6465976
+initial-empty-to-large | 8.154 | 10.365 | 18188536 | 14758240
+full-replacement-from-empty | 10.752 | 10.734 | 19645064 | 15888760
+
+Stable/reordered and 1% membership churn improve strongly. A one-off 99% shrink
+remains about0.65ms slower; a first large report/full replacement does not show a
+consistent time improvement. These are bookkeeping microbenchmarks, not whole
+cache-loading or frame-rate speedups. All receipts/raw logs remain outside Git at:
+/home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/incremental_visibility_264
+
+Reproduce focused correctness checks:
+./gradlew --offline visibilityMembershipTest worldCacheVisibilityTest
+Run the opt-in allocation/timing replay:
+./gradlew --offline visibilityMembershipBenchmark
+
+Live deployment and measurements are recorded separately after verification.

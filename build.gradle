@@ -242,6 +242,25 @@ tasks.register('debugHarnessJavaTest', JavaExec) {
     mainClass.set('me.cortex.voxy.debugtest.DebugHarnessBehaviorTest')
 }
 
+[
+    visibilityMembershipTest: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest',
+    worldCacheVisibilityTest: 'me.cortex.voxy.client.lod.WorldCacheVisibilityBehaviorTest',
+    visibilityMembershipBenchmark: 'me.cortex.voxy.client.lod.VisibleSectionStateBehaviorTest'
+].each { name, entrypoint ->
+    tasks.register(name, JavaExec) {
+        description = name == 'visibilityMembershipBenchmark'
+                ? 'Replay visibility traces against the former full-rebuild algorithm'
+                : 'Verify visibility membership and planner lifecycle behavior offline'
+        dependsOn tasks.named('schedulerTestClasses')
+        classpath = sourceSets.schedulerTest.runtimeClasspath
+        mainClass.set(entrypoint)
+        def scratch = layout.buildDirectory.dir('visibility-test-tmp')
+        jvmArgs '-Xmx2g', "-Djava.io.tmpdir=${scratch.get().asFile}"
+        doFirst { scratch.get().asFile.mkdirs() }
+        if (name == 'visibilityMembershipBenchmark') args '--benchmark'
+    }
+}
+
 tasks.register('debugHarnessPythonTest', Exec) {
     description = 'Run declarative live-test runner behavior tests'
     commandLine 'python3', '-m', 'unittest', 'tools/test_run_live_client_test.py'
