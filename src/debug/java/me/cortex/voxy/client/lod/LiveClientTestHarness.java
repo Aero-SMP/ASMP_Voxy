@@ -803,12 +803,12 @@ final class LiveClientTestHarness {
         final String dimension;
         final double x, y, z;
         final float yaw, pitch;
-        final long deadlineNanos, markerFrame;
+        final long deadlineNanos;
         final DebugPoseStabilizer stabilizer;
         PoseExpectation(DebugTestCommandPayload command, long deadlineNanos, long markerFrame) {
             this.dimension = command.dimension(); this.x = command.x(); this.y = command.y();
             this.z = command.z(); this.yaw = command.yaw(); this.pitch = command.pitch();
-            this.deadlineNanos = deadlineNanos; this.markerFrame = markerFrame;
+            this.deadlineNanos = deadlineNanos;
             this.stabilizer = new DebugPoseStabilizer(markerFrame);
         }
     }
