@@ -1,0 +1,71 @@
+Coordinator and publication diagnostics (client debug 0.2.263-beta)
+
+Purpose
+Measure actual regional-owner CPU and locate delays that hold mesh-worker leases.
+This change adds instrumentation only; the owner order, 10 ms wake timeout,
+publication ownership, save retention and release decisions are unchanged.
+Normal clients use no-op hooks and a zero diagnostic clock.
+
+Read VOXY_PIPELINE lines in the client's logs/voxy-client-debug.log, or uploaded
+copies under Voxy_Testing/logs/client-upload. Summaries are captured about once
+per second; use sessionId and sessionSampleNanos to reject repeats/stale samples.
+
+CPU
+ownerThread is the exact Java owner thread id, not the Windows native thread id.
+ownerCpu reports AVAILABLE/UNSUPPORTED/DISABLED/UNAVAILABLE. ownerCpuNanos is
+cumulative CPU time for that thread. ownerCpuSample=BASELINE establishes the first
+endpoint; DELTA adds ownerCpuDeltaNanos and ownerCpuSampleWallNanos.
+ownerOneCorePercent = 100 * CPU delta / sample wall delta. 100 means one logical
+CPU fully occupied, irrespective of total core count. Platform CPU accounting is
+quantized; short zero deltas are not proof of zero work. Aggregate several valid
+DELTA windows. A missing or invalid CPU reading resets the baseline.
+
+Owner phases
+ownerPhaseOrder gives the fixed array order for ownerPhaseCount, ownerPhaseNanos
+and ownerPhaseMaxNanos. All are cumulative for this owner session. Subtract two
+samples to obtain phase time for a window; maxima are lifetime maxima, not deltas.
+ownerLoops counts turns. ownerBusyNanos counts elapsed wall time outside WAIT;
+it includes blocking and preemption, so it is not CPU usage. WAIT measures the
+existing awaitWake call. Completed phase totals exclude the currently open phase;
+ownerActivePhase and ownerActivePhaseAgeNanos expose its partial interval. The
+summary is built in DEBUG_SAMPLE, so the captured active phase normally says that.
+
+Publication handoffs
+handoffOrder indexes handoffCount, handoffNanos and handoffMaxNanos:
+  0 MESH_TO_CLAIM: worker result completion until the owner claims valid geometry.
+  1 CLAIM_TO_SUBMIT: owner claim until an accepted publication attempt starts.
+  2 SUBMIT_TO_ADMISSION: accepted attempt start until actual renderer admission.
+  3 ADMISSION_TO_OBSERVE: renderer admission until the owner sees it.
+  4 OBSERVE_TO_REUSE: owner observation until the exact worker slot becomes idle.
+Submission is stamped before the publisher call because admission can occur
+before the call returns. BUSY attempts are omitted; accepted returned/retried
+attempts each contribute to stage 1. The admission stamp is immutable across
+closure, repeated callbacks and shutdown. Publication references freeze their
+mesh and submit stamps so a later demand revision cannot rewrite old measurements.
+Optional saves can postpone reuse after observation. Asynchronous cleanup is
+excluded from the owner handoff cohort.
+
+Use count deltas with time deltas to compute mean delay. Cohorts differ: stage 0
+includes empty geometry, stage 1 includes accepted retries, while stages 2-4 are
+nonempty admitted work observed/reused by the owner. Do not add separate stage
+means as an end-to-end mean. Existing meshToLeaseReleaseNanos is the end-to-end
+completion-to-observation counter; publishedToReusableNanos measures worker-result
+publication to reuse. The mesh completion stamp is after worker save-retention
+bookkeeping, rather than the exact return instant of mesher.mesh().
+
+Interpretation
+High owner CPU plus heavy phase totals indicates CPU work to simplify. Low owner
+CPU with large elapsed phase totals indicates waiting/blocking/preemption.
+Large stage 0 or 3 implicates owner servicing latency. Large stage 1 implicates
+ready-work scheduling/handoff backpressure. Large stage 2 implicates renderer
+admission, and large stage 4 implicates retained save/release work. None alone
+proves a specific lock is the cause.
+
+Verification
+Client jars and scheduler fixtures compile. The external diagnostics runner tests
+normal/debug timestamp range/identity and invokes production admission, topology,
+allocator, shutdown and callback lock-order fixtures. Both facade variants pass.
+An independent pre-deployment Windows thread measurement matched native thread
+23356 in game PID 26104 and measured 8.28125 CPU seconds / 15.0915796 wall seconds
+= 54.8733 percent of one CPU at 2026-10-06T06:25:01Z. This is a current-workload
+sample, not a cache-startup saturation measurement.

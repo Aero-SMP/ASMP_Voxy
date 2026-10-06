@@ -1,0 +1,69 @@
+Client 263 coordinator diagnostics deployment and first measurements
+2026-10-06 UTC
+
+Deployment
+Built and deployed debug client 0.2.263-beta from code commit
+995b09ff0fdfb4aa21f157df16330fd869a4a3a4 on feature/cache-first-background-updates.
+Installed JAR SHA-256:
+5317997f4ef924cbd94faac35330917d0c4b38797800b044fafc87c1ace859a9
+Actual PC: GIORKOSPC, Modrinth Aero SMP profile.
+Old game PID26104/start2026-10-06T04:27:01.9374711Z was replaced by
+PID3372/start2026-10-06T06:37:45.4831580Z. Debug header, installed hash,
+regional ACTIVE/accepted HELLO and live new CPU/phase/handoff fields verified.
+
+Both backup helper PID/start identities survived. General settings, user download
+and storage selections, cache-test/reset markers and feed requests were preserved.
+No cache reset or transport hold was requested. The independently copied old262
+jar/settings are in the PC profile's .voxy-updater/cache-first-live/coordinator263.
+Controller260/native260 stayed running at PID306308/307526 with unchanged start
+ticks, artifact/native/config/unrelated-mod hashes and native memory caps.
+The finite live run completed in289.568seconds, below its300second target and
+600second limit. No residual diagnostic hold or pending artifact remained.
+
+Observed owner CPU (percent of ONE logical CPU, not whole-machine percent)
+Before deployment: independent Windows exact-thread CPU counters measured54.8733%
+over15.0916seconds on native thread23356; all three5second windows were54-56%.
+After restart: the owner reached95.602% in an approximately1second window while
+bulk cache loading. A34.37second heavy interval averaged approximately84.65%.
+The first39.38seconds of the captured owner interval averaged79.16%.
+A subsequent31.76second settled interval averaged55.245%, with only10new cache
+hits. Independent Windows sampling agreed:88.9135% for its first5seconds,
+then54.2196% and56.0790%. It is intermittently near saturation while loading,
+not continuously at100%.
+
+Phase evidence
+In the34.37second heavy interval, DOWNLOADS accounted for18.9163seconds and
+DEMAND9.6441seconds of elapsed owner time. Together those phases were89.33%
+of the non-WAIT elapsed time. These are WALL timings, not per-phase CPU readings.
+DOWNLOADS is processCacheDownloads(), which includes visible-key/watch-ancestor
+reconstruction and retention updates, as well as background download coordination.
+The phase label does not establish that network transfer itself is expensive.
+DEMAND includes demand/detail mailbox processing. A specific expensive inner
+operation or lock remains to be isolated before choosing a performance change.
+
+Handoff evidence
+Counters report completion-to-claim, claim-to-accepted-submit, submit-to-actual
+admission, admission-to-owner-observation, and observation-to-slot-reuse.
+The final sample had57781nonempty admitted/reused results, with lifetime mean
+submit-to-admission approximately0.0656ms, admission-to-observation1.332ms,
+and observation-to-reuse0.0833ms. Claim-to-submit and completion-to-claim have
+different cohorts; consult coordinator_timings263.txt before combining statistics.
+
+Validation and evidence
+Normal/debug client builds passed. Publication admission, topology/allocation,
+retry/stale fence, shutdown and callback lock-order fixtures passed for both
+facades. Additional checks verified normal timestamps0, debug timestamp range,
+and timestamp preservation after repeated admission/close/shutdown. Normal jar
+excludes SessionDebugTelemetry and other debug implementation/test classes.
+
+All raw receipts, runner source, build/check logs and frozen logs are outside the
+project at /home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/coordinator_timings_263.
+Final whole debug capture:
+captures/frozen263-1791268800736931058/voxy-client-debug.log
+SHA-256:1a28fbb87383c6179dc9eca1d0751f32ce654b0509206621f385ef8e88200df7
+Its67pipeline records have66unique sessionId/sessionSampleNanos pairs. Reject
+repeated summaries and derive CPU means from cumulative endpoints when summaries
+were skipped; do not blindly average or sum logged delta percentages.
+Deployment receipt:receipts/finished263-1791268818125367810.json.
+The source checkout was isolated during building/deployment; final integration
+uses a guarded fast-forward of the existing feature branch only.
