@@ -10,10 +10,10 @@ import java.util.UUID;
 /** Pure arithmetic/IPC acknowledgment checks: no server, networking or integration launch. */
 public final class LivePressureRoutesChecks {
     public static void main(String[] arguments) {
-        check(LivePressureRoutes.remainingMillis(1_600_000, 1_000_000) == 600_000, "original clock");
+        check(LivePressureRoutes.remainingMillis(1_600_000, 1_000_000) == 600_000, "declared deadline");
         check(LivePressureRoutes.remainingMillis(1_600_000, 1_100_000) == 500_000, "clock not extended");
         rejects(() -> LivePressureRoutes.remainingMillis(1_000_000, 1_000_000));
-        rejects(() -> LivePressureRoutes.remainingMillis(1_600_001, 1_000_000));
+        check(LivePressureRoutes.remainingMillis(2_800_000, 1_000_000) == 1_800_000, "longer owned watchdog permitted");
         rejects(() -> LivePressureRoutes.remainingMillis(Long.MAX_VALUE, -1));
 
         UUID request = UUID.fromString("11111111-1111-1111-1111-111111111111");

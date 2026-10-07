@@ -265,8 +265,8 @@ final class LivePressureRoutes {
         long remaining;
         try { remaining = Math.subtractExact(deadline, now); }
         catch (ArithmeticException overflow) { throw new IllegalArgumentException("invalid deadline", overflow); }
-        if (remaining <= 0 || remaining > 600_000)
-            throw new IllegalArgumentException("deadline must be within the original 600 s live clock");
+        if (remaining <= 0)
+            throw new IllegalArgumentException("deadline must be in the future");
         return remaining;
     }
 

@@ -406,6 +406,7 @@ struct ClientStats {
     validation_ns: u64,
     max_completion_ns: u64,
     completion_ns: u64,
+    completion_histogram: [u64; 32],
     first_coarse_ns: u64,
     first_detail_ns: u64,
     last_progress_ns: u64,
@@ -413,6 +414,9 @@ struct ClientStats {
     max_pending_ns: u64,
     phase_records: [u64; 3],
     phase_missing: [u64; 3],
+    phase_coarse_records: [u64; 3],
+    phase_detail_records: [u64; 3],
+    phase_payload_bytes: [u64; 3],
     missing_pending: usize,
     plateau_missing_samples: u64,
     plateau_idle_samples: u64,
@@ -421,6 +425,7 @@ struct ClientStats {
     validated_lanes: u8,
     failures: u64,
     failure: Option<String>,
+    setup_rtt_ns: u64,
     rtt_ns: u64,
     cwnd: u64,
     lost_packets: u64,
@@ -602,6 +607,10 @@ fn eligible(
 fn age_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
+fn completion_bucket(nanos: u64) -> usize {
+    // Log2 microsecond upper bounds; the final bucket includes overflow.
+    (64 - nanos.div_ceil(1000).saturating_sub(1).leading_zeros() as usize).min(31)
+}
 fn worker_record(
     directory: &Path,
     world: [u8; 32],
@@ -685,6 +694,18 @@ async fn client(run: Run, anchor: Anchor, route: [u8; 32], owned: Arc<ClientStat
         let connection = endpoint
             .connect_with(run.tls.clone(), relay.local, "voxy.local")?
             .await?;
+        let setup_rtt_ns = connection.stats().path.rtt.as_nanos().min(u64::MAX as u128) as u64;
+        {
+            let mut stats = owned.stats.lock().unwrap();
+            stats.setup_rtt_ns = setup_rtt_ns;
+            stats.rtt_ns = setup_rtt_ns;
+        }
+        emit(&format!(
+            "{{\"event\":\"client_tls_ready\",\"run\":{},\"client\":{},\"elapsed_ns\":{},\"setup_rtt_ns\":{setup_rtt_ns}}}",
+            quote(&run.id),
+            anchor.index,
+            age_ns(run.started)
+        ));
         connection_owned = Some(connection.clone());
         *owned.connection.lock().unwrap() = Some(connection.clone());
         let watched = connection.clone();
@@ -870,10 +891,14 @@ async fn client(run: Run, anchor: Anchor, route: [u8; 32], owned: Arc<ClientStat
                             if let Some(cohort)=plateau_phase(*run.phase.borrow(),run.plateau_seconds) {
                                 if status!=RecordStatus::Absent { stats.phase_records[cohort]+=1; }
                                 if request.missing && matches!(status,RecordStatus::Data|RecordStatus::Empty) { stats.phase_missing[cohort]+=1; }
+                                if matches!(status,RecordStatus::Data|RecordStatus::Empty) {
+                                    if request.key.level==4 {stats.phase_coarse_records[cohort]+=1;}else{stats.phase_detail_records[cohort]+=1;}
+                                    stats.phase_payload_bytes[cohort]+=payload_bytes;
+                                }
                             }
                             stats.payload_bytes += payload_bytes;
                             stats.decode_ns += decode; stats.persist_ns += persist; stats.worker_queue_ns += queue; stats.resume_ns += age_ns(finished);
-                            stats.completion_ns += latency; stats.max_completion_ns = stats.max_completion_ns.max(latency); stats.last_progress_ns = age_ns(run.started);
+                            stats.completion_ns += latency; stats.completion_histogram[completion_bucket(latency)]+=1; stats.max_completion_ns = stats.max_completion_ns.max(latency); stats.last_progress_ns = age_ns(run.started);
                             match status { RecordStatus::Data => stats.data += 1, RecordStatus::Empty => stats.empty += 1,
                                 RecordStatus::Absent => stats.absent += 1, RecordStatus::Reuse => { stats.reuse += 1; stats.cache_hits += 1; }, _ => {} }
                             if descriptor.status != RecordStatus::Absent {
@@ -1120,7 +1145,7 @@ async fn client(run: Run, anchor: Anchor, route: [u8; 32], owned: Arc<ClientStat
 }
 fn counter_json(value: relay::Counters) -> String {
     format!(
-        "{{\"attempted_packets\":{},\"attempted_ip_bytes\":{},\"serviced_packets\":{},\"serviced_ip_bytes\":{},\"dropped_packets\":{},\"dropped_ip_bytes\":{},\"delivered_packets\":{},\"delivered_ip_bytes\":{},\"pending_packets\":{},\"pending_ip_bytes\":{},\"abandoned_packets\":{},\"abandoned_ip_bytes\":{},\"socket_errors\":{},\"truncated\":{},\"late_ns\":{},\"max_late_ns\":{},\"first_service_ns\":{},\"last_service_ns\":{},\"max_accounted_packet\":{},\"rate_violation_windows\":{},\"max_window_excess_bytes\":{},\"loss_draws\":{},\"send_wait_ns\":{},\"max_send_wait_ns\":{},\"first_send_ns\":{},\"last_send_ns\":{},\"delivery_late_ns\":{},\"max_delivery_late_ns\":{}}}",
+        "{{\"attempted_packets\":{},\"attempted_ip_bytes\":{},\"serviced_packets\":{},\"serviced_ip_bytes\":{},\"dropped_packets\":{},\"dropped_ip_bytes\":{},\"delivered_packets\":{},\"delivered_ip_bytes\":{},\"pending_packets\":{},\"pending_ip_bytes\":{},\"abandoned_packets\":{},\"abandoned_ip_bytes\":{},\"socket_errors\":{},\"truncated\":{},\"late_ns\":{},\"max_late_ns\":{},\"first_service_ns\":{},\"last_service_ns\":{},\"max_accounted_packet\":{},\"rate_violation_windows\":{},\"max_window_excess_bytes\":{},\"send_rate_violation_windows\":{},\"max_send_window_excess_bytes\":{},\"max_send_window_ip_bytes\":{},\"loss_draws\":{},\"send_wait_ns\":{},\"max_send_wait_ns\":{},\"first_send_ns\":{},\"last_send_ns\":{},\"delivery_late_ns\":{},\"max_delivery_late_ns\":{}}}",
         value.attempted_packets,
         value.attempted_bytes,
         value.serviced_packets,
@@ -1142,6 +1167,9 @@ fn counter_json(value: relay::Counters) -> String {
         value.max_accounted_packet,
         value.rate_violation_windows,
         value.max_window_excess_bytes,
+        value.send_rate_violation_windows,
+        value.max_send_window_excess_bytes,
+        value.max_send_window_ip_bytes,
         value.loss_draws,
         value.send_wait_ns,
         value.max_send_wait_ns,
@@ -1153,6 +1181,10 @@ fn counter_json(value: relay::Counters) -> String {
 }
 fn snapshot(id: &str, index: usize, state: &ClientState, started: Instant, event: &str) {
     let stats = state.stats.lock().unwrap();
+    let completion_histogram = &stats.completion_histogram;
+    let phase_coarse_records = &stats.phase_coarse_records;
+    let phase_detail_records = &stats.phase_detail_records;
+    let phase_payload_bytes = &stats.phase_payload_bytes;
     let relay_owned = state.relay.lock().unwrap();
     let relay = relay_owned.as_ref().map(|state| state.lock().unwrap());
     let up = relay
@@ -1170,7 +1202,7 @@ fn snapshot(id: &str, index: usize, state: &ClientState, started: Instant, event
         .as_ref()
         .map_or_else(|| "null".into(), |error| quote(error));
     emit(&format!(
-        "{{\"event\":{},\"run\":{},\"client\":{index},\"elapsed_ns\":{},\"authenticated\":{},\"closed\":{},\"records\":{},\"data\":{},\"empty\":{},\"absent\":{},\"reuse\":{},\"not_ready\":{},\"payload_bytes\":{},\"cache_hits\":{},\"inventory_records\":{},\"pending\":{},\"requested\":{},\"decode_ns\":{},\"persist_ns\":{},\"worker_queue_ns\":{},\"resume_ns\":{},\"catalogue_validation_ns\":{},\"completion_ns\":{},\"max_completion_ns\":{},\"first_coarse_ns\":{},\"first_detail_ns\":{},\"last_progress_ns\":{},\"max_pending_ns\":{},\"max_event_loop_late_ns\":{},\"phase_records\":[{},{},{}],\"validated_lanes\":{},\"phase_missing\":[{},{},{}],\"missing_pending\":{},\"plateau_missing_samples\":{},\"plateau_idle_samples\":{},\"trailing_records\":{},\"frontier_nodes\":{},\"failures\":{},\"failure\":{failure},\"rtt_ns\":{},\"cwnd\":{},\"lost_packets\":{},\"lost_bytes\":{},\"sent_packets\":{},\"quinn_udp_tx_bytes\":{},\"quinn_udp_rx_bytes\":{},\"up\":{up},\"down\":{down},\"relay_failure\":{relay_failure}}}",
+        "{{\"event\":{},\"run\":{},\"client\":{index},\"elapsed_ns\":{},\"authenticated\":{},\"closed\":{},\"records\":{},\"data\":{},\"empty\":{},\"absent\":{},\"reuse\":{},\"not_ready\":{},\"payload_bytes\":{},\"cache_hits\":{},\"inventory_records\":{},\"pending\":{},\"requested\":{},\"decode_ns\":{},\"persist_ns\":{},\"worker_queue_ns\":{},\"resume_ns\":{},\"catalogue_validation_ns\":{},\"completion_ns\":{},\"completion_histogram\":{completion_histogram:?},\"max_completion_ns\":{},\"first_coarse_ns\":{},\"first_detail_ns\":{},\"last_progress_ns\":{},\"max_pending_ns\":{},\"max_event_loop_late_ns\":{},\"phase_records\":[{},{},{}],\"phase_coarse_records\":{phase_coarse_records:?},\"phase_detail_records\":{phase_detail_records:?},\"phase_useful_payload_bytes\":{phase_payload_bytes:?},\"validated_lanes\":{},\"phase_missing\":[{},{},{}],\"missing_pending\":{},\"plateau_missing_samples\":{},\"plateau_idle_samples\":{},\"trailing_records\":{},\"frontier_nodes\":{},\"failures\":{},\"failure\":{failure},\"setup_rtt_ns\":{},\"rtt_ns\":{},\"cwnd\":{},\"lost_packets\":{},\"lost_bytes\":{},\"sent_packets\":{},\"quinn_udp_tx_bytes\":{},\"quinn_udp_rx_bytes\":{},\"up\":{up},\"down\":{down},\"relay_failure\":{relay_failure}}}",
         quote(event),
         quote(id),
         age_ns(started),
@@ -1212,6 +1244,7 @@ fn snapshot(id: &str, index: usize, state: &ClientState, started: Instant, event
         stats.trailing_records,
         stats.frontier_nodes,
         stats.failures,
+        stats.setup_rtt_ns,
         stats.rtt_ns,
         stats.cwnd,
         stats.lost_packets,
@@ -1252,6 +1285,15 @@ fn parse_anchors(path: &Path) -> Result<HashMap<usize, Anchor>> {
     Ok(anchors)
 }
 fn runner_arithmetic_check() -> Result<()> {
+    ensure!(
+        completion_bucket(0) == 0
+            && completion_bucket(1000) == 0
+            && completion_bucket(1001) == 1
+            && completion_bucket(2000) == 1
+            && completion_bucket(2001) == 2
+            && completion_bucket(u64::MAX) == 31,
+        "completion histogram boundaries"
+    );
     let anchor = Anchor {
         index: 0,
         dimension: "minecraft:overworld".into(),
@@ -1312,7 +1354,7 @@ fn unix_ms() -> Result<u64> {
         .try_into()?)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = HashMap::new();
     let mut input = std::env::args().skip(1);
@@ -1321,7 +1363,7 @@ async fn main() -> Result<()> {
             println!(
                 "Rust authenticated pressure clients. No Minecraft connection or world mutation.\n\
                 --server IP:PORT --cert DER --routes SECRET_TSV --locations TSV --cache OWNED_NEW_DIRECTORY --run-id ID\n\
-                [--clients 100 --duration 330 --plateau-seconds 240 --stop-unix-ms PRESSURE_CUTOFF --cleanup-unix-ms ORIGINAL_RUN_DEADLINE]\n\
+                [--clients 30 --duration 330 --plateau-seconds 240 --stop-unix-ms PRESSURE_CUTOFF --cleanup-unix-ms ORIGINAL_RUN_DEADLINE]\n\
                 [--rtt-ms 300 --loss-percent 10 --cap-kbps 1000 --seed 17]\n\
                 Use --clients 1 --plateau-seconds 10 --duration 30 for finite calibration; --rtt-ms 0 --loss-percent 0 for baseline.\n\
                 Secret TSV: zero-based index<TAB>token64. Location TSV: client<TAB>dimension<TAB>x<TAB>y<TAB>z.\n\
@@ -1377,8 +1419,8 @@ async fn main() -> Result<()> {
                 .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)),
         "invalid run ID"
     );
-    let clients: usize = number(&args, "clients", "100")?;
-    ensure!((1..=100).contains(&clients), "clients must be1..100");
+    let clients: usize = number(&args, "clients", "30")?;
+    ensure!((1..=30).contains(&clients), "clients must be1..30");
     let duration: u64 = number(&args, "duration", "330")?;
     let plateau_seconds: u64 = number(&args, "plateau-seconds", "240")?;
     ensure!(
@@ -1503,11 +1545,10 @@ async fn main() -> Result<()> {
         "cleanup deadline precedes pressure stop"
     );
     let cleanup_remaining = cleanup_ms.saturating_sub(unix_ms()?);
-    ensure!(
-        cleanup_remaining > 0 && cleanup_remaining <= 600_000,
-        "cleanup deadline must remain within the original finite600s experiment"
-    );
-    let cleanup_deadline = Instant::now() + Duration::from_millis(cleanup_remaining);
+    ensure!(cleanup_remaining > 0, "cleanup deadline already elapsed");
+    let cleanup_deadline = Instant::now()
+        .checked_add(Duration::from_millis(cleanup_remaining))
+        .context("cleanup deadline cannot be represented by the monotonic clock")?;
     let (stop_sender, stop) = watch::channel(false);
     let (phase_sender, phase) = watch::channel(None);
     let run = Run {
@@ -1562,8 +1603,13 @@ async fn main() -> Result<()> {
         let run = run.clone();
         tasks.spawn(async move { (index, client(run, anchor, route, state).await) });
     }
+    let completion_bounds = (0..31)
+        .map(|index| (1000_u64 << index).to_string())
+        .chain(std::iter::once("null".into()))
+        .collect::<Vec<_>>()
+        .join(",");
     emit(&format!(
-        "{{\"event\":\"run_started\",\"run\":{},\"clients\":{clients},\"rtt_ms\":{},\"loss_percent_per_direction\":{},\"full_duplex_cap_kbps\":{},\"seed\":{},\"external_stop_unix_ms\":{external_ms},\"external_cleanup_unix_ms\":{cleanup_ms},\"plateau_seconds\":{plateau_seconds},\"minecraft_connections\":0}}",
+        "{{\"event\":\"run_started\",\"run\":{},\"clients\":{clients},\"rtt_ms\":{},\"loss_percent_per_direction\":{},\"full_duplex_cap_kbps\":{},\"seed\":{},\"external_stop_unix_ms\":{external_ms},\"external_cleanup_unix_ms\":{cleanup_ms},\"plateau_seconds\":{plateau_seconds},\"minecraft_connections\":0,\"runtime\":\"current_thread\",\"completion_histogram_upper_bounds_ns\":[{completion_bounds}]}}",
         quote(&id),
         profile.delay.as_secs_f64() * 2000.0,
         profile.loss_percent,
@@ -1619,10 +1665,7 @@ async fn main() -> Result<()> {
     for (index, state) in states.iter().enumerate() {
         snapshot(&id, index, state, started, "client_final");
         let stats = state.stats.lock().unwrap();
-        if clients == 100
-            && completed_plateau
-            && stats.phase_missing.iter().any(|count| *count == 0)
-        {
+        if clients > 1 && completed_plateau && stats.phase_missing.iter().any(|count| *count == 0) {
             failure.get_or_insert(format!(
                 "client{index} did not continue missing DATA/EMPTY completions through each plateau phase"
             ));
@@ -1630,7 +1673,7 @@ async fn main() -> Result<()> {
         if let Some(error) = &stats.failure {
             failure.get_or_insert(format!("client{index}: {error}"));
         }
-        if clients == 100
+        if clients > 1
             && completed_plateau
             && (stats.plateau_missing_samples == 0 || stats.plateau_idle_samples != 0)
         {
@@ -1649,6 +1692,8 @@ async fn main() -> Result<()> {
             if relay.failure.is_some()
                 || relay.up.rate_violation_windows != 0
                 || relay.down.rate_violation_windows != 0
+                || relay.up.send_rate_violation_windows != 0
+                || relay.down.send_rate_violation_windows != 0
                 || relay.up.truncated != 0
                 || relay.down.truncated != 0
             {

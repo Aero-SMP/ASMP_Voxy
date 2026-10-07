@@ -1,8 +1,12 @@
-# Server bottleneck timings and 100 Rust clients: implementation and live-test plan
+# Server bottleneck timings and 30 Rust clients: implementation and live-test plan
 
-Status: plan only, written 2026-10-06. No instrumentation, builds, deployment,
-route registration, impairment or live pressure test was performed when writing
-this document.
+Written 2026-10-06; testing authorization updated 2026-10-07. Implementation and
+live-attempt evidence are recorded in the corresponding implementation results.
+The user now requests 30 virtual clients instead of 100, minimal generator CPU/RAM,
+per-core/per-thread CPU and detailed streaming diagnostics. The user explicitly
+removed all testing-duration and attempt limits and authorized
+continuation without repeated permission. This overrides the original single-clock
+rule. Failed attempts remain preserved; every owned attempt is cleaned before retry.
 
 Repository: `/home/aerosmp/Desktop/ASMP_Voxy_Cache_First_Updates`.
 Branch: `feature/cache-first-background-updates`.
@@ -12,13 +16,13 @@ the start of review. Recheck source and concurrent work before implementation.
 ## 1. Required outcome and scope
 
 First add and validate server timings that distinguish processing from waiting.
-Then run **100 simultaneous independent Rust clients against the live Testing
+Then run **30 simultaneous independent Rust clients against the live Testing
 Voxy QUIC server**, using its current authentication and terrain protocol. They
 do not connect to Minecraft, render terrain or create Minecraft players.
 
 | Property | Required profile |
 | --- | --- |
-| Concurrent fake clients | 100, with distinct authenticated routes and QUIC connections |
+| Concurrent fake clients | 30, with distinct authenticated routes and QUIC connections |
 | Ping | 300 ms unloaded round-trip target, approximately 150 ms each way |
 | Loss | Seeded independent 10% datagram loss in each direction |
 | Download ceiling | 1,000,000 bits/s per client, actual IP/UDP traffic including routing envelope, QUIC overhead and retransmissions |
@@ -31,7 +35,7 @@ Serialization, queueing, ACK delay and loss recovery can raise observed RTT abov
 loss fraction is statistical; 10% in each direction does not mean exactly 10% of
 round trips fail. These interpretations are explicit plan assumptions.
 
-This request re-enables the 100-client verification previously suspended in
+This request re-enables the 30-client verification previously suspended in
 `tools/LIVE_PRESSURE.md`. It does not re-enable artificial block-change pressure.
 No world generation, source-world edits, renderer changes, cache resets, protocol
 changes, new integration tests, arbitrary service budgets or production tuning.
@@ -46,8 +50,8 @@ this task to bypass that rejection.
 
 | Finding at the reviewed baseline | Consequence |
 | --- | --- |
-| `rust-server/src/live_pressure.rs:391-396` explicitly supports one registered route; `489-525` selects only five sections and can exit from a warm cache before connecting. | Extend the Rust runner into persistent independent clients with sustained useful demand. Do not treat 100 invocations of its current workload as acceptance. |
-| `rust-server/src/server.rs:1307-1314` replaces an authenticated connection on the same route. | Generate 100 distinct test-owned tokens; never copy the PC token. |
+| `rust-server/src/live_pressure.rs:391-396` explicitly supports one registered route; `489-525` selects only five sections and can exit from a warm cache before connecting. | Extend the Rust runner into persistent independent clients with sustained useful demand. Do not treat 30 invocations of its old workload as acceptance. |
+| `rust-server/src/server.rs:1307-1314` replaces an authenticated connection on the same route. | Generate 30 distinct test-owned tokens; never copy the PC token. |
 | `server/.../RustBackend.java:390-403` and native `server.rs:359-370` already own registration/revocation. | Register through the Java bridge, without tokenless admission or another writer to native stdin. |
 | `server.rs::send_claim`, starting at 1513, awaits preparation, catalogue announcement, body reading, admission and stream writing. | Measure these stages and their waits separately. |
 | `regional/runtime.rs::region` can reuse an active regional snapshot; a miss opens and validates its directory. `PreparedSection::body` reads compressed bytes and checks their CRC. | Count cache hits/misses; do not describe every request as rebuilding or recompressing terrain. |
@@ -98,7 +102,7 @@ cross-check. Linux distinguishes thread and process CPU clocks in its
 - Use fixed stage/histogram storage and existing interest/lane ownership. Avoid
   per-request maps, per-packet printing and allocations in timing updates. Keep
   detailed histograms global; per-session counts, totals and active ages establish
-  fairness without duplicating the entire histogram set 100 times.
+  fairness without duplicating the entire histogram set 30 times.
 - Snapshot each connection's Quinn RTT, congestion window, loss/congestion and
   UDP counters. Confirm field definitions against pinned Quinn `0.11.11` and
   quinn-proto `0.11.17` locally. The official
@@ -136,7 +140,7 @@ Build the affected normal/debug artifacts offline with the pinned dependencies.
 Perform focused arithmetic/ownership checks for timer termination, cancellation,
 histogram bounds, rate/loss accounting and cleanup; do not add or run integration
 tests. Validate actual stage emission and timing-on/off overhead on equivalent
-one-client live traffic before admitting 100 clients. Retain equal verbose-log
+one-client live traffic before admitting 30 clients. Retain equal verbose-log
 settings, workload and source/cache conditions; an inconclusive comparison is
 labelled as such, not reported as zero overhead. Reject missing stages, broken
 accounting, hot-path allocation/locking regressions or instrumentation that
@@ -144,10 +148,10 @@ materially changes the measured workload. Do not tune production scheduling here
 
 ## 4. Extend the Rust live runner
 
-Use the existing `live_pressure` binary, one shared async runtime and **100
+Use the existing `live_pressure` binary, one shared async runtime and **30
 independent client states**, each with its own token, Quinn endpoint/connection,
 protocol state and run-owned cache directory. Separate OS processes are not
-needed to exercise 100 server connections. Reuse the current codec, TLS certificate
+needed to exercise 30 server connections. Reuse the current codec, TLS certificate
 validation, routing envelope and section-integrity checks. Do not resurrect the
 old Python pressure protocol or add a Minecraft dependency to the clients.
 
@@ -155,7 +159,7 @@ old Python pressure protocol or add a Minecraft dependency to the clients.
 
 Add debug-only, privileged run start/status/stop operations to the existing
 server test harness. Bind the route registry to one run ID and external deadline;
-reject conflicting live ownership. Register 100 random nonzero tokens through
+reject conflicting live ownership. Register 30 random nonzero tokens through
 `RustBackend.register(token, 1000)` and await each actual native-ready response.
 Use the same total-cap settings in each client's current-protocol bootstrap.
 
@@ -176,7 +180,7 @@ owned and untouched. No new public network admission/control endpoint is needed.
 
 ### 4.2 Sustained terrain workload
 
-Derive 100 distinct populated anchors from the current manifest/world identities,
+Derive 30 distinct populated anchors from the current manifest/world identities,
 border and saved Anvil location tables. Avoid unsupported/out-of-border terrain
 and empty-only points. Save anchors and workload seed in the run manifest. Use
 the active overworld first; no Minecraft teleport is needed for virtual clients.
@@ -188,10 +192,10 @@ Replenish completed desires through the existing request-window behavior rather
 than a fabricated sections-per-second throttle. Do not keep an unbounded pending
 world list or rescan/sort the whole world on every completion.
 
-Keep all 100 connections alive through deterministic changing-view/movement and
+Keep all 30 connections alive through deterministic changing-view/movement and
 warm-revisit phases. Keep actual missing demand available while cached sections
 use local data and correct HAVE/REUSE behavior. Warm cache must not bypass QUIC
-connection establishment or quietly turn the pressure plateau into 100 idle
+connection establishment or quietly turn the pressure plateau into 30 idle
 sessions. Distinct starting areas exercise spatially distributed work; deliberate
 later overlap can expose shared catalogue/build reuse and must be labelled.
 
@@ -249,7 +253,7 @@ actual send timestamps. Verify seeded decisions exactly and report observed loss
 with sample counts/statistical uncertainty. Reconcile final packet/byte totals,
 including packets abandoned during cleanup. Check the rate ceiling per client
 over measured windows, allowing only the disclosed indivisible-datagram boundary
-and measured clock precision. An aggregate 100 Mbps check is insufficient.
+and measured clock precision. An aggregate 30 Mbps check is insufficient.
 
 If the relay cannot preserve delay/rate/loss fidelity under load, mark the run
 inconclusive. Do not quietly substitute application sleeps, drop decoded sections
@@ -281,29 +285,32 @@ Keep the native external ceiling **999,997,440 bytes, swap disabled**, and Java
 introduce new runtime memory/CPU/send budgets. Observe native cgroup current/peak,
 events/OOM deltas, RSS, CPU, file I/O, PSI, Java heap/RSS/GC, and host available
 memory throughout. The Rust generator/relays run outside the native server cgroup;
-report their resource use and same-host contention, too. The 100 download caps
-allow at most 100 Mbps combined accounted traffic; useful goodput will be lower
+report their resource use and same-host contention, too. The 30 download caps
+allow at most 30 Mbps combined accounted traffic; useful goodput will be lower
 because of loss and overhead. Real-PC traffic is separate.
 
-Use one externally enforced **600 s live-test clock with a 180 s restoration
-reserve**. This is an experiment duration, not a service work budget. All live
-calibration, timing overhead observations, registration, handshakes, pressure,
-stream drain and restoration share this non-resettable clock. Build/preparation
-happens beforehand. A proposed schedule is:
+There is **no overall testing-time or attempt limit**. Continue calibration,
+diagnosis and corrected attempts without asking for renewed permission. Each
+owned load invocation still has a finite externally enforced shutdown deadline
+and reserved cleanup time so an abandoned operator cannot strand load or routes.
+Choose that watchdog to accommodate the workload; it is not a project-wide test
+budget or a service work budget. Do not reset an activated attempt's deadline or
+conceal its failure: clean it, close its lease truthfully and prepare a new attempt.
+Build/preparation happens beforehand. An illustrative successful sequence is:
 
 | Relative time | Operation |
 | --- | --- |
 | 0-60 s | One-client profile/timing checks and PC baseline; fail early if diagnostics or impairment are invalid. |
-| 60-150 s | Register/ramp to 100 distinct authenticated sessions and prove server/client agreement. |
-| 150-390 s | Hold all 100: cold coverage 90 s, finer detail/changing anchors 90 s, warm revisit with continuing missing demand 60 s. Capture PC telemetry/screenshots concurrently through existing authorized controls. |
+| 60-150 s | Register/ramp to 30 distinct authenticated sessions and prove server/client agreement. |
+| 150-390 s | Hold all 30: cold coverage 90 s, finer detail/changing anchors 90 s, warm revisit with continuing missing demand 60 s. Capture PC telemetry/screenshots concurrently through existing authorized controls. |
 | 390-420 s | Freeze new work, capture final counters, begin close/revocation. |
-| 420-600 s | Restore and verify; this period permits cleanup only. |
+| After load | Restore and verify before releasing ownership or retrying. |
 
-Earlier phases consuming extra time do not shift the reserve or create another
-clock. Require the full 240 s plateau; insufficient time/session loss means
-incomplete verification, not a shorter passing run. Any fault/resource-exhaustion
-signal stops new pressure and triggers cleanup. Stop the test-owned load first;
-never kill unrelated processes or raise the existing hard ceiling to finish.
+Require the full 240 s plateau for a passing 30-client result; insufficient time or
+session loss means incomplete verification, not a shorter passing run. Correct
+the cause and retry after verified cleanup. Any fault/resource-exhaustion signal
+stops new pressure and triggers cleanup. Stop test-owned load first; never kill
+unrelated processes or raise the existing hard memory ceiling to finish.
 
 Keep both backup SSH connections alive before, during and after any scoped Testing
 restart and load. Use the independent operator/deadline guard for Rust client and
@@ -326,12 +333,12 @@ retain `cleanup_pending` and report the unresolved operation.
 
 ## 7. Acceptance and bottleneck report
 
-The run is valid only with independent server/client proof of **100 concurrently
+The run is valid only with independent server/client proof of **30 concurrently
 authenticated fake sessions for the entire 240 s plateau**, each following the
 verified profile, requesting useful missing terrain, receiving valid coarse
 terrain and continuing useful completions. Report counts/minimum concurrency,
 per-client useful throughput/latency distributions, the slowest clients, outstanding
-ages and any disconnects. Connecting 100 idle endpoints is not acceptance.
+ages and any disconnects. Connecting 30 idle endpoints is not acceptance.
 
 Require zero integrity/authentication/scope failures, no new OOM kills, unchanged
 hard limits, verified cleanup, preserved PC cache/settings and backup routes.
@@ -367,6 +374,51 @@ bottleneck. Propose fixes only after the measured report; do not combine unrelat
 optimizations with this instrumentation and verification task.
 
 Implementation deliverables: debug-only diagnostics and native packaging proof;
-reused Rust 100-client runner with owned datagram impairment; debug route ownership
+reused Rust 30-client runner with owned datagram impairment; debug route ownership
 and expiry; updated `tools/LIVE_PRESSURE.md`; external workload/run/evidence files;
 and a project-audit results document with a truthful PASS/FAIL/inconclusive outcome.
+
+
+## 8. Expanded30-player measurement scope
+
+Use30 independent Rust clients, without Minecraft/rendering, and spread their
+anchors across the full eligible square. Keep generator memory small through
+shared immutable metadata, one async I/O thread, reused decode scratch and fixed
+latency histograms. Decoding/persistence run outside the I/O event thread. Measure
+actual generator CPU/RSS and event-loop/relay lateness; do not infer lightness
+from the implementation or introduce CPU/memory work quotas.
+
+Collect one-second host logical-CPU time categories, socket/core/SMT topology,
+and native/Java/generator/observer process and thread utime/stime, keyed by stable
+PID/TID start identities. Report100% as one logical CPU and show average, sampled
+peak and per-thread totals. Host per-core load and process/thread CPU attribution
+are separate measurements. A thread's last scheduled CPU does not allocate its
+CPU time to that core. Exact process-by-core CPU needs scheduler tracing; report
+that unavailable if host permissions do not allow it without changing shared
+host policy. Include context switches, faults, cgroup throttling, PSI, host memory,
+RSS categories, process I/O, native current/peak/events, and actual Java heap/GC.
+Optional unexposed counters remain unavailable, not zero.
+
+For each client and cold/movement/warm phase collect validated DATA/EMPTY/REUSE,
+compressed payload and actual IP traffic, first coarse/detail latency, request
+completion count/sum/max and fixed-bin percentile bounds, continuing missing
+progress, outstanding ages, no-progress intervals, cache reuse and coverage/detail
+progress. Report slowest clients, distributions, fairness and aggregate useful
+throughput. Include RTT before application bootstrap versus loaded RTT, loss,
+retransmissions, congestion window, overhead ratio, bandwidth utilization,
+packet/byte reconciliation and service/send-completion window cap checks.
+
+Rank server request queues, executor queue/work/resume, catalogue waits/builds,
+body read/CRC, admission, stream backpressure, socket/pacer and shared build/
+publication CPU and wall time using same-epoch interval deltas. Show completed
+and still-active work; inclusive and overlapping stages are not additive latency.
+Distinguish constrained-link delivery from insufficient server throughput using
+per-client demand, backlog growth, useful completion, CPU/I/O stalls and generator
+headroom. A cap passing below1Mbps does not establish why it was underutilized.
+
+Use real-PC typed snapshots, debug logs and screenshots for separate rendering/
+client observations. Rust clients do not reproduce Java meshing, GPU upload or
+30 physical PCs. A successful sustained30-client run establishes capacity for
+this saved-terrain/profile/workload; it does not prove all production worlds,
+continuous block-change load, long-duration reliability or all client renderers.
+Do not label the server production-ready solely because the transport test passed.

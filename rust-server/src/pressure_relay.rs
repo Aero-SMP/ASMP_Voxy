@@ -39,6 +39,9 @@ pub struct Counters {
     pub max_accounted_packet: u64,
     pub rate_violation_windows: u64,
     pub max_window_excess_bytes: u64,
+    pub send_rate_violation_windows: u64,
+    pub max_send_window_excess_bytes: u64,
+    pub max_send_window_ip_bytes: u64,
     pub loss_draws: u64,
     pub send_wait_ns: u64,
     pub max_send_wait_ns: u64,
@@ -68,10 +71,29 @@ struct Direction {
     counters: Counters,
     window: VecDeque<(Instant, u64)>,
     window_bytes: u64,
+    send_window: VecDeque<(Instant, u64)>,
+    send_window_bytes: u64,
 }
 fn service_duration(bytes: u64, kbps: u64) -> Duration {
     // Ceil integer nanoseconds: never round a packet's serialization downward.
     Duration::from_nanos(((u128::from(bytes) * 8_000_000).div_ceil(u128::from(kbps))) as u64)
+}
+fn window_excess(
+    window: &mut VecDeque<(Instant, u64)>,
+    bytes: &mut u64,
+    now: Instant,
+    packet_bytes: u64,
+    allowance: u64,
+) -> u64 {
+    while window
+        .front()
+        .is_some_and(|(time, _)| now.duration_since(*time) >= Duration::from_secs(1))
+    {
+        *bytes -= window.pop_front().unwrap().1;
+    }
+    window.push_back((now, packet_bytes));
+    *bytes += packet_bytes;
+    bytes.saturating_sub(allowance)
 }
 impl Direction {
     fn new(profile: Profile, seed: u64) -> Self {
@@ -84,6 +106,8 @@ impl Direction {
             counters: Counters::default(),
             window: VecDeque::new(),
             window_bytes: 0,
+            send_window: VecDeque::new(),
+            send_window_bytes: 0,
         }
     }
     fn push(&mut self, payload: &[u8], now: Instant, ipv6: bool) {
@@ -138,23 +162,19 @@ impl Direction {
             self.counters.first_service_ns = stamp;
         }
         self.counters.last_service_ns = stamp;
-        // Sliding one-second actual-service check. Each packet is appended/removed once.
-        while self
-            .window
-            .front()
-            .is_some_and(|(time, _)| now.duration_since(*time) >= Duration::from_secs(1))
-        {
-            self.window_bytes -= self.window.pop_front().unwrap().1;
-        }
-        self.window.push_back((now, packet.accounted));
-        self.window_bytes += packet.accounted;
+        // Each packet is appended/removed once. Loss still consumes service capacity.
         let allowance = self.profile.kbps * 125 + self.counters.max_accounted_packet;
-        if self.window_bytes > allowance {
+        let excess = window_excess(
+            &mut self.window,
+            &mut self.window_bytes,
+            now,
+            packet.accounted,
+            allowance,
+        );
+        if excess > 0 {
             self.counters.rate_violation_windows += 1;
-            self.counters.max_window_excess_bytes = self
-                .counters
-                .max_window_excess_bytes
-                .max(self.window_bytes - allowance);
+            self.counters.max_window_excess_bytes =
+                self.counters.max_window_excess_bytes.max(excess);
         }
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
@@ -177,6 +197,23 @@ impl Direction {
         sent: bool,
     ) {
         if sent {
+            // Observe completed UDP sends independently of charged/drop service times.
+            let excess = window_excess(
+                &mut self.send_window,
+                &mut self.send_window_bytes,
+                actual,
+                packet.accounted,
+                self.profile.kbps * 125 + self.counters.max_accounted_packet,
+            );
+            self.counters.max_send_window_ip_bytes = self
+                .counters
+                .max_send_window_ip_bytes
+                .max(self.send_window_bytes);
+            if excess > 0 {
+                self.counters.send_rate_violation_windows += 1;
+                self.counters.max_send_window_excess_bytes =
+                    self.counters.max_send_window_excess_bytes.max(excess);
+            }
             let wait = actual
                 .saturating_duration_since(send_start)
                 .as_nanos()
@@ -358,15 +395,44 @@ pub fn arithmetic_check() -> Result<()> {
     }
     for index in 0..1000 {
         let time = origin + Duration::from_millis(160 + index * 10);
-        ensure!(
-            direction.take(time, origin).is_some(),
-            "FIFO service missed"
-        );
+        let (packet, dropped) = direction
+            .take(time, origin)
+            .context("FIFO service missed")?;
+        if !dropped {
+            direction.counters.delivered_packets += 1;
+            direction.counters.delivered_bytes += packet.accounted;
+        }
+        direction.finish_service(time, origin, time, &packet, !dropped);
     }
     ensure!(
         direction.counters.serviced_bytes == 1_250_000
-            && direction.counters.rate_violation_windows == 0,
+            && direction.counters.rate_violation_windows == 0
+            && direction.counters.send_rate_violation_windows == 0
+            && direction.counters.max_send_window_ip_bytes <= 126_250,
         "rate accounting"
+    );
+    let mut window = VecDeque::new();
+    let mut bytes = 0;
+    for _ in 0..101 {
+        ensure!(
+            window_excess(&mut window, &mut bytes, origin, 1250, 126_250) == 0,
+            "one-packet window allowance"
+        );
+    }
+    ensure!(
+        window_excess(&mut window, &mut bytes, origin, 1250, 126_250) == 1250,
+        "window excess accounting"
+    );
+    ensure!(
+        window_excess(
+            &mut window,
+            &mut bytes,
+            origin + Duration::from_secs(1),
+            1250,
+            126_250,
+        ) == 0
+            && bytes == 1250,
+        "window expiry boundary"
     );
     ensure!(
         direction.counters.dropped_packets > 50 && direction.counters.dropped_packets < 150,
