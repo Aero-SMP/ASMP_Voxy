@@ -290,7 +290,23 @@ impl ServerState {
                 && connection.stable_id() == session.id
             {
                 let stats = connection.stats();
+                let controller = connection.congestion_state();
+                let initial_window = controller.initial_window();
+                let metrics = controller.metrics();
+                let controller = controller.into_any();
+                let name = if controller.is::<quinn::congestion::Bbr>() {
+                    "bbr"
+                } else if controller.is::<quinn::congestion::Cubic>() {
+                    "cubic"
+                } else {
+                    "unknown"
+                };
                 record["quinn"] = serde_json::json!({"rtt_ns":stats.path.rtt.as_nanos() as u64,"cwnd":stats.path.cwnd,
+                    "controller":name,"initial_window_bytes":initial_window,"controller_pacing_rate_bps":metrics.pacing_rate,
+                    "controller_pacing_rate_definition":"controller_telemetry_only_not_independent_packet_pacing",
+                    "packet_pacing_definition":"quinn_1_25_times_cwnd_over_smoothed_rtt",
+                    "bytes_in_flight":null,"app_limited":null,"recovery_state":null,
+                    "unavailable_definition":"pinned_quinn_public_stats_do_not_expose_these_values",
                     "lost_packets":stats.path.lost_packets,"lost_bytes":stats.path.lost_bytes,"sent_packets":stats.path.sent_packets,
                     "congestion_events":stats.path.congestion_events,"udp_tx_bytes":stats.udp_tx.bytes,"udp_tx_datagrams":stats.udp_tx.datagrams,
                     "udp_rx_bytes":stats.udp_rx.bytes,"udp_rx_datagrams":stats.udp_rx.datagrams});
@@ -2340,6 +2356,10 @@ fn make_server_config(identity: &PersistentIdentity) -> Result<quinn::ServerConf
 
 fn make_transport_config() -> Result<Arc<quinn::TransportConfig>> {
     let mut transport = quinn::TransportConfig::default();
+    let mut controller = quinn::congestion::BbrConfig::default();
+    // Match the existing CUBIC startup flight for controller-only live comparisons.
+    controller.initial_window(12_000);
+    transport.congestion_controller_factory(Arc::new(controller));
     // Control, eight section lanes, and one low-priority discovery lane share this connection.
     transport.max_concurrent_bidi_streams(VarInt::from_u32(10));
     transport.max_concurrent_uni_streams(VarInt::from_u32(0));

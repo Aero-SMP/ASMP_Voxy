@@ -11,7 +11,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     task::{Context as PollContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -170,8 +173,79 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 fn emit(value: &str) {
-    println!("{value}");
-    let _ = std::io::stdout().flush();
+    if let Some(output) = OUTPUT.get() {
+        // The owned writer drains concurrently; filesystem waits never run on a QUIC driver.
+        let bytes = value.len() as u64;
+        let queued = OUTPUT_PENDING_BYTES
+            .fetch_add(bytes, Relaxed)
+            .saturating_add(bytes);
+        OUTPUT_PEAK_BYTES.fetch_max(queued, Relaxed);
+        if output.send(Output::Line(value.to_owned())).is_err() {
+            OUTPUT_PENDING_BYTES.fetch_sub(bytes, Relaxed);
+        }
+    } else {
+        println!("{value}");
+    }
+}
+enum Output {
+    Line(String),
+    Finish,
+}
+static OUTPUT: OnceLock<std::sync::mpsc::Sender<Output>> = OnceLock::new();
+static OUTPUT_PENDING_BYTES: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+struct OutputWriter {
+    thread: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+impl OutputWriter {
+    fn start() -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        ensure!(
+            OUTPUT.set(sender).is_ok(),
+            "output writer already initialized"
+        );
+        let thread = std::thread::Builder::new()
+            .name("voxy-pressure-output".into())
+            .spawn(move || {
+                let stdout = io::stdout();
+                let mut output = io::BufWriter::new(stdout.lock());
+                for message in receiver {
+                    match message {
+                        Output::Line(line) => {
+                            writeln!(output, "{line}")?;
+                            output.flush()?;
+                            OUTPUT_PENDING_BYTES.fetch_sub(line.len() as u64, Relaxed);
+                        }
+                        Output::Finish => break,
+                    }
+                }
+                output.flush()
+            })?;
+        Ok(Self {
+            thread: Some(thread),
+        })
+    }
+    fn finish(mut self) -> Result<()> {
+        if let Some(output) = OUTPUT.get() {
+            let _ = output.send(Output::Finish);
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("output thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+impl Drop for OutputWriter {
+    fn drop(&mut self) {
+        if let Some(output) = OUTPUT.get() {
+            let _ = output.send(Output::Finish);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn argument<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
@@ -447,6 +521,7 @@ struct Run {
     directory: Arc<PathBuf>,
     settings: StreamingSettings,
     profile: relay::Profile,
+    relay_runtime: tokio::runtime::Handle,
     phase: watch::Receiver<Option<Instant>>,
     stop: watch::Receiver<bool>,
     started: Instant,
@@ -670,7 +745,11 @@ async fn client(run: Run, anchor: Anchor, route: [u8; 32], owned: Arc<ClientStat
         ..run.profile
     };
     let (relay_stop, relay_stopping) = watch::channel(false);
-    let relay = relay::Relay::start(run.server, profile, relay_stopping).await?;
+    let server = run.server;
+    let relay = run
+        .relay_runtime
+        .spawn(relay::Relay::start(server, profile, relay_stopping))
+        .await??;
     *owned.relay.lock().unwrap() = Some(relay.stats.clone());
     emit(&format!(
         "{{\"event\":\"relay_bound\",\"run\":{},\"client\":{},\"front\":{},\"backend\":{},\"front_inode\":{},\"back_inode\":{}}}",
@@ -929,7 +1008,7 @@ async fn client(run: Run, anchor: Anchor, route: [u8; 32], owned: Arc<ClientStat
                 stats.sent_packets = quic.path.sent_packets;
                 stats.udp_tx = quic.udp_tx.bytes;
                 stats.udp_rx = quic.udp_rx.bytes;
-                // A 100ms pulse offers an explicit event-loop late-poll cross-check.
+                // This owner pulse includes awaited workers; relay-thread heartbeat measures timer fidelity.
                 stats.max_pending_ns = pending
                     .values()
                     .map(|value| age_ns(value.sent))
@@ -1145,7 +1224,7 @@ async fn client(run: Run, anchor: Anchor, route: [u8; 32], owned: Arc<ClientStat
 }
 fn counter_json(value: relay::Counters) -> String {
     format!(
-        "{{\"attempted_packets\":{},\"attempted_ip_bytes\":{},\"serviced_packets\":{},\"serviced_ip_bytes\":{},\"dropped_packets\":{},\"dropped_ip_bytes\":{},\"delivered_packets\":{},\"delivered_ip_bytes\":{},\"pending_packets\":{},\"pending_ip_bytes\":{},\"abandoned_packets\":{},\"abandoned_ip_bytes\":{},\"socket_errors\":{},\"truncated\":{},\"late_ns\":{},\"max_late_ns\":{},\"first_service_ns\":{},\"last_service_ns\":{},\"max_accounted_packet\":{},\"rate_violation_windows\":{},\"max_window_excess_bytes\":{},\"send_rate_violation_windows\":{},\"max_send_window_excess_bytes\":{},\"max_send_window_ip_bytes\":{},\"loss_draws\":{},\"send_wait_ns\":{},\"max_send_wait_ns\":{},\"first_send_ns\":{},\"last_send_ns\":{},\"delivery_late_ns\":{},\"max_delivery_late_ns\":{}}}",
+        "{{\"attempted_packets\":{},\"attempted_ip_bytes\":{},\"serviced_packets\":{},\"serviced_ip_bytes\":{},\"dropped_packets\":{},\"dropped_ip_bytes\":{},\"delivered_packets\":{},\"delivered_ip_bytes\":{},\"pending_packets\":{},\"pending_ip_bytes\":{},\"abandoned_packets\":{},\"abandoned_ip_bytes\":{},\"socket_errors\":{},\"truncated\":{},\"late_ns\":{},\"max_late_ns\":{},\"first_service_ns\":{},\"last_service_ns\":{},\"max_accounted_packet\":{},\"rate_violation_windows\":{},\"max_window_excess_bytes\":{},\"send_rate_violation_windows\":{},\"max_send_window_excess_bytes\":{},\"max_send_window_ip_bytes\":{},\"loss_draws\":{},\"send_wait_ns\":{},\"max_send_wait_ns\":{},\"first_send_ns\":{},\"last_send_ns\":{},\"delivery_late_ns\":{},\"max_delivery_late_ns\":{},\"service_lateness\":{},\"delivery_lateness\":{},\"send_wait\":{},\"queue_residence\":{}}}",
         value.attempted_packets,
         value.attempted_bytes,
         value.serviced_packets,
@@ -1176,7 +1255,17 @@ fn counter_json(value: relay::Counters) -> String {
         value.first_send_ns,
         value.last_send_ns,
         value.delivery_late_ns,
-        value.max_delivery_late_ns
+        value.max_delivery_late_ns,
+        timing_json(value.service_lateness),
+        timing_json(value.delivery_lateness),
+        timing_json(value.send_wait),
+        timing_json(value.queue_residence)
+    )
+}
+fn timing_json(value: relay::Timing) -> String {
+    format!(
+        "{{\"count\":{},\"sum_ns\":{},\"max_ns\":{},\"histogram\":{:?}}}",
+        value.count, value.sum_ns, value.max_ns, value.histogram
     )
 }
 fn snapshot(id: &str, index: usize, state: &ClientState, started: Instant, event: &str) {
@@ -1202,7 +1291,7 @@ fn snapshot(id: &str, index: usize, state: &ClientState, started: Instant, event
         .as_ref()
         .map_or_else(|| "null".into(), |error| quote(error));
     emit(&format!(
-        "{{\"event\":{},\"run\":{},\"client\":{index},\"elapsed_ns\":{},\"authenticated\":{},\"closed\":{},\"records\":{},\"data\":{},\"empty\":{},\"absent\":{},\"reuse\":{},\"not_ready\":{},\"payload_bytes\":{},\"cache_hits\":{},\"inventory_records\":{},\"pending\":{},\"requested\":{},\"decode_ns\":{},\"persist_ns\":{},\"worker_queue_ns\":{},\"resume_ns\":{},\"catalogue_validation_ns\":{},\"completion_ns\":{},\"completion_histogram\":{completion_histogram:?},\"max_completion_ns\":{},\"first_coarse_ns\":{},\"first_detail_ns\":{},\"last_progress_ns\":{},\"max_pending_ns\":{},\"max_event_loop_late_ns\":{},\"phase_records\":[{},{},{}],\"phase_coarse_records\":{phase_coarse_records:?},\"phase_detail_records\":{phase_detail_records:?},\"phase_useful_payload_bytes\":{phase_payload_bytes:?},\"validated_lanes\":{},\"phase_missing\":[{},{},{}],\"missing_pending\":{},\"plateau_missing_samples\":{},\"plateau_idle_samples\":{},\"trailing_records\":{},\"frontier_nodes\":{},\"failures\":{},\"failure\":{failure},\"setup_rtt_ns\":{},\"rtt_ns\":{},\"cwnd\":{},\"lost_packets\":{},\"lost_bytes\":{},\"sent_packets\":{},\"quinn_udp_tx_bytes\":{},\"quinn_udp_rx_bytes\":{},\"up\":{up},\"down\":{down},\"relay_failure\":{relay_failure}}}",
+        "{{\"event\":{},\"run\":{},\"client\":{index},\"elapsed_ns\":{},\"authenticated\":{},\"closed\":{},\"records\":{},\"data\":{},\"empty\":{},\"absent\":{},\"reuse\":{},\"not_ready\":{},\"payload_bytes\":{},\"cache_hits\":{},\"inventory_records\":{},\"pending\":{},\"requested\":{},\"decode_ns\":{},\"persist_ns\":{},\"worker_queue_ns\":{},\"resume_ns\":{},\"catalogue_validation_ns\":{},\"completion_ns\":{},\"completion_histogram\":{completion_histogram:?},\"max_completion_ns\":{},\"first_coarse_ns\":{},\"first_detail_ns\":{},\"last_progress_ns\":{},\"max_pending_ns\":{},\"max_client_progress_late_ns\":{},\"phase_records\":[{},{},{}],\"phase_coarse_records\":{phase_coarse_records:?},\"phase_detail_records\":{phase_detail_records:?},\"phase_useful_payload_bytes\":{phase_payload_bytes:?},\"validated_lanes\":{},\"phase_missing\":[{},{},{}],\"missing_pending\":{},\"plateau_missing_samples\":{},\"plateau_idle_samples\":{},\"trailing_records\":{},\"frontier_nodes\":{},\"failures\":{},\"failure\":{failure},\"setup_rtt_ns\":{},\"rtt_ns\":{},\"cwnd\":{},\"lost_packets\":{},\"lost_bytes\":{},\"sent_packets\":{},\"quinn_udp_tx_bytes\":{},\"quinn_udp_rx_bytes\":{},\"up\":{up},\"down\":{down},\"relay_failure\":{relay_failure}}}",
         quote(event),
         quote(id),
         age_ns(started),
@@ -1551,6 +1640,8 @@ async fn main() -> Result<()> {
         .context("cleanup deadline cannot be represented by the monotonic clock")?;
     let (stop_sender, stop) = watch::channel(false);
     let (phase_sender, phase) = watch::channel(None);
+    let output = OutputWriter::start()?;
+    let relays = relay::RelayRuntime::start()?;
     let run = Run {
         id: Arc::new(id.clone()),
         server,
@@ -1558,6 +1649,7 @@ async fn main() -> Result<()> {
         directory: Arc::new(directory),
         settings,
         profile,
+        relay_runtime: relays.handle.clone(),
         phase,
         stop,
         started,
@@ -1609,7 +1701,7 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     emit(&format!(
-        "{{\"event\":\"run_started\",\"run\":{},\"clients\":{clients},\"rtt_ms\":{},\"loss_percent_per_direction\":{},\"full_duplex_cap_kbps\":{},\"seed\":{},\"external_stop_unix_ms\":{external_ms},\"external_cleanup_unix_ms\":{cleanup_ms},\"plateau_seconds\":{plateau_seconds},\"minecraft_connections\":0,\"runtime\":\"current_thread\",\"completion_histogram_upper_bounds_ns\":[{completion_bounds}]}}",
+        "{{\"event\":\"run_started\",\"run\":{},\"clients\":{clients},\"rtt_ms\":{},\"loss_percent_per_direction\":{},\"full_duplex_cap_kbps\":{},\"seed\":{},\"external_stop_unix_ms\":{external_ms},\"external_cleanup_unix_ms\":{cleanup_ms},\"plateau_seconds\":{plateau_seconds},\"minecraft_connections\":0,\"runtime\":\"current_thread\",\"relay_runtime\":\"one_dedicated_current_thread\",\"output_writer\":\"dedicated_thread\",\"completion_histogram_upper_bounds_ns\":[{completion_bounds}],\"relay_histogram_upper_bounds_ns\":[{completion_bounds}]}}",
         quote(&id),
         profile.delay.as_secs_f64() * 2000.0,
         profile.loss_percent,
@@ -1631,6 +1723,9 @@ async fn main() -> Result<()> {
                 break;
             },
             _=pulse.tick()=>{
+                emit(&format!("{{\"event\":\"relay_heartbeat\",\"run\":{},\"elapsed_ns\":{},\"lateness\":{},\"output_pending_bytes\":{},\"output_peak_bytes\":{}}}",
+                    quote(&id),age_ns(started),timing_json(*relays.heartbeat.lock().unwrap()),
+                    OUTPUT_PENDING_BYTES.load(Relaxed),OUTPUT_PEAK_BYTES.load(Relaxed)));
                 let count=states.iter().filter(|state|state.stats.lock().unwrap().authenticated &&state.connection.lock().unwrap().as_ref().is_some_and(|connection|connection.close_reason().is_none())).count();
                 if count==clients && plateau.is_none(){let start=Instant::now();plateau=Some(start);phase_sender.send(Some(start))?;emit(&format!("{{\"event\":\"plateau_begin\",\"run\":{},\"clients\":{clients},\"elapsed_ns\":{}}}",quote(&id),age_ns(started)));}
                 if plateau.is_some(){minimum=minimum.min(count);if count!=clients{failure=Some("authenticated plateau concurrency dropped".into());break;}}
@@ -1701,6 +1796,15 @@ async fn main() -> Result<()> {
             }
         }
     }
+    emit(&format!(
+        "{{\"event\":\"relay_heartbeat_final\",\"run\":{},\"elapsed_ns\":{},\"lateness\":{}}}",
+        quote(&id),
+        age_ns(started),
+        timing_json(*relays.heartbeat.lock().unwrap())
+    ));
+    if let Err(error) = relays.finish() {
+        failure.get_or_insert(error.to_string());
+    }
     let success = completed_plateau && failure.is_none();
     emit(&format!(
         "{{\"event\":\"run_finished\",\"run\":{},\"clients\":{clients},\"full_plateau\":{completed_plateau},\"minimum_plateau\":{minimum},\"elapsed_ns\":{},\"technical_checks_passed\":{success},\"acceptance\":\"inconclusive\",\"acceptance_pending\":[\"profile_calibration\",\"native_route_and_shared_work_cleanup\",\"generator_fidelity_and_resources\",\"real_pc_and_backup_routes\"],\"profile_fidelity_verified\":false,\"failure\":{},\"route_cleanup_owner\":\"debug_java_and_external_operator\"}}",
@@ -1710,6 +1814,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .map_or_else(|| "null".into(), |error| quote(error))
     ));
+    output.finish()?;
     ensure!(
         success,
         "pressure run incomplete: {}",

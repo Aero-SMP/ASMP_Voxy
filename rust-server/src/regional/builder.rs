@@ -1,9 +1,10 @@
+use super::source::RegionContentTable;
 use super::{
     ChunkSourceRecord, RegionFile, RegionFileBuilder, RegionLayout, RegionSourceTable,
     SectionCoordinate, SectionFrame,
 };
 use crate::{
-    anvil::{AnvilWorld, RegionHeader},
+    anvil::{AnvilWorld, RegionHeader, RegionalReader},
     catalog::Catalog,
     key::SectionKey,
     lod::{Section, build_parent_from_refs},
@@ -32,6 +33,7 @@ pub struct RegionalBuildStats {
 pub struct RegionalBuild {
     pub terrain: Result<RegionFile>,
     pub source: RegionSourceTable,
+    pub(crate) content: RegionContentTable,
     pub stats: RegionalBuildStats,
 }
 
@@ -60,6 +62,8 @@ pub fn rebuild_region_incremental(
     source: &AnvilWorld,
     registry: &Arc<RwLock<Registry>>,
     header: &RegionHeader,
+    reader: &mut RegionalReader<'_>,
+    mut content: RegionContentTable,
     previous: &RegionFile,
     source_table: &RegionSourceTable,
     changed_groups: &BTreeSet<(i32, i32)>,
@@ -103,6 +107,7 @@ pub fn rebuild_region_incremental(
         for &(x, z) in &affected_horizontal[top as usize] {
             let column = rebuild_changed_column(
                 source,
+                reader,
                 registry,
                 previous,
                 &mut file,
@@ -139,8 +144,11 @@ pub fn rebuild_region_incremental(
             }
         }
 
+        reader.verify()?;
         verify_header(source, header)?;
-        publish(file, output.as_ref(), source_table.clone(), stats)
+        populate_content(&mut content, reader);
+        content.bind(world_identity, source_table);
+        publish(file, output.as_ref(), source_table.clone(), content, stats)
     })
 }
 
@@ -149,6 +157,7 @@ type SectionColumn = BTreeMap<i32, Section>;
 #[allow(clippy::too_many_arguments)]
 fn rebuild_changed_column(
     source: &AnvilWorld,
+    reader: &mut RegionalReader<'_>,
     registry: &Arc<RwLock<Registry>>,
     previous: &RegionFile,
     output: &mut RegionFileBuilder,
@@ -163,7 +172,7 @@ fn rebuild_changed_column(
         bail!("incremental rebuild descended into an unaffected column");
     }
     if level == 0 {
-        let group = source.load_level_zero_group(x, z, registry)?;
+        let group = reader.load_level_zero_group(x, z, registry)?;
         stats.chunks_read += 4;
         stats.generated_chunks += group.chunks.iter().filter(|chunk| chunk.is_some()).count();
         let mut sections = SectionColumn::new();
@@ -191,6 +200,7 @@ fn rebuild_changed_column(
             if affected[child_level as usize].contains(&coordinate) {
                 let child = rebuild_changed_column(
                     source,
+                    reader,
                     registry,
                     previous,
                     output,
@@ -308,6 +318,8 @@ pub fn rebuild_region(
             .region_z
             .checked_mul(16)
             .context("regional group z overflow")?;
+        let mut reader = source.regional_reader(header)?;
+        let mut content = RegionContentTable::new(world_identity, &source_table);
         let mut stats = RegionalBuildStats::default();
         let mut level = BTreeMap::<SectionKey, Section>::new();
 
@@ -320,7 +332,7 @@ pub fn rebuild_region(
                 let mut groups = Vec::with_capacity(4);
                 for dz in 0..2i32 {
                     for dx in 0..2i32 {
-                        let group = source.load_level_zero_group(
+                        let group = reader.load_level_zero_group(
                             first_group_x + dx,
                             first_group_z + dz,
                             registry,
@@ -430,15 +442,28 @@ pub fn rebuild_region(
 
         // Publication must describe one source snapshot. A changed marker/header aborts this bounded
         // transaction; the caller retries the region rather than publishing mixed old/new cells.
+        reader.verify()?;
         verify_header(source, header)?;
-        publish(file, output.as_ref(), source_table, stats)
+        populate_content(&mut content, &reader);
+        content.bind(world_identity, &source_table);
+        publish(file, output.as_ref(), source_table, content, stats)
     })
+}
+
+fn populate_content(content: &mut RegionContentTable, reader: &RegionalReader<'_>) {
+    for slot in 0..super::source::CHUNKS_PER_REGION {
+        if let Some(digest) = reader.content_digest(slot) {
+            content.set(slot, digest);
+            crate::diagnostics::count(crate::diagnostics::Counter::RawPopulated, 1);
+        }
+    }
 }
 
 fn publish(
     file: RegionFileBuilder,
     output: &Path,
     source: RegionSourceTable,
+    content: RegionContentTable,
     mut stats: RegionalBuildStats,
 ) -> Result<RegionalBuild> {
     let terrain = file.write_atomic(output).and_then(|region| {
@@ -454,6 +479,7 @@ fn publish(
     Ok(RegionalBuild {
         terrain,
         source,
+        content,
         stats,
     })
 }

@@ -56,6 +56,38 @@ pub enum Stage {
     DirtyCoalesce,
     SourceInspect,
     SourceTable,
+    SourceOpen,
+    SourceRecordRead,
+    RawHash,
+    SemanticInspect,
+    SemanticHash,
+    CellBuild,
+    SharedOpenWait,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum Counter {
+    SourceChunks,
+    RawBytes,
+    SourceOpens,
+    SourceReads,
+    ExternalOpens,
+    ExternalVerifications,
+    SemanticInspections,
+    MaterializedCells,
+    MaterializedBytes,
+    RawMatch,
+    RawMiss,
+    RawPopulated,
+    CompanionOwnerMismatch,
+    CompanionFallback,
+    CompanionBytesWritten,
+    SemanticEqual,
+    SemanticChanged,
+    OpenOwner,
+    OpenWaiter,
+    OpenFailure,
 }
 
 #[cfg(not(feature = "debug-diagnostics"))]
@@ -87,6 +119,9 @@ pub fn record(_: Stage, _: Duration, _: u64) {}
 #[cfg(not(feature = "debug-diagnostics"))]
 #[inline(always)]
 pub fn hit(_: usize) {}
+#[cfg(not(feature = "debug-diagnostics"))]
+#[inline(always)]
+pub fn count(_: Counter, _: u64) {}
 #[cfg(not(feature = "debug-diagnostics"))]
 #[inline(always)]
 pub fn quiet() -> bool {
@@ -135,18 +170,22 @@ pub async fn blocking<T: Send + 'static>(
 #[cfg(feature = "debug-diagnostics")]
 mod debug {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     };
     use std::time::Instant;
-    const N: usize = Stage::SourceTable as usize + 1;
+    const N: usize = Stage::SharedOpenWait as usize + 1;
+    const C: usize = Counter::OpenFailure as usize + 1;
     // Bin i covers elapsed <= 2^i microseconds; the last bin is open ended.
     const BINS: usize = 32;
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static QUIET: AtomicBool = AtomicBool::new(false);
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     static STAGES: [Metric; N] = [const { Metric::new() }; N];
+    static COUNTERS: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
     static HITS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
     pub const HIT_NAMES: [&str; 6] = [
         "snapshot_hit",
@@ -208,13 +247,96 @@ mod debug {
         "dirty_columns_coalesced",
         "source_inspect",
         "source_table_write",
+        "anvil_open",
+        "anvil_record_read",
+        "compressed_content_hash",
+        "semantic_inspect_inclusive",
+        "semantic_hash",
+        "materialize_cells",
+        "shared_generation_open_wait",
     ];
+    const COUNTER_NAMES: [&str; C] = [
+        "source_chunks",
+        "raw_bytes",
+        "source_opens",
+        "source_reads",
+        "external_opens",
+        "external_verifications",
+        "semantic_inspections",
+        "materialized_cells",
+        "materialized_bytes",
+        "raw_match",
+        "raw_miss",
+        "raw_populated",
+        "companion_owner_mismatch",
+        "companion_fallback",
+        "companion_bytes_written",
+        "semantic_equal",
+        "semantic_changed",
+        "open_owner",
+        "open_waiter",
+        "open_failure",
+    ];
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Allocations {
+        calls: u64,
+        bytes: u64,
+    }
+    thread_local! {
+        static ALLOCATIONS: Cell<Allocations> = const { Cell::new(Allocations { calls: 0, bytes: 0 }) };
+    }
+    struct MeasuredSystem;
+    #[cfg(not(test))]
+    #[global_allocator]
+    static ALLOCATOR: MeasuredSystem = MeasuredSystem;
+    fn allocated(bytes: usize) {
+        if enabled() {
+            let _ = ALLOCATIONS.try_with(|tally| {
+                let old = tally.get();
+                tally.set(Allocations {
+                    calls: old.calls.saturating_add(1),
+                    bytes: old.bytes.saturating_add(bytes as u64),
+                });
+            });
+        }
+    }
+    unsafe impl GlobalAlloc for MeasuredSystem {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                allocated(layout.size());
+            }
+            pointer
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                allocated(layout.size());
+            }
+            pointer
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let result = unsafe { System.realloc(pointer, layout, size) };
+            if !result.is_null() {
+                allocated(size.saturating_sub(layout.size()));
+            }
+            result
+        }
+    }
+    fn allocations() -> Allocations {
+        ALLOCATIONS.try_with(Cell::get).unwrap_or_default()
+    }
     struct Metric {
         count: AtomicU64,
         failed: AtomicU64,
         cancelled: AtomicU64,
         sum: AtomicU64,
         cpu: AtomicU64,
+        allocation_calls: AtomicU64,
+        allocated_bytes: AtomicU64,
         max: AtomicU64,
         bytes: AtomicU64,
         active: AtomicU64,
@@ -229,6 +351,8 @@ mod debug {
                 cancelled: AtomicU64::new(0),
                 sum: AtomicU64::new(0),
                 cpu: AtomicU64::new(0),
+                allocation_calls: AtomicU64::new(0),
+                allocated_bytes: AtomicU64::new(0),
                 max: AtomicU64::new(0),
                 bytes: AtomicU64::new(0),
                 active: AtomicU64::new(0),
@@ -270,6 +394,21 @@ mod debug {
     unsafe extern "C" {
         fn clock_gettime(clock: std::ffi::c_int, out: *mut Timespec) -> std::ffi::c_int;
     }
+    // CLOCK_MONOTONIC = 1, shared with the external operator's time.monotonic().
+    fn host_monotonic_ns() -> Option<u64> {
+        let mut time = Timespec { sec: 0, ns: 0 };
+        if unsafe { clock_gettime(1, &mut time) } != 0
+            || time.sec < 0
+            || !(0..1_000_000_000).contains(&time.ns)
+        {
+            return None;
+        }
+        Some(
+            (time.sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(time.ns as u64),
+        )
+    }
     fn thread_cpu() -> u64 {
         let mut time = Timespec { sec: 0, ns: 0 };
         if unsafe { clock_gettime(3, &mut time) } != 0 {
@@ -284,6 +423,7 @@ mod debug {
         stage: Stage,
         start: Option<Instant>,
         cpu: Option<(std::thread::ThreadId, u64)>,
+        allocations: Option<Allocations>,
         status: u8,
         bytes: u64,
     }
@@ -310,6 +450,7 @@ mod debug {
                 stage,
                 start,
                 cpu: (active && cpu).then(|| (std::thread::current().id(), thread_cpu())),
+                allocations: (active && cpu).then(allocations),
                 status: if cpu { 1 } else { 2 },
                 bytes: 0,
             }
@@ -331,6 +472,20 @@ mod debug {
                 .map_or(0, |(_, start)| thread_cpu().saturating_sub(start));
             let metric = &STAGES[self.stage as usize];
             metric.complete(nanos(start.elapsed()), cpu, self.bytes, self.status);
+            if self
+                .cpu
+                .is_some_and(|(id, _)| id == std::thread::current().id())
+            {
+                if let Some(start) = self.allocations {
+                    let end = allocations();
+                    metric
+                        .allocation_calls
+                        .fetch_add(end.calls.saturating_sub(start.calls), Relaxed);
+                    metric
+                        .allocated_bytes
+                        .fetch_add(end.bytes.saturating_sub(start.bytes), Relaxed);
+                }
+            }
             metric.active.fetch_sub(1, Relaxed);
         }
     }
@@ -356,13 +511,20 @@ mod debug {
             HITS[index].fetch_add(1, Relaxed);
         }
     }
+    pub fn count(counter: Counter, value: u64) {
+        if enabled() {
+            COUNTERS[counter as usize].fetch_add(value, Relaxed);
+        }
+    }
     pub fn snapshot() -> serde_json::Value {
+        let host_monotonic = host_monotonic_ns();
         let now = now_ns();
         let stages = STAGES.iter().enumerate().map(|(i,m)| {
             let oldest = m.oldest.load(Relaxed);
             let active=m.active.load(Relaxed);
             serde_json::json!({"stage":NAMES[i], "counter_unit":if i==Stage::DirtyCoalesce as usize{"dirty_columns"}else{"bytes"}, "count":m.count.load(Relaxed), "failed":m.failed.load(Relaxed),
                 "cancelled":m.cancelled.load(Relaxed), "wall_ns":m.sum.load(Relaxed), "thread_cpu_ns":m.cpu.load(Relaxed),
+                "allocation_calls":m.allocation_calls.load(Relaxed), "allocated_bytes":m.allocated_bytes.load(Relaxed),
                 "max_ns":m.max.load(Relaxed), "bytes":m.bytes.load(Relaxed), "active":active,
                 "active_age_upper_bound_ns":if active==0||oldest==0 {0}else{now.saturating_sub(oldest)},
                 "active_age_definition":"continuous_busy_epoch_upper_bound",
@@ -373,9 +535,20 @@ mod debug {
             .enumerate()
             .map(|(i, name)| ((*name).to_owned(), serde_json::json!(HITS[i].load(Relaxed))))
             .collect::<serde_json::Map<_, _>>();
-        serde_json::json!({"enabled":enabled(),"monotonic_ns":now,"inclusive_stages":true,
+        let counters = COUNTER_NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    (*name).to_owned(),
+                    serde_json::json!(COUNTERS[i].load(Relaxed)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::json!({"enabled":enabled(),"monotonic_ns":now,"host_monotonic_ns":host_monotonic,"inclusive_stages":true,
             "histogram_upper_bounds_ns":(0..BINS).map(|i|if i==BINS-1 {None}else{Some((1u64<<i)*1000)}).collect::<Vec<_>>(),
-            "hits":hits,"stages":stages})
+            "allocation_definition":"inclusive_same_thread_successful_alloc_and_positive_realloc_growth_no_frees",
+            "hits":hits,"counters":counters,"stages":stages})
     }
     /// Network-free arithmetic/ownership checks against the actual production probe helpers.
     pub fn self_check() -> anyhow::Result<serde_json::Value> {

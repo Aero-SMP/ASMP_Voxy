@@ -131,12 +131,8 @@ impl RegionSourceTable {
         hash.finalize().as_bytes()[..16].try_into().unwrap()
     }
 
-    pub fn write_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let parent = path
-            .parent()
-            .context("regional source file has no parent")?;
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    /// The single authoritative serialization also binds disposable acceleration data.
+    pub fn serialized_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(SOURCE_FILE_BYTES);
         bytes.extend_from_slice(SOURCE_MAGIC);
         bytes.extend_from_slice(&self.region_x.to_le_bytes());
@@ -153,6 +149,23 @@ impl RegionSourceTable {
         }
         bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
         debug_assert_eq!(bytes.len(), SOURCE_FILE_BYTES);
+
+        bytes
+    }
+
+    pub fn serialized_digest(&self) -> [u8; 32] {
+        // The parser validates all reserved bytes and record encodings, so this canonical
+        // serialization is identical to the exact validated file, including its checksums.
+        *blake3::hash(&self.serialized_bytes()).as_bytes()
+    }
+
+    pub fn write_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .context("regional source file has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let bytes = self.serialized_bytes();
 
         let temporary = temporary_path(path);
         let result = (|| -> Result<()> {
@@ -210,6 +223,174 @@ impl RegionSourceTable {
             bail!("regional source table generation zero is reserved");
         }
         Ok(table)
+    }
+}
+
+const CONTENT_MAGIC: &[u8; 8] = b"VXYCONT\0";
+const CONTENT_HEADER_BYTES: usize = 96;
+const CONTENT_BITS_BYTES: usize = CHUNKS_PER_REGION / 8;
+const CONTENT_FILE_BYTES: usize =
+    CONTENT_HEADER_BYTES + CONTENT_BITS_BYTES * 2 + CHUNKS_PER_REGION * 32 + 32;
+
+/// Optional, transaction-owned raw content identities; never terrain authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegionContentTable {
+    world: [u8; 32],
+    coordinate: (i32, i32),
+    generation: u64,
+    source_digest: [u8; 32],
+    populated: [u8; CONTENT_BITS_BYTES],
+    present: [u8; CONTENT_BITS_BYTES],
+    digests: Box<[[u8; 32]; CHUNKS_PER_REGION]>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentOwnerMismatch;
+impl std::fmt::Display for ContentOwnerMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("compressed-content companion owner mismatch")
+    }
+}
+impl std::error::Error for ContentOwnerMismatch {}
+
+impl RegionContentTable {
+    pub fn coordinate(&self) -> (i32, i32) {
+        self.coordinate
+    }
+    pub fn new(world: [u8; 32], source: &RegionSourceTable) -> Self {
+        let mut table = Self {
+            world,
+            coordinate: (0, 0),
+            generation: 0,
+            source_digest: [0; 32],
+            populated: [0; CONTENT_BITS_BYTES],
+            present: [0; CONTENT_BITS_BYTES],
+            digests: Box::new([[0; 32]; CHUNKS_PER_REGION]),
+        };
+        table.bind(world, source);
+        table
+    }
+
+    pub fn bind(&mut self, world: [u8; 32], source: &RegionSourceTable) {
+        self.world = world;
+        self.coordinate = (source.region_x, source.region_z);
+        self.generation = source.terrain_generation;
+        self.source_digest = source.serialized_digest();
+    }
+
+    pub fn matches(&self, slot: usize, digest: Option<[u8; 32]>) -> bool {
+        let bit = 1 << (slot % 8);
+        self.populated[slot / 8] & bit != 0
+            && (self.present[slot / 8] & bit != 0) == digest.is_some()
+            && digest.is_none_or(|digest| self.digests[slot] == digest)
+    }
+
+    pub fn set(&mut self, slot: usize, digest: Option<[u8; 32]>) {
+        let bit = 1 << (slot % 8);
+        self.populated[slot / 8] |= bit;
+        self.present[slot / 8] &= !bit;
+        self.digests[slot] = digest.unwrap_or([0; 32]);
+        if digest.is_some() {
+            self.present[slot / 8] |= bit;
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(CONTENT_FILE_BYTES);
+        bytes.extend_from_slice(CONTENT_MAGIC);
+        bytes.extend_from_slice(&self.world);
+        bytes.extend_from_slice(&self.coordinate.0.to_le_bytes());
+        bytes.extend_from_slice(&self.coordinate.1.to_le_bytes());
+        bytes.extend_from_slice(&self.generation.to_le_bytes());
+        bytes.extend_from_slice(&self.source_digest);
+        bytes.extend_from_slice(&(CHUNKS_PER_REGION as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&self.populated);
+        bytes.extend_from_slice(&self.present);
+        for digest in self.digests.iter() {
+            bytes.extend_from_slice(digest);
+        }
+        bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
+        bytes
+    }
+
+    pub fn open(path: &Path, world: [u8; 32], source: &RegionSourceTable) -> Result<Self> {
+        let file = File::open(path)?;
+        if file.metadata()?.len() != CONTENT_FILE_BYTES as u64 {
+            bail!("compressed-content companion length mismatch");
+        }
+        let mut bytes = vec![0; CONTENT_FILE_BYTES];
+        file.read_exact_at(&mut bytes, 0)?;
+        if &bytes[..8] != CONTENT_MAGIC
+            || bytes[92..96] != [0; 4]
+            || u32::from_le_bytes(bytes[88..92].try_into().unwrap()) as usize != CHUNKS_PER_REGION
+            || blake3::hash(&bytes[..CONTENT_FILE_BYTES - 32]).as_bytes()
+                != &bytes[CONTENT_FILE_BYTES - 32..]
+        {
+            bail!("compressed-content companion integrity mismatch");
+        }
+        let mut table = Self::new(world, source);
+        if bytes[8..40] != world
+            || bytes[40..44] != source.region_x.to_le_bytes()
+            || bytes[44..48] != source.region_z.to_le_bytes()
+            || bytes[48..56] != source.terrain_generation.to_le_bytes()
+            || bytes[56..88] != table.source_digest
+        {
+            return Err(ContentOwnerMismatch.into());
+        }
+        table
+            .populated
+            .copy_from_slice(&bytes[96..96 + CONTENT_BITS_BYTES]);
+        table
+            .present
+            .copy_from_slice(&bytes[96 + CONTENT_BITS_BYTES..96 + CONTENT_BITS_BYTES * 2]);
+        for slot in 0..CHUNKS_PER_REGION {
+            let bit = 1 << (slot % 8);
+            let present = table.present[slot / 8] & bit != 0;
+            let populated = table.populated[slot / 8] & bit != 0;
+            let offset = CONTENT_HEADER_BYTES + CONTENT_BITS_BYTES * 2 + slot * 32;
+            table.digests[slot].copy_from_slice(&bytes[offset..offset + 32]);
+            if (present && !populated) || (!present && table.digests[slot] != [0; 32]) {
+                bail!("compressed-content companion invalid presence");
+            }
+            if populated && present != source.records[slot].generated {
+                bail!("compressed-content companion presence differs from source owner");
+            }
+        }
+        Ok(table)
+    }
+
+    /// Losing this file loses only an optimization; authoritative fsyncs remain unchanged.
+    pub fn write_atomic(&self, path: &Path) -> Result<()> {
+        let bytes = self.bytes();
+        if let Ok(file) = File::open(path)
+            && file
+                .metadata()
+                .is_ok_and(|meta| meta.len() == bytes.len() as u64)
+        {
+            let mut old = vec![0; bytes.len()];
+            if file.read_exact_at(&mut old, 0).is_ok() && old == bytes {
+                return Ok(());
+            }
+        }
+        let temporary = temporary_path(path);
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            fs::rename(&temporary, path)?;
+            crate::diagnostics::count(
+                crate::diagnostics::Counter::CompanionBytesWritten,
+                bytes.len() as u64,
+            );
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 }
 

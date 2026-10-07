@@ -326,10 +326,14 @@ fn saved_lighting_updates_match_full_build_after_reopening_at_every_lod() {
         let full_time = start.elapsed();
         let table = RegionSourceTable::open(f.root.join("full.vxsource")).unwrap();
         let start = std::time::Instant::now();
+        let mut reader = f.source.regional_reader(&header).unwrap();
+        let content = super::source::RegionContentTable::new(world, &table);
         let incremental_build = rebuild_region_incremental(
             &f.source,
             &f.registry,
             &header,
+            &mut reader,
+            content,
             &previous,
             &table,
             &BTreeSet::from([(-16, -16)]),

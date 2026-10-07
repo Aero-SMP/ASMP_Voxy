@@ -7,7 +7,110 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::watch, task::JoinHandle};
+use tokio::{
+    net::UdpSocket,
+    sync::{oneshot, watch},
+    task::JoinHandle,
+};
+
+/// All impairment sockets/timers live on this one thread, away from client owners,
+/// output and blocking validation. The handle is shared by all virtual clients.
+pub struct RelayRuntime {
+    pub handle: tokio::runtime::Handle,
+    pub heartbeat: Arc<Mutex<Timing>>,
+    stop: Option<oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl RelayRuntime {
+    pub fn start() -> Result<Self> {
+        let (ready_send, ready_receive) = std::sync::mpsc::sync_channel(1);
+        let (stop, stopped) = oneshot::channel();
+        let heartbeat = Arc::new(Mutex::new(Timing::default()));
+        let observed = heartbeat.clone();
+        let thread =
+            std::thread::Builder::new()
+                .name("voxy-pressure-relay".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_send.send(Err(error));
+                            return;
+                        }
+                    };
+                    if ready_send.send(Ok(runtime.handle().clone())).is_err() {
+                        return;
+                    }
+                    runtime.block_on(async move {
+                        let mut stopped = stopped;
+                        let mut pulse = tokio::time::interval(Duration::from_millis(100));
+                        pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tokio::select! {
+                                _ = &mut stopped => break,
+                                scheduled = pulse.tick() => {
+                                    observed.lock().unwrap().record(
+                                        tokio::time::Instant::now().saturating_duration_since(scheduled));
+                                }
+                            }
+                        }
+                    });
+                })?;
+        let handle = ready_receive
+            .recv()
+            .context("relay runtime startup ended")??;
+        Ok(Self {
+            handle,
+            heartbeat,
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+    pub fn finish(mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("relay runtime thread panicked"))?;
+        }
+        Ok(())
+    }
+}
+impl Drop for RelayRuntime {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timing {
+    pub count: u64,
+    pub sum_ns: u64,
+    pub max_ns: u64,
+    /// Bin i has upper bound 1000*2^i ns; the last bin is open ended.
+    pub histogram: [u64; 32],
+}
+impl Timing {
+    fn record(&mut self, duration: Duration) {
+        let ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.count += 1;
+        self.sum_ns = self.sum_ns.saturating_add(ns);
+        self.max_ns = self.max_ns.max(ns);
+        let us = ns.div_ceil(1000).max(1);
+        let bucket = (64 - (us - 1).leading_zeros() as usize).min(31);
+        self.histogram[bucket] += 1;
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
@@ -49,6 +152,10 @@ pub struct Counters {
     pub last_send_ns: u64,
     pub delivery_late_ns: u64,
     pub max_delivery_late_ns: u64,
+    pub service_lateness: Timing,
+    pub delivery_lateness: Timing,
+    pub send_wait: Timing,
+    pub queue_residence: Timing,
 }
 #[derive(Debug, Default)]
 pub struct Stats {
@@ -153,6 +260,12 @@ impl Direction {
             .min(u64::MAX as u128) as u64;
         self.counters.late_ns += late;
         self.counters.max_late_ns = self.counters.max_late_ns.max(late);
+        self.counters
+            .service_lateness
+            .record(now.saturating_duration_since(due));
+        self.counters
+            .queue_residence
+            .record(now.saturating_duration_since(packet.arrived));
         self.counters.pending_packets -= 1;
         self.counters.pending_bytes -= packet.accounted;
         self.counters.serviced_packets += 1;
@@ -226,6 +339,12 @@ impl Direction {
             self.counters.max_send_wait_ns = self.counters.max_send_wait_ns.max(wait);
             self.counters.delivery_late_ns += late;
             self.counters.max_delivery_late_ns = self.counters.max_delivery_late_ns.max(late);
+            self.counters
+                .send_wait
+                .record(actual.saturating_duration_since(send_start));
+            self.counters
+                .delivery_lateness
+                .record(actual.saturating_duration_since(packet.due.unwrap()));
             let stamp = actual
                 .duration_since(origin)
                 .as_nanos()

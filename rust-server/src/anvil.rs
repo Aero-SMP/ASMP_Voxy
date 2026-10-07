@@ -1,8 +1,8 @@
 use crate::{
-    crc::xxh64,
+    crc::{Xxh64, xxh64},
+    diagnostics::{Counter, Stage},
     key::SectionKey,
     lod::{Cell, SECTION_VOLUME, Section, cell_index},
-    read_file_bounded,
     registry::Registry,
     write_lock,
 };
@@ -14,7 +14,8 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{Cursor, Read, Seek, SeekFrom},
+    io::{Cursor, Read},
+    os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -43,6 +44,29 @@ pub struct RegionHeader {
     pub region_z: i32,
     pub entries: Vec<RegionEntry>,
     pub file_marker: u64,
+    pub external_stamp: [u8; 16],
+    file_identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 /// Compact discovery metadata. Full headers and semantic source tables belong to one build.
@@ -50,6 +74,7 @@ pub struct RegionHeader {
 pub struct RegionAvailability {
     pub file_marker: u64,
     pub header_fingerprint: [u8; 16],
+    pub external_stamp: [u8; 16],
     pub saved: [u64; 16],
     pub readable: bool,
 }
@@ -68,6 +93,7 @@ impl RegionAvailability {
         Self {
             file_marker: header.file_marker,
             header_fingerprint: header_fingerprint(&header.entries),
+            external_stamp: header.external_stamp,
             saved,
             readable: true,
         }
@@ -182,6 +208,251 @@ struct BiomesNbt {
     data: Option<LongArray>,
 }
 
+/// One source snapshot owns its handle and all decode scratch. Loaded bytes cannot outlive
+/// a mutable borrow of this reader, so the next chunk cannot reset a live decoder's buffers.
+pub struct RegionalReader<'a> {
+    world: &'a AnvilWorld,
+    header: &'a RegionHeader,
+    file: File,
+    compressed: Vec<u8>,
+    decompressed: Vec<u8>,
+    content: Box<[Option<Option<[u8; 32]>>; 1024]>,
+    external: BTreeMap<usize, ExternalSource>,
+}
+
+struct ExternalSource {
+    path: PathBuf,
+    identity: FileIdentity,
+    kind: u8,
+    digest: [u8; 32],
+}
+
+pub struct SourceChunk<'a> {
+    x: i32,
+    z: i32,
+    sector: u32,
+    sectors: u8,
+    kind: u8,
+    compressed: &'a [u8],
+    decompressed: &'a mut Vec<u8>,
+    digest: [u8; 32],
+    default_sky_light: u8,
+}
+
+impl SourceChunk<'_> {
+    pub fn content_digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    fn source_fingerprint(&self) -> u64 {
+        fingerprint(self.sector, self.sectors, self.kind, self.compressed)
+    }
+
+    fn decompress(&mut self) -> Result<()> {
+        crate::diagnostics::sync_result(Stage::SourceDecode, || {
+            decompress_into(self.kind, self.compressed, self.decompressed)
+        })
+        .with_context(|| format!("decompress chunk ({},{})", self.x, self.z))
+    }
+
+    pub fn inspect(&mut self, registry: &Arc<RwLock<Registry>>) -> Result<TerrainFingerprint> {
+        self.decompress()?;
+        crate::diagnostics::count(Counter::SemanticInspections, 1);
+        crate::diagnostics::sync_result(Stage::SemanticInspect, || {
+            let chunk = NormalizedChunk::read(self.decompressed, registry)?;
+            chunk.check_coordinates(self.x, self.z)?;
+            let fingerprint = chunk.fingerprint(self.default_sky_light);
+            Ok(fingerprint)
+        })
+    }
+
+    pub fn decode(&mut self, registry: &Arc<RwLock<Registry>>) -> Result<ParsedChunk> {
+        self.decompress()?;
+        let mut chunk = parse_chunk(self.decompressed, registry, self.default_sky_light)?;
+        if chunk.x != self.x || chunk.z != self.z {
+            bail!(
+                "chunk coordinate mismatch: requested ({},{}), NBT says ({},{})",
+                self.x,
+                self.z,
+                chunk.x,
+                chunk.z
+            );
+        }
+        chunk.source_fingerprint = self.source_fingerprint();
+        Ok(chunk)
+    }
+}
+
+impl RegionalReader<'_> {
+    pub fn read_chunk(&mut self, x: i32, z: i32) -> Result<Option<SourceChunk<'_>>> {
+        if x.div_euclid(32) != self.header.region_x || z.div_euclid(32) != self.header.region_z {
+            bail!("chunk ({x},{z}) is outside its captured region");
+        }
+        crate::diagnostics::count(Counter::SourceChunks, 1);
+        let slot = (z.rem_euclid(32) * 32 + x.rem_euclid(32)) as usize;
+        let entry = self.header.entries[slot];
+        let sector = entry.location >> 8;
+        let sectors = (entry.location & 0xff) as usize;
+        if sector == 0 || sectors == 0 {
+            self.content[slot] = Some(None);
+            return Ok(None);
+        }
+        if sector < 2 {
+            bail!("chunk ({x},{z}) points inside its region header");
+        }
+        let reading = crate::diagnostics::Span::sync(Stage::SourceRead);
+        let record = crate::diagnostics::Span::sync(Stage::SourceRecordRead);
+        let mut prefix = [0u8; 5];
+        self.file
+            .read_exact_at(&mut prefix, u64::from(sector) * 4096)?;
+        let length = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as usize;
+        if length == 0 || length > sectors * 4096 - 4 || length > MAX_COMPRESSED_CHUNK {
+            bail!("chunk ({x},{z}) has invalid compressed length {length}");
+        }
+        let kind = prefix[4] & 0x7f;
+        if !(1..=4).contains(&kind) {
+            bail!("unsupported Anvil compression type {kind}");
+        }
+        let external = prefix[4] & 0x80 != 0;
+        let external_source = if external {
+            let path = self.world.region_dir().join(format!("c.{x}.{z}.mcc"));
+            let identity = read_external(&path, &mut self.compressed)?;
+            Some((path, identity))
+        } else {
+            self.compressed.resize(length - 1, 0);
+            self.file
+                .read_exact_at(&mut self.compressed, u64::from(sector) * 4096 + 5)?;
+            None
+        };
+        let count = self.compressed.len() as u64;
+        crate::diagnostics::count(Counter::SourceReads, 1);
+        record.finish(true, count);
+        reading.finish(true, count);
+        let hashing = crate::diagnostics::Span::sync(Stage::RawHash);
+        let digest = content_digest(kind, &self.compressed);
+        hashing.finish(true, count);
+        crate::diagnostics::count(Counter::RawBytes, count);
+        if let Some((path, identity)) = external_source {
+            if let Some(previous) = self.external.get(&slot)
+                && (previous.identity != identity
+                    || previous.digest != digest
+                    || previous.kind != kind)
+            {
+                bail!(
+                    "Anvil source snapshot changed: external chunk ({x},{z}) changed during reading"
+                );
+            }
+            self.external.insert(
+                slot,
+                ExternalSource {
+                    path,
+                    identity,
+                    kind,
+                    digest,
+                },
+            );
+        }
+        self.content[slot] = Some(Some(digest));
+        Ok(Some(SourceChunk {
+            x,
+            z,
+            sector,
+            sectors: sectors as u8,
+            kind,
+            compressed: &self.compressed,
+            decompressed: &mut self.decompressed,
+            digest,
+            default_sky_light: self.world.default_sky_light(),
+        }))
+    }
+
+    /// None means unread, Some(None) means observed absent, Some(Some(hash)) means present.
+    pub fn content_digest(&self, slot: usize) -> Option<Option<[u8; 32]>> {
+        self.content.get(slot).copied().flatten()
+    }
+
+    pub fn load_level_zero_group(
+        &mut self,
+        x: i32,
+        z: i32,
+        registry: &Arc<RwLock<Registry>>,
+    ) -> Result<LevelZeroGroup> {
+        let base_x = x.checked_mul(2).context("chunk-group x overflow")?;
+        let base_z = z.checked_mul(2).context("chunk-group z overflow")?;
+        let mut chunks = Vec::with_capacity(4);
+        for dz in 0..2 {
+            for dx in 0..2 {
+                let x = base_x.checked_add(dx).context("chunk x overflow")?;
+                let z = base_z.checked_add(dz).context("chunk z overflow")?;
+                chunks.push(match self.read_chunk(x, z)? {
+                    Some(mut source) => Some(source.decode(registry)?),
+                    None => None,
+                });
+            }
+        }
+        Ok(LevelZeroGroup { x, z, chunks })
+    }
+
+    /// Recheck separate external payloads as actual bytes; regional headers do not own them.
+    pub fn verify(&mut self) -> Result<()> {
+        for external in self.external.values() {
+            let identity = read_external(&external.path, &mut self.compressed)?;
+            let digest = content_digest(external.kind, &self.compressed);
+            crate::diagnostics::count(Counter::ExternalVerifications, 1);
+            if identity != external.identity || digest != external.digest {
+                bail!("Anvil source snapshot changed: external payload changed before publication");
+            }
+        }
+        if FileIdentity::from_metadata(&self.file.metadata()?) != self.header.file_identity
+            || FileIdentity::from_metadata(&fs::metadata(&self.header.path)?)
+                != self.header.file_identity
+        {
+            bail!("Anvil source snapshot changed: regional descriptor/path changed");
+        }
+        let current = self
+            .world
+            .region_header(self.header.region_x, self.header.region_z)?
+            .context("Anvil source snapshot changed: region vanished before publication")?;
+        if current.file_identity != self.header.file_identity
+            || current.entries != self.header.entries
+        {
+            bail!("Anvil source snapshot changed: regional header changed");
+        }
+        Ok(())
+    }
+}
+
+fn read_external(path: &Path, buffer: &mut Vec<u8>) -> Result<FileIdentity> {
+    let opening = crate::diagnostics::Span::sync(Stage::SourceOpen);
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    crate::diagnostics::count(Counter::ExternalOpens, 1);
+    let identity = FileIdentity::from_metadata(&file.metadata()?);
+    if identity.length > MAX_EXTERNAL_CHUNK as u64 {
+        bail!("external chunk exceeds {MAX_EXTERNAL_CHUNK} bytes");
+    }
+    if FileIdentity::from_metadata(&fs::metadata(path)?) != identity {
+        bail!("Anvil source snapshot changed: external file replaced before reading");
+    }
+    opening.finish(true, 0);
+    buffer.resize(identity.length as usize, 0);
+    file.read_exact_at(buffer, 0)?;
+    if FileIdentity::from_metadata(&file.metadata()?) != identity
+        || FileIdentity::from_metadata(&fs::metadata(path)?) != identity
+    {
+        bail!("Anvil source snapshot changed: external file changed during reading");
+    }
+    Ok(identity)
+}
+
+fn content_digest(kind: u8, bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"Voxy compressed Anvil content\0");
+    hash.update(&[kind]);
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+    *hash.finalize().as_bytes()
+}
+
 impl AnvilWorld {
     pub fn new(dimension: String, root: PathBuf) -> Self {
         Self { dimension, root }
@@ -202,6 +473,7 @@ impl AnvilWorld {
     pub fn region_headers(&self) -> Result<RegionHeaders> {
         let directory = self.region_dir();
         let mut out = RegionHeaders::default();
+        let mut external = BTreeMap::new();
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -219,6 +491,17 @@ impl AnvilWorld {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
+            if let Some((x, z)) = parse_external_filename(&path) {
+                add_external_stamp(
+                    external
+                        .entry((x.div_euclid(32), z.div_euclid(32)))
+                        .or_insert([0; 16]),
+                    x,
+                    z,
+                    &entry.metadata()?,
+                );
+                continue;
+            }
             let Some((x, z)) = parse_region_filename(&path) else {
                 continue;
             };
@@ -244,6 +527,12 @@ impl AnvilWorld {
                 }),
             }
         }
+        for header in &mut out.valid {
+            header.external_stamp = external
+                .get(&(header.region_x, header.region_z))
+                .copied()
+                .unwrap_or_default();
+        }
         out.valid
             .sort_unstable_by_key(|header| (header.region_x, header.region_z));
         out.failed
@@ -266,9 +555,21 @@ impl AnvilWorld {
             Err(error) => return Err(error).context("enumerate saved Anvil regions"),
         };
         let mut inventory = BTreeMap::new();
+        let mut external = BTreeMap::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
+            if let Some((x, z)) = parse_external_filename(&path) {
+                add_external_stamp(
+                    external
+                        .entry((x.div_euclid(32), z.div_euclid(32)))
+                        .or_insert([0; 16]),
+                    x,
+                    z,
+                    &entry.metadata()?,
+                );
+                continue;
+            }
             let Some(coordinate) = parse_region_filename(&path) else {
                 continue;
             };
@@ -291,12 +592,16 @@ impl AnvilWorld {
                     Err(_) => RegionAvailability {
                         file_marker: marker,
                         header_fingerprint: [0; 16],
+                        external_stamp: [0; 16],
                         saved: [0; 16],
                         readable: false,
                     },
                 }
             };
             inventory.insert(coordinate, availability);
+        }
+        for (coordinate, availability) in &mut inventory {
+            availability.external_stamp = external.get(coordinate).copied().unwrap_or_default();
         }
         Ok(inventory)
     }
@@ -330,160 +635,67 @@ impl AnvilWorld {
         }
     }
 
+    pub fn regional_reader<'a>(&'a self, header: &'a RegionHeader) -> Result<RegionalReader<'a>> {
+        if header.entries.len() != 1024
+            || header.path
+                != self
+                    .region_dir()
+                    .join(format!("r.{}.{}.mca", header.region_x, header.region_z))
+        {
+            bail!("regional reader header does not belong to this source");
+        }
+        let opening = crate::diagnostics::Span::sync(Stage::SourceOpen);
+        let file =
+            File::open(&header.path).with_context(|| format!("open {}", header.path.display()))?;
+        crate::diagnostics::count(Counter::SourceOpens, 1);
+        if FileIdentity::from_metadata(&file.metadata()?) != header.file_identity
+            || FileIdentity::from_metadata(&fs::metadata(&header.path)?) != header.file_identity
+        {
+            bail!("Anvil source snapshot changed: regional file changed before reading");
+        }
+        opening.finish(true, 0);
+        Ok(RegionalReader {
+            world: self,
+            header,
+            file,
+            compressed: Vec::new(),
+            decompressed: Vec::new(),
+            content: Box::new([None; 1024]),
+            external: BTreeMap::new(),
+        })
+    }
+
     pub fn read_chunk(
         &self,
-        chunk_x: i32,
-        chunk_z: i32,
+        x: i32,
+        z: i32,
         registry: &Arc<RwLock<Registry>>,
     ) -> Result<Option<ParsedChunk>> {
-        let reading = crate::diagnostics::Span::sync(crate::diagnostics::Stage::SourceRead);
-        let path = self.region_path(chunk_x, chunk_z);
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                reading.finish(true, 0);
-                return Ok(None);
-            }
-            Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
-        };
-        // Some pregenerators leave durable zero-byte placeholders. They are an unambiguous
-        // empty region snapshot; a later Anvil header changes both length and file marker.
-        if file.metadata()?.len() == 0 {
-            reading.finish(true, 0);
+        let Some(header) = self.region_header(x.div_euclid(32), z.div_euclid(32))? else {
             return Ok(None);
-        }
-        let index = (chunk_x.rem_euclid(32) + chunk_z.rem_euclid(32) * 32) as u64;
-        file.seek(SeekFrom::Start(index * 4))?;
-        let mut location = [0u8; 4];
-        file.read_exact(&mut location)?;
-        let sector = u32::from_be_bytes([0, location[0], location[1], location[2]]);
-        let sectors = location[3] as usize;
-        if sector == 0 || sectors == 0 {
-            reading.finish(true, 0);
-            return Ok(None);
-        }
-        if sector < 2 {
-            bail!("chunk ({chunk_x},{chunk_z}) points inside its region header");
-        }
-        file.seek(SeekFrom::Start(u64::from(sector) * 4096))?;
-        let mut length_bytes = [0u8; 4];
-        file.read_exact(&mut length_bytes)?;
-        let length = u32::from_be_bytes(length_bytes) as usize;
-        if length == 0 || length > sectors * 4096 - 4 || length > MAX_COMPRESSED_CHUNK {
-            bail!("chunk ({chunk_x},{chunk_z}) has invalid compressed length {length}");
-        }
-        let mut compression = [0u8; 1];
-        file.read_exact(&mut compression)?;
-        let external = compression[0] & 0x80 != 0;
-        let compression = compression[0] & 0x7f;
-        let compressed = if external {
-            read_file_bounded(
-                &self.region_dir().join(format!("c.{chunk_x}.{chunk_z}.mcc")),
-                MAX_EXTERNAL_CHUNK,
-            )?
-        } else {
-            let mut bytes = vec![0; length - 1];
-            file.read_exact(&mut bytes)?;
-            bytes
         };
-        let source_fingerprint = fingerprint(sector, sectors as u8, compression, &compressed);
-        reading.finish(true, compressed.len() as u64);
-        let nbt = crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceDecode, || {
-            decompress(compression, &compressed)
-        })
-        .with_context(|| {
-            format!(
-                "decompress chunk ({chunk_x},{chunk_z}) in {}",
-                path.display()
-            )
-        })?;
-        let mut chunk =
-            crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceNbt, || {
-                parse_chunk(&nbt, registry, self.default_sky_light())
-            })?;
-        if chunk.x != chunk_x || chunk.z != chunk_z {
-            bail!(
-                "chunk coordinate mismatch: requested ({chunk_x},{chunk_z}), NBT says ({},{})",
-                chunk.x,
-                chunk.z
-            );
-        }
-        chunk.source_fingerprint = source_fingerprint;
-        Ok(Some(chunk))
+        let mut reader = self.regional_reader(&header)?;
+        let chunk = match reader.read_chunk(x, z)? {
+            Some(mut source) => Some(source.decode(registry)?),
+            None => None,
+        };
+        reader.verify()?;
+        Ok(chunk)
     }
 
-    pub fn chunk_fingerprint(&self, chunk_x: i32, chunk_z: i32) -> Result<Option<u64>> {
-        let path = self.region_path(chunk_x, chunk_z);
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if file.metadata()?.len() == 0 {
+    pub fn chunk_fingerprint(&self, x: i32, z: i32) -> Result<Option<u64>> {
+        let Some(header) = self.region_header(x.div_euclid(32), z.div_euclid(32))? else {
             return Ok(None);
-        }
-        let index = (chunk_x.rem_euclid(32) + chunk_z.rem_euclid(32) * 32) as u64;
-        file.seek(SeekFrom::Start(index * 4))?;
-        let mut location = [0u8; 4];
-        file.read_exact(&mut location)?;
-        let sector = u32::from_be_bytes([0, location[0], location[1], location[2]]);
-        let sectors = location[3] as usize;
-        if sector == 0 || sectors == 0 {
-            return Ok(None);
-        }
-        if sector < 2 {
-            bail!("chunk ({chunk_x},{chunk_z}) points inside its region header");
-        }
-        file.seek(SeekFrom::Start(u64::from(sector) * 4096))?;
-        let mut length_bytes = [0; 4];
-        file.read_exact(&mut length_bytes)?;
-        let length = u32::from_be_bytes(length_bytes) as usize;
-        if length == 0 || length > sectors * 4096 - 4 || length > MAX_COMPRESSED_CHUNK {
-            bail!("invalid chunk length while fingerprinting");
-        }
-        let mut compression = [0];
-        file.read_exact(&mut compression)?;
-        let external = compression[0] & 0x80 != 0;
-        let kind = compression[0] & 0x7f;
-        let bytes = if external {
-            read_file_bounded(
-                &self.region_dir().join(format!("c.{chunk_x}.{chunk_z}.mcc")),
-                MAX_EXTERNAL_CHUNK,
-            )?
-        } else {
-            let mut bytes = vec![0; length - 1];
-            file.read_exact(&mut bytes)?;
-            bytes
         };
-        let limit = if external {
-            MAX_EXTERNAL_CHUNK
-        } else {
-            MAX_COMPRESSED_CHUNK
-        };
-        if bytes.len() > limit {
-            bail!("chunk exceeds compressed size limit while fingerprinting");
-        }
-        Ok(Some(fingerprint(sector, sectors as u8, kind, &bytes)))
+        let mut reader = self.regional_reader(&header)?;
+        let fingerprint = reader
+            .read_chunk(x, z)?
+            .map(|source| source.source_fingerprint());
+        reader.verify()?;
+        Ok(fingerprint)
     }
 
-    /// Reads every canonical compressed-chunk fingerprint from one already-snapshotted region
-    /// through a single file handle. Regional publication uses this compact source table
-    /// to distinguish the actually changed 2×2 chunk groups from unrelated region rewrites.
     pub fn region_fingerprints(&self, header: &RegionHeader) -> Result<Vec<Option<u64>>> {
-        if header.entries.len() != 1024 {
-            bail!("region fingerprint scan requires exactly 1024 header entries");
-        }
-        let expected_path = self
-            .region_dir()
-            .join(format!("r.{}.{}.mca", header.region_x, header.region_z));
-        if header.path != expected_path {
-            bail!("region fingerprint header path disagrees with its coordinates");
-        }
-        let mut file =
-            File::open(&header.path).with_context(|| format!("open {}", header.path.display()))?;
-        if region_file_marker(&file.metadata()?) != header.file_marker {
-            bail!("region changed before its fingerprint scan began");
-        }
         let base_x = header
             .region_x
             .checked_mul(32)
@@ -492,73 +704,44 @@ impl AnvilWorld {
             .region_z
             .checked_mul(32)
             .context("region chunk z overflow")?;
+        let mut reader = self.regional_reader(header)?;
         let mut output = Vec::with_capacity(1024);
-        for (slot, entry) in header.entries.iter().enumerate() {
-            let sector = entry.location >> 8;
-            let sectors = (entry.location & 0xff) as usize;
-            if sector == 0 || sectors == 0 {
-                output.push(None);
-                continue;
-            }
-            if sector < 2 {
-                bail!("region chunk entry points inside its header");
-            }
-            file.seek(SeekFrom::Start(u64::from(sector) * 4096))?;
-            let mut length_bytes = [0u8; 4];
-            file.read_exact(&mut length_bytes)?;
-            let length = u32::from_be_bytes(length_bytes) as usize;
-            if length == 0 || length > sectors * 4096 - 4 || length > MAX_COMPRESSED_CHUNK {
-                bail!("invalid compressed chunk length during region fingerprint scan");
-            }
-            let mut compression = [0u8; 1];
-            file.read_exact(&mut compression)?;
-            let external = compression[0] & 0x80 != 0;
-            let kind = compression[0] & 0x7f;
-            let chunk_x = base_x
-                .checked_add(slot as i32 & 31)
+        for slot in 0..1024 {
+            let x = base_x
+                .checked_add(slot & 31)
                 .context("region chunk x overflow")?;
-            let chunk_z = base_z
-                .checked_add(slot as i32 >> 5)
+            let z = base_z
+                .checked_add(slot >> 5)
                 .context("region chunk z overflow")?;
-            let bytes = if external {
-                read_file_bounded(
-                    &self.region_dir().join(format!("c.{chunk_x}.{chunk_z}.mcc")),
-                    MAX_EXTERNAL_CHUNK,
-                )?
-            } else {
-                let mut bytes = vec![0; length - 1];
-                file.read_exact(&mut bytes)?;
-                bytes
-            };
-            output.push(Some(fingerprint(sector, sectors as u8, kind, &bytes)));
+            output.push(
+                reader
+                    .read_chunk(x, z)?
+                    .map(|source| source.source_fingerprint()),
+            );
         }
-        if region_file_marker(&file.metadata()?) != header.file_marker {
-            bail!("region changed during its fingerprint scan");
-        }
+        reader.verify()?;
         Ok(output)
     }
 
     pub fn load_level_zero_group(
         &self,
-        group_x: i32,
-        group_z: i32,
+        x: i32,
+        z: i32,
         registry: &Arc<RwLock<Registry>>,
     ) -> Result<LevelZeroGroup> {
-        let base_chunk_x = group_x.checked_mul(2).context("chunk-group x overflow")?;
-        let base_chunk_z = group_z.checked_mul(2).context("chunk-group z overflow")?;
-        let mut chunks = Vec::with_capacity(4);
-        for dz in 0..2 {
-            for dx in 0..2 {
-                let x = base_chunk_x.checked_add(dx).context("chunk x overflow")?;
-                let z = base_chunk_z.checked_add(dz).context("chunk z overflow")?;
-                chunks.push(self.read_chunk(x, z, registry)?);
-            }
-        }
-        Ok(LevelZeroGroup {
-            x: group_x,
-            z: group_z,
-            chunks,
-        })
+        let base_x = x.checked_mul(2).context("chunk-group x overflow")?;
+        let base_z = z.checked_mul(2).context("chunk-group z overflow")?;
+        let Some(header) = self.region_header(base_x.div_euclid(32), base_z.div_euclid(32))? else {
+            return Ok(LevelZeroGroup {
+                x,
+                z,
+                chunks: vec![None; 4],
+            });
+        };
+        let mut reader = self.regional_reader(&header)?;
+        let group = reader.load_level_zero_group(x, z, registry)?;
+        reader.verify()?;
+        Ok(group)
     }
 
     pub fn verify_sources(&self, sources: &[(i32, i32, Option<u64>)]) -> Result<()> {
@@ -711,11 +894,17 @@ fn find_custom_dimensions(
 }
 
 fn read_region_header(path: &Path, region_x: i32, region_z: i32) -> Result<RegionHeader> {
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     let metadata = file.metadata()?;
+    let file_identity = FileIdentity::from_metadata(&metadata);
     let mut header = [0u8; REGION_HEADER_BYTES];
     if metadata.len() != 0 {
-        file.read_exact(&mut header)?;
+        file.read_exact_at(&mut header, 0)?;
+    }
+    if FileIdentity::from_metadata(&file.metadata()?) != file_identity
+        || FileIdentity::from_metadata(&fs::metadata(path)?) != file_identity
+    {
+        bail!("Anvil source snapshot changed: file changed while capturing its header");
     }
     let mut entries = Vec::with_capacity(1024);
     for index in 0..1024 {
@@ -732,7 +921,47 @@ fn read_region_header(path: &Path, region_x: i32, region_z: i32) -> Result<Regio
         region_z,
         entries,
         file_marker: region_file_marker(&metadata),
+        external_stamp: [0; 16],
+        file_identity,
     })
+}
+
+fn parse_external_filename(path: &Path) -> Option<(i32, i32)> {
+    let name = path.file_name()?.to_str()?;
+    let mut parts = name.split('.');
+    if parts.next()? != "c" {
+        return None;
+    }
+    let x: i32 = parts.next()?.parse().ok()?;
+    let z: i32 = parts.next()?.parse().ok()?;
+    if parts.next()? != "mcc" || parts.next().is_some() || name != format!("c.{x}.{z}.mcc") {
+        return None;
+    }
+    Some((x, z))
+}
+
+/// Commutative metadata aggregation keeps directory order irrelevant. This discovers changes;
+/// only subsequently read, verified content bytes may authorize semantic reuse.
+fn add_external_stamp(stamp: &mut [u8; 16], x: i32, z: i32, metadata: &fs::Metadata) {
+    let identity = FileIdentity::from_metadata(metadata);
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"Voxy external Anvil metadata\0");
+    hash.update(&x.to_le_bytes());
+    hash.update(&z.to_le_bytes());
+    for value in [
+        identity.device,
+        identity.inode,
+        identity.length,
+        identity.modified.0 as u64,
+        identity.modified.1 as u64,
+        identity.changed.0 as u64,
+        identity.changed.1 as u64,
+    ] {
+        hash.update(&value.to_le_bytes());
+    }
+    for (output, input) in stamp.iter_mut().zip(hash.finalize().as_bytes()) {
+        *output ^= input;
+    }
 }
 
 fn region_file_marker(metadata: &fs::Metadata) -> u64 {
@@ -763,7 +992,8 @@ fn region_is_representable(region_x: i32, region_z: i32) -> bool {
     (MIN_REGION..=MAX_REGION).contains(&region_x) && (MIN_REGION..=MAX_REGION).contains(&region_z)
 }
 
-fn decompress(kind: u8, compressed: &[u8]) -> Result<Vec<u8>> {
+fn decompress_into(kind: u8, compressed: &[u8], output: &mut Vec<u8>) -> Result<()> {
+    output.clear();
     let reader: Box<dyn Read> = match kind {
         1 => Box::new(GzDecoder::new(compressed)),
         2 => Box::new(ZlibDecoder::new(compressed)),
@@ -771,86 +1001,76 @@ fn decompress(kind: u8, compressed: &[u8]) -> Result<Vec<u8>> {
         4 => Box::new(Lz4BlockInput::new(compressed)),
         _ => bail!("unsupported Anvil compression type {kind}"),
     };
-    let mut output = Vec::new();
     reader
         .take(MAX_DECOMPRESSED_CHUNK + 1)
-        .read_to_end(&mut output)?;
+        .read_to_end(output)?;
     if output.len() as u64 > MAX_DECOMPRESSED_CHUNK {
         bail!("decompressed chunk exceeds {MAX_DECOMPRESSED_CHUNK} bytes");
     }
-    Ok(output)
+    Ok(())
 }
 
-fn parse_chunk(
-    bytes: &[u8],
-    registry: &Arc<RwLock<Registry>>,
-    default_sky_light: u8,
-) -> Result<ParsedChunk> {
-    let decoded: ChunkNbt = fastnbt::from_bytes(bytes).context("decode chunk NBT")?;
-    if decoded.status != "full" && decoded.status != "minecraft:full" {
-        // A valid in-progress Anvil chunk is a confirmed temporary absence, not corruption.
-        // Remembering its source fingerprint with an empty section set prevents a pregenerator
-        // from forcing the same decompression and error log every poll; a later save changes the
-        return Ok(ParsedChunk {
-            x: decoded.x,
-            z: decoded.z,
-            sections: BTreeMap::new(),
-            source_fingerprint: 0,
-            terrain_fingerprint: terrain_fingerprint(&BTreeMap::new()),
-        });
-    }
-    let mut sections = BTreeMap::new();
-    for section in decoded.sections {
-        let (block_names, block_data) = if let Some(block_states) = &section.block_states {
-            if block_states.palette.is_empty() || block_states.palette.len() > 4096 {
+struct NormalizedSection {
+    nbt: SectionNbt,
+    blocks: Vec<u32>,
+    biomes: Vec<u32>,
+    block_layout: PackedPalette,
+    biome_layout: PackedPalette,
+}
+
+impl NormalizedSection {
+    fn prepare(nbt: SectionNbt, registry: &Arc<RwLock<Registry>>) -> Result<Self> {
+        let (names, data) = if let Some(states) = &nbt.block_states {
+            if states.palette.is_empty() || states.palette.len() > 4096 {
                 bail!(
                     "section {} block palette has invalid size {}",
-                    section.y,
-                    block_states.palette.len()
+                    nbt.y,
+                    states.palette.len()
                 );
             }
             (
-                block_states
+                states
                     .palette
                     .iter()
                     .map(canonical_block_state)
                     .collect::<Vec<_>>(),
-                block_states.data.as_ref().map(|data| &data[..]),
+                states.data.as_ref().map(|data| &data[..]),
             )
         } else {
-            // Minecraft may retain only light/biome information for an all-air section.
             (vec!["minecraft:air".to_owned()], None)
         };
-        let biome_names = section
-            .biomes
-            .as_ref()
-            .map(|biomes| biomes.palette.clone())
-            .filter(|palette| !palette.is_empty())
-            .unwrap_or_else(|| vec!["minecraft:plains".to_owned()]);
+        let fallback;
+        let biome_names = match &nbt.biomes {
+            Some(biomes) if !biomes.palette.is_empty() => &biomes.palette[..],
+            _ => {
+                fallback = ["minecraft:plains".to_owned()];
+                &fallback[..]
+            }
+        };
         if biome_names.len() > 64 {
-            bail!("section {} biome palette exceeds 64 entries", section.y);
+            bail!("section {} biome palette exceeds 64 entries", nbt.y);
         }
-        if block_names
+        if names
             .iter()
             .chain(biome_names.iter())
             .any(|name| name.is_empty() || name.len() > 4096)
         {
             bail!(
                 "section {} contains an empty or overlong mapping name",
-                section.y
+                nbt.y
             );
         }
-        let biome_data = section
+        let biome_data = nbt
             .biomes
             .as_ref()
             .and_then(|biomes| biomes.data.as_ref())
             .map(|data| &data[..]);
-        // Validate packed cardinality and every index before mutating the durable registry.
-        let block_indexes = unpack_anvil_palette(block_data, block_names.len(), 4096, 4)?;
-        let biome_indexes = unpack_anvil_palette(biome_data, biome_names.len(), 64, 1)?;
-        let (block_ids, biome_ids) = {
+        // Cardinality and every packed index are validated before adding mapping IDs, as before.
+        let block_layout = PackedPalette::validate(data, names.len(), 4096, 4)?;
+        let biome_layout = PackedPalette::validate(biome_data, biome_names.len(), 64, 1)?;
+        let (blocks, biomes) = {
             let mut registry = write_lock(registry)?;
-            let blocks = block_names
+            let blocks = names
                 .iter()
                 .map(|name| registry.block_id(name))
                 .collect::<Result<Vec<_>>>()?;
@@ -860,77 +1080,216 @@ fn parse_chunk(
                 .collect::<Result<Vec<_>>>()?;
             (blocks, biomes)
         };
-        let block_light = section.block_light.as_ref().map(|data| &data[..]);
-        let sky_light = section.sky_light.as_ref().map(|data| &data[..]);
-        if block_light.as_ref().is_some_and(|data| data.len() != 2048)
-            || sky_light.as_ref().is_some_and(|data| data.len() != 2048)
+        if nbt
+            .block_light
+            .as_ref()
+            .is_some_and(|data| data.len() != 2048)
+            || nbt
+                .sky_light
+                .as_ref()
+                .is_some_and(|data| data.len() != 2048)
         {
-            bail!("section {} has a malformed light array", section.y);
+            bail!("section {} has a malformed light array", nbt.y);
         }
-        let mut cells = Vec::with_capacity(4096);
-        for index in 0..4096 {
-            let x = index & 15;
-            let z = (index >> 4) & 15;
-            let y = (index >> 8) & 15;
-            let biome_index = (x >> 2) | ((z >> 2) << 2) | ((y >> 2) << 4);
-            let block = block_ids[block_indexes[index]];
-            let biome = if block == 0 {
-                0
-            } else {
-                biome_ids[biome_indexes[biome_index]]
-            };
-            let block_value = nibble(block_light, index, 0);
-            let sky_value = nibble(sky_light, index, default_sky_light);
-            cells.push(Cell {
-                block,
-                biome,
-                light: (block_value << 4) | sky_value,
-            });
-        }
-        if sections
-            .insert(
-                section.y as i32,
-                ChunkSection {
-                    y: section.y as i32,
-                    cells,
-                },
-            )
-            .is_some()
-        {
-            bail!(
-                "chunk ({},{}) contains duplicate section Y {}",
-                decoded.x,
-                decoded.z,
-                section.y
-            );
+        Ok(Self {
+            nbt,
+            blocks,
+            biomes,
+            block_layout,
+            biome_layout,
+        })
+    }
+
+    fn cell(&self, index: usize, default_sky_light: u8) -> Cell {
+        let block_data = self
+            .nbt
+            .block_states
+            .as_ref()
+            .and_then(|states| states.data.as_ref())
+            .map(|data| &data[..]);
+        let biome_data = self
+            .nbt
+            .biomes
+            .as_ref()
+            .and_then(|biomes| biomes.data.as_ref())
+            .map(|data| &data[..]);
+        let biome_index =
+            ((index & 15) >> 2) | ((((index >> 4) & 15) >> 2) << 2) | (((index >> 8) >> 2) << 4);
+        let block = self.blocks[self.block_layout.index(block_data, index)];
+        let biome = if block == 0 {
+            0
+        } else {
+            self.biomes[self.biome_layout.index(biome_data, biome_index)]
+        };
+        let block_light = nibble(
+            self.nbt.block_light.as_ref().map(|data| &data[..]),
+            index,
+            0,
+        );
+        let sky_light = nibble(
+            self.nbt.sky_light.as_ref().map(|data| &data[..]),
+            index,
+            default_sky_light,
+        );
+        Cell {
+            block,
+            biome,
+            light: (block_light << 4) | sky_light,
         }
     }
-    let terrain_fingerprint = terrain_fingerprint(&sections);
-    Ok(ParsedChunk {
-        x: decoded.x,
-        z: decoded.z,
-        sections,
-        source_fingerprint: 0,
-        terrain_fingerprint,
-    })
 }
 
-/// Hashes only the normalized inputs consumed by LOD generation. Palette order, unrelated NBT,
-/// compression, and region-file placement have already disappeared at this boundary.
-fn terrain_fingerprint(sections: &BTreeMap<i32, ChunkSection>) -> TerrainFingerprint {
-    const SEED_A: u64 = 0x5658_5932_5445_5252;
-    const SEED_B: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut bytes = Vec::with_capacity(4 + sections.len() * (4 + 4096 * 9));
-    bytes.extend_from_slice(&(sections.len() as u32).to_le_bytes());
-    for (&y, section) in sections {
-        bytes.extend_from_slice(&y.to_le_bytes());
-        for cell in &section.cells {
-            bytes.extend_from_slice(&cell.block.to_le_bytes());
-            bytes.extend_from_slice(&cell.biome.to_le_bytes());
-            bytes.push(cell.light);
+struct NormalizedChunk {
+    x: i32,
+    z: i32,
+    sections: BTreeMap<i32, NormalizedSection>,
+}
+
+impl NormalizedChunk {
+    fn read(bytes: &[u8], registry: &Arc<RwLock<Registry>>) -> Result<Self> {
+        let decoded: ChunkNbt = crate::diagnostics::sync_result(Stage::SourceNbt, || {
+            fastnbt::from_bytes(bytes).context("decode chunk NBT")
+        })?;
+        let mut sections = BTreeMap::new();
+        if decoded.status == "full" || decoded.status == "minecraft:full" {
+            for section in decoded.sections {
+                let y = i32::from(section.y);
+                // Keep input registration order; BTreeMap supplies only the digest's sorted order.
+                let section = NormalizedSection::prepare(section, registry)?;
+                if sections.insert(y, section).is_some() {
+                    bail!(
+                        "chunk ({},{}) contains duplicate section Y {}",
+                        decoded.x,
+                        decoded.z,
+                        y
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            x: decoded.x,
+            z: decoded.z,
+            sections,
+        })
+    }
+
+    fn check_coordinates(&self, x: i32, z: i32) -> Result<()> {
+        if self.x != x || self.z != z {
+            bail!(
+                "chunk coordinate mismatch: requested ({x},{z}), NBT says ({},{})",
+                self.x,
+                self.z
+            );
+        }
+        Ok(())
+    }
+
+    fn fingerprint(&self, default_sky_light: u8) -> TerrainFingerprint {
+        let hashing = crate::diagnostics::Span::sync(Stage::SemanticHash);
+        let mut hash = TerrainHasher::new(self.sections.len());
+        for (&y, section) in &self.sections {
+            hash.section(
+                y,
+                (0..4096).map(|index| section.cell(index, default_sky_light)),
+            );
+        }
+        hashing.finish(true, self.sections.len() as u64 * 4096);
+        hash.finish()
+    }
+
+    fn materialize(self, default_sky_light: u8) -> ParsedChunk {
+        let building = crate::diagnostics::Span::sync(Stage::CellBuild);
+        let count = self.sections.len() as u64 * 4096;
+        let sections = self
+            .sections
+            .into_iter()
+            .map(|(y, section)| {
+                let cells = (0..4096)
+                    .map(|index| section.cell(index, default_sky_light))
+                    .collect();
+                (y, ChunkSection { y, cells })
+            })
+            .collect();
+        crate::diagnostics::count(Counter::MaterializedCells, count);
+        crate::diagnostics::count(
+            Counter::MaterializedBytes,
+            count * std::mem::size_of::<Cell>() as u64,
+        );
+        building.finish(true, count);
+        let terrain_fingerprint = terrain_fingerprint(&sections);
+        ParsedChunk {
+            x: self.x,
+            z: self.z,
+            sections,
+            source_fingerprint: 0,
+            terrain_fingerprint,
         }
     }
-    [xxh64(&bytes, SEED_A), xxh64(&bytes, SEED_B)]
+}
+
+fn parse_chunk(
+    bytes: &[u8],
+    registry: &Arc<RwLock<Registry>>,
+    default_sky_light: u8,
+) -> Result<ParsedChunk> {
+    let chunk = NormalizedChunk::read(bytes, registry)?;
+    Ok(chunk.materialize(default_sky_light))
+}
+
+const TERRAIN_SEED_A: u64 = 0x5658_5932_5445_5252;
+const TERRAIN_SEED_B: u64 = 0x9e37_79b9_7f4a_7c15;
+
+struct TerrainHasher {
+    hashes: [Xxh64; 2],
+}
+
+impl TerrainHasher {
+    fn new(count: usize) -> Self {
+        let mut hash = Self {
+            hashes: [Xxh64::new(TERRAIN_SEED_A), Xxh64::new(TERRAIN_SEED_B)],
+        };
+        hash.update(&(count as u32).to_le_bytes());
+        hash
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for hash in &mut self.hashes {
+            hash.update(bytes);
+        }
+    }
+
+    fn section(&mut self, y: i32, cells: impl Iterator<Item = Cell>) {
+        self.update(&y.to_le_bytes());
+        let mut bytes = [0u8; 32 * 9];
+        let mut count = 0;
+        for cell in cells {
+            let at = count * 9;
+            bytes[at..at + 4].copy_from_slice(&cell.block.to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&cell.biome.to_le_bytes());
+            bytes[at + 8] = cell.light;
+            count += 1;
+            if count == 32 {
+                self.update(&bytes);
+                count = 0;
+            }
+        }
+        self.update(&bytes[..count * 9]);
+    }
+
+    fn finish(self) -> TerrainFingerprint {
+        [self.hashes[0].finish(), self.hashes[1].finish()]
+    }
+}
+
+/// The digest byte order is shared by full decoding and semantic-only inspection.
+fn terrain_fingerprint(sections: &BTreeMap<i32, ChunkSection>) -> TerrainFingerprint {
+    let hashing = crate::diagnostics::Span::sync(Stage::SemanticHash);
+    let mut hash = TerrainHasher::new(sections.len());
+    for (&y, section) in sections {
+        hash.section(y, section.cells.iter().copied());
+    }
+    hashing.finish(true, sections.len() as u64 * 4096);
+    hash.finish()
 }
 
 fn canonical_block_state(entry: &BlockPaletteNbt) -> String {
@@ -946,45 +1305,78 @@ fn canonical_block_state(entry: &BlockPaletteNbt) -> String {
     format!("{}[{properties}]", entry.name)
 }
 
+#[derive(Clone, Copy)]
+struct PackedPalette {
+    per_long: usize,
+    bits: u8,
+    mask: u64,
+}
+
+impl PackedPalette {
+    fn validate(
+        data: Option<&[i64]>,
+        palette_len: usize,
+        count: usize,
+        minimum_bits: u8,
+    ) -> Result<Self> {
+        if palette_len == 0 {
+            bail!("empty Anvil palette");
+        }
+        if palette_len > count {
+            bail!("Anvil palette has {palette_len} entries for only {count} values");
+        }
+        if palette_len == 1 {
+            return Ok(Self {
+                per_long: 0,
+                bits: 0,
+                mask: 0,
+            });
+        }
+        let bits = minimum_bits.max((usize::BITS - (palette_len - 1).leading_zeros()) as u8);
+        if bits >= 64 {
+            bail!("Anvil palette needs unsupported {bits}-bit indexes");
+        }
+        let per_long = 64 / bits as usize;
+        let expected = count.div_ceil(per_long);
+        let values = data.context("multi-value palette is missing packed data")?;
+        if values.len() != expected {
+            bail!(
+                "packed palette has {} longs; expected exactly {expected}",
+                values.len()
+            );
+        }
+        let layout = Self {
+            per_long,
+            bits,
+            mask: (1u64 << bits) - 1,
+        };
+        for index in 0..count {
+            let value = layout.index(data, index);
+            if value >= palette_len {
+                bail!("packed palette index {value} exceeds {palette_len} entries");
+            }
+        }
+        Ok(layout)
+    }
+
+    fn index(self, data: Option<&[i64]>, index: usize) -> usize {
+        if self.per_long == 0 {
+            return 0;
+        }
+        ((data.expect("validated packed palette")[index / self.per_long] as u64
+            >> ((index % self.per_long) * self.bits as usize))
+            & self.mask) as usize
+    }
+}
+
 pub fn unpack_anvil_palette(
     data: Option<&[i64]>,
     palette_len: usize,
     count: usize,
     minimum_bits: u8,
 ) -> Result<Vec<usize>> {
-    if palette_len == 0 {
-        bail!("empty Anvil palette");
-    }
-    if palette_len > count {
-        bail!("Anvil palette has {palette_len} entries for only {count} values");
-    }
-    if palette_len == 1 {
-        return Ok(vec![0; count]);
-    }
-    let bits = minimum_bits.max((usize::BITS - (palette_len - 1).leading_zeros()) as u8);
-    if bits >= 64 {
-        bail!("Anvil palette needs unsupported {bits}-bit indexes");
-    }
-    let per_long = 64 / bits as usize;
-    let expected = count.div_ceil(per_long);
-    let data = data.context("multi-value palette is missing packed data")?;
-    if data.len() != expected {
-        bail!(
-            "packed palette has {} longs; expected exactly {expected}",
-            data.len()
-        );
-    }
-    let mask = (1u64 << bits) - 1;
-    let mut output = Vec::with_capacity(count);
-    for index in 0..count {
-        let value = ((data[index / per_long] as u64 >> ((index % per_long) * bits as usize)) & mask)
-            as usize;
-        if value >= palette_len {
-            bail!("packed palette index {value} exceeds {palette_len} entries");
-        }
-        output.push(value);
-    }
-    Ok(output)
+    let layout = PackedPalette::validate(data, palette_len, count, minimum_bits)?;
+    Ok((0..count).map(|index| layout.index(data, index)).collect())
 }
 
 fn fingerprint(sector: u32, sectors: u8, compression: u8, bytes: &[u8]) -> u64 {

@@ -1,9 +1,10 @@
+use super::source::{ContentOwnerMismatch, RegionContentTable};
 use super::{
     ChunkSourceRecord, RegionFile, RegionLayout, RegionSourceTable, rebuild_region,
     rebuild_region_incremental, wire::DEFAULT_UPDATE_INTERVAL_MILLIS,
 };
 use crate::{
-    anvil::{AnvilWorld, RegionAvailability, RegionHeader},
+    anvil::{AnvilWorld, RegionAvailability, RegionHeader, RegionalReader},
     read_lock,
     registry::Registry,
     safe_dimension_name, write_lock,
@@ -14,7 +15,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -53,6 +54,7 @@ pub struct RegionalRuntime {
     inventory_revision: AtomicU64,
     maintenance: Mutex<Maintenance>,
     priority: Mutex<PriorityRequests>,
+    openings: Mutex<BTreeMap<((i32, i32), u64), Arc<GenerationOpening>>>,
     dirty: Mutex<BTreeMap<(i32, i32), [u64; 16]>>,
     // Remains set after dirty bits are captured and after a failed transaction. Negative
     // answers must not mistake a temporarily empty dirty map for completed reconciliation.
@@ -71,8 +73,17 @@ struct SourceStamp {
     header: [u8; 16],
     reconciled: bool,
     saved: [u64; 16],
+    external_stamp: Option<[u8; 16]>,
 }
 impl SourceStamp {
+    fn external_matches(&self, stamp: [u8; 16]) -> bool {
+        self.external_stamp == Some(stamp) || (self.external_stamp.is_none() && stamp == [0; 16])
+    }
+    fn captured(table: &RegionSourceTable, header: &RegionHeader) -> Self {
+        let mut stamp = Self::from_table(table);
+        stamp.external_stamp = Some(header.external_stamp);
+        stamp
+    }
     fn from_table(table: &RegionSourceTable) -> Self {
         let mut saved = [0; 16];
         for z in 0..32 {
@@ -90,6 +101,7 @@ impl SourceStamp {
             header: table.header_fingerprint(),
             reconciled: table.reconciled,
             saved,
+            external_stamp: None,
         }
     }
 }
@@ -121,6 +133,67 @@ struct PriorityRequests {
     membership: BTreeSet<(i32, i32)>,
     subscriptions: BTreeMap<(i32, i32), usize>,
     active: BTreeMap<(i32, i32), Arc<RegionFile>>,
+}
+
+#[derive(Debug, Default)]
+struct GenerationOpening {
+    result: Mutex<Option<Result<Option<Arc<RegionFile>>, OpeningError>>>,
+    ready: Condvar,
+}
+
+#[derive(Clone, Debug)]
+struct OpeningError {
+    message: String,
+    unsafe_state: Option<&'static str>,
+}
+impl OpeningError {
+    fn error(self) -> anyhow::Error {
+        match self.unsafe_state {
+            Some(message) => anyhow::Error::new(crate::UnsafeState(message)).context(self.message),
+            None => anyhow::Error::msg(self.message),
+        }
+    }
+}
+
+/// All terminal paths, including an unwinding owner, settle and remove the flight.
+struct OpeningOwner<'a> {
+    runtime: &'a RegionalRuntime,
+    key: ((i32, i32), u64),
+    flight: Arc<GenerationOpening>,
+    settled: bool,
+}
+impl OpeningOwner<'_> {
+    fn settle(&mut self, result: Result<Option<Arc<RegionFile>>, OpeningError>) {
+        *self
+            .flight
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(result);
+        self.flight.ready.notify_all();
+        let mut openings = self
+            .runtime
+            .openings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if openings
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            openings.remove(&self.key);
+        }
+        self.settled = true;
+    }
+}
+impl Drop for OpeningOwner<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            crate::diagnostics::count(crate::diagnostics::Counter::OpenFailure, 1);
+            self.settle(Err(OpeningError {
+                message: "regional opening owner ended before completion".into(),
+                unsafe_state: None,
+            }));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +458,7 @@ impl RegionalRuntime {
             inventory_revision: AtomicU64::new(1),
             maintenance: Mutex::new(maintenance),
             priority: Mutex::new(PriorityRequests::default()),
+            openings: Mutex::new(BTreeMap::new()),
             dirty: Mutex::new(BTreeMap::new()),
             reconciling: Mutex::new(BTreeSet::new()),
             waiting_ready: Mutex::new(BTreeSet::new()),
@@ -475,6 +549,7 @@ impl RegionalRuntime {
                     && stamp.generation == generation
                     && stamp.marker == availability.file_marker
                     && stamp.header == availability.header_fingerprint
+                    && stamp.external_matches(availability.external_stamp)
             }))
     }
 
@@ -524,10 +599,12 @@ impl RegionalRuntime {
             && regions.get(&coordinate) == Some(&stamp.generation)
             && stamp.marker == availability.file_marker
             && stamp.header == availability.header_fingerprint
+            && stamp.external_matches(availability.external_stamp)
         {
             // A validated persisted table and the unchanged freshly read Anvil header agree.
             // Changed markers still require semantic reads, including missed saves on restart.
             stamp.reconciled = true;
+            stamp.external_stamp = Some(availability.external_stamp);
         }
         Ok(())
     }
@@ -586,29 +663,93 @@ impl RegionalRuntime {
             let Some(generation) = read_lock(&self.regions)?.get(&coordinate).copied() else {
                 return Ok(None);
             };
-            match self.open_generation(coordinate, generation) {
-                Ok(region) => {
-                    let region = Arc::new(region);
-                    let mut priority = self
-                        .priority
-                        .lock()
-                        .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?;
-                    if priority.subscriptions.contains_key(&coordinate) {
-                        priority.active.insert(coordinate, region.clone());
+            let key = (coordinate, generation);
+            let (flight, owner) = {
+                let mut openings = self
+                    .openings
+                    .lock()
+                    .map_err(|_| crate::UnsafeState("regional opening lock poisoned"))?;
+                match openings.get(&key) {
+                    Some(flight) => (flight.clone(), false),
+                    None => {
+                        let flight = Arc::new(GenerationOpening::default());
+                        openings.insert(key, flight.clone());
+                        (flight, true)
                     }
-                    Ok(Some(region))
                 }
-                Err(error) => {
-                    let removed = self.quarantine_generation(x, z, generation)?;
-                    if removed {
-                        eprintln!(
-                            "{}: quarantined damaged regional shard ({x},{z}) generation {generation} while opening it: {error:#}",
-                            self.dimension
-                        );
-                    }
-                    Ok(None)
+            };
+            if !owner {
+                crate::diagnostics::count(crate::diagnostics::Counter::OpenWaiter, 1);
+                let wait = crate::diagnostics::Span::new(crate::diagnostics::Stage::SharedOpenWait);
+                let mut result = flight
+                    .result
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                while result.is_none() {
+                    result = flight
+                        .ready
+                        .wait(result)
+                        .unwrap_or_else(|error| error.into_inner());
                 }
+                wait.finish(true, 0);
+                return result
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .map_err(OpeningError::error);
             }
+            crate::diagnostics::count(crate::diagnostics::Counter::OpenOwner, 1);
+            let mut owner = OpeningOwner {
+                runtime: self,
+                key,
+                flight,
+                settled: false,
+            };
+            let result = (|| -> Result<Option<Arc<RegionFile>>> {
+                match self.open_generation(coordinate, generation) {
+                    Ok(region) => {
+                        let region = Arc::new(region);
+                        // Keep generation metadata locked only across the short publication;
+                        // installation takes its write lock before the active-index lock.
+                        let generations = read_lock(&self.regions)?;
+                        let mut priority = self
+                            .priority
+                            .lock()
+                            .map_err(|_| crate::UnsafeState("regional priority lock poisoned"))?;
+                        if !self.retired.load(Ordering::Acquire)
+                            && generations.get(&coordinate) == Some(&generation)
+                            && priority.subscriptions.contains_key(&coordinate)
+                            && priority
+                                .active
+                                .get(&coordinate)
+                                .is_none_or(|active| active.generation() <= generation)
+                        {
+                            priority.active.insert(coordinate, region.clone());
+                        }
+                        Ok(Some(region))
+                    }
+                    Err(error) => {
+                        crate::diagnostics::count(crate::diagnostics::Counter::OpenFailure, 1);
+                        let removed = self.quarantine_generation(x, z, generation)?;
+                        if removed {
+                            eprintln!(
+                                "{}: quarantined damaged regional shard ({x},{z}) generation {generation} while opening it: {error:#}",
+                                self.dimension
+                            );
+                        }
+                        Ok(None)
+                    }
+                }
+            })();
+            owner.settle(result.as_ref().map(Clone::clone).map_err(|error| {
+                OpeningError {
+                    message: format!("{error:#}"),
+                    unsafe_state: error
+                        .downcast_ref::<crate::UnsafeState>()
+                        .map(|state| state.0),
+                }
+            }));
+            result
         })
     }
 
@@ -834,6 +975,7 @@ impl RegionalRuntime {
             .active
             .remove(&coordinate);
         remove_if_exists(&self.source_path(coordinate))?;
+        let _ = fs::remove_file(self.content_path(coordinate));
         self.prioritize_region(region_x, region_z)?;
         Ok(true)
     }
@@ -1019,7 +1161,15 @@ impl RegionalRuntime {
         for coordinate in dirty {
             // A save can create a region after the last directory snapshot. Read that one header.
             match self.source.region_header(coordinate.0, coordinate.1) {
-                Ok(Some(header)) => {
+                Ok(Some(mut header)) => {
+                    // External discovery belongs to the one inventory directory pass. A
+                    // dirty-slot header read preserves that stamp until the next pass.
+                    if let Some(availability) = read_lock(&self.inventory)?
+                        .as_ref()
+                        .and_then(|inventory| inventory.get(&coordinate))
+                    {
+                        header.external_stamp = availability.external_stamp;
+                    }
                     let availability = RegionAvailability::from_header(&header);
                     if let Some(inventory) = write_lock(&self.inventory)?.as_mut() {
                         let changed = !inventory
@@ -1155,6 +1305,7 @@ impl RegionalRuntime {
                     && source.generation == *generation
                     && source.marker == header.file_marker
                     && source.header == header.header_fingerprint
+                    && source.external_matches(header.external_stamp)
             })
         }))
     }
@@ -1203,7 +1354,9 @@ impl RegionalRuntime {
         #[cfg(test)]
         super::faults::hit("cleanup", &self.terrain_path(coordinate))?;
         remove_if_exists(&self.terrain_path(coordinate))?;
-        remove_if_exists(&self.source_path(coordinate))
+        remove_if_exists(&self.source_path(coordinate))?;
+        let _ = fs::remove_file(self.content_path(coordinate));
+        Ok(())
     }
 
     fn refresh_coordinate(
@@ -1217,12 +1370,24 @@ impl RegionalRuntime {
             use super::builder::{SourceChanged, UnusableBaseline, verify_header};
             #[cfg(test)]
             super::faults::hit("candidate", &self.terrain_path(coordinate))?;
-            let header =
+            let mut header =
                 crate::diagnostics::sync_result(crate::diagnostics::Stage::SourceInspect, || {
                     self.source.region_header(coordinate.0, coordinate.1)
                 })
                 .context("fresh candidate header")?
                 .ok_or(SourceChanged)?;
+            let external_stamp = read_lock(&self.inventory)?
+                .as_ref()
+                .and_then(|inventory| inventory.get(&coordinate))
+                .map(|availability| availability.external_stamp);
+            header.external_stamp = external_stamp.unwrap_or_default();
+            // A failed/unknown inventory cannot certify the absence of external edits.
+            let inspect_all = [u64::MAX; 16];
+            let forced = if external_stamp.is_some() {
+                forced
+            } else {
+                &inspect_all
+            };
 
             if let Some(retry) = maintenance.retry.get(&coordinate).copied()
                 && retry.kind == RetryKind::Reconcile
@@ -1310,10 +1475,12 @@ impl RegionalRuntime {
             if let (Some(region), Some(source)) = (&region, &stored)
                 && source.terrain_generation == region.generation()
                 && source.header_matches(&header.entries, header.file_marker)
+                && stamp.is_some_and(|stamp| stamp.external_matches(header.external_stamp))
                 && forced.iter().all(|bits| *bits == 0)
             {
                 if let Some(stamp) = write_lock(&self.sources)?.get_mut(&coordinate) {
                     stamp.reconciled = true;
+                    stamp.external_stamp = Some(header.external_stamp);
                 }
                 if !was_authoritative {
                     self.install(region.clone(), result)?;
@@ -1343,7 +1510,8 @@ impl RegionalRuntime {
                     })
                     .context("metadata-only sidecar")?;
                     write_lock(&self.sources)?
-                        .insert(coordinate, SourceStamp::from_table(&probe.table));
+                        .insert(coordinate, SourceStamp::captured(&probe.table, &header));
+                    self.publish_content(&probe.content);
                     result.metadata_only += 1;
                     crate::diagnostics::hit(4);
                     if !was_authoritative {
@@ -1367,10 +1535,12 @@ impl RegionalRuntime {
                 )
             };
             let attempted = match incremental {
-                Some(probe) => rebuild_region_incremental(
+                Some(mut probe) => rebuild_region_incremental(
                     &self.source,
                     &self.registry,
                     &header,
+                    &mut probe.reader,
+                    probe.content,
                     region.as_ref().unwrap(),
                     &probe.table,
                     &probe.changed_groups,
@@ -1438,7 +1608,9 @@ impl RegionalRuntime {
                 built.source.write_atomic(self.source_path(coordinate))
             })
             .context("source-table publication")?;
-            write_lock(&self.sources)?.insert(coordinate, SourceStamp::from_table(&built.source));
+            write_lock(&self.sources)?
+                .insert(coordinate, SourceStamp::captured(&built.source, &header));
+            self.publish_content(&built.content);
             Ok(())
         })
     }
@@ -1541,22 +1713,83 @@ impl RegionalRuntime {
 
     /// Reads only Anvil records whose header changed. Semantic changes identify the exact 2x2
     /// chunk groups whose LOD columns and ancestors need replacement.
-    fn probe_saved_changes(
-        &self,
-        header: &RegionHeader,
+    fn probe_saved_changes<'a>(
+        &'a self,
+        header: &'a RegionHeader,
         previous: &RegionSourceTable,
         generation: u64,
         forced: &[u64; 16],
-    ) -> Result<SavedChangeProbe> {
+    ) -> Result<SavedChangeProbe<'a>> {
         let mut updated = RegionSourceTable::new(
             header.region_x,
             header.region_z,
             generation,
             header.file_marker,
         )?;
+        let coordinate = (header.region_x, header.region_z);
+        let prior_external = read_lock(&self.sources)?
+            .get(&coordinate)
+            .is_some_and(|stamp| stamp.external_matches(header.external_stamp));
+        #[cfg(feature = "debug-diagnostics")]
+        let observe_companion = |status: &str, reason: &str| {
+            if crate::diagnostics::enabled() {
+                eprintln!(
+                    "VOXY_DEBUG_COMPANION {}",
+                    serde_json::json!({
+                        "pid": std::process::id(),
+                        "monotonic_ns": crate::diagnostics::now_ns(),
+                        "dimension": &self.dimension,
+                        "region": [coordinate.0, coordinate.1],
+                        "source_generation": previous.terrain_generation,
+                        "candidate_generation": generation,
+                        "world_identity": self.world_identity,
+                        "status": status,
+                        "reason": reason,
+                        "integrity_and_owner_validated": status == "validated"
+                    })
+                );
+            }
+        };
+        let mut content = match RegionContentTable::open(
+            &self.content_path(coordinate),
+            self.world_identity,
+            previous,
+        ) {
+            Ok(content) => {
+                #[cfg(feature = "debug-diagnostics")]
+                observe_companion("validated", "none");
+                content
+            }
+            Err(error) => {
+                #[cfg(feature = "debug-diagnostics")]
+                {
+                    let reason = if error.is::<ContentOwnerMismatch>() {
+                        "owner_mismatch"
+                    } else if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                        if io.kind() == std::io::ErrorKind::NotFound {
+                            "missing"
+                        } else {
+                            "io_error"
+                        }
+                    } else {
+                        "corrupt"
+                    };
+                    observe_companion("rejected", reason);
+                }
+                let counter = if error.is::<ContentOwnerMismatch>() {
+                    crate::diagnostics::Counter::CompanionOwnerMismatch
+                } else {
+                    crate::diagnostics::Counter::CompanionFallback
+                };
+                crate::diagnostics::count(counter, 1);
+                RegionContentTable::new(self.world_identity, previous)
+            }
+        };
+        let mut reader = self.source.regional_reader(header)?;
         let mut changed_groups = BTreeSet::new();
-        let unnotified = header.file_marker != previous.anvil_file_marker
-            && (!previous.reconciled || forced.iter().all(|bits| *bits == 0));
+        let unnotified = !prior_external
+            || (header.file_marker != previous.anvil_file_marker
+                && (!previous.reconciled || forced.iter().all(|bits| *bits == 0)));
         let base_x = header.region_x * 32;
         let base_z = header.region_z * 32;
         for (slot, entry) in header.entries.iter().copied().enumerate() {
@@ -1572,39 +1805,69 @@ impl RegionalRuntime {
             {
                 old
             } else {
-                let chunk = self.source.read_chunk(
-                    base_x + i32::from(local_x),
-                    base_z + i32::from(local_z),
-                    &self.registry,
-                )?;
+                let mut chunk =
+                    reader.read_chunk(base_x + i32::from(local_x), base_z + i32::from(local_z))?;
+                let digest = chunk.as_ref().map(|chunk| chunk.content_digest());
+                let raw_match = digest.is_some() == old.generated && content.matches(slot, digest);
+                let semantic_fingerprint = if raw_match {
+                    crate::diagnostics::count(crate::diagnostics::Counter::RawMatch, 1);
+                    old.semantic_fingerprint
+                } else {
+                    crate::diagnostics::count(crate::diagnostics::Counter::RawMiss, 1);
+                    match chunk.as_mut() {
+                        Some(chunk) => chunk.inspect(&self.registry)?,
+                        None => [0; 2],
+                    }
+                };
                 let current = ChunkSourceRecord {
-                    generated: chunk.is_some(),
+                    generated: digest.is_some(),
                     anvil_location: entry.location,
                     anvil_timestamp: entry.timestamp,
-                    semantic_fingerprint: chunk
-                        .as_ref()
-                        .map_or([0; 2], |chunk| chunk.terrain_fingerprint),
+                    semantic_fingerprint,
                 };
+                content.set(slot, digest);
+                crate::diagnostics::count(crate::diagnostics::Counter::RawPopulated, 1);
                 if current.generated != old.generated
                     || current.semantic_fingerprint != old.semantic_fingerprint
                 {
+                    crate::diagnostics::count(crate::diagnostics::Counter::SemanticChanged, 1);
                     changed_groups.insert((
                         (base_x + i32::from(local_x)).div_euclid(2),
                         (base_z + i32::from(local_z)).div_euclid(2),
                     ));
+                } else if !raw_match {
+                    crate::diagnostics::count(crate::diagnostics::Counter::SemanticEqual, 1);
                 }
                 current
             };
             updated.set_record(local_x, local_z, record)?;
         }
+        reader.verify()?;
         super::builder::verify_header(&self.source, header)?;
         if changed_groups.is_empty() {
             updated.terrain_generation = previous.terrain_generation;
         }
+        content.bind(self.world_identity, &updated);
         Ok(SavedChangeProbe {
             table: updated,
             changed_groups,
+            content,
+            reader,
         })
+    }
+
+    fn publish_content(&self, content: &RegionContentTable) {
+        if content
+            .write_atomic(&self.content_path(content.coordinate()))
+            .is_err()
+        {
+            crate::diagnostics::count(crate::diagnostics::Counter::CompanionFallback, 1);
+        }
+    }
+
+    fn content_path(&self, coordinate: (i32, i32)) -> PathBuf {
+        self.root
+            .join(format!("r.{}.{}.vxcontent", coordinate.0, coordinate.1))
     }
 
     fn terrain_path(&self, coordinate: (i32, i32)) -> PathBuf {
@@ -1618,9 +1881,11 @@ impl RegionalRuntime {
     }
 }
 
-struct SavedChangeProbe {
+struct SavedChangeProbe<'a> {
     table: RegionSourceTable,
     changed_groups: BTreeSet<(i32, i32)>,
+    content: RegionContentTable,
+    reader: RegionalReader<'a>,
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {
