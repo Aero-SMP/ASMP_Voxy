@@ -1,10 +1,112 @@
 # Server timings and 100 Rust clients: implementation results
 
-Date: 2026-10-06. Branch: `feature/cache-first-background-updates`.
+Updated: 2026-10-07. Branch: `feature/cache-first-background-updates`.
 Selected plan: `server_timings_100_rust_clients_live_pressure_implementation_plan.md`,
 SHA-256 `4b2fb89e6189df4026e7efe62a96405fe06a8bbb0157cbd5ed331ed44cebc025`.
 
-**Implementation and offline gates: PASS. Live verification: NOT RUN / INCONCLUSIVE.**
+**Implementation and offline gates: PASS. First live attempt: ABORTED / INCONCLUSIVE;
+100-client plateau: NOT RUN.** Server269 is now deployed and its actual native
+identity matches the debug embedding. PC268 was retained and confirmed through
+both SSH routes and signed typed results. The October6 preparation status below
+is historical; the October7 evidence in the next section supersedes it.
+
+## October7 live attempt and cleanup
+
+Run: `d617ed73-ce07-4fd8-b2ea-d63455863f34`. All owned evidence is under
+`/home/aerosmp/Desktop/Codex_Tools/Voxy_Workflow_Tooling/tasks/server-pressure-20261006/runs/d617ed73-ce07-4fd8-b2ea-d63455863f34/`.
+The immutable600-second clock closed after435.588seconds. No additional clock
+has been activated. Two earlier preparation manifests were never activated;
+one was cancelled while PREPARED, and one failed before RunStore preparation.
+
+Both existing PC host keys matched newly assigned loopback SSH ports34431 and44977.
+Only the stale local `tunnel-port` records were repaired; pins and remote helpers
+were preserved. `receipts/route-rediscovery-oct7.json` records old/new ports and
+unchanged pin hashes. Real PC game22328/start07:37:23.7265165Z and helpers24924/21732
+remained alive. Scoped Testing deployment preserved configuration, unrelated mods,
+saved worlds and the PC cache. The first typed BEGIN was explicitly rejected
+with `No player was found` during ordinary reconnect; the later BEGIN succeeded,
+with exact signed PC268 build identity. There was no replay of an uncertain call.
+
+The Java bridge registered100 unique run-owned routes and native READY confirmed
+them. This establishes registration, **not100 connections or capacity**. Only one
+Rust client was admitted for each of the two calibration workloads below.
+
+| One-client workload | Unshaped baseline | Impaired, timings off |
+| --- | ---: | ---: |
+| Added RTT / seeded loss each direction / full-duplex cap | 0ms /0% /1000kbps | 300ms /10% /1000kbps |
+| First validated coarse terrain | 615.076ms | 6631.362ms |
+| First validated finer terrain | 1675.256ms | 12505.493ms |
+| Validated records, DATA/EMPTY | 105,99/6 | 10,9/1 |
+| Validated compressed payload bytes | 586649 | 51021 |
+| Shared plateau start after runner launch | 2.001s | 13.002s |
+| Full required5-second calibration plateau | Yes | No; original15-second runner window elapsed |
+| Runner technical outcome | PASS | INCOMPLETE; `external/setup deadline before full plateau` |
+| Final Quinn smoothed RTT estimate | 54.488ms | 317.309ms |
+| Intentionally dropped upload /download datagrams | 0/416;0/575 | 16/134;16/178 |
+| Integrity/protocol errors, relay errors/truncation/rate violations | 0 observed | 0 observed |
+
+These are measured calibration results, not100-client results or a controlled
+timing-overhead comparison. Smoothed RTT under traffic is not an unloaded RTT
+distribution. Loss percentages are statistical; the saved analyzer verified
+the exact seeded drop counts, packet/byte reconciliation and reported service
+ceilings. No timing-on workload completed, so server processing bottlenecks and
+instrumentation overhead remain unmeasured. Probes were off; zero stage counters
+cannot be interpreted as zero processing time.
+
+Three external-driver mistakes were found and corrected without changing Voxy
+source or artifacts:
+
+- The PC preservation gate compared the derived `estimatedWorldBytes` field as
+  a user control. Bootstrap legitimately refreshed3632364026 to3351352893. The
+  corrected comparison excludes only that derived field and its containing file
+  hash; all actual settings, anchors, artifacts, game/helpers and cache markers
+  remain checked. Neither value was written back to the PC.
+- The resource reader assumed this cgroup exposed `io.stat`. Its absence raised
+  a known read failure; watch's fault cleanup correctly entered RESTORING. Optional
+  unavailable I/O/PSI counters now remain null, never fabricated zeros. Mandatory
+  memory limits/events and process identity checks are unchanged. No complete
+  resource sample was captured by that failed observer, so generator CPU/RSS,
+  native peak/PSI and socket-close-tail claims are unavailable for this attempt.
+- The15-second one-client window left less than5seconds after measured13-second
+  impaired setup. Its experiment ceiling is now30seconds, while retaining the
+  full5-second calibration plateau and original600/180-second run boundaries.
+  The attempted follow-up was rejected before submission because the run had
+  already entered RESTORING; it did not start another client or change timings.
+
+`owner-corrections.json` records corrected external helper hashes. `analysis.json`
+contains saved-artifact analysis, and `testing-latest-after-cleanup.log` has SHA256
+`4c822d3856e3dfd1d1e367c785fed8f5877addc12c1da4d49054044aa1507e1f`.
+
+Cleanup independently observed zero owned routes, sessions, subscriptions, routed
+sockets, exclusive/unknown source regions, and no surviving guard/runner processes.
+The native diagnostic-reset acknowledgement proved reporting/probes off.
+`cleanup-proposal.json`, confirmed typed END/ABORTED finish, and `closure.stdout`
+establish restoration and the closed cooperative lease. PC controls/cache markers
+and helpers, Testing configuration/unrelated mods, and MainPID2703517/start52797315
+were preserved. No operator pose change occurred; natural login-position settlement
+was recorded rather than overwritten. No screenshot or controlled FPS observation
+was performed. The final real-PC snapshot showed67314 cache hits,67554 activated
+sections and44682 GPU draws; those cumulative counters establish activity only.
+
+Loaded Testing JavaPID267145/start58275978 and nativePID268114/start58277257 use
+debugserver269/native51d0d065…; the exact hashes remain in the artifact table below.
+The retained PC268 hash is
+`74dc0d71781c677bca2256a04d3913b6bfac87adf67d1b8220cb7d81cac38eeb`.
+Actual Java heap init/max were1073741824/4294967296bytes. Native hard limit remained
+999997440bytes with swap0; its new cgroup's OOM/kill/group-kill and max-event
+counters remained0. Native memory.current at final closure was621707264bytes,
+**not a measured peak or100-client pressure observation**. The candidate remains
+loaded; prepared267 rollback is preserved.
+
+The plan's one-clock rule requires new authorization before another live attempt;
+this request is pending. Remaining gates are successful impaired off/on calibration,
+stage/overhead validation, profile calibration, the complete100×240-second plateau,
+resource/fairness/bottleneck measurements, real-PC screenshots and verified cleanup.
+No capacity or bottleneck ranking is claimed. No integration tests, client updater
+publication or GitHub publishing occurred.
+
+## Historical October6 preparation status
+
 Both pinned PC backup SSH routes returned `SSH_ROUTE_UNAVAILABLE` during repeated
 read-only checks, including 22:21 UTC. The question about bringing the PC/client
 online remains unanswered. The plan requires fresh proof of both backup routes
