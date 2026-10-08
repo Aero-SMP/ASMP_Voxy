@@ -2557,7 +2557,7 @@ public final class ClientSession {
                     || !downloads.drops().isEmpty() || !downloads.changes().isEmpty()
                     || this.hasUrgentDownloadInterest()) return null;
             int available = 0; for (var worker : this.sectionWorkers) if (worker.idle()) available++;
-            if (downloads.waiting() >= available) return null;
+            if (available == 0 || downloads.waitingAtLeast(available)) return null;
             return downloads.next(owner.ticket(), this.connectionEpoch);
         }
 

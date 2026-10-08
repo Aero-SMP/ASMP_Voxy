@@ -144,7 +144,7 @@ public final class WorldCacheVisibilityBehaviorTest {
             var visible = fixture.seedJob(FIRST, A, 102, 3, false);
             var other = fixture.seedJob(SECOND, removed, 103, 4, false);
             check(dimension.pendingJobs.get(region(A)) == 2, "shared job-region count not seeded");
-            check(planner.waiting() == 3, "waiting-job fixture count differs");
+            check(planner.waitingAtLeast(3) && !planner.waitingAtLeast(4), "waiting-job fixture count differs");
 
             visibility.update(2, new long[]{A, C});
             planner.view(FIRST, 0, 0, visibility);
@@ -161,7 +161,7 @@ public final class WorldCacheVisibilityBehaviorTest {
                     "cancellation corrupted pending region counts");
             check(fixture.dimension(SECOND).pendingJobs.get(region(removed)) == 1,
                     "other-dimension region count changed");
-            check(planner.waiting() == 2, "cancelled job remained in waiting count");
+            check(planner.waitingAtLeast(2) && !planner.waitingAtLeast(3), "cancelled job remained in waiting count");
             check(dimension.queued.size() == beforeAdded + 9,
                     "added root must enqueue its eight children plus the cancelled-job reoffer");
             assertFrontier(dimension, "added visible root and cancelled job reoffer");

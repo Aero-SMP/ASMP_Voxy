@@ -680,7 +680,7 @@ public final class CacheDownloadAdmissionBehaviorTest {
                     && admitted.dimensionId() == DIMENSION && admitted.worldIdentity().equals(WORLD),
                     "actual planner did not admit one scoped request with spare capacity");
             check(s.interestChanges.contains(stale.key), "unrelated pending watch was consumed to admit prefetch");
-            check(f.planner.waiting() == 1, "selector admitted more than one request");
+            check(f.planner.waitingAtLeast(1) && !f.planner.waitingAtLeast(2), "selector admitted more than one request");
             var occupied = s.sectionWorkers[0].resource.acquire();
             check(s.selectCacheDownload(true) == null && f.planner.pending() == 1, "waiting-versus-idle bound changed");
             check(occupied != null, "fixture failed to occupy idle capacity");
@@ -727,7 +727,7 @@ public final class CacheDownloadAdmissionBehaviorTest {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             do {
                 f.session.processStages(true);
-                check(f.planner.pending() == 0 && f.planner.waiting() == 0, "actual refused send leaked a ticket/job");
+                check(f.planner.pending() == 0 && !f.planner.waitingAtLeast(1), "actual refused send leaked a ticket/job");
                 if (transfers[0] > 0) break;
                 Thread.sleep(1);
             } while (System.nanoTime() < deadline);
@@ -804,7 +804,7 @@ public final class CacheDownloadAdmissionBehaviorTest {
             // This is the real planner rollback called by the production failed-send
             // branch, tested independently of a socket-backed QUIC instance.
             f.planner.unsent(next.ticket());
-            check(f.planner.job(next.ticket()) == null && f.planner.waiting() == 0 && f.planner.drops().isEmpty(),
+            check(f.planner.job(next.ticket()) == null && !f.planner.waitingAtLeast(1) && f.planner.drops().isEmpty(),
                     "unsent rollback retained ticket or manufactured cancellation");
             Thread thread = new Thread(writer, "fixture control writer"); thread.start();
             try {

@@ -640,7 +640,11 @@ final class WorldCacheDownloads implements AutoCloseable {
     Job job(long ticket) { return this.jobs.get(ticket); }
     Job pending(int dimension, long key) { return this.requested.get(new RegionalProtocol.ScopedKey(dimension, key)); }
     int pending() { return this.jobs.size(); }
-    int waiting() { int count = 0; for (var job : this.jobs.values()) if (!job.processing) count++; return count; }
+    boolean waitingAtLeast(int count) {
+        if (count <= 0) return true;
+        for (var job : this.jobs.values()) if (!job.processing && --count == 0) return true;
+        return false;
+    }
     boolean current(Job job) { return !this.closed && this.jobs.get(job.ticket) == job && this.dimensions.get(job.dimension.info.id()) == job.dimension; }
     RegionalProtocol.Desire next(long ticket, long connection) throws IOException {
         drainDirectory();
@@ -669,7 +673,8 @@ final class WorldCacheDownloads implements AutoCloseable {
                 if (coverage == null) { dimension.offer(node); return null; }
                 LocalSection have = coverage.bindings.get(key);
                 if (have != null && have.kind() != LocalSection.ABSENT) {
-                    dimension.expand(node); this.skipped++; this.wake.run(); return null;
+                    if (!coverage.full.contains(key)) dimension.expand(node);
+                    this.skipped++; this.wake.run(); return null;
                 }
                 // The existing view record already owns this miss/ticket. Descendants
                 // may still prepare, but never replace its in-flight request with prefetch.
